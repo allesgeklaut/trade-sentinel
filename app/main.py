@@ -61,23 +61,6 @@ async def screen_results(universe:str):
         if universe not in universe_names(): raise ValueError('Unknown universe')
         return await results(universe)
     except ValueError as e: raise HTTPException(404,str(e))
-@app.post('/api/explain/{ticker}')
-async def explain(ticker:str):
-    rows=await candles(ticker.upper())
-    try: r=compute(rows)
-    except ValueError as e: raise HTTPException(400,str(e))
-    prompt=f"You are a cautious stock-research assistant. Explain this deterministic research signal in <=100 words. Never issue a recommendation or promise. Ticker {ticker.upper()}; signal {r['action']}; reason {r['reason']}; indicators {json.dumps(r['snapshot'])}. Mention it needs independent research."
-    try:
-        timeout = httpx.Timeout(
-            connect=10.0,
-            read=settings.ollama_timeout_seconds,
-            write=30.0,
-            pool=10.0,
-        )
-        async with httpx.AsyncClient(timeout=timeout) as c: out=(await c.post(settings.ollama_url.rstrip('/')+'/api/generate',json={"model":settings.ollama_model,"prompt":prompt,"stream":False})).json()
-        return {"text":out.get('response','No Ollama response'),"model":settings.ollama_model}
-    except Exception as e: return {"text":f"Ollama unavailable: {e}","model":settings.ollama_model}
-
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -96,6 +79,9 @@ async def _stock_context(ticker: str) -> str:
         f"Signal: {r['action']}\n"
         f"Reason: {r['reason']}\n"
         f"Indicators: {json.dumps(r['snapshot'])}\n"
+        f"Decision rules: BUY when close > SMA-50 and SMA-50 > SMA-200 and SMA-50 is higher than six trading days ago, "
+        f"and RSI > 50 with the prior day RSI <= 50, and MACD > MACD signal. SELL when close < SMA-50 and SMA-50 < SMA-200. "
+        f"Otherwise HOLD."
     )
 
 @app.post('/api/chat/{ticker}')
