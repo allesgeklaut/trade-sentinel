@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     ollama_url: str = "http://host.docker.internal:11434"
     ollama_model: str = "qwen3.6:27b-q3_K_M"
     refresh_minutes: int = 60
+    screener_refresh_hour_utc: int = 22
     paper_trading: bool = True
     max_notional_per_order: float = 1000
     max_daily_loss: float = 100

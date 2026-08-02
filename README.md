@@ -1,34 +1,21 @@
 # Trade Sentinel MVP
 
-Self-hosted, paper-first stock research dashboard. It fetches daily candles from Twelve Data, caches them in SQLite, computes transparent trend/RSI/MACD/ATR signals, stores analysis history, and can ask a local Ollama model to explain an already-computed signal. It deliberately does **not** place live orders.
+Self-hosted, paper-first stock research dashboard using Twelve Data only. It caches daily candles in SQLite, computes transparent signals, provides Twelve Data ticker/company autocomplete, and screens a local editable universe for sustained trends. It has no broker credentials or execution routes.
 
 ## Run
-
 ```bash
 cp .env.example .env
-# Set TWELVE_DATA_API_KEY and your reachable OLLAMA_URL
-# For Linux Docker engines, use your host LAN IP or add host-gateway mapping.
+# Set TWELVE_DATA_API_KEY and a container-reachable OLLAMA_URL
 docker compose up -d --build
 ```
+Open `http://SERVER:8010`.
 
-Open `http://SERVER:8010`. The first refresh needs the Twelve Data key. Add or remove tickers in the UI. Data lives in the named volume `trade_sentinel_data`.
+## Ticker autocomplete
+Type two or more characters in the add field. The frontend debounces remote Twelve Data `/symbol_search` requests by 300 ms, then displays the provider's canonical symbol, instrument name and exchange. Select a match before adding it to avoid ambiguous tickers.
 
-## Safety model
+## Local screener
+`universes/us-large-cap.txt` is an editable 41-symbol starter universe. Add `atx.txt` or `xetra.txt`, one provider symbol per line, then rebuild the image. **Update** fetches daily history sequentially, writes it into SQLite, and ranks entries by trend alignment, 20/60-day momentum, RSI, and relative volume. It consumes one Twelve Data time-series request per symbol, so run it once after market close (not repeatedly) on the free quota.
 
-- `PAPER_TRADING=true` is mandatory for this MVP; no broker credentials or execution routes exist.
-- Signals are deterministic, versioned and persisted with their indicator snapshot.
-- LLM output is explanatory only; it receives no credentials and cannot execute actions.
-- Keep the service behind your normal Cloudflare Access/OIDC setup; it has no built-in auth.
+The screener intentionally is not scheduled in this MVP: manually update it initially so data-credit consumption remains fully visible and predictable. Add a scheduler only after selecting the universe size and market-close time you want.
 
-## Signal policy
-
-`BUY` means bullish SMA alignment plus an RSI recovery; `SELL` means a bearish trend break; all other states are `HOLD`. These are research signals, not financial advice. Backtest and paper-trade before considering any real execution.
-
-## API
-
-- `GET /api/watchlist`
-- `POST /api/watchlist/{ticker}` / `DELETE /api/watchlist/{ticker}`
-- `POST /api/refresh/{ticker}`
-- `GET /api/dashboard/{ticker}`
-- `POST /api/explain/{ticker}`
-- `GET /healthz`
+Signals/screener rankings are research tools, not financial advice. Validate in a backtest and paper mode before any live execution.
