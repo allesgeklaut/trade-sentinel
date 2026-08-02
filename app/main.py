@@ -67,7 +67,13 @@ async def explain(ticker:str):
     except ValueError as e: raise HTTPException(400,str(e))
     prompt=f"You are a cautious stock-research assistant. Explain this deterministic research signal in <=100 words. Never issue a recommendation or promise. Ticker {ticker.upper()}; signal {r['action']}; reason {r['reason']}; indicators {json.dumps(r['snapshot'])}. Mention it needs independent research."
     try:
-        async with httpx.AsyncClient(timeout=45) as c: out=(await c.post(settings.ollama_url.rstrip('/')+'/api/generate',json={"model":settings.ollama_model,"prompt":prompt,"stream":False})).json()
+        timeout = httpx.Timeout(
+            connect=10.0,
+            read=settings.ollama_timeout_seconds,
+            write=30.0,
+            pool=10.0,
+        )
+        async with httpx.AsyncClient(timeout=timeout) as c: out=(await c.post(settings.ollama_url.rstrip('/')+'/api/generate',json={"model":settings.ollama_model,"prompt":prompt,"stream":False})).json()
         return {"text":out.get('response','No Ollama response'),"model":settings.ollama_model}
     except Exception as e: return {"text":f"Ollama unavailable: {e}","model":settings.ollama_model}
 app.mount('/',StaticFiles(directory='static',html=True),name='static')
