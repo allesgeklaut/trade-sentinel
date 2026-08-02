@@ -1,25 +1,79 @@
-# Yahoo Finance symbols: US, Xetra, Vienna, Euronext. Edit freely.
-AAPL
-MSFT
+# Yahoo Finance symbols. Global AI, semiconductors, cloud/compute, robotics,
+# space/connectivity and selected recent IPOs. One canonical Yahoo symbol per line.
+# Research universe only: inclusion is not a recommendation.
+
+# AI compute, semiconductors and networking
 NVDA
-AMZN
+AMD
+AVGO
+TSM
+ASML.AS
+MU
+ARM
+MRVL
+QCOM
+INTC
+SMCI
+ANET
+VRT
+CORZ
+NBIS
+
+# Hyperscalers and AI platforms
+MSFT
 GOOGL
+AMZN
 META
-SPY
-QQQ
-IFX.DE
+ORCL
+IBM
+PLTR
+NOW
+CRM
+ADBE
+SNOW
+DDOG
+MDB
+
+# AI applications, data, voice and automation
+AI
+SOUN
+PATH
+UPST
+TEM
+BBAI
+RGTI
+IONQ
+QBTS
+RKLB
+
+# AI infrastructure and recent AI-focused IPOs
+CRWV
+FIG
+CRCL
+CHYM
+ETOR
+
+# Space, connectivity and defence technology
+SPCX
+ASTS
+LUNR
+RDW
+KTOS
+PL
+IRDM
+
+# Global AI and technology listings
 SAP.DE
 SIE.DE
-ALV.DE
-DTE.DE
-BAS.DE
-BMW.DE
-ASML.AS
-MC.PA
-OR.PA
-NESN.SW
-NOVN.SW
-OMV.VI
-VOE.VI
-EBS.VI
-ANDR.VI
+IFX.DE
+AMS.MC
+DSY.PA
+AI.PA
+BESI.AS
+NEM.DE
+SOF.BR
+
+# Broad benchmarks for relative context
+QQQ
+SOXX
+SMH

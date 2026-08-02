@@ -2,8 +2,8 @@ from datetime import datetime
 from functools import partial
 import asyncio
 import httpx
-import math
 import pandas as pd
+import numpy as np
 import yfinance as yf
 from sqlalchemy import select
 from .db import Candle, Session
@@ -15,54 +15,20 @@ def provider():
     if value=="twelvedata" and not settings.twelve_data_api_key: raise ValueError("TWELVE_DATA_API_KEY is required when MARKET_DATA_PROVIDER=twelvedata")
     return value
 
-def yahoo_history(ticker: str) -> list[dict]:
-    frame = yf.Ticker(ticker).history(
-        period="2y",
-        interval="1d",
-        auto_adjust=False,
-        actions=False,
-        repair=True,
-        keepna=False,
-        raise_errors=True,
-    )
-
-    if frame.empty:
-        raise ValueError(f"No Yahoo Finance daily data for {ticker}")
-
-    required = ["Open", "High", "Low", "Close", "Volume"]
-
-    # Reject broken Yahoo rows, especially incomplete final daily candles.
-    frame = frame.dropna(subset=["Open", "High", "Low", "Close"]).copy()
-
-    # Extra protection against inf/-inf values before SQLite insertion.
-    frame = frame.replace([float("inf"), float("-inf")], pd.NA)
-    frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
-
-    if frame.empty:
-        raise ValueError(f"No valid Yahoo Finance daily candles for {ticker}")
-
-    return [
-        {
-            "timestamp": row.Index.to_pydatetime().replace(tzinfo=None),
-            "open": float(row.Open),
-            "high": float(row.High),
-            "low": float(row.Low),
-            "close": float(row.Close),
-            "volume": float(row.Volume or 0),
-        }
-        for row in frame.itertuples()
-    ]
-
+def yahoo_history(ticker):
+    frame=yf.Ticker(ticker).history(period="2y",interval="1d",auto_adjust=False,actions=False,raise_errors=True)
+    if frame.empty: raise ValueError(f"No Yahoo Finance daily data for {ticker}")
+    frame=frame.replace([np.inf,-np.inf],np.nan).dropna(subset=["Open","High","Low","Close"])
+    if frame.empty: raise ValueError(f"No valid Yahoo Finance daily data for {ticker}")
+    return [{"timestamp":x.Index.to_pydatetime().replace(tzinfo=None),"open":float(x.Open),"high":float(x.High),"low":float(x.Low),"close":float(x.Close),"volume":float(x.Volume or 0)} for x in frame.itertuples()]
 def yahoo_search(q):
     quotes=yf.Search(q,max_results=8,news_count=0,lists_count=0,enable_fuzzy_query=True,raise_errors=True).quotes
     return [{"symbol":x.get("symbol"),"name":x.get("shortname") or x.get("longname") or x.get("symbol"),"exchange":x.get("exchDisp") or x.get("exchange",""),"country":x.get("region", ""),"type":x.get("quoteType","")} for x in quotes if x.get("symbol")]
-
 async def search(q):
     if provider()=="yfinance": return await asyncio.to_thread(yahoo_search,q)
     async with httpx.AsyncClient(timeout=10) as c: data=(await c.get("https://api.twelvedata.com/symbol_search",params={"symbol":q,"outputsize":8,"apikey":settings.twelve_data_api_key})).json()
     if data.get("status")=="error": raise ValueError(data.get("message","Symbol search failed"))
     return [{"symbol":x.get("symbol"),"name":x.get("instrument_name",x.get("symbol")),"exchange":x.get("exchange",""),"country":x.get("country",""),"type":x.get("instrument_type","")} for x in data.get("data",[])]
-
 async def refresh(ticker):
     if provider()=="yfinance": values=await asyncio.to_thread(yahoo_history,ticker)
     else:
@@ -76,7 +42,6 @@ async def refresh(ticker):
                 for key in ["open","high","low","close","volume"]: setattr(row,key,x[key])
             else: s.add(Candle(ticker=ticker,**x))
         await s.commit()
-
 async def candles(ticker):
     async with Session() as s:
         rows=(await s.scalars(select(Candle).where(Candle.ticker==ticker).order_by(Candle.timestamp))).all()

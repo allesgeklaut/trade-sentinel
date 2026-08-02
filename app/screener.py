@@ -22,7 +22,9 @@ def score(rows):
     value=(35 if trend=="BULLISH" else 18 if trend=="UPTREND" else 0)+min(max(r20,0),20)+min(max(r60,0),20)/2+min(max((rv-1)*10,0),10)+(10 if 50<=rsi<=70 else 3 if 45<=rsi<75 else 0)
     return dict(score=round(value,2),trend=trend,return_20d=round(r20,2),return_60d=round(r60,2),rsi=round(rsi,2),relative_volume=round(rv,2),close=round(float(c.iloc[-1]),2))
 async def run(name):
-    symbols=tickers(name); results=[]
+    # Preserve order while preventing duplicate symbols from violating the
+    # (universe, ticker) database constraint.
+    symbols=list(dict.fromkeys(tickers(name))); results=[]
     for symbol in symbols:
         try:
             await refresh(symbol); out=score(await candles(symbol))
