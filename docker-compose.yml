@@ -1,0 +1,13 @@
+services:
+  trade-sentinel:
+    build: .
+    container_name: trade-sentinel
+    restart: unless-stopped
+    ports: ["8002:8000"]
+    env_file: .env
+    volumes: ["trade_sentinel_data:/data"]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: ["/tmp"]
+volumes:
+  trade_sentinel_data:
