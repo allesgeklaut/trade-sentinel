@@ -1,19 +1,20 @@
 import json, httpx
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from .config import settings
 from .db import Watchlist, Session, init_db
 from .market import refresh, candles
 from .analysis import compute, persist, history
+from .screener import universe_names, run, results
 @asynccontextmanager
 async def lifespan(app):
     await init_db()
     async with Session() as s:
-        for t in settings.watchlist.split(','): s.add(Watchlist(ticker=t.strip().upper()))
-        try: await s.commit()
-        except: await s.rollback()
+        for t in settings.watchlist.split(','):
+            if not await s.get(Watchlist,t.strip().upper()): s.add(Watchlist(ticker=t.strip().upper()))
+        await s.commit()
     yield
 app=FastAPI(title="Trade Sentinel",lifespan=lifespan)
 @app.get('/healthz')
@@ -23,14 +24,22 @@ async def watchlist():
     async with Session() as s: return [x.ticker for x in (await s.scalars(select(Watchlist).order_by(Watchlist.ticker))).all()]
 @app.post('/api/watchlist/{ticker}')
 async def add(ticker:str):
-    async with Session() as s: s.add(Watchlist(ticker=ticker.upper())); await s.commit()
-    return {"ticker":ticker.upper()}
+    ticker=ticker.upper()
+    async with Session() as s:
+        if not await s.get(Watchlist,ticker): s.add(Watchlist(ticker=ticker)); await s.commit()
+    return {"ticker":ticker}
 @app.delete('/api/watchlist/{ticker}')
 async def remove(ticker:str):
     async with Session() as s:
         x=await s.get(Watchlist,ticker.upper())
         if x: await s.delete(x); await s.commit()
     return {"ok":True}
+@app.get('/api/symbols')
+async def symbols(q:str=Query(min_length=2,max_length=80)):
+    if not settings.twelve_data_api_key: raise HTTPException(400,"TWELVE_DATA_API_KEY is not configured")
+    async with httpx.AsyncClient(timeout=10) as c: data=(await c.get('https://api.twelvedata.com/symbol_search',params={"symbol":q,"outputsize":8,"apikey":settings.twelve_data_api_key})).json()
+    if data.get('status')=='error': raise HTTPException(400,data.get('message','Symbol search failed'))
+    return [{"symbol":x.get("symbol"),"name":x.get("instrument_name",x.get("symbol")),"exchange":x.get("exchange",""),"country":x.get("country",""),"type":x.get("instrument_type","")} for x in data.get('data',[])]
 @app.post('/api/refresh/{ticker}')
 async def fetch(ticker:str):
     try: await refresh(ticker.upper()); return {"ok":True}
@@ -40,6 +49,18 @@ async def dashboard(ticker:str):
     rows=await candles(ticker.upper())
     try: r=compute(rows); await persist(ticker.upper(),r); r['history']=await history(ticker.upper()); return r
     except ValueError as e: raise HTTPException(400,str(e))
+@app.get('/api/screener/universes')
+async def universes(): return universe_names()
+@app.post('/api/screener/run/{universe}')
+async def screen_run(universe:str):
+    try: return await run(universe)
+    except ValueError as e: raise HTTPException(404,str(e))
+@app.get('/api/screener/{universe}')
+async def screen_results(universe:str):
+    try:
+        if universe not in universe_names(): raise ValueError('Unknown universe')
+        return await results(universe)
+    except ValueError as e: raise HTTPException(404,str(e))
 @app.post('/api/explain/{ticker}')
 async def explain(ticker:str):
     rows=await candles(ticker.upper())
