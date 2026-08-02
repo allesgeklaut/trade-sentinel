@@ -1,21 +1,32 @@
 # Trade Sentinel MVP
 
-Self-hosted, paper-first stock research dashboard using Twelve Data only. It caches daily candles in SQLite, computes transparent signals, provides Twelve Data ticker/company autocomplete, and screens a local editable universe for sustained trends. It has no broker credentials or execution routes.
+A self-hosted, paper-only stock research dashboard. Market data is switched globally with **one environment variable**; all providers normalize historical daily OHLCV data into the same local SQLite cache, so charts, signals, autocomplete, and screening use the selected backend consistently.
+
+## Choose a provider
+
+```dotenv
+# Default: free/best-effort US + international coverage, including Yahoo symbols such as IFX.DE and OMV.VI
+MARKET_DATA_PROVIDER=yfinance
+
+# Alternative: requires an API key; Basic coverage is mainly US equities/ETFs, forex and crypto
+# MARKET_DATA_PROVIDER=twelvedata
+# TWELVE_DATA_API_KEY=your_key
+```
+
+`yfinance` uses Yahoo Finance's public endpoints through the `yfinance` library. It enables global ticker search and mixed US/EU screeners without a data key, but it is not an official market-data API: cache aggressively, throttle manual screener runs, and treat it as EOD/best-effort research data. Do not use it for execution.
 
 ## Run
+
 ```bash
 cp .env.example .env
-# Set TWELVE_DATA_API_KEY and a container-reachable OLLAMA_URL
+nano .env
 docker compose up -d --build
 ```
-Open `http://SERVER:8010`.
 
-## Ticker autocomplete
-Type two or more characters in the add field. The frontend debounces remote Twelve Data `/symbol_search` requests by 300 ms, then displays the provider's canonical symbol, instrument name and exchange. Select a match before adding it to avoid ambiguous tickers.
+Open `http://SERVER:8010`. Altering `MARKET_DATA_PROVIDER` requires a restart: `docker compose up -d --build`.
 
-## Local screener
-`universes/us-large-cap.txt` is an editable 41-symbol starter universe. Add `atx.txt` or `xetra.txt`, one provider symbol per line, then rebuild the image. **Update** fetches daily history sequentially, writes it into SQLite, and ranks entries by trend alignment, 20/60-day momentum, RSI, and relative volume. It consumes one Twelve Data time-series request per symbol, so run it once after market close (not repeatedly) on the free quota.
+## Autocomplete and screener
 
-The screener intentionally is not scheduled in this MVP: manually update it initially so data-credit consumption remains fully visible and predictable. Add a scheduler only after selecting the universe size and market-close time you want.
+Autocomplete uses the selected provider. With `yfinance`, it supports fuzzy company/ticker lookup and returns canonical Yahoo symbols such as `IFX.DE`, `ASML.AS`, and `OMV.VI`. The `global-large-cap` universe mixes US, German, Dutch, French, Swiss, and Vienna listings. Press **Update** manually after markets close; it downloads and caches about two years of daily candles for each symbol, then ranks trend alignment, 20/60-day momentum, RSI, and relative volume.
 
-Signals/screener rankings are research tools, not financial advice. Validate in a backtest and paper mode before any live execution.
+No live broker or order API exists. Signals and rankings are research tools, not financial advice.
