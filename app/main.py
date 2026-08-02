@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
+from pydantic import BaseModel
 from .config import settings
 from .db import Watchlist, Session, init_db
 from .market import refresh, candles, search, provider
@@ -76,4 +77,60 @@ async def explain(ticker:str):
         async with httpx.AsyncClient(timeout=timeout) as c: out=(await c.post(settings.ollama_url.rstrip('/')+'/api/generate',json={"model":settings.ollama_model,"prompt":prompt,"stream":False})).json()
         return {"text":out.get('response','No Ollama response'),"model":settings.ollama_model}
     except Exception as e: return {"text":f"Ollama unavailable: {e}","model":settings.ollama_model}
-app.mount('/',StaticFiles(directory='static',html=True),name='static')
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatRequest(BaseModel):
+    messages: list[ChatMessage]
+
+async def _stock_context(ticker: str) -> str:
+    """Build a system prompt with deterministic stock data so the LLM has facts to chat about."""
+    rows = await candles(ticker)
+    r = compute(rows)
+    return (
+        f"You are a trading expert. You are chatting with a user about {ticker}. "
+        f"Use the deterministic research data below as your only source of facts. "
+        f"Ticker: {ticker}\n"
+        f"Signal: {r['action']}\n"
+        f"Reason: {r['reason']}\n"
+        f"Indicators: {json.dumps(r['snapshot'])}\n"
+    )
+
+@app.post('/api/chat/{ticker}')
+async def chat(ticker: str, req: ChatRequest):
+    """Multi-turn chat about a stock. Pass the full message history; the system context is rebuilt each turn."""
+    ticker = ticker.upper()
+    if not req.messages:
+        raise HTTPException(400, "messages must not be empty")
+    # Sanitise: keep only the last 20 messages, only role/content, only known roles
+    history = []
+    for m in req.messages[-20:]:
+        if m.role in ('user', 'assistant') and m.content.strip():
+            history.append({"role": m.role, "content": m.content})
+    if not history:
+        raise HTTPException(400, "no valid messages")
+    system_prompt = await _stock_context(ticker)
+    try:
+        timeout = httpx.Timeout(
+            connect=10.0,
+            read=settings.ollama_timeout_seconds,
+            write=30.0,
+            pool=10.0,
+        )
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            out = (await c.post(
+                settings.ollama_url.rstrip('/') + '/api/chat',
+                json={
+                    "model": settings.ollama_model,
+                    "messages": [{"role": "system", "content": system_prompt}] + history,
+                    "stream": False,
+                },
+            )).json()
+        text = out.get('message', {}).get('content', '') or 'No Ollama response'
+        return {"text": text, "model": settings.ollama_model}
+    except Exception as e:
+        return {"text": f"Ollama unavailable: {e}", "model": settings.ollama_model}
+
+app.mount('/', StaticFiles(directory='static', html=True), name='static')

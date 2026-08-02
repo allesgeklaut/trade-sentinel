@@ -101,6 +101,87 @@
             line-height: 1.5
         }
 
+        /* AI chat */
+        .ai-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            margin-bottom: 10px
+        }
+
+        .ai-hint {
+            color: #7aaa81;
+            font-size: 12px
+        }
+
+        .ai-thread {
+            max-height: 320px;
+            overflow-y: auto;
+            padding: 8px 4px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            border: 1px solid #12351c;
+            background: #050a07;
+            margin-bottom: 10px
+        }
+
+        .ai-msg {
+            padding: 8px 12px;
+            border-radius: 4px;
+            line-height: 1.5;
+            font-size: 13px;
+            white-space: pre-wrap;
+            word-wrap: break-word
+        }
+
+        .ai-msg.user {
+            background: #0a2412;
+            border: 1px solid #1d6030;
+            align-self: flex-end;
+            max-width: 88%;
+            color: #b7ffc0
+        }
+
+        .ai-msg.assistant {
+            background: #071009;
+            border: 1px solid #12351c;
+            align-self: flex-start;
+            max-width: 92%;
+            color: #b7ffc0
+        }
+
+        .ai-msg.system {
+            background: transparent;
+            border: 1px dashed #318e43;
+            color: #7aaa81;
+            font-size: 12px;
+            align-self: center;
+            text-align: center
+        }
+
+        .ai-empty {
+            color: #7aaa81;
+            font-size: 12px;
+            text-align: center;
+            padding: 20px
+        }
+
+        .ai-form {
+            display: flex;
+            gap: 6px
+        }
+
+        .ai-form input {
+            flex: 1
+        }
+
+        .ai-form input:disabled,
+        .ai-form button:disabled {
+            opacity: 0.4;
+            cursor: not-allowed
+        }
+
         table {
             width: 100%;
             border-collapse: collapse;
@@ -275,14 +356,24 @@
             <div id="watch"></div>
         </aside>
         <section>
-            <div class="panel"><button onclick="refreshData()">Refresh data</button> <button onclick="explain()">Ask
+            <div class="panel"><button onclick="refreshData()">Refresh data</button> <button onclick="startChat()">Ask
                     local LLM</button><button onclick="showExplainModal()" style="margin-left:6px">Explain This
                     Screen</button><b id="ticker"></b>
                 <div id="signal"></div>
                 <div id="chart"></div>
             </div>
-            <div class="panel"><b>AI EXPLANATION</b>
-                <pre id="ai">Select a symbol, then ask Ollama for a read-only explanation.</pre>
+            <div class="panel">
+                <div class="ai-header"><b>AI EXPLANATION</b>
+                    <span class="ai-hint">Ask follow-up questions about <span id="ai-ticker">the selected
+                            stock</span></span>
+                </div>
+                <div id="ai-thread" class="ai-thread">
+                    <div class="ai-empty">Select a symbol, then ask Ollama for a read-only explanation.</div>
+                </div>
+                <form id="ai-form" class="ai-form" onsubmit="return sendChat(event)">
+                    <input id="ai-input" autocomplete="off" placeholder="Ask a follow-up question…" disabled>
+                    <button id="ai-send" type="submit" disabled>Send</button>
+                </form>
             </div>
         </section>
         <aside class="panel"><b>DISCOVER // LOCAL SCREENER</b>
@@ -350,10 +441,96 @@
         document.getElementById('explain-backdrop-container').addEventListener('click', e => {
             if (e.target.id === 'explain-backdrop-container') closeExplainModal();
         });
+
+        // --- AI chat (per-ticker conversation thread) ---
+        const chatState = {
+            ticker: null,        // ticker the thread belongs to
+            messages: [],        // [{role, content}] — only user/assistant
+            busy: false,         // a request is in flight
+        };
+
+        function escapeHtml(s) {
+            return String(s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+        }
+
+        function renderChat() {
+            const thread = document.getElementById('ai-thread');
+            if (chatState.messages.length === 0) {
+                thread.innerHTML = '<div class="ai-empty">Select a symbol, then ask Ollama for a read-only explanation.</div>';
+                return;
+            }
+            thread.innerHTML = chatState.messages
+                .map(m => `<div class="ai-msg ${m.role}">${escapeHtml(m.content)}</div>`)
+                .join('');
+            thread.scrollTop = thread.scrollHeight;
+        }
+
+        function setChatEnabled(enabled) {
+            document.getElementById('ai-input').disabled = !enabled;
+            document.getElementById('ai-send').disabled = !enabled || chatState.busy;
+        }
+
+        function updateChatHeader() {
+            const el = document.getElementById('ai-ticker');
+            el.textContent = chatState.ticker ? chatState.ticker : 'the selected stock';
+        }
+
+        function resetChat() {
+            chatState.ticker = current || null;
+            chatState.messages = [];
+            chatState.busy = false;
+            updateChatHeader();
+            setChatEnabled(!!chatState.ticker);
+            renderChat();
+        }
+
+        async function pushAndReply(userText) {
+            if (chatState.busy || !chatState.ticker) return;
+            chatState.busy = true;
+            setChatEnabled(true);
+            chatState.messages.push({ role: 'user', content: userText });
+            renderChat();
+            try {
+                const x = await api('chat/' + chatState.ticker, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ messages: chatState.messages }),
+                });
+                chatState.messages.push({ role: 'assistant', content: x.text });
+            } catch (e) {
+                chatState.messages.push({ role: 'assistant', content: 'Error: ' + e.message });
+            }
+            chatState.busy = false;
+            setChatEnabled(true);
+            renderChat();
+        }
+
+        async function startChat() {
+            // Seed the thread with the initial signal explanation for the current ticker
+            if (!current) return;
+            if (chatState.ticker !== current) resetChat();
+            if (chatState.messages.length > 0) return; // already started
+            await pushAndReply('Give me a read-only explanation of the current signal for ' + current + '.');
+        }
+
+        async function sendChat(ev) {
+            ev.preventDefault();
+            if (chatState.busy) return;
+            if (!current) return;
+            if (chatState.ticker !== current) resetChat();
+            const input = document.getElementById('ai-input');
+            const text = input.value.trim();
+            if (!text) return;
+            input.value = '';
+            await pushAndReply(text);
+        }
     </script>
     <script>
         let screenLimit = 20;
-        let current, chart, timer; const $ = s => document.querySelector(s); async function api(p, o) { let r = await fetch('/api/' + p, o); if (!r.ok) throw Error(await r.text()); return r.json() } async function loadWatch() { let a = await api('watchlist'); $('#watch').innerHTML = a.map(t => `<div class=ticker onclick="openTicker('${t}')">${t}<button onclick="event.stopPropagation();del('${t}')">x</button></div>`).join(''); if (!current && a[0]) openTicker(a[0]) } async function openTicker(t) { current = t; $('#ticker').textContent = ' // ' + t; try { let d = await api('dashboard/' + t); draw(d); $('#status').textContent = 'ONLINE // ' + t } catch (e) { $('#status').textContent = 'ERROR: refresh required'; $('#signal').textContent = e.message } } function draw(d) { let s = d.snapshot; $('#signal').innerHTML = `<h2 class="${d.action.toLowerCase()}">${d.action}</h2><p>${d.reason}</p>` + Object.entries(s).map(([k, v]) => `<span class=metric>${k}<br><b>${v}</b></span>`).join(''); $('#chart').innerHTML = ''; chart = LightweightCharts.createChart($('#chart'), { height: 420, layout: { background: { color: '#071009' }, textColor: '#b7ffc0' }, grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } } }); chart.addCandlestickSeries({ upColor: '#42ff72', downColor: '#ff5c70', borderVisible: false, wickUpColor: '#42ff72', wickDownColor: '#ff5c70' }).setData(d.candles); chart.timeScale().fitContent() } async function refreshData() { try { $('#status').textContent = 'FETCHING...'; await api('refresh/' + current, { method: 'POST' }); await openTicker(current); $('#status').textContent = 'ONLINE' } catch (e) { $('#status').textContent = e.message } } async function explain() { $('#ai').textContent = 'Querying local Ollama...'; let x = await api('explain/' + current, { method: 'POST' }); $('#ai').textContent = x.text } async function del(t) { await api('watchlist/' + t, { method: 'DELETE' }); current = null; loadWatch() } function choose(x) { $('#new').value = x.symbol; $('#matches').innerHTML = '' } $('#new').oninput = () => { clearTimeout(timer); let q = $('#new').value.trim(); if (q.length < 2) return $('#matches').innerHTML = ''; timer = setTimeout(async () => { try { let a = await api('symbols?q=' + encodeURIComponent(q)); $('#matches').innerHTML = a.map(x => `<div class=match onclick='choose(${JSON.stringify(x)})'><span>${x.symbol}<br><small>${x.name}</small></span><small>${x.exchange}</small></div>`).join('') } catch (e) { $('#matches').innerHTML = '' } }, 300) }; $('#add').onsubmit = async e => { e.preventDefault(); let t = $('#new').value.trim(); if (t) { await api('watchlist/' + t, { method: 'POST' }); $('#new').value = ''; $('#matches').innerHTML = ''; loadWatch() } }; async function loadUniverses() { let u = await api('screener/universes'); $('#universe').innerHTML = u.map(x => `<option>${x}</option>`).join(''); showScreen() }
+        let current, chart, timer; const $ = s => document.querySelector(s); async function api(p, o) { let r = await fetch('/api/' + p, o); if (!r.ok) throw Error(await r.text()); return r.json() } async function loadWatch() { let a = await api('watchlist'); $('#watch').innerHTML = a.map(t => `<div class=ticker onclick="openTicker('${t}')">${t}<button onclick="event.stopPropagation();del('${t}')">x</button></div>`).join(''); if (!current && a[0]) openTicker(a[0]) } async function openTicker(t) { current = t; $('#ticker').textContent = ' // ' + t; if (typeof resetChat === 'function') resetChat(); try { let d = await api('dashboard/' + t); draw(d); $('#status').textContent = 'ONLINE // ' + t } catch (e) { $('#status').textContent = 'ERROR: refresh required'; $('#signal').textContent = e.message } } function draw(d) { let s = d.snapshot; $('#signal').innerHTML = `<h2 class="${d.action.toLowerCase()}">${d.action}</h2><p>${d.reason}</p>` + Object.entries(s).map(([k, v]) => `<span class=metric>${k}<br><b>${v}</b></span>`).join(''); $('#chart').innerHTML = ''; chart = LightweightCharts.createChart($('#chart'), { height: 420, layout: { background: { color: '#071009' }, textColor: '#b7ffc0' }, grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } } }); chart.addCandlestickSeries({ upColor: '#42ff72', downColor: '#ff5c70', borderVisible: false, wickUpColor: '#42ff72', wickDownColor: '#ff5c70' }).setData(d.candles); chart.timeScale().fitContent() } async function refreshData() { try { $('#status').textContent = 'FETCHING...'; await api('refresh/' + current, { method: 'POST' }); await openTicker(current); $('#status').textContent = 'ONLINE' } catch (e) { $('#status').textContent = e.message } } async function explain() { $('#ai').textContent = 'Querying local Ollama...'; let x = await api('explain/' + current, { method: 'POST' }); $('#ai').textContent = x.text } async function del(t) { await api('watchlist/' + t, { method: 'DELETE' }); current = null; loadWatch() } function choose(x) { $('#new').value = x.symbol; $('#matches').innerHTML = '' } $('#new').oninput = () => { clearTimeout(timer); let q = $('#new').value.trim(); if (q.length < 2) return $('#matches').innerHTML = ''; timer = setTimeout(async () => { try { let a = await api('symbols?q=' + encodeURIComponent(q)); $('#matches').innerHTML = a.map(x => `<div class=match onclick='choose(${JSON.stringify(x)})'><span>${x.symbol}<br><small>${x.name}</small></span><small>${x.exchange}</small></div>`).join('') } catch (e) { $('#matches').innerHTML = '' } }, 300) }; $('#add').onsubmit = async e => { e.preventDefault(); let t = $('#new').value.trim(); if (t) { await api('watchlist/' + t, { method: 'POST' }); $('#new').value = ''; $('#matches').innerHTML = ''; loadWatch() } }; async function loadUniverses() { let u = await api('screener/universes'); $('#universe').innerHTML = u.map(x => `<option>${x}</option>`).join(''); showScreen() }
         async function showScreen() {
             let a = await api('screener/' + $('#universe').value);
 
