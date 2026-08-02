@@ -5,7 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from .config import settings
 from .db import Watchlist, Session, init_db
-from .market import refresh, candles
+from .market import refresh, candles, search, provider
 from .analysis import compute, persist, history
 from .screener import universe_names, run, results
 @asynccontextmanager
@@ -18,7 +18,7 @@ async def lifespan(app):
     yield
 app=FastAPI(title="Trade Sentinel",lifespan=lifespan)
 @app.get('/healthz')
-async def health(): return {"ok":True,"paper_trading":settings.paper_trading}
+async def health(): return {"ok":True,"paper_trading":settings.paper_trading,"market_data_provider":provider()}
 @app.get('/api/watchlist')
 async def watchlist():
     async with Session() as s: return [x.ticker for x in (await s.scalars(select(Watchlist).order_by(Watchlist.ticker))).all()]
@@ -36,10 +36,9 @@ async def remove(ticker:str):
     return {"ok":True}
 @app.get('/api/symbols')
 async def symbols(q:str=Query(min_length=2,max_length=80)):
-    if not settings.twelve_data_api_key: raise HTTPException(400,"TWELVE_DATA_API_KEY is not configured")
-    async with httpx.AsyncClient(timeout=10) as c: data=(await c.get('https://api.twelvedata.com/symbol_search',params={"symbol":q,"outputsize":8,"apikey":settings.twelve_data_api_key})).json()
-    if data.get('status')=='error': raise HTTPException(400,data.get('message','Symbol search failed'))
-    return [{"symbol":x.get("symbol"),"name":x.get("instrument_name",x.get("symbol")),"exchange":x.get("exchange",""),"country":x.get("country",""),"type":x.get("instrument_type","")} for x in data.get('data',[])]
+    try: return await search(q)
+    except ValueError as e: raise HTTPException(400,str(e))
+    except Exception as e: raise HTTPException(502,f"{provider()} symbol search failed: {e}")
 @app.post('/api/refresh/{ticker}')
 async def fetch(ticker:str):
     try: await refresh(ticker.upper()); return {"ok":True}

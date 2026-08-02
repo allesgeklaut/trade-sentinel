@@ -1,14 +1,11 @@
 from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:////data/trading.db"
+    market_data_provider: str = "yfinance"
     twelve_data_api_key: str = ""
-    watchlist: str = "AAPL,MSFT,NVDA,VOO"
+    watchlist: str = "AAPL,MSFT,NVDA,VOO,IFX.DE"
     ollama_url: str = "http://host.docker.internal:11434"
     ollama_model: str = "qwen3.6:27b-q3_K_M"
-    refresh_minutes: int = 60
-    screener_refresh_hour_utc: int = 22
     paper_trading: bool = True
-    max_notional_per_order: float = 1000
-    max_daily_loss: float = 100
     class Config: env_file = ".env"
-settings = Settings()
+settings=Settings()

@@ -1,0 +1,25 @@
+# Yahoo Finance symbols: US, Xetra, Vienna, Euronext. Edit freely.
+AAPL
+MSFT
+NVDA
+AMZN
+GOOGL
+META
+SPY
+QQQ
+IFX.DE
+SAP.DE
+SIE.DE
+ALV.DE
+DTE.DE
+BAS.DE
+BMW.DE
+ASML.AS
+MC.PA
+OR.PA
+NESN.SW
+NOVN.SW
+OMV.VI
+VOE.VI
+EBS.VI
+ANDR.VI
