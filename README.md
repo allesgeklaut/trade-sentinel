@@ -30,3 +30,11 @@ Open `http://SERVER:8010`. Altering `MARKET_DATA_PROVIDER` requires a restart: `
 Autocomplete uses the selected provider. With `yfinance`, it supports fuzzy company/ticker lookup and returns canonical Yahoo symbols such as `IFX.DE`, `ASML.AS`, and `OMV.VI`. The `global-large-cap` universe mixes US, German, Dutch, French, Swiss, and Vienna listings. Press **Update** manually after markets close; it downloads and caches about two years of daily candles for each symbol, then ranks trend alignment, 20/60-day momentum, RSI, and relative volume.
 
 No live broker or order API exists. Signals and rankings are research tools, not financial advice.
+
+## AI / space universe
+
+`universes/global-large-cap.txt` is now an AI and advanced-technology research universe. It includes semiconductors, AI infrastructure/platforms, application/automation names, space/connectivity companies, selected European listings, and recent IPOs such as CoreWeave (`CRWV`), Figma (`FIG`), Circle (`CRCL`), Chime (`CHYM`) and eToro (`ETOR`). SpaceX is listed as `SPCX`; use provider autocomplete to confirm current symbol availability before a screen run. A company being included only makes it a candidate for a rule-based research screen, not an investment recommendation.
+
+## Fix: duplicate screener symbols
+
+The screener deduplicates a universe while preserving its order before downloading data and saving results. This prevents duplicate entries such as a symbol classified in both AI and space groups from violating SQLite's `(universe, ticker)` uniqueness constraint.
