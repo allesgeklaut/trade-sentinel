@@ -3,7 +3,7 @@ from sqlalchemy import desc, select
 from .db import Signal, Session
 
 def compute(rows):
-    if len(rows)<60: raise ValueError("Need at least 60 daily candles")
+    if len(rows) < 16: raise ValueError("Need at least 16 daily candles")
     d=pd.DataFrame(rows); c=d.close
     d["sma20"]=c.rolling(20).mean(); d["sma50"]=c.rolling(50).mean(); d["sma200"]=c.rolling(200).mean()
     delta=c.diff(); up=delta.clip(lower=0).ewm(alpha=1/14,adjust=False).mean(); down=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean(); d["rsi"]=100-(100/(1+up/down))
@@ -14,7 +14,11 @@ def compute(rows):
     bearish=x.close<x.sma50 and x.sma50<x.sma200
     action="BUY" if bullish and recovery else "SELL" if bearish else "HOLD"
     reason=("Bullish trend alignment and RSI recovery with MACD confirmation" if action=="BUY" else "Bearish trend break: price below SMA-50 and SMA-50 below SMA-200" if action=="SELL" else "No complete entry or exit setup; wait for the defined rules")
-    snap={k:round(float(x[k]),2) for k in ["close","sma20","sma50","sma200","rsi","macd","macd_signal","atr14"]}
+    def norm(v):
+        try: v=float(v)
+        except Exception: return None
+        return None if pd.isna(v) else round(v,2)
+    snap={k:norm(x[k]) for k in ["close","sma20","sma50","sma200","rsi","macd","macd_signal","atr14"]}
     return {"action":action,"reason":reason,"snapshot":snap,"candles":rows}
 async def persist(ticker,result):
     async with Session() as s: s.add(Signal(ticker=ticker,action=result["action"],reason=result["reason"],snapshot=json.dumps(result["snapshot"]))); await s.commit()
