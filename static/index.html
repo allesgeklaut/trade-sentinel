@@ -122,6 +122,146 @@
         .bullish {
             color: #42ff72
         }
+
+        /* Explain modal */
+        #explain-backdrop {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, .65);
+            z-index: 100;
+            justify-content: center;
+            align-items: flex-start;
+            padding-top: 4vh;
+            overflow-y: auto
+        }
+
+        #explain-backdrop.open {
+            display: flex
+        }
+
+        #explain-modal {
+            background: #071009;
+            border: 1px solid #318e43;
+            border-radius: 6px;
+            width: 520px;
+            max-width: 92vw;
+            max-height: 90vh;
+            display: flex;
+            flex-direction: column
+        }
+
+        .explain-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 14px 18px;
+            border-bottom: 1px solid #1d6030
+        }
+
+        .explain-header h2 {
+            margin: 0;
+            font-size: 15px
+        }
+
+        .explain-close {
+            background: none;
+            border: 1px solid #318e43;
+            color: #b7ffc0;
+            width: 28px;
+            height: 28px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px
+        }
+
+        .explain-body {
+            padding: 14px 18px;
+            overflow-y: auto
+        }
+
+        .glossary-intro {
+            color: #7aaa81;
+            margin-bottom: 12px;
+            line-height: 1.5
+        }
+
+        .glossary-section-title {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #318e43;
+            margin: 16px 0 8px
+        }
+
+        .glossary-item {
+            border-bottom: 1px solid #12351c
+        }
+
+        .glossary-term {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 9px 4px;
+            cursor: pointer;
+            color: #b7ffc0
+        }
+
+        .glossary-term:hover {
+            color: #42ff72
+        }
+
+        .glossary-arrow {
+            font-size: 10px;
+            transition: transform .15s ease
+        }
+
+        .glossary-item.open .glossary-arrow {
+            transform: rotate(90deg)
+        }
+
+        .glossary-def {
+            display: none;
+            padding: 6px 4px 12px 12px;
+            color: #7aaa81;
+            line-height: 1.55;
+            font-size: 13px
+        }
+
+        .glossary-item.open .glossary-def {
+            display: block
+        }
+
+        #explain-backdrop-container {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 100;
+            background: rgba(0, 0, 0, .65);
+            display: none;
+        }
+
+        #explain-backdrop-container.open {
+            display: flex;
+        }
+
+        #explain-modal-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 100;
+            display: none;
+        }
+
+        #explain-modal-container.open {
+            display: flex;
+        }
     </style>
 </head>
 
@@ -136,7 +276,8 @@
         </aside>
         <section>
             <div class="panel"><button onclick="refreshData()">Refresh data</button> <button onclick="explain()">Ask
-                    local LLM</button> <b id="ticker"></b>
+                    local LLM</button><button onclick="showExplainModal()" style="margin-left:6px">Explain This
+                    Screen</button><b id="ticker"></b>
                 <div id="signal"></div>
                 <div id="chart"></div>
             </div>
@@ -150,6 +291,66 @@
             <div id="screen">No screen run yet.</div>
         </aside>
     </main>
+    <div id="explain-backdrop-container">
+        <div id="explain-modal">
+            <div class="explain-header">
+                Explain This Screen
+                <button class="explain-close" onclick="closeExplainModal()">&times;</button>
+            </div>
+            <div id="explain-body" class="explain-body"></div>
+        </div>
+    </div>
+    <script>
+        const GLOSSARY = {
+            'close': 'Current closing price of the stock.',
+            'open': 'Opening price for today\'s session.',
+            'high': 'Highest price reached during today\'s session.',
+            'low': 'Lowest price reached during today\'s session.',
+            'volume': 'Total number of shares traded today. High volume confirms trend strength.',
+            'sma20': 'Simple Moving Average over the last 20 trading days. A short-term trend indicator — price above it suggests upward momentum.',
+            'sma50': 'Simple Moving Average over the last 50 trading days. A medium-term trend indicator used by many institutional traders.',
+            'sma200': 'Simple Moving Average over the last 200 trading days. Long-term trend baseline — above it is generally bullish, below it bearish.',
+            'rsi': 'Relative Strength Index (0-100). Measures momentum: above 70 may indicate overbought (potential sell), below 30 oversold (potential buy).',
+            'macd': 'Moving Average Convergence Divergence. Shows the difference between two EMAs. Positive and rising suggests bullish momentum.',
+            'macd_signal': 'Signal line for MACD — an EMA of the MACD itself. When MACD crosses above this, it\'s a buy signal; below, a sell signal.',
+            'atr14': 'Average True Range (14 periods). Measures market volatility — higher values mean more price movement and risk.',
+            'return_20d': 'Percentage change in price over the last 20 trading days. Positive = gain, negative = loss.',
+            'relative_volume': 'Today\'s volume divided by average daily volume. Above 1 means heavier-than-normal trading activity.',
+            'score': 'Composite risk score (0-100) derived from trend, momentum, and volatility signals. Higher = stronger opportunity.',
+            'action': 'Recommended action: BUY, SELL, or HOLD based on combined technical analysis.',
+            'reason': 'Plain-language summary of why the recommended action was chosen.'
+        };
+
+        function showExplainModal() {
+            const body = document.getElementById('explain-body');
+            body.innerHTML = '';
+            for (const [term, def] of Object.entries(GLOSSARY)) {
+                const item = document.createElement('div');
+                item.className = 'glossary-item';
+                item.innerHTML = `<span class="glossary-term">${term} <span class="glossary-arrow">▶</span></span><p class="glossary-def">${def}</p>`;
+                item.addEventListener('click', () => {
+                    item.classList.toggle('open');
+                });
+                body.appendChild(item);
+            }
+            document.getElementById('explain-backdrop-container').classList.add('open');
+        }
+
+        function closeExplainModal() {
+            const container = document.getElementById('explain-backdrop-container');
+            if (container) {
+                container.classList.remove('open');
+            }
+        }
+
+        // Close on Escape key or backdrop click
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape') closeExplainModal();
+        });
+        document.getElementById('explain-backdrop-container').addEventListener('click', e => {
+            if (e.target.id === 'explain-backdrop-container') closeExplainModal();
+        });
+    </script>
     <script>
         let screenLimit = 20;
         let current, chart, timer; const $ = s => document.querySelector(s); async function api(p, o) { let r = await fetch('/api/' + p, o); if (!r.ok) throw Error(await r.text()); return r.json() } async function loadWatch() { let a = await api('watchlist'); $('#watch').innerHTML = a.map(t => `<div class=ticker onclick="openTicker('${t}')">${t}<button onclick="event.stopPropagation();del('${t}')">x</button></div>`).join(''); if (!current && a[0]) openTicker(a[0]) } async function openTicker(t) { current = t; $('#ticker').textContent = ' // ' + t; try { let d = await api('dashboard/' + t); draw(d); $('#status').textContent = 'ONLINE // ' + t } catch (e) { $('#status').textContent = 'ERROR: refresh required'; $('#signal').textContent = e.message } } function draw(d) { let s = d.snapshot; $('#signal').innerHTML = `<h2 class="${d.action.toLowerCase()}">${d.action}</h2><p>${d.reason}</p>` + Object.entries(s).map(([k, v]) => `<span class=metric>${k}<br><b>${v}</b></span>`).join(''); $('#chart').innerHTML = ''; chart = LightweightCharts.createChart($('#chart'), { height: 420, layout: { background: { color: '#071009' }, textColor: '#b7ffc0' }, grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } } }); chart.addCandlestickSeries({ upColor: '#42ff72', downColor: '#ff5c70', borderVisible: false, wickUpColor: '#42ff72', wickDownColor: '#ff5c70' }).setData(d.candles); chart.timeScale().fitContent() } async function refreshData() { try { $('#status').textContent = 'FETCHING...'; await api('refresh/' + current, { method: 'POST' }); await openTicker(current); $('#status').textContent = 'ONLINE' } catch (e) { $('#status').textContent = e.message } } async function explain() { $('#ai').textContent = 'Querying local Ollama...'; let x = await api('explain/' + current, { method: 'POST' }); $('#ai').textContent = x.text } async function del(t) { await api('watchlist/' + t, { method: 'DELETE' }); current = null; loadWatch() } function choose(x) { $('#new').value = x.symbol; $('#matches').innerHTML = '' } $('#new').oninput = () => { clearTimeout(timer); let q = $('#new').value.trim(); if (q.length < 2) return $('#matches').innerHTML = ''; timer = setTimeout(async () => { try { let a = await api('symbols?q=' + encodeURIComponent(q)); $('#matches').innerHTML = a.map(x => `<div class=match onclick='choose(${JSON.stringify(x)})'><span>${x.symbol}<br><small>${x.name}</small></span><small>${x.exchange}</small></div>`).join('') } catch (e) { $('#matches').innerHTML = '' } }, 300) }; $('#add').onsubmit = async e => { e.preventDefault(); let t = $('#new').value.trim(); if (t) { await api('watchlist/' + t, { method: 'POST' }); $('#new').value = ''; $('#matches').innerHTML = ''; loadWatch() } }; async function loadUniverses() { let u = await api('screener/universes'); $('#universe').innerHTML = u.map(x => `<option>${x}</option>`).join(''); showScreen() }
