@@ -6,6 +6,7 @@
     <title>Trade Sentinel</title>
     <script
         src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked@13.0.3/marked.min.js"></script>
     <style>
         body {
             margin: 0;
@@ -117,20 +118,20 @@
         .ai-thread {
             max-height: 320px;
             overflow-y: auto;
-            padding: 8px 4px;
+            padding: 6px 4px;
             display: flex;
             flex-direction: column;
-            gap: 8px;
+            gap: 4px;
             border: 1px solid #12351c;
             background: #050a07;
-            margin-bottom: 10px
+            margin-bottom: 8px
         }
 
         .ai-msg {
-            padding: 8px 12px;
+            padding: 6px 10px;
             border-radius: 4px;
-            line-height: 1.5;
-            font-size: 13px;
+            line-height: 1.4;
+            font-size: 12px;
             white-space: pre-wrap;
             word-wrap: break-word
         }
@@ -149,6 +150,96 @@
             align-self: flex-start;
             max-width: 92%;
             color: #b7ffc0
+        }
+
+        /* Markdown rendered inside assistant bubbles */
+        .ai-msg.assistant p {
+            margin: 0 0 8px
+        }
+
+        .ai-msg.assistant p:last-child {
+            margin-bottom: 0
+        }
+
+        .ai-msg.assistant strong {
+            color: #42ff72
+        }
+
+        .ai-msg.assistant em {
+            color: #ffd65c;
+            font-style: italic
+        }
+
+        .ai-msg.assistant h1,
+        .ai-msg.assistant h2,
+        .ai-msg.assistant h3,
+        .ai-msg.assistant h4 {
+            margin: 8px 0 4px;
+            color: #b7ffc0;
+            font-weight: bold
+        }
+
+        .ai-msg.assistant h1 {
+            font-size: 15px
+        }
+
+        .ai-msg.assistant h2 {
+            font-size: 14px
+        }
+
+        .ai-msg.assistant h3,
+        .ai-msg.assistant h4 {
+            font-size: 13px
+        }
+
+        .ai-msg.assistant ul,
+        .ai-msg.assistant ol {
+            margin: 4px 0 8px;
+            padding-left: 20px
+        }
+
+        .ai-msg.assistant li {
+            margin: 2px 0
+        }
+
+        .ai-msg.assistant code {
+            background: #050a07;
+            border: 1px solid #12351c;
+            padding: 1px 5px;
+            font-size: 12px;
+            color: #42ff72
+        }
+
+        .ai-msg.assistant pre {
+            background: #050a07;
+            border: 1px solid #12351c;
+            padding: 8px;
+            margin: 6px 0;
+            overflow-x: auto
+        }
+
+        .ai-msg.assistant pre code {
+            border: 0;
+            padding: 0;
+            background: transparent
+        }
+
+        .ai-msg.assistant blockquote {
+            border-left: 3px solid #318e43;
+            margin: 6px 0;
+            padding: 2px 10px;
+            color: #7aaa81
+        }
+
+        .ai-msg.assistant a {
+            color: #42ff72;
+            text-decoration: underline
+        }
+
+        .ai-msg.assistant hr {
+            border: 0;
+            border-top: 1px solid #12351c;
+            margin: 8px 0
         }
 
         .ai-msg.system {
@@ -373,6 +464,7 @@
                 <form id="ai-form" class="ai-form" onsubmit="return sendChat(event)">
                     <input id="ai-input" autocomplete="off" placeholder="Ask a follow-up question…" disabled>
                     <button id="ai-send" type="submit" disabled>Send</button>
+                    <button id="ai-stop" type="button" onclick="stopChat()" disabled>Stop</button>
                 </form>
             </div>
         </section>
@@ -456,21 +548,43 @@
                 .replace(/>/g, '&gt;');
         }
 
+        // Configure marked: GitHub-flavoured markdown, GFM line breaks, no raw HTML in input
+        if (typeof marked !== 'undefined') {
+            marked.setOptions({
+                gfm: true,
+                breaks: true,
+                // marked >= 12 exposes headerIds/mangle via separate API; default is fine
+            });
+            // Sanitise: strip any raw HTML tags the model might emit
+            const renderer = new marked.Renderer();
+            const origHtml = renderer.html.bind(renderer);
+            renderer.html = function (token) { return ''; }; // drop raw HTML blocks
+            // (text-level HTML is already escaped by marked.parse)
+        }
+
+        function renderMessage(m) {
+            if (m.role === 'assistant' && typeof marked !== 'undefined') {
+                return `<div class="ai-msg ${m.role}">${marked.parse(m.content)}</div>`;
+            }
+            return `<div class="ai-msg ${m.role}">${escapeHtml(m.content)}</div>`;
+        }
+
         function renderChat() {
             const thread = document.getElementById('ai-thread');
             if (chatState.messages.length === 0) {
                 thread.innerHTML = '<div class="ai-empty">Select a symbol, then ask Ollama for a read-only explanation.</div>';
                 return;
             }
-            thread.innerHTML = chatState.messages
-                .map(m => `<div class="ai-msg ${m.role}">${escapeHtml(m.content)}</div>`)
-                .join('');
+            thread.innerHTML = chatState.messages.map(renderMessage).join('');
             thread.scrollTop = thread.scrollHeight;
         }
 
+        let chatAbortController = null;
+
         function setChatEnabled(enabled) {
-            document.getElementById('ai-input').disabled = !enabled;
+            document.getElementById('ai-input').disabled = !enabled || chatState.busy;
             document.getElementById('ai-send').disabled = !enabled || chatState.busy;
+            document.getElementById('ai-stop').disabled = !enabled || !chatState.busy;
         }
 
         function updateChatHeader() {
@@ -489,6 +603,10 @@
 
         async function pushAndReply(userText) {
             if (chatState.busy || !chatState.ticker) return;
+            if (chatAbortController) {
+                chatAbortController.abort();
+            }
+            chatAbortController = new AbortController();
             chatState.busy = true;
             setChatEnabled(true);
             chatState.messages.push({ role: 'user', content: userText });
@@ -498,14 +616,21 @@
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ messages: chatState.messages }),
+                    signal: chatAbortController.signal,
                 });
                 chatState.messages.push({ role: 'assistant', content: x.text });
             } catch (e) {
-                chatState.messages.push({ role: 'assistant', content: 'Error: ' + e.message });
+                if (e.name === 'AbortError') {
+                    chatState.messages.push({ role: 'assistant', content: 'Request stopped.' });
+                } else {
+                    chatState.messages.push({ role: 'assistant', content: 'Error: ' + e.message });
+                }
+            } finally {
+                chatState.busy = false;
+                chatAbortController = null;
+                setChatEnabled(true);
+                renderChat();
             }
-            chatState.busy = false;
-            setChatEnabled(true);
-            renderChat();
         }
 
         async function startChat() {
@@ -513,7 +638,14 @@
             if (!current) return;
             if (chatState.ticker !== current) resetChat();
             if (chatState.messages.length > 0) return; // already started
-            await pushAndReply('Give me a read-only explanation of the current signal for ' + current + '.');
+            await pushAndReply('Give me an explanation of the current signal for ' + current + '.');
+        }
+
+        function stopChat() {
+            if (chatAbortController) {
+                chatAbortController.abort();
+                chatAbortController = null;
+            }
         }
 
         async function sendChat(ev) {
