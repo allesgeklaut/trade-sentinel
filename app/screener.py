@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import pandas as pd
 from sqlalchemy import delete, select
@@ -32,7 +32,7 @@ async def run(name):
         except Exception: continue
     async with Session() as s:
         await s.execute(delete(ScreenerResult).where(ScreenerResult.universe==name))
-        for symbol,x in results: s.add(ScreenerResult(universe=name,ticker=symbol,updated_at=datetime.utcnow(),**x))
+        for symbol,x in results: s.add(ScreenerResult(universe=name,ticker=symbol,updated_at=datetime.now(timezone.utc),**x))
         await s.commit()
     return {"universe":name,"processed":len(symbols),"ranked":len(results)}
 async def results(name):
