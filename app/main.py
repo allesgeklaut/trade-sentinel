@@ -6,7 +6,7 @@ from sqlalchemy import select
 from pydantic import BaseModel
 from .config import settings
 from .db import Watchlist, Session, init_db
-from .market import refresh, candles, search, provider
+from .market import refresh, candles, search, info, provider
 from .analysis import compute, persist, history
 from .screener import universe_names, run, results
 @asynccontextmanager
@@ -35,6 +35,11 @@ async def remove(ticker:str):
         x=await s.get(Watchlist,ticker.upper())
         if x: await s.delete(x); await s.commit()
     return {"ok":True}
+@app.get('/api/info/{ticker}')
+async def ticker_info(ticker:str):
+    try: return {"ticker":ticker.upper(),"name":await info(ticker.upper())}
+    except Exception: return {"ticker":ticker.upper(),"name":""}
+
 @app.get('/api/symbols')
 async def symbols(q:str=Query(min_length=2,max_length=80)):
     try: return await search(q)
@@ -47,7 +52,11 @@ async def fetch(ticker:str):
 @app.get('/api/dashboard/{ticker}')
 async def dashboard(ticker:str):
     rows=await candles(ticker.upper())
-    try: r=compute(rows); await persist(ticker.upper(),r); r['history']=await history(ticker.upper()); return r
+    try:
+        r=compute(rows)
+        await persist(ticker.upper(),r)
+        r['history']=await history(ticker.upper())
+        return r
     except ValueError as e: raise HTTPException(400,str(e))
 @app.get('/api/screener/universes')
 async def universes(): return universe_names()
@@ -76,12 +85,14 @@ async def _stock_context(ticker: str) -> str:
         f"You are a trading expert. You are chatting with a user about {ticker}. "
         f"Use the deterministic research data below as your only source of facts. "
         f"Ticker: {ticker}\n"
-        f"Signal: {r['action']}\n"
+        f"Signal: {r['action']} (strength {r['strength']}/100)\n"
         f"Reason: {r['reason']}\n"
         f"Indicators: {json.dumps(r['snapshot'])}\n"
-        f"Decision rules: BUY when close > SMA-50 and SMA-50 > SMA-200 and SMA-50 is higher than six trading days ago, "
-        f"and RSI > 50 with the prior day RSI <= 50, and MACD > MACD signal. SELL when close < SMA-50 and SMA-50 < SMA-200. "
-        f"Otherwise HOLD."
+        f"Decision rules: BUY when close > SMA-50 > SMA-200, SMA-50 rising over 6 days, "
+        f"RSI in a fresh cross above 50 or rising in the 50-70 band (not overbought <75), "
+        f"MACD > MACD signal, and volume surge (>1.25× 20-day average). "
+        f"SELL on early exit (close < SMA-50, MACD bearish, RSI breaks below 50) or "
+        f"bearish trend (close < SMA-50 < SMA-200, SMA-50 falling). Otherwise HOLD."
     )
 
 @app.post('/api/chat/{ticker}')
@@ -91,11 +102,11 @@ async def chat(ticker: str, req: ChatRequest):
     if not req.messages:
         raise HTTPException(400, "messages must not be empty")
     # Sanitise: keep only the last 20 messages, only role/content, only known roles
-    history = []
+    history_msgs = []
     for m in req.messages[-20:]:
         if m.role in ('user', 'assistant') and m.content.strip():
-            history.append({"role": m.role, "content": m.content})
-    if not history:
+            history_msgs.append({"role": m.role, "content": m.content})
+    if not history_msgs:
         raise HTTPException(400, "no valid messages")
     system_prompt = await _stock_context(ticker)
     try:
@@ -110,7 +121,7 @@ async def chat(ticker: str, req: ChatRequest):
                 settings.ollama_url.rstrip('/') + '/api/chat',
                 json={
                     "model": settings.ollama_model,
-                    "messages": [{"role": "system", "content": system_prompt}] + history,
+                    "messages": [{"role": "system", "content": system_prompt}] + history_msgs,
                     "stream": False,
                 },
             )).json()

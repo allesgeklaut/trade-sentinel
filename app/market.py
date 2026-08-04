@@ -21,9 +21,31 @@ def yahoo_history(ticker):
     frame=frame.replace([np.inf,-np.inf],np.nan).dropna(subset=["Open","High","Low","Close"])
     if frame.empty: raise ValueError(f"No valid Yahoo Finance daily data for {ticker}")
     return [{"timestamp":x.Index.to_pydatetime().replace(tzinfo=None),"open":float(x.Open),"high":float(x.High),"low":float(x.Low),"close":float(x.Close),"volume":float(x.Volume or 0)} for x in frame.itertuples()]
+def yahoo_info(ticker):
+    """Fetch a human-readable company name for a single ticker."""
+    t = yf.Ticker(ticker)
+    try:
+        fi = t.fast_info
+        name = getattr(fi, "short_name", None) or getattr(fi, "long_name", None)
+        if name:
+            return name
+    except Exception:
+        pass
+    try:
+        i = t.info
+        return i.get("shortName") or i.get("longName") or ""
+    except Exception:
+        return ""
+
 def yahoo_search(q):
     quotes=yf.Search(q,max_results=8,news_count=0,lists_count=0,enable_fuzzy_query=True,raise_errors=True).quotes
     return [{"symbol":x.get("symbol"),"name":x.get("shortname") or x.get("longname") or x.get("symbol"),"exchange":x.get("exchDisp") or x.get("exchange",""),"country":x.get("region", ""),"type":x.get("quoteType","")} for x in quotes if x.get("symbol")]
+async def info(ticker):
+    if provider()=="yfinance": return await asyncio.to_thread(yahoo_info,ticker)
+    async with httpx.AsyncClient(timeout=10) as c:
+        data=(await c.get("https://api.twelvedata.com/profile",params={"symbol":ticker,"apikey":settings.twelve_data_api_key})).json()
+    return data.get("name","") if data.get("status")!="error" else ""
+
 async def search(q):
     if provider()=="yfinance": return await asyncio.to_thread(yahoo_search,q)
     async with httpx.AsyncClient(timeout=10) as c: data=(await c.get("https://api.twelvedata.com/symbol_search",params={"symbol":q,"outputsize":8,"apikey":settings.twelve_data_api_key})).json()
@@ -32,7 +54,7 @@ async def search(q):
 async def refresh(ticker):
     if provider()=="yfinance": values=await asyncio.to_thread(yahoo_history,ticker)
     else:
-        async with httpx.AsyncClient(timeout=20) as c: data=(await c.get("https://api.twelvedata.com/time_series",params={"symbol":ticker,"interval":"1day","outputsize":365,"apikey":settings.twelve_data_api_key})).json()
+        async with httpx.AsyncClient(timeout=20) as c: data=(await c.get("https://api.twelvedata.com/time_series",params={"symbol":ticker,"interval":"1day","outputsize":730,"apikey":settings.twelve_data_api_key})).json()
         if data.get("status")=="error" or "values" not in data: raise ValueError(data.get("message","market-data response had no candles"))
         values=[{"timestamp":datetime.fromisoformat(x["datetime"]),"open":float(x["open"]),"high":float(x["high"]),"low":float(x["low"]),"close":float(x["close"]),"volume":float(x.get("volume") or 0)} for x in data["values"]]
     async with Session() as s:

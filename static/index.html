@@ -733,9 +733,8 @@
             const key = ticker.toUpperCase();
             if (symbolNameCache[key] !== undefined) return symbolNameCache[key];
             try {
-                const data = await api('symbols?q=' + encodeURIComponent(key));
-                const match = Array.isArray(data) && data.find(x => x.symbol?.toUpperCase() === key);
-                const name = match?.name || (Array.isArray(data) && data[0]?.name) || '';
+                const data = await api('info/' + encodeURIComponent(key));
+                const name = data.name || '';
                 symbolNameCache[key] = name;
                 return name;
             } catch (_) {
