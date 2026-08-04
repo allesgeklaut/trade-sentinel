@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from .config import settings
 from .db import Watchlist, Session, init_db
 from .market import refresh, candles, search, info, provider
-from .analysis import compute, persist, history
+from .analysis import compute, persist, history, MIN_CANDLES
 from .screener import universe_names, run, results
 @asynccontextmanager
 async def lifespan(app):
@@ -51,19 +51,30 @@ async def fetch(ticker:str, period:str=None):
     except Exception as e: raise HTTPException(400,str(e))
 @app.get('/api/dashboard/{ticker}')
 async def dashboard(ticker:str, period:str=None):
-    # Always analyse the full cached dataset — indicators need >=206 candles
+    # Always fetch the full cached dataset — indicators need >=206 candles
     all_rows = await candles(ticker.upper())
+    candles_for_chart = list(all_rows)
+    # Slice candles for the chart based on the selected range
+    if period:
+        period_counts = {"6m":126,"2y":504,"5y":1260,"10y":2520,"max":5000}
+        count = period_counts.get(period)
+        if count: candles_for_chart = candles_for_chart[-count:]
     try:
         r = compute(all_rows)
         await persist(ticker.upper(), r)
         r['history'] = await history(ticker.upper())
-        # Slice candles for the chart based on the selected range
-        if period:
-            period_counts = {"6m":126,"2y":504,"5y":1260,"10y":2520,"max":5000}
-            count = period_counts.get(period)
-            if count: r['candles'] = r['candles'][-count:]
-        return r
-    except ValueError as e: raise HTTPException(400,str(e))
+    except ValueError:
+        # Not enough candles for full analysis — return chart with placeholder signal
+        r = {
+            "action": "N/A",
+            "reason": f"Insufficient data for analysis ({len(all_rows)} candles, need {MIN_CANDLES}). Chart shown for reference only.",
+            "snapshot": {},
+            "strength": 0,
+            "candles": [],
+        }
+        r['history'] = []
+    r['candles'] = candles_for_chart
+    return r
 @app.get('/api/screener/universes')
 async def universes(): return universe_names()
 @app.post('/api/screener/run/{universe}')
@@ -86,20 +97,29 @@ class ChatRequest(BaseModel):
 async def _stock_context(ticker: str) -> str:
     """Build a system prompt with deterministic stock data so the LLM has facts to chat about."""
     rows = await candles(ticker)
-    r = compute(rows)
-    return (
-        f"You are a trading expert. You are chatting with a user about {ticker}. "
-        f"Use the deterministic research data below as your only source of facts. "
-        f"Ticker: {ticker}\n"
-        f"Signal: {r['action']} (strength {r['strength']}/100)\n"
-        f"Reason: {r['reason']}\n"
-        f"Indicators: {json.dumps(r['snapshot'])}\n"
-        f"Decision rules: BUY when close > SMA-50 > SMA-200, SMA-50 rising over 6 days, "
-        f"RSI in a fresh cross above 50 or rising in the 50-70 band (not overbought <75), "
-        f"MACD > MACD signal, and volume surge (>1.25× 20-day average). "
-        f"SELL on early exit (close < SMA-50, MACD bearish, RSI breaks below 50) or "
-        f"bearish trend (close < SMA-50 < SMA-200, SMA-50 falling). Otherwise HOLD."
-    )
+    try:
+        r = compute(rows)
+        return (
+            f"You are a trading expert. You are chatting with a user about {ticker}. "
+            f"Use the deterministic research data below as your only source of facts. "
+            f"Ticker: {ticker}\n"
+            f"Signal: {r['action']} (strength {r['strength']}/100)\n"
+            f"Reason: {r['reason']}\n"
+            f"Indicators: {json.dumps(r['snapshot'])}\n"
+            f"Decision rules: BUY when close > SMA-50 > SMA-200, SMA-50 rising over 6 days, "
+            f"RSI in a fresh cross above 50 or rising in the 50-70 band (not overbought <75), "
+            f"MACD > MACD signal, and volume surge (>1.25× 20-day average). "
+            f"SELL on early exit (close < SMA-50, MACD bearish, RSI breaks below 50) or "
+            f"bearish trend (close < SMA-50 < SMA-200, SMA-50 falling). Otherwise HOLD."
+        )
+    except ValueError:
+        return (
+            f"You are a trading expert. You are chatting with a user about {ticker}. "
+            f"There is currently insufficient historical data for a full technical analysis "
+            f"({len(rows)} candles available, need {MIN_CANDLES}). "
+            f"Be transparent about this limitation. You can discuss what you know, "
+            f"but do not fabricate indicator values or signals."
+        )
 
 @app.post('/api/chat/{ticker}')
 async def chat(ticker: str, req: ChatRequest):
