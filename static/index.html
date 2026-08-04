@@ -3,6 +3,7 @@
 
 <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Trade Sentinel</title>
     <script
         src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
@@ -113,6 +114,63 @@
             padding: 10px;
             margin: 5px;
             min-width: 90px
+        }
+
+        /* --- Responsive / mobile --- */
+        /* Toggle button hidden on desktop, always visible on mobile */
+        #chart-toggle { display: none }
+        .chart-panel.collapsed #chart { display: none }
+
+        @media (max-width: 900px) {
+            #chart-toggle { display: inline-block !important }
+            header, main {
+                padding: 10px
+            }
+            header {
+                flex-direction: column;
+                gap: 6px;
+                font-size: 12px
+            }
+            header b { word-break: break-word }
+            main {
+                grid-template-columns: 1fr;
+                gap: 12px
+            }
+            #chart { height: 300px }
+            .metric {
+                min-width: 70px;
+                padding: 8px;
+                margin: 3px;
+                font-size: 12px
+            }
+            .ticker-name { max-width: 110px }
+            .matches { width: 100%; position: static; margin-top: 4px }
+            .ai-thread { max-height: 300px; padding: 8px 6px; gap: 8px }
+            .ai-msg { padding: 8px 12px; font-size: 13px; line-height: 1.5 }
+            .ai-msg.user { max-width: 85% }
+            .ai-msg.assistant { max-width: 95% }
+            .ai-header { flex-wrap: wrap; gap: 4px }
+            .ai-form { flex-wrap: wrap; gap: 6px }
+            .ai-form input { flex: 1 1 100% }
+            .ai-form button { flex: 1; padding: 10px }
+            #explain-modal { width: 100%; max-height: 100vh; border-radius: 0 }
+            .explain-body { padding: 10px }
+            table { font-size: 11px }
+            td, th { padding: 4px }
+            button, input { padding: 10px; font-size: 14px }
+        }
+
+        @media (max-width: 480px) {
+            header b { font-size: 13px }
+            #chart { height: 240px }
+            .metric { min-width: 60px; padding: 6px; margin: 2px; font-size: 11px }
+            .ticker-name { display: none }
+            .ticker-name-inline { font-size: 11px; display: block; margin-left: 0; margin-top: 2px }
+            .ai-thread { max-height: 260px; padding: 6px 4px; gap: 6px }
+            .ai-msg { padding: 7px 10px; font-size: 13px }
+            .ai-msg.user { max-width: 82% }
+            .ai-msg.assistant { max-width: 94% }
+            .ai-empty { padding: 16px 10px }
         }
 
         pre {
@@ -495,13 +553,14 @@
             <div id="watch"></div>
         </aside>
         <section>
-            <div class="panel"><button onclick="refreshData()">Refresh data</button> <button onclick="startChat()">Ask
+            <div class="panel chart-panel"><button onclick="refreshData()">Refresh data</button> <button onclick="startChat()">Ask
                     local LLM</button><button onclick="showExplainModal()" style="margin-left:6px">Explain This
                     Screen</button><b id="ticker"></b><span id="ticker-name" class="ticker-name-inline"></span>
                 <div id="signal"></div>
+                <button id="chart-toggle" onclick="toggleChart()" style="display:none;margin-top:8px">Show chart ▸</button>
                 <div id="chart"></div>
             </div>
-            <div class="panel">
+            <div class="panel chat-panel">
                 <div class="ai-header"><b>AI EXPLANATION</b>
                     <span class="ai-hint">Ask follow-up questions about <span id="ai-ticker">the selected
                             stock</span></span>
@@ -726,6 +785,34 @@
         let current, chart, timer;
         const $ = s => document.querySelector(s);
         const symbolNameCache = {};
+
+        function isMobile() { return window.matchMedia('(max-width: 900px)').matches }
+
+        function toggleChart() {
+            const panel = document.querySelector('.chart-panel');
+            const btn = document.getElementById('chart-toggle');
+            if (panel.classList.contains('collapsed')) {
+                panel.classList.remove('collapsed');
+                btn.textContent = 'Hide chart ▾';
+                // re-fit chart content after it becomes visible
+                if (chart) setTimeout(() => chart.timeScale().fitContent(), 50);
+            } else {
+                panel.classList.add('collapsed');
+                btn.textContent = 'Show chart ▸';
+            }
+        }
+
+        // On mobile, collapse the chart by default so the chat is immediately visible
+        if (isMobile()) {
+            document.addEventListener('DOMContentLoaded', () => {
+                const panel = document.querySelector('.chart-panel');
+                const btn = document.getElementById('chart-toggle');
+                if (panel) {
+                    panel.classList.add('collapsed');
+                    btn.textContent = 'Show chart ▸';
+                }
+            });
+        }
 
         async function api(p, o) {
             let r = await fetch('/api/' + p, o);
