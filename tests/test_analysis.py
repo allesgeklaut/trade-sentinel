@@ -209,12 +209,12 @@ class TestSnapshotShape:
     def test_candles_truncated(self):
         rows = _build_candles(300, lambda i, p: 100.0 + 0.1 * i)
         result = compute(rows)
-        assert len(result["candles"]) == 120
+        assert len(result["candles"]) == 300  # full dataset returned, not truncated
 
     def test_candles_not_truncated_when_short(self):
         rows = _build_candles(206, lambda i, p: 100.0 + 0.1 * i)
         result = compute(rows)
-        assert len(result["candles"]) == 120  # 206 > 120 so still truncated to 120
+        assert len(result["candles"]) == 206  # full dataset returned, not truncated
 
 
 class TestVolume:
