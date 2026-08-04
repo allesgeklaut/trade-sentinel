@@ -168,7 +168,7 @@ def compute(rows: list[dict]) -> dict:
         "reason": reason,
         "snapshot": snap,
         "strength": int(strength),
-        "candles": rows[-120:],
+        "candles": rows,  # full period — market.py already sliced by range
     }
 
 

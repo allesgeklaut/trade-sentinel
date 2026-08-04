@@ -46,16 +46,22 @@ async def symbols(q:str=Query(min_length=2,max_length=80)):
     except ValueError as e: raise HTTPException(400,str(e))
     except Exception as e: raise HTTPException(502,f"{provider()} symbol search failed: {e}")
 @app.post('/api/refresh/{ticker}')
-async def fetch(ticker:str):
-    try: await refresh(ticker.upper()); return {"ok":True}
+async def fetch(ticker:str, period:str=None):
+    try: await refresh(ticker.upper(), period); return {"ok":True}
     except Exception as e: raise HTTPException(400,str(e))
 @app.get('/api/dashboard/{ticker}')
-async def dashboard(ticker:str):
-    rows=await candles(ticker.upper())
+async def dashboard(ticker:str, period:str=None):
+    # Always analyse the full cached dataset — indicators need >=206 candles
+    all_rows = await candles(ticker.upper())
     try:
-        r=compute(rows)
-        await persist(ticker.upper(),r)
-        r['history']=await history(ticker.upper())
+        r = compute(all_rows)
+        await persist(ticker.upper(), r)
+        r['history'] = await history(ticker.upper())
+        # Slice candles for the chart based on the selected range
+        if period:
+            period_counts = {"6m":126,"2y":504,"5y":1260,"10y":2520,"max":5000}
+            count = period_counts.get(period)
+            if count: r['candles'] = r['candles'][-count:]
         return r
     except ValueError as e: raise HTTPException(400,str(e))
 @app.get('/api/screener/universes')
