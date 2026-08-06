@@ -12,6 +12,16 @@ class Settings(BaseSettings):
 
     paper_trading: bool = True
 
+    # --- Autonomous paper-trading simulation -----------------------------
+    sim_enabled: bool = True
+    sim_monthly_allowance: float = 1000.0
+    sim_start_cash: float = 0.0
+    sim_universe: str = "global-large-cap"
+    sim_strategy: str = "deterministic"  # deterministic | llm | hybrid
+    sim_max_position_pct: float = 15.0
+    sim_min_cash_pct: float = 5.0
+    sim_run_hour: int = 22
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

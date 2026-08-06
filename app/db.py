@@ -65,6 +65,73 @@ class ScreenerResult(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
+# =====================================================================
+# Autonomous paper-trading simulation tables
+# =====================================================================
+
+class SimAccount(Base):
+    """Singleton row (id=1) tracking the sim account balance."""
+
+    __tablename__ = "sim_account"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cash: Mapped[float] = mapped_column(Float, default=0)
+    last_allowance_month: Mapped[str | None] = mapped_column(String(7), nullable=True)  # YYYY-MM
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class SimPosition(Base):
+    """Current open positions in the sim portfolio."""
+
+    __tablename__ = "sim_positions"
+    __table_args__ = (UniqueConstraint("ticker"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(32), unique=True)
+    shares: Mapped[float] = mapped_column(Float)
+    avg_cost: Mapped[float] = mapped_column(Float)
+    opened_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class SimTrade(Base):
+    """Executed trade log for the sim portfolio."""
+
+    __tablename__ = "sim_trades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(32), index=True)
+    side: Mapped[str] = mapped_column(String(4))  # BUY | SELL
+    shares: Mapped[float] = mapped_column(Float)
+    price: Mapped[float] = mapped_column(Float)
+    cash_after: Mapped[float] = mapped_column(Float)
+    reason: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class SimAllowance(Base):
+    """Monthly imaginary deposit log."""
+
+    __tablename__ = "sim_allowances"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    amount: Mapped[float] = mapped_column(Float)
+    month: Mapped[str] = mapped_column(String(7), unique=True)  # YYYY-MM
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class SimSnapshot(Base):
+    """Equity-curve snapshot taken after each sim run."""
+
+    __tablename__ = "sim_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    cash: Mapped[float] = mapped_column(Float)
+    positions_value: Mapped[float] = mapped_column(Float)
+    total_equity: Mapped[float] = mapped_column(Float)
+    allowance_total: Mapped[float] = mapped_column(Float, default=0)
+
+
 engine = create_async_engine(settings.database_url)
 Session = async_sessionmaker(engine, expire_on_commit=False)
 
