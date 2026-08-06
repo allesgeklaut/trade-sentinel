@@ -9,6 +9,8 @@ from .db import Watchlist, Session, init_db
 from .market import refresh, candles, search, info, provider
 from .analysis import compute, persist, history, MIN_CANDLES
 from .screener import universe_names, run, results
+from . import sim
+
 @asynccontextmanager
 async def lifespan(app):
     await init_db()
@@ -16,7 +18,11 @@ async def lifespan(app):
         for t in settings.watchlist.split(','):
             if not await s.get(Watchlist,t.strip().upper()): s.add(Watchlist(ticker=t.strip().upper()))
         await s.commit()
+    if settings.sim_enabled:
+        sim.start_scheduler()
     yield
+    if settings.sim_enabled:
+        sim.stop_scheduler()
 app=FastAPI(title="Trade Sentinel",lifespan=lifespan)
 @app.get('/healthz')
 async def health(): return {"ok":True,"paper_trading":settings.paper_trading,"market_data_provider":provider()}
@@ -155,5 +161,45 @@ async def chat(ticker: str, req: ChatRequest):
         return {"text": text, "model": settings.ollama_model}
     except Exception as e:
         return {"text": f"Ollama unavailable: {e}", "model": settings.ollama_model}
+
+# =====================================================================
+# Autonomous paper-trading simulation endpoints
+# =====================================================================
+
+@app.get('/api/sim/status')
+async def sim_status():
+    """Portfolio snapshot: cash, positions, equity, P&L."""
+    val = await sim.valuate()
+    allowance_result = await sim.deposit_allowance()  # ensures account exists
+    return {**val, "sim_enabled": settings.sim_enabled, "sim_strategy": settings.sim_strategy,
+            "sim_universe": settings.sim_universe}
+
+@app.get('/api/sim/trades')
+async def sim_trades(limit: int = Query(default=100, ge=1, le=500)):
+    """Trade log (most recent first)."""
+    return await sim.get_trades(limit)
+
+@app.get('/api/sim/equity')
+async def sim_equity(limit: int = Query(default=365, ge=1, le=1000)):
+    """Equity-curve snapshots for charting (oldest-first)."""
+    return await sim.get_equity_curve(limit)
+
+@app.get('/api/sim/allowances')
+async def sim_allowances():
+    """Monthly allowance deposit history."""
+    return await sim.get_allowances()
+
+@app.post('/api/sim/run')
+async def sim_run():
+    """Manually trigger a sim decision cycle."""
+    try:
+        return await sim.run_cycle()
+    except Exception as e:
+        raise HTTPException(500, f"Sim cycle failed: {e}")
+
+@app.post('/api/sim/reset')
+async def sim_reset():
+    """Wipe all sim tables and restart with start cash."""
+    return await sim.reset_sim()
 
 app.mount('/', StaticFiles(directory='static', html=True), name='static')
