@@ -9,7 +9,10 @@
         src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked@13.0.3/marked.min.js"></script>
     <style>
-        :root { --bench-color:#ff9f43 }
+        :root {
+            --bench-color: #ff9f43
+        }
+
         body {
             margin: 0;
             background: #050a07;
@@ -119,63 +122,189 @@
 
         /* --- Responsive / mobile --- */
         /* Toggle button hidden on desktop, always visible on mobile */
-        #chart-toggle { display: none }
-        .chart-panel.collapsed #chart { display: none }
+        #chart-toggle {
+            display: none
+        }
 
-        .range-btn { padding: 4px 10px; font-size: 12px }
-        .range-btn.range-active { background: #1d6030; color: #b7ffc0; border-color: #42ff72 }
+        .chart-panel.collapsed #chart {
+            display: none
+        }
+
+        .range-btn {
+            padding: 4px 10px;
+            font-size: 12px
+        }
+
+        .range-btn.range-active {
+            background: #1d6030;
+            color: #b7ffc0;
+            border-color: #42ff72
+        }
 
         @media (max-width: 900px) {
-            #chart-toggle { display: inline-block !important }
-            header, main {
+            #chart-toggle {
+                display: inline-block !important
+            }
+
+            header,
+            main {
                 padding: 10px
             }
+
             header {
                 flex-direction: column;
                 gap: 6px;
                 font-size: 12px
             }
-            .nav-toggle { justify-content: center }
-            header b { word-break: break-word }
+
+            .nav-toggle {
+                justify-content: center
+            }
+
+            header b {
+                word-break: break-word
+            }
+
             main {
                 grid-template-columns: 1fr;
                 gap: 12px
             }
-            #chart { height: 300px }
+
+            #chart {
+                height: 300px
+            }
+
             .metric {
                 min-width: 70px;
                 padding: 8px;
                 margin: 3px;
                 font-size: 12px
             }
-            .ticker-name { max-width: 110px }
-            .matches { width: 100%; position: static; margin-top: 4px }
-            .ai-thread { max-height: 300px; padding: 8px 6px; gap: 8px }
-            .ai-msg { padding: 8px 12px; font-size: 13px; line-height: 1.5 }
-            .ai-msg.user { max-width: 85% }
-            .ai-msg.assistant { max-width: 95% }
-            .ai-header { flex-wrap: wrap; gap: 4px }
-            .ai-form { flex-wrap: wrap; gap: 6px }
-            .ai-form input { flex: 1 1 100% }
-            .ai-form button { flex: 1; padding: 10px }
-            #explain-modal { width: 100%; max-height: 100vh; border-radius: 0 }
-            .explain-body { padding: 10px }
-            table { font-size: 11px }
-            td, th { padding: 4px }
-            button, input { padding: 10px; font-size: 14px }
+
+            .ticker-name {
+                max-width: 110px
+            }
+
+            .matches {
+                width: 100%;
+                position: static;
+                margin-top: 4px
+            }
+
+            .ai-thread {
+                max-height: 300px;
+                padding: 8px 6px;
+                gap: 8px
+            }
+
+            .ai-msg {
+                padding: 8px 12px;
+                font-size: 13px;
+                line-height: 1.5
+            }
+
+            .ai-msg.user {
+                max-width: 85%
+            }
+
+            .ai-msg.assistant {
+                max-width: 95%
+            }
+
+            .ai-header {
+                flex-wrap: wrap;
+                gap: 4px
+            }
+
+            .ai-form {
+                flex-wrap: wrap;
+                gap: 6px
+            }
+
+            .ai-form input {
+                flex: 1 1 100%
+            }
+
+            .ai-form button {
+                flex: 1;
+                padding: 10px
+            }
+
+            #explain-modal {
+                width: 100%;
+                max-height: 100vh;
+                border-radius: 0
+            }
+
+            .explain-body {
+                padding: 10px
+            }
+
+            table {
+                font-size: 11px
+            }
+
+            td,
+            th {
+                padding: 4px
+            }
+
+            button,
+            input {
+                padding: 10px;
+                font-size: 14px
+            }
         }
 
         @media (max-width: 480px) {
-            header b { font-size: 13px }
-            #chart { height: 240px }
-            .metric { min-width: 60px; padding: 6px; margin: 2px; font-size: 11px }
-            .ticker-name { display: none }
-            .ticker-name-inline { font-size: 11px; display: block; margin-left: 0; margin-top: 2px }
-            .ai-thread { max-height: 260px; padding: 6px 4px; gap: 6px }
-            .ai-msg { padding: 7px 10px; font-size: 13px }
-            .ai-msg.user { max-width: 82% }
-            .ai-msg.assistant { max-width: 94% }
-            .ai-empty { padding: 16px 10px }
+            header b {
+                font-size: 13px
+            }
+
+            #chart {
+                height: 240px
+            }
+
+            .metric {
+                min-width: 60px;
+                padding: 6px;
+                margin: 2px;
+                font-size: 11px
+            }
+
+            .ticker-name {
+                display: none
+            }
+
+            .ticker-name-inline {
+                font-size: 11px;
+                display: block;
+                margin-left: 0;
+                margin-top: 2px
+            }
+
+            .ai-thread {
+                max-height: 260px;
+                padding: 6px 4px;
+                gap: 6px
+            }
+
+            .ai-msg {
+                padding: 7px 10px;
+                font-size: 13px
+            }
+
+            .ai-msg.user {
+                max-width: 82%
+            }
+
+            .ai-msg.assistant {
+                max-width: 94%
+            }
+
+            .ai-empty {
+                padding: 16px 10px
+            }
         }
 
         pre {
@@ -402,8 +531,13 @@
             text-align: left
         }
 
-        .bullish { color: #42ff72 }
-        .n/a { color: #7aaa81 }
+        .bullish {
+            color: #42ff72
+        }
+
+        .n/a {
+            color: #7aaa81
+        }
 
         /* Explain modal */
         #explain-backdrop {
@@ -546,27 +680,102 @@
         }
 
         /* --- Simulation view --- */
-        .nav-toggle { display:flex; gap:6px }
-        .nav-toggle button { border-color:#1d6030; padding:6px 12px; font-size:13px }
-        .nav-toggle button.nav-active { background:#1d6030; color:#b7ffc0; border-color:#42ff72 }
-        #sim-view { display:none; max-width:1400px; margin:auto; padding:18px }
-        #sim-view.active { display:block }
-        .sim-section { border:1px solid #1d6030; padding:14px; background:#071009; margin-bottom:18px }
-        .sim-section h3 { margin:0 0 10px; font-size:14px; color:#42ff72 }
-        .sim-grid2 { display:grid; grid-template-columns:1fr 1fr; gap:18px; margin-bottom:18px }
-        #sim-chart { height:320px }
-        .sim-actions { display:flex; gap:10px; align-items:center; margin-top:10px }
-        .sim-loading { opacity:0.5; pointer-events:none }
-        .sim-empty { color:#7aaa81; font-size:12px; padding:20px; text-align:center }
-        @media (max-width:900px){ .sim-grid2 { grid-template-columns:1fr } }
-        .bench-metric { border-color:#ff9f43 !important }
-        .bench-label { font-size:11px; color:#ff9f43; margin:4px 0 8px }
+        .nav-toggle {
+            display: flex;
+            gap: 6px
+        }
+
+        .nav-toggle button {
+            border-color: #1d6030;
+            padding: 6px 12px;
+            font-size: 13px
+        }
+
+        .nav-toggle button.nav-active {
+            background: #1d6030;
+            color: #b7ffc0;
+            border-color: #42ff72
+        }
+
+        #sim-view {
+            display: none;
+            max-width: 1400px;
+            margin: auto;
+            padding: 18px
+        }
+
+        #sim-view.active {
+            display: block
+        }
+
+        .sim-section {
+            border: 1px solid #1d6030;
+            padding: 14px;
+            background: #071009;
+            margin-bottom: 18px
+        }
+
+        .sim-section h3 {
+            margin: 0 0 10px;
+            font-size: 14px;
+            color: #42ff72
+        }
+
+        .sim-grid2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 18px;
+            margin-bottom: 18px
+        }
+
+        #sim-chart {
+            height: 320px
+        }
+
+        .sim-actions {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-top: 10px
+        }
+
+        .sim-loading {
+            opacity: 0.5;
+            pointer-events: none
+        }
+
+        .sim-empty {
+            color: #7aaa81;
+            font-size: 12px;
+            padding: 20px;
+            text-align: center
+        }
+
+        @media (max-width:900px) {
+            .sim-grid2 {
+                grid-template-columns: 1fr
+            }
+        }
+
+        .bench-metric {
+            border-color: #ff9f43 !important
+        }
+
+        .bench-label {
+            font-size: 11px;
+            color: #ff9f43;
+            margin: 4px 0 8px
+        }
     </style>
 
 </head>
 
 <body>
-    <header><b>TRADE SENTINEL // PAPER-ONLY RESEARCH TERMINAL</b><div class="nav-toggle"><button id="nav-dashboard" class="nav-active" onclick="showView('dashboard')">Dashboard</button><button id="nav-sim" onclick="showView('sim')">Simulation</button></div><span id="status">loading</span></header>
+    <header><b>TRADE SENTINEL // PAPER-ONLY RESEARCH TERMINAL</b>
+        <div class="nav-toggle"><button id="nav-dashboard" class="nav-active"
+                onclick="showView('dashboard')">Dashboard</button><button id="nav-sim"
+                onclick="showView('sim')">Simulation</button></div><span id="status">loading</span>
+    </header>
     <main id="dashboard-view">
         <aside class="panel">
             <form id="add"><input id="new" autocomplete="off" placeholder="Ticker or company"><button>Add</button>
@@ -575,12 +784,14 @@
             <div id="watch"></div>
         </aside>
         <section>
-            <div class="panel chart-panel"><button onclick="refreshData()">Refresh data</button> <button onclick="startChat()">Ask
+            <div class="panel chart-panel"><button onclick="refreshData()">Refresh data</button> <button
+                    onclick="startChat()">Ask
                     local LLM</button><button onclick="showExplainModal()" style="margin-left:6px">Explain This
                     Screen</button><b id="ticker"></b><span id="ticker-name" class="ticker-name-inline"></span>
                 <div id="signal"></div>
                 <div id="chart-range-bar" style="margin:8px 0;display:flex;gap:4px;flex-wrap:wrap"></div>
-                <button id="chart-toggle" onclick="toggleChart()" style="display:none;margin-top:8px">Show chart ▸</button>
+                <button id="chart-toggle" onclick="toggleChart()" style="display:none;margin-top:8px">Show chart
+                    ▸</button>
                 <div id="chart"></div>
             </div>
             <div class="panel chat-panel">
@@ -605,7 +816,9 @@
         </aside>
     </main>
     <section id="sim-view">
-        <div class="sim-section"><div id="sim-summary"></div></div>
+        <div class="sim-section">
+            <div id="sim-summary"></div>
+        </div>
         <div class="sim-section">
             <div class="sim-section-title">Equity Curve</div>
             <div style="display:flex;gap:16px;margin-bottom:8px">
@@ -616,33 +829,38 @@
         </div>
         <div class="sim-grid2">
             <div class="sim-section">
-                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">POSITIONS</h3><div id="sim-positions"></div>
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">POSITIONS</h3>
+                <div id="sim-positions"></div>
             </div>
             <div class="sim-section">
-                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">TRADE LOG</h3><div id="sim-trades"></div>
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">TRADE LOG</h3>
+                <div id="sim-trades"></div>
             </div>
         </div>
         <div class="sim-grid2">
             <div class="sim-section">
-                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">ALLOWANCE LOG</h3><div id="sim-allowances"></div>
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">ALLOWANCE LOG</h3>
+                <div id="sim-allowances"></div>
             </div>
             <div class="sim-section">
                 <div class="bench-label">BENCHMARK: MSCI WORLD DCA</div>
                 <div id="sim-benchmark"></div>
             </div>
-        <div class="sim-grid2">
-            <div class="sim-section">
-                <div class="bench-label">ACTIONS</div>
-                <div class="sim-actions">
-                    <button id="sim-run-btn" onclick="runSim()">Run Bot Now</button>
-                    <button onclick="resetSim()">Reset Sim</button>
+            <div class="sim-grid2">
+                <div class="sim-section">
+                    <div class="bench-label">ACTIONS</div>
+                    <div class="sim-actions">
+                        <button id="sim-run-btn" onclick="runSim()">Run Bot Now</button>
+                        <button onclick="resetSim()">Reset Sim</button>
+                    </div>
                 </div>
             </div>
-        </div>
-        <div class="sim-section">
-            <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">LLM REASONING</h3>
-            <div id="sim-reasoning" style="white-space:pre-wrap;word-wrap:break-word;max-height:400px;overflow-y:auto;font-size:13px;line-height:1.5"></div>
-        </div>
+            <div class="sim-section">
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">LLM REASONING</h3>
+                <div id="sim-reasoning"
+                    style="white-space:pre-wrap;word-wrap:break-word;max-height:400px;overflow-y:auto;font-size:13px;line-height:1.5">
+                </div>
+            </div>
     </section>
     <div id="explain-backdrop-container">
         <div id="explain-modal">
@@ -847,10 +1065,10 @@
         let screenLimit = 20;
         let current, chart, timer;
         let currentRange = '6m';
-        const RANGES = ['6m','2y','5y','10y','max'];
-        const RANGE_LABELS = {'6m':'6M','2y':'2Y','5y':'5Y','10y':'10Y','max':'MAX'};
+        const RANGES = ['6m', '2y', '5y', '10y', 'max'];
+        const RANGE_LABELS = { '6m': '6M', '2y': '2Y', '5y': '5Y', '10y': '10Y', 'max': 'MAX' };
         // Track which ranges we've already fetched so we don't re-download
-        const RANGE_ORDER = ['6m','2y','5y','10y','max'];
+        const RANGE_ORDER = ['6m', '2y', '5y', '10y', 'max'];
         const fetchedRanges = new Set();
         const $ = s => document.querySelector(s);
         const symbolNameCache = {};
@@ -943,7 +1161,7 @@
             if (!current && a[0]) openTicker(a[0]);
         }
 
-        async function openTicker(t) { current = t; fetchedRanges.clear(); $('#ticker').textContent = ' // ' + t; $('#ticker-name').textContent = ''; if (typeof resetChat === 'function') resetChat(); try { let [d, name] = await Promise.all([api('dashboard/' + t + '?period=' + currentRange), resolveSymbolName(t)]); fetchedRanges.add(t + ':' + currentRange); draw(d); $('#ticker-name').textContent = name ? ` — ${name}` : ''; $('#status').textContent = 'ONLINE // ' + t } catch (e) { $('#status').textContent = 'ERROR: refresh required'; $('#signal').textContent = e.message } } function draw(d) { let s = d.snapshot; $('#signal').innerHTML = `<h2 class="${d.action.toLowerCase()}">${d.action}</h2><p>${d.reason}</p>` + (s && Object.keys(s).length ? Object.entries(s).map(([k, v]) => `<span class=metric>${k}<br><b>${v}</b></span>`).join('') : '<span style="color:#7aaa81">No indicators available — insufficient data for analysis.</span>'); $('#chart').innerHTML = ''; const chartOpts = { height: 420, layout: { background: { color: '#071009' }, textColor: '#b7ffc0' }, grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } }, timeScale: { tickMarkFormatter: (time, tickMarkType, locale) => { const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']; let M, D, Y; if (time && typeof time === 'object' && time.year) { M = MONTHS[time.month - 1]; D = time.day; Y = time.year; } else if (typeof time === 'string') { const dt = new Date(time); M = MONTHS[dt.getUTCMonth()]; D = dt.getUTCDate(); Y = dt.getUTCFullYear(); } else { const dt = new Date(time * 1000); M = MONTHS[dt.getUTCMonth()]; D = dt.getUTCDate(); Y = dt.getUTCFullYear(); } if (tickMarkType === 0) return `${D} ${M}`; if (tickMarkType === 1 || tickMarkType === 2) return M; if (tickMarkType === 3) return String(Y); return `${D} ${M}`; } } }; chart = LightweightCharts.createChart($('#chart'), chartOpts); chart.addCandlestickSeries({ upColor: '#42ff72', downColor: '#ff5c70', borderVisible: false, wickUpColor: '#42ff72', wickDownColor: '#ff5c70' }).setData(d.candles || []); chart.timeScale().fitContent() } async function refreshData() { try { $('#status').textContent = 'FETCHING...'; await api('refresh/' + current + '?period=' + currentRange, { method: 'POST' }); await openTicker(current); $('#status').textContent = 'ONLINE' } catch (e) { $('#status').textContent = e.message } } async function explain() { $('#ai').textContent = 'Querying local Ollama...'; let x = await api('explain/' + current, { method: 'POST' }); $('#ai').textContent = x.text } async function del(t) { await api('watchlist/' + t, { method: 'DELETE' }); current = null; loadWatch() } function choose(x) { $('#new').value = x.symbol; $('#matches').innerHTML = '' } $('#new').oninput = () => { clearTimeout(timer); let q = $('#new').value.trim(); if (q.length < 2) return $('#matches').innerHTML = ''; timer = setTimeout(async () => { try { let a = await api('symbols?q=' + encodeURIComponent(q)); $('#matches').innerHTML = a.map(x => `<div class=match onclick='choose(${JSON.stringify(x)})'><span>${x.symbol}<br><small>${x.name}</small></span><small>${x.exchange}</small></div>`).join('') } catch (e) { $('#matches').innerHTML = '' } }, 300) }; $('#add').onsubmit = async e => { e.preventDefault(); let t = $('#new').value.trim(); if (t) { await api('watchlist/' + t, { method: 'POST' }); $('#new').value = ''; $('#matches').innerHTML = ''; loadWatch() } }; async function loadUniverses() { let u = await api('screener/universes'); $('#universe').innerHTML = u.map(x => `<option>${x}</option>`).join(''); showScreen() }
+        async function openTicker(t) { current = t; fetchedRanges.clear(); $('#ticker').textContent = ' // ' + t; $('#ticker-name').textContent = ''; if (typeof resetChat === 'function') resetChat(); try { let [d, name] = await Promise.all([api('dashboard/' + t + '?period=' + currentRange), resolveSymbolName(t)]); fetchedRanges.add(t + ':' + currentRange); draw(d); $('#ticker-name').textContent = name ? ` — ${name}` : ''; $('#status').textContent = 'ONLINE // ' + t } catch (e) { $('#status').textContent = 'ERROR: refresh required'; $('#signal').textContent = e.message } } function draw(d) { let s = d.snapshot; $('#signal').innerHTML = `<h2 class="${d.action.toLowerCase()}">${d.action}</h2><p>${d.reason}</p>` + (s && Object.keys(s).length ? Object.entries(s).map(([k, v]) => `<span class=metric>${k}<br><b>${v}</b></span>`).join('') : '<span style="color:#7aaa81">No indicators available — insufficient data for analysis.</span>'); $('#chart').innerHTML = ''; const chartOpts = { height: 420, layout: { background: { color: '#071009' }, textColor: '#b7ffc0' }, grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } }, timeScale: { tickMarkFormatter: (time, tickMarkType, locale) => { const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']; let M, D, Y; if (time && typeof time === 'object' && time.year) { M = MONTHS[time.month - 1]; D = time.day; Y = time.year; } else if (typeof time === 'string') { const dt = new Date(time); M = MONTHS[dt.getUTCMonth()]; D = dt.getUTCDate(); Y = dt.getUTCFullYear(); } else { const dt = new Date(time * 1000); M = MONTHS[dt.getUTCMonth()]; D = dt.getUTCDate(); Y = dt.getUTCFullYear(); } if (tickMarkType === 0) return `${D} ${M}`; if (tickMarkType === 1 || tickMarkType === 2) return M; if (tickMarkType === 3) return String(Y); return `${D} ${M}`; } } }; chart = LightweightCharts.createChart($('#chart'), chartOpts); chart.addCandlestickSeries({ upColor: '#42ff72', downColor: '#ff5c70', borderVisible: false, wickUpColor: '#42ff72', wickDownColor: '#ff5c70' }).setData(d.candles || []); chart.timeScale().fitContent() } async function refreshData() { try { $('#status').textContent = 'FETCHING...'; await api('refresh/' + current + '?period=' + currentRange, { method: 'POST' }); await openTicker(current); $('#status').textContent = 'ONLINE' } catch (e) { $('#status').textContent = e.message } } async function explain() { $('#ai').textContent = 'Querying local Ollama...'; let x = await api('explain/' + current, { method: 'POST' }); $('#ai').textContent = x.text } async function del(t) { await api('watchlist/' + t, { method: 'DELETE' }); current = null; loadWatch() } function choose(x) { $('#new').value = x.symbol; $('#matches').innerHTML = '' } $('#new').oninput = () => { clearTimeout(timer); let q = $('#new').value.trim(); if (q.length < 2) return $('#matches').innerHTML = ''; timer = setTimeout(async () => { try { let a = await api('symbols?q=' + encodeURIComponent(q)); $('#matches').innerHTML = a.map(x => `<div class=match onclick='choose(${JSON.stringify(x)})'><span>${x.symbol}<br><small>${x.name}</small></span><small>${x.exchange}</small></div>`).join('') } catch (e) { $('#matches').innerHTML = '' } }, 300) }; $('#add').onsubmit = async e => { e.preventDefault(); let t = $('#new').value.trim(); if (t) { await api('watchlist/' + t, { method: 'POST' }); $('#new').value = ''; $('#matches').innerHTML = ''; loadWatch() } }; async function loadUniverses() { let u = await api('screener/universes'); $('#universe').innerHTML = u.map(x => `<option>${x}</option>`).join(''); showScreen() }
         async function showScreen() {
             let a = await api('screener/' + $('#universe').value);
 
@@ -1039,14 +1257,14 @@
                 }
                 document.getElementById('sim-chart').innerHTML = '';
                 simChart = LightweightCharts.createChart(document.getElementById('sim-chart'), {
-                    height: 320, layout: { background:{color:'#071009'}, textColor:'#b7ffc0' },
-                    grid: { vertLines:{color:'#12351c'}, horzLines:{color:'#12351c'} },
-                    timeScale: { timeVisible:true, secondsVisible:false }
+                    height: 320, layout: { background: { color: '#071009' }, textColor: '#b7ffc0' },
+                    grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } },
+                    timeScale: { timeVisible: true, secondsVisible: false }
                 });
-                const line = simChart.addLineSeries({ color:'#42ff72', lineWidth:2 });
+                const line = simChart.addLineSeries({ color: '#42ff72', lineWidth: 2 });
                 line.setData(snaps.map(s => ({ time: Math.floor(new Date(s.at).getTime() / 1000), value: s.total_equity })));
                 if (bench && bench.equity_curve && bench.equity_curve.length) {
-                    const benchLine = simChart.addLineSeries({ color:'#ff9f43', lineWidth:2 });
+                    const benchLine = simChart.addLineSeries({ color: '#ff9f43', lineWidth: 2 });
                     benchLine.setData(bench.equity_curve.map(s => ({ time: Math.floor(new Date(s.at).getTime() / 1000), value: s.total_equity })));
                 }
                 simChart.timeScale().fitContent();
@@ -1061,7 +1279,7 @@
                     ['Ticker', b.ticker || '—'],
                     ['Shares', b.shares != null ? b.shares.toFixed(4) : '—'],
                     ['Avg Cost', b.avg_cost != null ? '$' + b.avg_cost.toFixed(2) : '—'],
-                    ['Price', b.price != null ? '$' + b.price.toFixed(2) : '—'],
+                    ['Price', b.current_price != null ? '$' + b.current_price.toFixed(2) : '—'],
                     ['Total Equity', b.total_equity != null ? '$' + b.total_equity.toFixed(2) : '—'],
                 ];
                 document.getElementById('sim-benchmark').innerHTML = metrics.map(([k, v]) => `<span class="metric bench-metric">${k}<br><b>${v}</b></span>`).join('');
