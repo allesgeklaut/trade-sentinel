@@ -134,6 +134,7 @@
                 gap: 6px;
                 font-size: 12px
             }
+            .nav-toggle { justify-content: center }
             header b { word-break: break-word }
             main {
                 grid-template-columns: 1fr;
@@ -542,12 +543,27 @@
         #explain-modal-container.open {
             display: flex;
         }
+
+        /* --- Simulation view --- */
+        .nav-toggle { display:flex; gap:6px }
+        .nav-toggle button { border-color:#1d6030; padding:6px 12px; font-size:13px }
+        .nav-toggle button.nav-active { background:#1d6030; color:#b7ffc0; border-color:#42ff72 }
+        #sim-view { display:none; max-width:1400px; margin:auto; padding:18px }
+        #sim-view.active { display:block }
+        .sim-section { border:1px solid #1d6030; padding:14px; background:#071009; margin-bottom:18px }
+        .sim-section h3 { margin:0 0 10px; font-size:14px; color:#42ff72 }
+        .sim-grid2 { display:grid; grid-template-columns:1fr 1fr; gap:18px; margin-bottom:18px }
+        #sim-chart { height:320px }
+        .sim-actions { display:flex; gap:10px; align-items:center; margin-top:10px }
+        .sim-loading { opacity:0.5; pointer-events:none }
+        .sim-empty { color:#7aaa81; font-size:12px; padding:20px; text-align:center }
+        @media (max-width:900px){ .sim-grid2 { grid-template-columns:1fr } }
     </style>
 </head>
 
 <body>
-    <header><b>TRADE SENTINEL // PAPER-ONLY RESEARCH TERMINAL</b><span id="status">loading</span></header>
-    <main>
+    <header><b>TRADE SENTINEL // PAPER-ONLY RESEARCH TERMINAL</b><div class="nav-toggle"><button id="nav-dashboard" class="nav-active" onclick="showView('dashboard')">Dashboard</button><button id="nav-sim" onclick="showView('sim')">Simulation</button></div><span id="status">loading</span></header>
+    <main id="dashboard-view">
         <aside class="panel">
             <form id="add"><input id="new" autocomplete="off" placeholder="Ticker or company"><button>Add</button>
                 <div id="matches" class="matches"></div>
@@ -584,6 +600,23 @@
             <div id="screen">No screen run yet.</div>
         </aside>
     </main>
+    <section id="sim-view">
+        <div class="sim-section"><div id="sim-summary"></div></div>
+        <div class="sim-section"><h3>EQUITY CURVE</h3><div id="sim-chart"></div></div>
+        <div class="sim-grid2">
+            <div class="sim-section"><h3>POSITIONS</h3><div id="sim-positions"></div></div>
+            <div class="sim-section"><h3>TRADE LOG</h3><div id="sim-trades"></div></div>
+        </div>
+        <div class="sim-grid2">
+            <div class="sim-section"><h3>ALLOWANCE LOG</h3><div id="sim-allowances"></div></div>
+            <div class="sim-section"><h3>ACTIONS</h3>
+                <div class="sim-actions">
+                    <button id="sim-run-btn" onclick="runSim()">Run Bot Now</button>
+                    <button onclick="resetSim()">Reset Sim</button>
+                </div>
+            </div>
+        </div>
+    </section>
     <div id="explain-backdrop-container">
         <div id="explain-modal">
             <div class="explain-header">
@@ -913,6 +946,102 @@
                 : 'No results. Press Update once; this may take several minutes.';
         }
         async function runScreen() { $('#screen').textContent = 'Updating universe sequentially; this uses one Twelve Data request per ticker...'; try { let x = await api('screener/run/' + $('#universe').value, { method: 'POST' }); $('#status').textContent = `SCREENED ${x.ranked}/${x.processed}`; showScreen() } catch (e) { $('#screen').textContent = e.message } } $('#universe').onchange = showScreen; loadWatch(); loadUniverses()
+
+        // --- Simulation view ---
+        let simChart = null;
+        let simLoaded = false;
+
+        function showView(view) {
+            const dash = document.getElementById('dashboard-view');
+            const sim = document.getElementById('sim-view');
+            const navDash = document.getElementById('nav-dashboard');
+            const navSim = document.getElementById('nav-sim');
+            if (view === 'sim') {
+                dash.style.display = 'none';
+                sim.classList.add('active');
+                navDash.classList.remove('nav-active');
+                navSim.classList.add('nav-active');
+                if (!simLoaded) { simLoaded = true; loadSimAll(); }
+            } else {
+                dash.style.display = 'grid';
+                sim.classList.remove('active');
+                navDash.classList.add('nav-active');
+                navSim.classList.remove('nav-active');
+            }
+        }
+
+        async function loadSimStatus() {
+            try {
+                const s = await api('sim/status');
+                const m = [
+                    ['Total Equity', s.total_equity != null ? '$' + s.total_equity.toFixed(2) : '—'],
+                    ['Cash', s.cash != null ? '$' + s.cash.toFixed(2) : '—'],
+                    ['Positions Value', s.positions_value != null ? '$' + s.positions_value.toFixed(2) : '—'],
+                    ['Allowance Total', s.allowance_total != null ? '$' + s.allowance_total.toFixed(2) : '—'],
+                    ['Strategy', s.sim_strategy || '—'],
+                    ['Universe', s.sim_universe || '—'],
+                ];
+                document.getElementById('sim-summary').innerHTML = m.map(([k, v]) => `<span class="metric">${k}<br><b>${v}</b></span>`).join('');
+                const pos = s.positions || [];
+                document.getElementById('sim-positions').innerHTML = pos.length ? `<table><tr><th>Ticker</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>P&L%</th></tr>${pos.map(p => {
+                    const pnl = p.pnl_pct;
+                    const cls = pnl > 0 ? 'buy' : pnl < 0 ? 'sell' : '';
+                    return `<tr><td>${p.ticker}</td><td>${p.shares}</td><td>$${p.avg_cost.toFixed(2)}</td><td>$${p.current_price.toFixed(2)}</td><td>$${p.value.toFixed(2)}</td><td class="${cls}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</td></tr>`;
+                }).join('')}</table>` : '<div class="sim-empty">No open positions.</div>';
+            } catch (e) { document.getElementById('sim-summary').innerHTML = 'Error: ' + escapeHtml(e.message); }
+        }
+
+        async function loadSimTrades() {
+            try {
+                const t = await api('sim/trades?limit=50');
+                document.getElementById('sim-trades').innerHTML = t.length ? `<table><tr><th>Time</th><th>Ticker</th><th>Side</th><th>Shares</th><th>Price</th><th>Reason</th></tr>${t.map(x => `<tr><td>${x.at || ''}</td><td>${x.ticker}</td><td class="${x.side === 'BUY' ? 'buy' : 'sell'}">${x.side}</td><td>${x.shares}</td><td>$${x.price.toFixed(2)}</td><td style="text-align:left">${escapeHtml(x.reason || '')}</td></tr>`).join('')}</table>` : '<div class="sim-empty">No trades yet — run the bot to start.</div>';
+            } catch (e) { document.getElementById('sim-trades').innerHTML = 'Error: ' + escapeHtml(e.message); }
+        }
+
+        function loadSimEquity() {
+            api('sim/equity?limit=365').then(snaps => {
+                if (simChart) { simChart.remove(); simChart = null; }
+                if (!snaps || !snaps.length) {
+                    document.getElementById('sim-chart').innerHTML = '<div class="sim-empty">No data yet — run the bot to start tracking.</div>';
+                    return;
+                }
+                document.getElementById('sim-chart').innerHTML = '';
+                simChart = LightweightCharts.createChart(document.getElementById('sim-chart'), {
+                    height: 320, layout: { background:{color:'#071009'}, textColor:'#b7ffc0' },
+                    grid: { vertLines:{color:'#12351c'}, horzLines:{color:'#12351c'} },
+                    timeScale: { timeVisible:true, secondsVisible:false }
+                });
+                const line = simChart.addLineSeries({ color:'#42ff72', lineWidth:2 });
+                line.setData(snaps.map(s => ({ time: Math.floor(new Date(s.at).getTime() / 1000), value: s.total_equity })));
+                simChart.timeScale().fitContent();
+            }).catch(e => { document.getElementById('sim-chart').innerHTML = 'Error: ' + escapeHtml(e.message); });
+        }
+
+        async function loadSimAllowances() {
+            try {
+                const a = await api('sim/allowances');
+                document.getElementById('sim-allowances').innerHTML = a.length ? `<table><tr><th>Month</th><th>Amount</th></tr>${a.map(x => `<tr><td>${x.month}</td><td>$${x.amount.toFixed(2)}</td></tr>`).join('')}</table>` : '<div class="sim-empty">No allowance records.</div>';
+            } catch (e) { document.getElementById('sim-allowances').innerHTML = 'Error: ' + escapeHtml(e.message); }
+        }
+
+        async function loadSimAll() {
+            loadSimStatus(); loadSimTrades(); loadSimEquity(); loadSimAllowances();
+        }
+
+        async function runSim() {
+            const btn = document.getElementById('sim-run-btn');
+            const orig = btn.textContent;
+            btn.textContent = 'Running...'; btn.classList.add('sim-loading'); btn.disabled = true;
+            try { await api('sim/run', { method: 'POST' }); } catch (e) { /* ignore */ }
+            btn.textContent = orig; btn.classList.remove('sim-loading'); btn.disabled = false;
+            loadSimAll();
+        }
+
+        async function resetSim() {
+            if (!confirm('Reset simulation? This clears all trades, positions, and equity history.')) return;
+            try { await api('sim/reset', { method: 'POST' }); } catch (e) { /* ignore */ }
+            loadSimAll();
+        }
     </script>
 </body>
 
