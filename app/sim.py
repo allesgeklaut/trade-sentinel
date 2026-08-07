@@ -1,8 +1,9 @@
 """Autonomous paper-trading simulation engine for Trade Sentinel.
 
 The bot receives an imaginary monthly allowance, decides when to buy/sell
-assets from a configurable universe using deterministic signals (with optional
-LLM hybrid mode planned), and tracks portfolio performance over time.
+assets from a configurable universe using deterministic signals, an LLM-based
+portfolio manager (hybrid mode), or a pure LLM mode, and tracks portfolio
+performance over time.
 
 All trades are executed at the latest cached daily close price — no real
 broker, no intraday, no shorting.  This is a research/education tool.
@@ -11,9 +12,12 @@ broker, no intraday, no shorting.  This is a research/education tool.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
+
+import httpx
 
 from sqlalchemy import delete, func, select
 
@@ -188,7 +192,7 @@ async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str) -
             return None
         acc.cash -= cost
 
-        pos = await s.get(SimPosition, ticker)
+        pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
         if pos:
             # Update weighted average cost
             total_shares = pos.shares + shares
@@ -217,7 +221,7 @@ async def _exec_sell(ticker: str, price: float, shares: float | None, reason: st
     Returns the trade dict or None if nothing to sell.
     """
     async with Session() as s:
-        pos = await s.get(SimPosition, ticker)
+        pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
         if pos is None or pos.shares <= 0:
             return None
 
@@ -333,7 +337,7 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
 
         # Check existing position size
         async with Session() as s:
-            pos = await s.get(SimPosition, ticker)
+            pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
         current_value = (pos.shares * price) if pos else 0
         if current_value >= max_position_value:
             continue  # position already at max
@@ -350,8 +354,283 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Hybrid / LLM strategy
+# ---------------------------------------------------------------------------
+
+_LLM_SYSTEM_PROMPT = (
+    "You are a disciplined portfolio manager reviewing deterministic technical "
+    "signals for a paper-trading simulation.\n"
+    "You will receive the current portfolio state and a list of candidate "
+    "tickers with their technical indicators (signal action, strength, close "
+    "price, RSI, MACD).\n"
+    "Your job: review the deterministic trade candidates and the signals, then "
+    "return your own decisions.\n"
+    "\n"
+    "Rules:\n"
+    "1. For each candidate ticker you may decide BUY, SELL, or HOLD.\n"
+    "2. You may also adjust the deterministic candidates: upgrade a HOLD to a "
+    "BUY, downgrade a BUY to HOLD, or reject a SELL.\n"
+    "3. Respect risk management: do not buy if cash is too low; do not over-"
+    "concentrate in a single ticker.\n"
+    "4. Decisions must be grounded in the provided signals and indicators.\n"
+    "\n"
+    "Return ONLY a JSON array of objects with the fields:\n"
+    '  "ticker": string, "action": "BUY"|"SELL"|"HOLD", "reason": string\n'
+    "\n"
+    "No markdown, no code fences, no prose — just the JSON array.\n"
+)
+
+
+def _build_llm_context(
+    valuation: dict[str, Any],
+    deterministic_trades: list[dict],
+    signals: dict[str, dict],
+) -> str:
+    """Build the compact context string sent to the LLM."""
+    lines: list[str] = []
+
+    # --- Portfolio state ---
+    lines.append("## Current Portfolio State")
+    lines.append(f"Cash: {valuation['cash']:.2f}")
+    lines.append(f"Positions value: {valuation['positions_value']:.2f}")
+    lines.append(f"Total equity: {valuation['total_equity']:.2f}")
+    lines.append(f"Cumulative allowance deposited: {valuation['allowance_total']:.2f}")
+    lines.append("")
+
+    if valuation["positions"]:
+        lines.append("Open positions:")
+        for p in valuation["positions"]:
+            lines.append(
+                f"  - {p['ticker']}: {p['shares']} shares @ avg {p['avg_cost']:.2f} "
+                f"| current {p['current_price']:.2f} | value {p['value']:.2f} "
+                f"| P&L {p['pnl_pct']:+.2f}%"
+            )
+    else:
+        lines.append("Open positions: none")
+    lines.append("")
+
+    # --- Signals summary ---
+    lines.append("## Signals (all candidate tickers)")
+    if signals:
+        lines.append(
+            f"{'ticker':<10} {'action':<6} {'strength':>8} "
+            f"{'close':>10} {'rsi':>6} {'macd':>10}"
+        )
+        for ticker, sig in sorted(signals.items()):
+            snap = sig.get("snapshot", {})
+            lines.append(
+                f"{ticker:<10} {sig['action']:<6} {sig['strength']:>8} "
+                f"{snap.get('close', 0):>10.2f} {snap.get('rsi', 0):>6.1f} "
+                f"{snap.get('macd', 0):>10.3f}"
+            )
+    else:
+        lines.append("(no signals available)")
+    lines.append("")
+
+    # --- Deterministic candidate trades ---
+    lines.append("## Deterministic Candidate Trades")
+    if deterministic_trades:
+        for t in deterministic_trades:
+            lines.append(
+                f"  - {t['ticker']} {t['side']} ×{t.get('shares', '?')} @ "
+                f"{t.get('price', '?'):.2f} — {t.get('reason', '')}"
+            )
+    else:
+        lines.append("(no deterministic trades proposed)")
+    lines.append("")
+
+    lines.append("## Your Decisions")
+    lines.append(
+        "Return ONLY a JSON array of objects: "
+        '{"ticker": "...", "action": "BUY|SELL|HOLD", "reason": "..."}. '
+        "No markdown, no prose."
+    )
+    return "\n".join(lines)
+
+
+def _parse_llm_decisions(content: str) -> list[dict] | None:
+    """Parse the LLM JSON array output, tolerating minor formatting issues.
+
+    Returns None if parsing fails so the caller can fall back.
+    """
+    if not content:
+        return None
+    text = content.strip()
+
+    # Strip markdown code fences if present
+    if text.startswith("```"):
+        # Remove opening fence (optionally with language tag)
+        first_nl = text.find("\n")
+        if first_nl != -1:
+            text = text[first_nl + 1:]
+        if text.endswith("```"):
+            text = text[:-3].strip()
+
+    # Extract the outermost JSON array
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    json_str = text[start:end + 1]
+
+    try:
+        decisions = json.loads(json_str)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    if not isinstance(decisions, list):
+        return None
+
+    # Validate / normalize entries
+    valid = []
+    for d in decisions:
+        if not isinstance(d, dict):
+            continue
+        ticker = d.get("ticker")
+        action = str(d.get("action", "")).upper().strip()
+        reason = str(d.get("reason", "")).strip()
+        if not ticker or action not in ("BUY", "SELL", "HOLD"):
+            continue
+        valid.append({"ticker": ticker, "action": action, "reason": reason})
+    return valid if valid else None
+
+
+async def _llm_decide(
+    valuation: dict[str, Any],
+    deterministic_trades: list[dict],
+    signals: dict[str, dict] | None = None,
+) -> list[dict]:
+    """Hybrid strategy: let an LLM review/adjust deterministic candidates.
+
+    Builds a structured context with the portfolio state, deterministic
+    candidates, and signal summaries, asks the LLM for a JSON array of
+    decisions, then executes each BUY/SELL through the same exec helpers.
+
+    If the LLM call fails or the response can't be parsed, falls back to the
+    deterministic trades.
+    """
+    # Default fallback
+    if signals is None:
+        signals = {}
+
+    context = _build_llm_context(valuation, deterministic_trades, signals)
+    url = settings.ollama_url.rstrip("/") + "/api/chat"
+    timeout = httpx.Timeout(
+        connect=10.0,
+        read=settings.ollama_timeout_seconds,
+        write=30.0,
+        pool=10.0,
+    )
+    payload = {
+        "model": settings.ollama_model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+            {"role": "user", "content": context},
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.warning("LLM decide failed (%s); falling back to deterministic", e)
+        return list(deterministic_trades)
+
+    # Ollama chat response: data["message"]["content"]
+    content = ""
+    try:
+        content = data.get("message", {}).get("content", "") or data.get("response", "")
+    except (AttributeError, TypeError):
+        pass
+
+    decisions = _parse_llm_decisions(content)
+    if decisions is None:
+        logger.warning("Could not parse LLM decisions; falling back to deterministic. Raw: %s", content[:500])
+        return list(deterministic_trades)
+
+    logger.info("LLM returned %d decisions", len(decisions))
+
+    # Recompute equity / budget guards (same logic as deterministic)
+    total_equity = valuation["total_equity"]
+    if total_equity <= 0:
+        return []
+
+    min_cash = total_equity * (settings.sim_min_cash_pct / 100)
+    max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+
+    executed: list[dict] = []
+
+    for decision in decisions:
+        ticker = decision["ticker"]
+        action = decision["action"]
+        reason = decision["reason"] or f"LLM {action}"
+
+        price = await _latest_close(ticker)
+        if price is None or price <= 0:
+            logger.warning("LLM decision for %s skipped: no price", ticker)
+            continue
+
+        if action == "BUY":
+            acc = await _account()
+            if acc.cash < min_cash:
+                logger.info("LLM BUY %s skipped: cash %.2f < min_cash %.2f", ticker, acc.cash, min_cash)
+                continue
+
+            async with Session() as s:
+                pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
+            current_value = (pos.shares * price) if pos else 0
+            if current_value >= max_position_value:
+                logger.info("LLM BUY %s skipped: position at max (%.2f >= %.2f)", ticker, current_value, max_position_value)
+                continue
+
+            budget = min(acc.cash - min_cash, max_position_value - current_value)
+            if budget < price:
+                logger.info("LLM BUY %s skipped: budget %.2f < price %.2f", ticker, budget, price)
+                continue
+
+            t = await _exec_buy(ticker, price, budget, f"LLM: {reason}")
+            if t:
+                executed.append(t)
+                # Update guards after each buy
+                valuation = await valuate()
+                total_equity = valuation["total_equity"]
+                min_cash = total_equity * (settings.sim_min_cash_pct / 100)
+                max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+
+        elif action == "SELL":
+            t = await _exec_sell(ticker, price, None, f"LLM: {reason}")
+            if t:
+                executed.append(t)
+                valuation = await valuate()
+                total_equity = valuation["total_equity"]
+                min_cash = total_equity * (settings.sim_min_cash_pct / 100)
+                max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+
+        else:  # HOLD
+            logger.info("LLM HOLD %s — %s", ticker, reason)
+            continue
+
+    return executed
+
+
+# ---------------------------------------------------------------------------
 # Main cycle
 # ---------------------------------------------------------------------------
+
+async def _gather_signals(tickers: list[str]) -> dict[str, dict]:
+    """Fetch compute() signals for every ticker, skipping failures."""
+    signals: dict[str, dict] = {}
+    for t in tickers:
+        try:
+            rows = await candles(t)
+            signals[t] = compute(rows)
+        except Exception:
+            continue
+    return signals
+
 
 async def run_cycle() -> dict[str, Any]:
     """Run one full sim cycle: deposit allowance → refresh → decide → snapshot.
@@ -378,13 +657,16 @@ async def run_cycle() -> dict[str, Any]:
     if strategy == "deterministic":
         trades = await _deterministic_decide(valuation)
     elif strategy == "llm":
-        # TODO: implement LLM strategy
-        logger.warning("LLM strategy not yet implemented, falling back to deterministic")
-        trades = await _deterministic_decide(valuation)
+        # Pure LLM: let the model decide entirely from portfolio context + signals
+        signals = await _gather_signals(tickers)
+        trades = await _llm_decide(valuation, [], signals)
     elif strategy == "hybrid":
-        # TODO: implement hybrid strategy
-        logger.warning("Hybrid strategy not yet implemented, falling back to deterministic")
-        trades = await _deterministic_decide(valuation)
+        # Hybrid: run deterministic first, then let LLM review/adjust
+        deterministic_trades = await _deterministic_decide(valuation)
+        # Recompute valuation after deterministic trades changed the portfolio
+        valuation = await valuate()
+        signals = await _gather_signals(tickers)
+        trades = await _llm_decide(valuation, deterministic_trades, signals)
     else:
         logger.warning("Unknown strategy '%s', falling back to deterministic", strategy)
         trades = await _deterministic_decide(valuation)
