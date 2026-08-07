@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 
 import httpx
@@ -38,6 +39,9 @@ from .screener import tickers as universe_tickers
 
 logger = logging.getLogger("trade_sentinel.sim")
 
+# Stores the raw LLM reasoning text from the most recent _llm_decide() call.
+_last_llm_reasoning: str = ""
+
 # How many candles to refresh for the sim universe (2y is a good balance
 # for indicator computation without excessive API load).
 _SIM_REFRESH_PERIOD = "2y"
@@ -47,12 +51,20 @@ _SIM_REFRESH_PERIOD = "2y"
 # Helpers
 # ---------------------------------------------------------------------------
 
+_TZ = ZoneInfo("Europe/Vienna")
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _now() -> datetime:
+    """Current time as naive Vienna local time."""
+    return datetime.now(_TZ).replace(tzinfo=None)
+
+
 def _current_month() -> str:
-    return _utcnow().strftime("%Y-%m")
+    return datetime.now(_TZ).strftime("%Y-%m")
 
 
 async def _latest_close(ticker: str) -> float | None:
@@ -179,12 +191,16 @@ async def _candidate_tickers() -> list[str]:
 
 
 async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str) -> dict | None:
-    """Execute a paper BUY.  Returns the trade dict or None if skipped."""
-    if price <= 0 or max_budget < price:
+    """Execute a paper BUY.  Returns the trade dict or None if skipped.
+
+    Uses fractional shares (rounded to 4 decimals) so the bot can always
+    deploy capital regardless of share price.
+    """
+    if price <= 0 or max_budget < 1:
         return None
-    # Buy as many shares as the budget allows (whole shares only)
-    shares = int(max_budget // price)
-    if shares < 1:
+    # Fractional shares — invest as much of the budget as possible
+    shares = round(max_budget / price, 4)
+    if shares < 0.0001:
         return None
     cost = shares * price
 
@@ -328,6 +344,19 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
     ]
     buy_candidates.sort(key=lambda x: x[1]["strength"], reverse=True)
 
+    # If no strict BUY signals, use a relaxed fallback: buy the best
+    # near-BUY candidates (HOLD with highest strength) so the bot stays
+    # active and deploys cash instead of sitting idle.
+    if not buy_candidates:
+        hold_candidates = [
+            (t, sig) for t, sig in signals.items()
+            if sig["action"] == "HOLD" and sig["strength"] >= 40
+        ]
+        hold_candidates.sort(key=lambda x: x[1]["strength"], reverse=True)
+        buy_candidates = hold_candidates[:3]  # limit relaxed buys
+        if buy_candidates:
+            logger.info("No strict BUY signals; using %d relaxed HOLD candidates (strength >= 40)", len(buy_candidates))
+
     for ticker, sig in buy_candidates:
         acc = await _account()
         if acc.cash < min_cash:
@@ -345,7 +374,7 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
             continue  # position already at max
 
         budget = min(acc.cash - min_cash, max_position_value - current_value)
-        if budget < price:
+        if budget < 1:
             continue
 
         t = await _exec_buy(ticker, price, budget, sig["reason"])
@@ -548,6 +577,10 @@ async def _llm_decide(
     except (AttributeError, TypeError):
         pass
 
+    # Store raw LLM reasoning for display in the frontend
+    global _last_llm_reasoning
+    _last_llm_reasoning = content
+
     decisions = _parse_llm_decisions(content)
     if decisions is None:
         logger.warning("Could not parse LLM decisions; falling back to deterministic. Raw: %s", content[:500])
@@ -589,8 +622,8 @@ async def _llm_decide(
                 continue
 
             budget = min(acc.cash - min_cash, max_position_value - current_value)
-            if budget < price:
-                logger.info("LLM BUY %s skipped: budget %.2f < price %.2f", ticker, budget, price)
+            if budget < 1:
+                logger.info("LLM BUY %s skipped: budget %.2f < $1", ticker, budget)
                 continue
 
             t = await _exec_buy(ticker, price, budget, f"LLM: {reason}")
@@ -704,12 +737,18 @@ async def run_cycle() -> dict[str, Any]:
         "refresh_errors": refresh_errors,
         "trades": trades,
         "valuation": post_valuation,
+        "llm_reasoning": _last_llm_reasoning,
     }
 
 
 # ---------------------------------------------------------------------------
 # Query helpers (for API endpoints)
 # ---------------------------------------------------------------------------
+
+def get_last_llm_reasoning() -> str:
+    """Return the raw LLM reasoning text from the most recent sim cycle."""
+    return _last_llm_reasoning
+
 
 async def get_trades(limit: int = 100) -> list[dict]:
     async with Session() as s:
@@ -933,7 +972,7 @@ _scheduler_task: asyncio.Task | None = None
 async def _scheduler_loop():
     """Background loop that runs the sim cycle daily at sim_run_hour UTC."""
     while True:
-        now = _utcnow()
+        now = _now()
         # Calculate seconds until next sim_run_hour
         target = now.replace(hour=settings.sim_run_hour, minute=0, second=0, microsecond=0)
         if target <= now:

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import String, Float, DateTime, Integer, UniqueConstraint, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -7,8 +8,20 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from .config import settings
 
 
+_TZ = ZoneInfo("Europe/Vienna")
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _now() -> datetime:
+    """Return current time as a naive datetime in Vienna local time.
+
+    Stored without tzinfo so SQLite columns stay simple, but values reflect
+    Europe/Vienna (CET/CEST) instead of UTC.
+    """
+    return datetime.now(_TZ).replace(tzinfo=None)
 
 
 class Base(DeclarativeBase):
@@ -77,7 +90,7 @@ class SimAccount(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     cash: Mapped[float] = mapped_column(Float, default=0)
     last_allowance_month: Mapped[str | None] = mapped_column(String(7), nullable=True)  # YYYY-MM
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
 class SimPosition(Base):
@@ -90,7 +103,7 @@ class SimPosition(Base):
     ticker: Mapped[str] = mapped_column(String(32), unique=True)
     shares: Mapped[float] = mapped_column(Float)
     avg_cost: Mapped[float] = mapped_column(Float)
-    opened_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    opened_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
 class SimTrade(Base):
@@ -105,7 +118,7 @@ class SimTrade(Base):
     price: Mapped[float] = mapped_column(Float)
     cash_after: Mapped[float] = mapped_column(Float)
     reason: Mapped[str] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
 class SimAllowance(Base):
@@ -116,7 +129,7 @@ class SimAllowance(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     amount: Mapped[float] = mapped_column(Float)
     month: Mapped[str] = mapped_column(String(7), unique=True)  # YYYY-MM
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
 class SimSnapshot(Base):
@@ -125,7 +138,7 @@ class SimSnapshot(Base):
     __tablename__ = "sim_snapshots"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, index=True)
     cash: Mapped[float] = mapped_column(Float)
     positions_value: Mapped[float] = mapped_column(Float)
     total_equity: Mapped[float] = mapped_column(Float)
@@ -142,7 +155,7 @@ class SimBenchmarkAccount(Base):
     shares: Mapped[float] = mapped_column(Float, default=0)
     avg_cost: Mapped[float] = mapped_column(Float, default=0)
     last_allowance_month: Mapped[str | None] = mapped_column(String(7), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
 class SimBenchmarkSnapshot(Base):
@@ -151,7 +164,7 @@ class SimBenchmarkSnapshot(Base):
     __tablename__ = "sim_benchmark_snapshots"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, index=True)
     shares: Mapped[float] = mapped_column(Float)
     price: Mapped[float] = mapped_column(Float)
     total_equity: Mapped[float] = mapped_column(Float)

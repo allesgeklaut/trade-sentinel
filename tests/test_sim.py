@@ -271,7 +271,7 @@ class TestExecBuy:
         assert t is not None
         assert t["ticker"] == "AAPL"
         assert t["side"] == "BUY"
-        assert t["shares"] == 33  # int(5000 // 150)
+        assert t["shares"] == pytest.approx(33.3333, abs=0.001)  # 5000 / 150 fractional
         assert t["price"] == 150.0
 
         # Check state
@@ -279,18 +279,18 @@ class TestExecBuy:
             from sqlalchemy import select as sa_select
             pos = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "AAPL"))
             assert pos is not None
-            assert pos.shares == 33
+            assert pos.shares == pytest.approx(33.3333, abs=0.001)
             assert pos.avg_cost == 150.0
 
             acc = await s.get(SimAccount, 1)
-            assert acc.cash == pytest.approx(10000 - 33 * 150)
+            assert acc.cash == pytest.approx(10000 - 33.3333 * 150, abs=0.01)
 
             trades = (await s.scalars(sa_select(SimTrade))).all()
             assert len(trades) == 1
 
     async def test_buy_insufficient_budget(self, with_cash):
-        """A buy with budget less than one share should be skipped."""
-        t = await sim._exec_buy("BRK.A", 500_000, 10000, "too expensive")
+        """A buy with budget under $1 should be skipped."""
+        t = await sim._exec_buy("BRK.A", 500_000, 0.5, "too expensive")
         assert t is None
 
     async def test_buy_zero_price(self, with_cash):
@@ -307,7 +307,7 @@ class TestExecBuy:
             from sqlalchemy import select as sa_select
             pos = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "AAPL"))
             assert pos is not None
-            assert pos.shares == 30
+            assert pos.shares == pytest.approx(30.0, abs=0.001)
             # Weighted avg: (20*100 + 10*150) / 30 = 3500/30 ≈ 116.67
             assert pos.avg_cost == pytest.approx(116.67, abs=0.1)
 
@@ -320,7 +320,7 @@ class TestExecSell:
         t = await sim._exec_sell("AAPL", 120.0, None, "sell all")
         assert t is not None
         assert t["side"] == "SELL"
-        assert t["shares"] == 20
+        assert t["shares"] == pytest.approx(20.0, abs=0.001)
         assert t["price"] == 120.0
 
         async with sim.Session() as s:
@@ -330,7 +330,7 @@ class TestExecSell:
 
             acc = await s.get(SimAccount, 1)
             # cash = 10000 - 2000 (buy) + 2400 (sell 20*120)
-            assert acc.cash == pytest.approx(10000 - 2000 + 2400)
+            assert acc.cash == pytest.approx(10000 - 2000 + 2400, abs=0.01)
 
     async def test_sell_no_position(self, with_cash):
         """Selling a ticker with no position should return None."""
@@ -343,13 +343,13 @@ class TestExecSell:
 
         t = await sim._exec_sell("AAPL", 110.0, 10, "partial sell")
         assert t is not None
-        assert t["shares"] == 10
+        assert t["shares"] == pytest.approx(10.0, abs=0.001)
 
         async with sim.Session() as s:
             from sqlalchemy import select as sa_select
             pos = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "AAPL"))
             assert pos is not None
-            assert pos.shares == 20  # 30 - 10
+            assert pos.shares == pytest.approx(20.0, abs=0.001)  # 30 - 10
 
 
 # ---------------------------------------------------------------------------
