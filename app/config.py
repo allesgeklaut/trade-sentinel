@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     sim_min_cash_pct: float = 5.0
     sim_run_hour: int = 22
 
+    # --- Benchmark (DCA control portfolio) --------------------------------
+    sim_benchmark_enabled: bool = True
+    sim_benchmark_ticker: str = "URTH"  # iShares MSCI World ETF
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

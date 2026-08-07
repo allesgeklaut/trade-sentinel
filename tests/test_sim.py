@@ -23,6 +23,7 @@ from app.config import settings
 from app.db import (
     Base,
     SimAccount,
+    SimBenchmarkAccount,
     SimPosition,
     SimSnapshot,
     SimTrade,
@@ -70,6 +71,112 @@ async def with_cash(mem_db):
         acc.cash = 10000.0
         await s.commit()
     return mem_db
+
+
+# ---------------------------------------------------------------------------
+# Benchmark (DCA control portfolio)
+# ---------------------------------------------------------------------------
+
+class TestBenchmark:
+    async def test_benchmark_valuate_empty(self, mem_db, monkeypatch):
+        """Benchmark valuation with no deposits should be zero."""
+        async def mock_close(ticker):
+            return 100.0
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+        val = await sim.benchmark_valuate()
+        assert val["shares"] == 0
+        assert val["total_equity"] == 0.0
+
+    async def test_benchmark_deposit_and_buy(self, mem_db, monkeypatch):
+        """DCA deposit should buy fractional shares at current price."""
+        monkeypatch.setattr(sim, "_current_month", lambda: "2026-01")
+        async def mock_close(ticker):
+            return 100.0
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+        result = await sim._benchmark_deposit_and_buy()
+        assert result["deposited"] is True
+        assert result["amount"] == settings.sim_monthly_allowance
+        assert result["shares"] == settings.sim_monthly_allowance / 100.0
+
+    async def test_benchmark_no_double_deposit(self, mem_db, monkeypatch):
+        """Second call in the same month should not deposit again."""
+        monkeypatch.setattr(sim, "_current_month", lambda: "2026-01")
+        async def mock_close(ticker):
+            return 100.0
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+        await sim._benchmark_deposit_and_buy()
+        result = await sim._benchmark_deposit_and_buy()
+        assert result["deposited"] is False
+
+    async def test_benchmark_deposit_next_month(self, mem_db, monkeypatch):
+        """A new month should trigger a fresh DCA deposit."""
+        monkeypatch.setattr(sim, "_current_month", lambda: "2026-01")
+        async def mock_close(ticker):
+            return 100.0
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+        await sim._benchmark_deposit_and_buy()
+        monkeypatch.setattr(sim, "_current_month", lambda: "2026-02")
+        result = await sim._benchmark_deposit_and_buy()
+        assert result["deposited"] is True
+        assert result["month"] == "2026-02"
+
+    async def test_benchmark_valuate_after_deposit(self, mem_db, monkeypatch):
+        """Valuation should reflect shares x current price after a deposit."""
+        monkeypatch.setattr(sim, "_current_month", lambda: "2026-01")
+        async def mock_close(ticker):
+            return 100.0
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+        await sim._benchmark_deposit_and_buy()
+        # Price goes up to 120
+        async def mock_close_120(ticker):
+            return 120.0
+        monkeypatch.setattr(sim, "_latest_close", mock_close_120)
+        val = await sim.benchmark_valuate()
+        # 1000 / 100 = 10 shares, now worth 120 each = 1200
+        assert val["shares"] == 10.0
+        assert val["total_equity"] == 1200.0
+        assert val["current_price"] == 120.0
+
+    async def test_benchmark_no_price_skips(self, mem_db, monkeypatch):
+        """If no price is available, the deposit should be skipped."""
+        monkeypatch.setattr(sim, "_current_month", lambda: "2026-01")
+        async def mock_close_none(ticker):
+            return None
+        monkeypatch.setattr(sim, "_latest_close", mock_close_none)
+        result = await sim._benchmark_deposit_and_buy()
+        assert result["deposited"] is False
+
+    async def test_benchmark_reset(self, mem_db, monkeypatch):
+        """Reset should wipe benchmark tables."""
+        monkeypatch.setattr(sim, "_current_month", lambda: "2026-01")
+        async def mock_close(ticker):
+            return 100.0
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+        await sim._benchmark_deposit_and_buy()
+        await sim.reset_benchmark()
+        val = await sim.benchmark_valuate()
+        assert val["shares"] == 0
+        assert val["total_equity"] == 0.0
+
+    async def test_benchmark_multiple_deposits_avg_cost(self, mem_db, monkeypatch):
+        """Multiple DCA deposits at different prices should track weighted avg cost."""
+        # Month 1: price 100
+        monkeypatch.setattr(sim, "_current_month", lambda: "2026-01")
+        async def mock_close_100(ticker):
+            return 100.0
+        monkeypatch.setattr(sim, "_latest_close", mock_close_100)
+        await sim._benchmark_deposit_and_buy()  # 10 shares @ 100
+        # Month 2: price 200
+        monkeypatch.setattr(sim, "_current_month", lambda: "2026-02")
+        async def mock_close_200(ticker):
+            return 200.0
+        monkeypatch.setattr(sim, "_latest_close", mock_close_200)
+        await sim._benchmark_deposit_and_buy()  # 5 shares @ 200
+
+        val = await sim.benchmark_valuate()
+        # 15 shares total, avg cost = (10*100 + 5*200) / 15 = 2000/15 ~= 133.33
+        assert val["shares"] == 15.0
+        assert val["avg_cost"] == pytest.approx(133.33, abs=0.1)
 
 
 # ---------------------------------------------------------------------------

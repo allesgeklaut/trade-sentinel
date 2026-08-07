@@ -26,6 +26,8 @@ from .config import settings
 from .db import (
     SimAccount,
     SimAllowance,
+    SimBenchmarkAccount,
+    SimBenchmarkSnapshot,
     SimPosition,
     SimSnapshot,
     SimTrade,
@@ -649,6 +651,15 @@ async def run_cycle() -> dict[str, Any]:
         except Exception as e:
             refresh_errors.append(f"{t}: {e}")
 
+    # 2b. Refresh benchmark ticker and run benchmark DCA
+    benchmark_result = {"deposited": False, "skipped": True}
+    if settings.sim_benchmark_enabled:
+        try:
+            await refresh(settings.sim_benchmark_ticker, _SIM_REFRESH_PERIOD)
+        except Exception as e:
+            refresh_errors.append(f"{settings.sim_benchmark_ticker}: {e}")
+        benchmark_result = await _benchmark_deposit_and_buy()
+
     # 3. Valuate
     valuation = await valuate()
 
@@ -684,8 +695,12 @@ async def run_cycle() -> dict[str, Any]:
         s.add(snap)
         await s.commit()
 
+    # 5b. Benchmark snapshot
+    await _benchmark_snapshot()
+
     return {
         "allowance": allowance_result,
+        "benchmark": benchmark_result,
         "refresh_errors": refresh_errors,
         "trades": trades,
         "valuation": post_valuation,
@@ -769,8 +784,143 @@ async def reset_sim() -> dict[str, Any]:
         s.add(acc)
         await s.commit()
 
+    await reset_benchmark()
     logger.info("Sim reset: cash=%.2f", settings.sim_start_cash)
     return {"ok": True, "cash": settings.sim_start_cash}
+
+
+# ---------------------------------------------------------------------------
+# Benchmark (DCA control portfolio)
+# ---------------------------------------------------------------------------
+
+async def benchmark_valuate() -> dict[str, Any]:
+    """Compute the DCA benchmark portfolio valuation."""
+    async with Session() as s:
+        acc = await s.get(SimBenchmarkAccount, 1)
+        if acc is None:
+            acc = SimBenchmarkAccount(id=1, cash=0, shares=0, avg_cost=0, last_allowance_month=None)
+            s.add(acc)
+            await s.commit()
+
+    price = await _latest_close(settings.sim_benchmark_ticker)
+    if price is None:
+        price = acc.avg_cost or 0.0
+    value = acc.shares * price
+
+    return {
+        "ticker": settings.sim_benchmark_ticker,
+        "shares": round(acc.shares, 6),
+        "avg_cost": round(acc.avg_cost, 4),
+        "current_price": round(price, 4),
+        "total_equity": round(value, 2),
+        "allowance_total": 0.0,  # filled below
+    }
+
+
+async def _benchmark_deposit_and_buy() -> dict[str, Any]:
+    """Deposit the monthly allowance into the benchmark and buy the ETF.
+
+    The benchmark always invests 100% of each allowance immediately
+    (dollar-cost averaging).  Uses fractional shares so the full amount
+    is always invested.
+    """
+    if not settings.sim_benchmark_enabled:
+        return {"deposited": False, "skipped": True}
+
+    month = _current_month()
+    ticker = settings.sim_benchmark_ticker
+
+    price = await _latest_close(ticker)
+    if price is None or price <= 0:
+        logger.warning("Benchmark: no price for %s, skipping deposit", ticker)
+        return {"deposited": False, "skipped": True, "reason": "no price"}
+
+    async with Session() as s:
+        acc = await s.get(SimBenchmarkAccount, 1)
+        if acc is None:
+            acc = SimBenchmarkAccount(id=1, cash=0, shares=0, avg_cost=0, last_allowance_month=None)
+            s.add(acc)
+
+        if acc.last_allowance_month == month:
+            return {"deposited": False, "skipped": False, "month": month}
+
+        amount = settings.sim_monthly_allowance
+        # Fractional shares for the benchmark (full investment)
+        new_shares = amount / price
+        total_shares = acc.shares + new_shares
+        acc.avg_cost = (acc.shares * acc.avg_cost + amount) / total_shares if total_shares > 0 else price
+        acc.shares = total_shares
+        acc.cash += amount  # track total deposited via cash in/out accounting
+        acc.last_allowance_month = month
+        await s.commit()
+
+        logger.info("Benchmark DCA: deposited %.2f, bought %.6f shares of %s @ %.2f",
+                     amount, new_shares, ticker, price)
+        return {
+            "deposited": True,
+            "amount": amount,
+            "month": month,
+            "shares": round(new_shares, 6),
+            "price": round(price, 4),
+        }
+
+
+async def _benchmark_snapshot() -> None:
+    """Take a snapshot of the benchmark portfolio for the equity curve."""
+    if not settings.sim_benchmark_enabled:
+        return
+
+    val = await benchmark_valuate()
+    price = val["current_price"]
+
+    # Compute allowance total from account cash (tracks cumulative deposits)
+    async with Session() as s:
+        acc = await s.get(SimBenchmarkAccount, 1)
+        allowance_total = acc.cash if acc else 0.0
+
+    async with Session() as s:
+        snap = SimBenchmarkSnapshot(
+            shares=val["shares"],
+            price=price,
+            total_equity=val["total_equity"],
+            allowance_total=round(allowance_total, 2),
+        )
+        s.add(snap)
+        await s.commit()
+
+
+async def get_benchmark_equity_curve(limit: int = 365) -> list[dict]:
+    """Return benchmark snapshots oldest-first for charting."""
+    async with Session() as s:
+        rows = (
+            await s.scalars(
+                select(SimBenchmarkSnapshot)
+                .order_by(SimBenchmarkSnapshot.created_at.desc())
+                .limit(limit)
+            )
+        ).all()
+        rows = list(reversed(rows))
+        return [
+            {
+                "at": r.created_at.isoformat(),
+                "shares": r.shares,
+                "price": r.price,
+                "total_equity": r.total_equity,
+                "allowance_total": r.allowance_total,
+            }
+            for r in rows
+        ]
+
+
+async def reset_benchmark() -> None:
+    """Wipe benchmark tables and re-initialize."""
+    async with Session() as s:
+        await s.execute(delete(SimBenchmarkSnapshot))
+        await s.execute(delete(SimBenchmarkAccount))
+        acc = SimBenchmarkAccount(id=1, cash=0, shares=0, avg_cost=0, last_allowance_month=None)
+        s.add(acc)
+        await s.commit()
+    logger.info("Benchmark reset")
 
 
 # ---------------------------------------------------------------------------
