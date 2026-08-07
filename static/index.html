@@ -9,6 +9,7 @@
         src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked@13.0.3/marked.min.js"></script>
     <style>
+        :root { --bench-color:#ff9f43 }
         body {
             margin: 0;
             background: #050a07;
@@ -558,7 +559,10 @@
         .sim-loading { opacity:0.5; pointer-events:none }
         .sim-empty { color:#7aaa81; font-size:12px; padding:20px; text-align:center }
         @media (max-width:900px){ .sim-grid2 { grid-template-columns:1fr } }
+        .bench-metric { border-color:#ff9f43 !important }
+        .bench-label { font-size:11px; color:#ff9f43; margin:4px 0 8px }
     </style>
+
 </head>
 
 <body>
@@ -602,14 +606,33 @@
     </main>
     <section id="sim-view">
         <div class="sim-section"><div id="sim-summary"></div></div>
-        <div class="sim-section"><h3>EQUITY CURVE</h3><div id="sim-chart"></div></div>
-        <div class="sim-grid2">
-            <div class="sim-section"><h3>POSITIONS</h3><div id="sim-positions"></div></div>
-            <div class="sim-section"><h3>TRADE LOG</h3><div id="sim-trades"></div></div>
+        <div class="sim-section">
+            <div class="sim-section-title">Equity Curve</div>
+            <div style="display:flex;gap:16px;margin-bottom:8px">
+                <span style="color:#42ff72;font-size:12px">● Bot</span>
+                <span style="color:#ff9f43;font-size:12px">● Benchmark (DCA)</span>
+            </div>
+            <div id="sim-chart"></div>
         </div>
         <div class="sim-grid2">
-            <div class="sim-section"><h3>ALLOWANCE LOG</h3><div id="sim-allowances"></div></div>
-            <div class="sim-section"><h3>ACTIONS</h3>
+            <div class="sim-section">
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">POSITIONS</h3><div id="sim-positions"></div>
+            </div>
+            <div class="sim-section">
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">TRADE LOG</h3><div id="sim-trades"></div>
+            </div>
+        </div>
+        <div class="sim-grid2">
+            <div class="sim-section">
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">ALLOWANCE LOG</h3><div id="sim-allowances"></div>
+            </div>
+            <div class="sim-section">
+                <div class="bench-label">BENCHMARK: MSCI WORLD DCA</div>
+                <div id="sim-benchmark"></div>
+            </div>
+        <div class="sim-grid2">
+            <div class="sim-section">
+                <div class="bench-label">ACTIONS</div>
                 <div class="sim-actions">
                     <button id="sim-run-btn" onclick="runSim()">Run Bot Now</button>
                     <button onclick="resetSim()">Reset Sim</button>
@@ -972,16 +995,18 @@
 
         async function loadSimStatus() {
             try {
-                const s = await api('sim/status');
+                const [s, bench] = await Promise.all([api('sim/status'), api('sim/benchmark').catch(() => null)]);
+                const benchEquity = bench && bench.total_equity != null ? '$' + bench.total_equity.toFixed(2) : '—';
                 const m = [
                     ['Total Equity', s.total_equity != null ? '$' + s.total_equity.toFixed(2) : '—'],
+                    ['Bench Equity', benchEquity, 'bench-metric'],
                     ['Cash', s.cash != null ? '$' + s.cash.toFixed(2) : '—'],
                     ['Positions Value', s.positions_value != null ? '$' + s.positions_value.toFixed(2) : '—'],
                     ['Allowance Total', s.allowance_total != null ? '$' + s.allowance_total.toFixed(2) : '—'],
                     ['Strategy', s.sim_strategy || '—'],
                     ['Universe', s.sim_universe || '—'],
                 ];
-                document.getElementById('sim-summary').innerHTML = m.map(([k, v]) => `<span class="metric">${k}<br><b>${v}</b></span>`).join('');
+                document.getElementById('sim-summary').innerHTML = m.map(([k, v, cls]) => `<span class="metric${cls ? ' ' + cls : ''}">${k}<br><b>${v}</b></span>`).join('');
                 const pos = s.positions || [];
                 document.getElementById('sim-positions').innerHTML = pos.length ? `<table><tr><th>Ticker</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>P&L%</th></tr>${pos.map(p => {
                     const pnl = p.pnl_pct;
@@ -999,7 +1024,10 @@
         }
 
         function loadSimEquity() {
-            api('sim/equity?limit=365').then(snaps => {
+            Promise.all([
+                api('sim/equity?limit=365').catch(() => null),
+                api('sim/benchmark').catch(() => null)
+            ]).then(([snaps, bench]) => {
                 if (simChart) { simChart.remove(); simChart = null; }
                 if (!snaps || !snaps.length) {
                     document.getElementById('sim-chart').innerHTML = '<div class="sim-empty">No data yet — run the bot to start tracking.</div>';
@@ -1013,8 +1041,27 @@
                 });
                 const line = simChart.addLineSeries({ color:'#42ff72', lineWidth:2 });
                 line.setData(snaps.map(s => ({ time: Math.floor(new Date(s.at).getTime() / 1000), value: s.total_equity })));
+                if (bench && bench.equity_curve && bench.equity_curve.length) {
+                    const benchLine = simChart.addLineSeries({ color:'#ff9f43', lineWidth:2 });
+                    benchLine.setData(bench.equity_curve.map(s => ({ time: Math.floor(new Date(s.at).getTime() / 1000), value: s.total_equity })));
+                }
                 simChart.timeScale().fitContent();
             }).catch(e => { document.getElementById('sim-chart').innerHTML = 'Error: ' + escapeHtml(e.message); });
+        }
+
+        async function loadSimBenchmark() {
+            try {
+                const b = await api('sim/benchmark');
+                if (!b) { document.getElementById('sim-benchmark').innerHTML = '<div class="sim-empty">No benchmark data.</div>'; return; }
+                const metrics = [
+                    ['Ticker', b.ticker || '—'],
+                    ['Shares', b.shares != null ? b.shares.toFixed(4) : '—'],
+                    ['Avg Cost', b.avg_cost != null ? '$' + b.avg_cost.toFixed(2) : '—'],
+                    ['Price', b.price != null ? '$' + b.price.toFixed(2) : '—'],
+                    ['Total Equity', b.total_equity != null ? '$' + b.total_equity.toFixed(2) : '—'],
+                ];
+                document.getElementById('sim-benchmark').innerHTML = metrics.map(([k, v]) => `<span class="metric bench-metric">${k}<br><b>${v}</b></span>`).join('');
+            } catch (e) { document.getElementById('sim-benchmark').innerHTML = '<div class="sim-empty">No benchmark data.</div>'; }
         }
 
         async function loadSimAllowances() {
@@ -1025,7 +1072,7 @@
         }
 
         async function loadSimAll() {
-            loadSimStatus(); loadSimTrades(); loadSimEquity(); loadSimAllowances();
+            loadSimStatus(); loadSimTrades(); loadSimEquity(); loadSimAllowances(); loadSimBenchmark();
         }
 
         async function runSim() {

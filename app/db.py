@@ -132,6 +132,33 @@ class SimSnapshot(Base):
     allowance_total: Mapped[float] = mapped_column(Float, default=0)
 
 
+class SimBenchmarkAccount(Base):
+    """Singleton row (id=1) tracking the DCA benchmark account."""
+
+    __tablename__ = "sim_benchmark_account"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cash: Mapped[float] = mapped_column(Float, default=0)
+    shares: Mapped[float] = mapped_column(Float, default=0)
+    avg_cost: Mapped[float] = mapped_column(Float, default=0)
+    last_allowance_month: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class SimBenchmarkSnapshot(Base):
+    """Equity-curve snapshot for the DCA benchmark, taken after each sim run."""
+
+    __tablename__ = "sim_benchmark_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    shares: Mapped[float] = mapped_column(Float)
+    price: Mapped[float] = mapped_column(Float)
+    total_equity: Mapped[float] = mapped_column(Float)
+    allowance_total: Mapped[float] = mapped_column(Float, default=0)
+
+
+
 engine = create_async_engine(settings.database_url)
 Session = async_sessionmaker(engine, expire_on_commit=False)
 

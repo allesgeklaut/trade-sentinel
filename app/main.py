@@ -172,7 +172,9 @@ async def sim_status():
     val = await sim.valuate()
     allowance_result = await sim.deposit_allowance()  # ensures account exists
     return {**val, "sim_enabled": settings.sim_enabled, "sim_strategy": settings.sim_strategy,
-            "sim_universe": settings.sim_universe}
+            "sim_universe": settings.sim_universe,
+            "benchmark_enabled": settings.sim_benchmark_enabled,
+            "benchmark_ticker": settings.sim_benchmark_ticker}
 
 @app.get('/api/sim/trades')
 async def sim_trades(limit: int = Query(default=100, ge=1, le=500)):
@@ -188,6 +190,13 @@ async def sim_equity(limit: int = Query(default=365, ge=1, le=1000)):
 async def sim_allowances():
     """Monthly allowance deposit history."""
     return await sim.get_allowances()
+
+@app.get('/api/sim/benchmark')
+async def sim_benchmark():
+    """DCA benchmark portfolio status + equity curve."""
+    val = await sim.benchmark_valuate()
+    curve = await sim.get_benchmark_equity_curve(365)
+    return {**val, "equity_curve": curve}
 
 @app.post('/api/sim/run')
 async def sim_run():
