@@ -485,3 +485,198 @@ class TestBuildLLMContext:
         ctx = sim._build_llm_context(val, trades, {})
         assert "AMD" in ctx
         assert "strong momentum" in ctx
+
+
+# ---------------------------------------------------------------------------
+# Year-long simulation with synthetic market data
+# ---------------------------------------------------------------------------
+
+import random
+from datetime import datetime, timedelta
+
+
+def _gen_synthetic_candles(start_price: float, daily_drift: float,
+                           n: int = 500, seed: int = 42) -> list[dict]:
+    """Generate *n* daily OHLCV candles with given drift + Gaussian noise.
+
+    Returns a list of dicts in the same shape as ``market.candles()``:
+    ``{time, open, high, low, close, volume}``.
+    """
+    rng = random.Random(seed)
+    rows: list[dict] = []
+    price = start_price
+    base_date = datetime(2025, 1, 1)
+    for i in range(n):
+        noise = rng.gauss(0, 0.015)  # 1.5% daily volatility
+        close = price * (1 + daily_drift + noise)
+        open_ = price
+        high = max(open_, close) * (1 + abs(rng.gauss(0, 0.004)))
+        low = min(open_, close) * (1 - abs(rng.gauss(0, 0.004)))
+        vol = 1_000_000 * (1 + abs(rng.gauss(0, 0.2)))
+        rows.append({
+            "time": (base_date + timedelta(days=i)).strftime("%Y-%m-%d"),
+            "open": round(open_, 2),
+            "high": round(high, 2),
+            "low": round(low, 2),
+            "close": round(close, 2),
+            "volume": round(vol, 0),
+        })
+        price = close
+    return rows
+
+
+class TestYearLongSimulation:
+    """End-to-end: 1 year of sim cycles on synthetic market data.
+
+    Generates ~500 daily candles for 4 tickers (uptrend, sideways, downtrend,
+    + benchmark ETF), progressively reveals them month-by-month, and runs the
+    full deterministic strategy + benchmark DCA for 12 monthly cycles.
+
+    No network, no LLM — purely deterministic.
+    """
+
+    SYNTHETIC = {
+        "BULL": _gen_synthetic_candles(100, 0.0008, 500, seed=1),    # ~+50%/yr
+        "FLAT":  _gen_synthetic_candles(100, 0.0,    500, seed=2),   # sideways
+        "BEAR":  _gen_synthetic_candles(100, -0.0008, 500, seed=3),  # ~-30%/yr
+        "URTH":  _gen_synthetic_candles(100, 0.0004, 500, seed=4),  # mild uptrend
+    }
+    MONTHS = [f"2026-{m:02d}" for m in range(1, 13)]
+    INITIAL_DAYS = 210   # enough for SMA-200 (MIN_CANDLES = 206)
+    DAYS_PER_MONTH = 21  # ~21 trading days per month
+
+    # -- sanity of the synthetic data itself --------------------------------
+
+    def test_synthetic_data_sanity(self):
+        """Generated data should have valid OHLCV shape and expected trends."""
+        for ticker, rows in self.SYNTHETIC.items():
+            assert len(rows) == 500
+            assert all(r["close"] > 0 for r in rows)
+            assert all(r["high"] >= r["close"] for r in rows)
+            assert all(r["low"] <= r["close"] for r in rows)
+            assert all(r["high"] >= r["low"] for r in rows)
+            assert all(r["volume"] > 0 for r in rows)
+        # BULL should end higher; BEAR should end lower
+        assert self.SYNTHETIC["BULL"][-1]["close"] > self.SYNTHETIC["BULL"][0]["close"]
+        assert self.SYNTHETIC["BEAR"][-1]["close"] < self.SYNTHETIC["BEAR"][0]["close"]
+
+    # -- the main year-long simulation --------------------------------------
+
+    async def test_one_year_deterministic(self, mem_db, monkeypatch):
+        """Run 12 monthly cycles and verify benchmark DCA + bot behavior."""
+        from sqlalchemy import select as sa_select
+        from app.db import (
+            SimAllowance,
+            SimBenchmarkSnapshot,
+            SimSnapshot,
+        )
+
+        # --- progressive data reveal state ---
+        reveal = {"day": self.INITIAL_DAYS}
+        synthetic = self.SYNTHETIC
+
+        # --- mock candles to return synthetic data up to current reveal ---
+        async def mock_candles(ticker, period=None):
+            data = synthetic.get(ticker, [])
+            return data[: reveal["day"]] if data else []
+
+        monkeypatch.setattr(sim, "candles", mock_candles)
+
+        # --- mock refresh to no-op (no yfinance calls) ---
+        async def mock_refresh(ticker, period="2y"):
+            pass
+
+        monkeypatch.setattr(sim, "refresh", mock_refresh)
+
+        # --- mock candidate tickers (skip watchlist / universe file) ---
+        async def mock_candidates():
+            return ["BULL", "FLAT", "BEAR"]
+
+        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
+
+        # --- mock _current_month to advance through 12 months ---
+        month_iter = iter(self.MONTHS)
+        current_month = [next(month_iter)]
+
+        def mock_current_month():
+            return current_month[0]
+
+        monkeypatch.setattr(sim, "_current_month", mock_current_month)
+
+        # --- ensure deterministic strategy + our benchmark ticker ---
+        monkeypatch.setattr(settings, "sim_strategy", "deterministic")
+        monkeypatch.setattr(settings, "sim_benchmark_ticker", "URTH")
+        monkeypatch.setattr(settings, "sim_benchmark_enabled", True)
+        monkeypatch.setattr(settings, "sim_start_cash", 0.0)
+
+        # --- run 12 monthly cycles ---
+        results = []
+        for i in range(12):
+            if i > 0:
+                current_month[0] = next(month_iter)
+                reveal["day"] += self.DAYS_PER_MONTH
+            result = await sim.run_cycle()
+            results.append(result)
+
+        # === Assertions ===
+
+        # 1. Benchmark: one DCA deposit per month (12 total)
+        bench_deposits = [r for r in results if r["benchmark"].get("deposited")]
+        assert len(bench_deposits) == 12, (
+            f"Expected 12 benchmark deposits, got {len(bench_deposits)}"
+        )
+
+        # 2. Benchmark account: shares accumulated, cumulative deposits tracked
+        bench_val = await sim.benchmark_valuate()
+        assert bench_val["shares"] > 0
+        assert bench_val["total_equity"] > 0
+        assert bench_val["ticker"] == "URTH"
+
+        async with mem_db() as s:
+            from app.db import SimBenchmarkAccount
+            bench_acc = await s.get(SimBenchmarkAccount, 1)
+            assert bench_acc is not None
+            assert bench_acc.shares > 0
+            # cash field tracks cumulative deposits (12 × monthly allowance)
+            assert bench_acc.cash == pytest.approx(
+                settings.sim_monthly_allowance * 12
+            )
+            assert bench_acc.last_allowance_month == self.MONTHS[-1]
+
+        # 3. Sim allowance: 12 monthly deposits recorded (ordered newest-first)
+        allowances = await sim.get_allowances()
+        assert len(allowances) == 12
+        assert allowances[-1]["month"] == "2026-01"
+        assert allowances[0]["month"] == "2026-12"
+        assert all(a["amount"] == settings.sim_monthly_allowance for a in allowances)
+
+        # 4. Snapshots: 12 sim + 12 benchmark
+        async with mem_db() as s:
+            sim_snaps = (await s.scalars(sa_select(SimSnapshot))).all()
+            bench_snaps = (await s.scalars(sa_select(SimBenchmarkSnapshot))).all()
+        assert len(sim_snaps) == 12
+        assert len(bench_snaps) == 12
+
+        # 5. Bot made at least one trade over the year
+        trades = await sim.get_trades(limit=500)
+        assert len(trades) >= 1, "Bot should have made at least one trade in a year"
+
+        # 6. Bot total equity is positive and allowance tracked
+        val = await sim.valuate()
+        assert val["total_equity"] > 0
+        assert val["allowance_total"] == pytest.approx(
+            settings.sim_monthly_allowance * 12
+        )
+
+        # 7. No negative cash
+        assert val["cash"] >= 0
+
+        # 8. Bot has at least one open position
+        assert len(val["positions"]) >= 1
+
+        # 9. Equity curve snapshots show non-decreasing allowance_total
+        curve = await sim.get_equity_curve(limit=365)
+        assert len(curve) == 12
+        assert curve[-1]["allowance_total"] == pytest.approx(
+            settings.sim_monthly_allowance * 12
+        )
