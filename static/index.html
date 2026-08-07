@@ -639,6 +639,10 @@
                 </div>
             </div>
         </div>
+        <div class="sim-section">
+            <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">LLM REASONING</h3>
+            <div id="sim-reasoning" style="white-space:pre-wrap;word-wrap:break-word;max-height:400px;overflow-y:auto;font-size:13px;line-height:1.5"></div>
+        </div>
     </section>
     <div id="explain-backdrop-container">
         <div id="explain-modal">
@@ -1071,8 +1075,17 @@
             } catch (e) { document.getElementById('sim-allowances').innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
 
+        async function loadSimReasoning() {
+            try {
+                const r = await api('sim/reasoning');
+                const el = document.getElementById('sim-reasoning');
+                if (!r.reasoning) { el.innerHTML = '<div class="sim-empty">No LLM reasoning captured yet — run the bot in LLM or hybrid mode.</div>'; return; }
+                el.innerHTML = escapeHtml(r.reasoning);
+            } catch (e) { document.getElementById('sim-reasoning').innerHTML = 'Error: ' + escapeHtml(e.message); }
+        }
+
         async function loadSimAll() {
-            loadSimStatus(); loadSimTrades(); loadSimEquity(); loadSimAllowances(); loadSimBenchmark();
+            loadSimStatus(); loadSimTrades(); loadSimEquity(); loadSimAllowances(); loadSimBenchmark(); loadSimReasoning();
         }
 
         async function runSim() {

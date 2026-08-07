@@ -206,6 +206,11 @@ async def sim_run():
     except Exception as e:
         raise HTTPException(500, f"Sim cycle failed: {e}")
 
+@app.get('/api/sim/reasoning')
+async def sim_reasoning():
+    """Return the raw LLM reasoning text from the most recent sim cycle."""
+    return {"reasoning": sim._last_llm_reasoning}
+
 @app.post('/api/sim/reset')
 async def sim_reset():
     """Wipe all sim tables and restart with start cash."""
