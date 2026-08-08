@@ -974,7 +974,7 @@ async def _scheduler_loop():
     while True:
         now = _now()
         # Calculate seconds until next sim_run_hour
-        target = now.replace(hour=settings.sim_run_hour, minute=0, second=0, microsecond=0)
+        target = now.replace(hour=settings.sim_run_hour, minute=settings.sim_run_minute, second=0, microsecond=0)
         if target <= now:
             # Already past today's run hour — schedule for tomorrow
             from datetime import timedelta

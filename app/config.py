@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     sim_max_position_pct: float = 15.0
     sim_min_cash_pct: float = 5.0
     sim_run_hour: int = 22
+    sim_run_minute: int = 30
 
     # --- Benchmark (DCA control portfolio) --------------------------------
     sim_benchmark_enabled: bool = True
