@@ -157,7 +157,7 @@ def compute(rows: list[dict]) -> dict:
             return None
         return None if pd.isna(v) else round(v, 2)
 
-    snap = {k: norm(x[k]) for k in ["close", "sma20", "sma50", "sma200", "rsi", "macd", "macd_signal", "atr14"]}
+    snap = {k: norm(x.get(k)) for k in ["close", "sma20", "sma50", "sma200", "rsi", "macd", "macd_signal", "atr14"]}
     snap["atr_stop"] = norm(atr_stop)
     snap["atr_pct"] = norm(100 * float(x.atr14) / float(x.close))
     snap["vol_surge"] = vol_surge

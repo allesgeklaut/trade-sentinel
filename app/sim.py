@@ -226,7 +226,7 @@ async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str) -
         s.add(trade)
         await s.commit()
 
-        logger.info("Sim BUY %s ×%d @%.2f — %s", ticker, shares, price, reason)
+        logger.info("Sim BUY %s ×%.4f @%.2f — %s", ticker, shares, price, reason)
         return {
             "ticker": ticker, "side": "BUY", "shares": shares, "price": price,
             "cash_after": round(acc.cash, 2), "reason": reason,
