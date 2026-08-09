@@ -128,7 +128,15 @@
         }
 
         #chart {
-            height: 420px
+            height: 400px;
+            margin-bottom: 0
+        }
+
+        /* Ensure the chart canvas stays inside its panel border with a
+           safety gap below for the chart library's axis labels. */
+        .chart-panel {
+            padding-bottom: 192px;
+            overflow: hidden
         }
 
         .metric {
@@ -830,7 +838,13 @@
         }
 
         #sim-chart {
-            height: 320px
+            height: 320px;
+            margin-bottom: 0
+        }
+
+        /* Same safety gap for the simulation chart panel. */
+        #sim-chart {
+            margin-bottom: 96px
         }
 
         .sim-actions {
