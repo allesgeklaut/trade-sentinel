@@ -784,6 +784,22 @@
             color: #42ff72
         }
 
+        /* Scrollable log tables so a long trade history doesn't push the
+           page down; the section header stays fixed, the table scrolls. */
+        #sim-trades, #sim-positions, #sim-allowances {
+            max-height: 320px;
+            overflow-y: auto
+        }
+
+        #sim-trades table thead th,
+        #sim-positions table thead th,
+        #sim-allowances table thead th {
+            position: sticky;
+            top: 0;
+            background: #071009;
+            z-index: 1
+        }
+
         .sim-grid2 {
             display: grid;
             grid-template-columns: 1fr 1fr;
