@@ -13,8 +13,12 @@
     <meta name="apple-mobile-web-app-title" content="Trade Sentinel">
     <title>Trade Sentinel</title>
     <script
-        src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/marked@13.0.3/marked.min.js"></script>
+        src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"
+        integrity="sha384-OK7vELvjHdhUFi31JYioPIcRHTROLdcDa6ZsNWgvgLaKj+9JqhU0Ad8g4wz3CXjA"
+        crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked@13.0.3/marked.min.js"
+        integrity="sha384-YTBHtsL8yVTHcLakYNyrOfK3K+QQcXiECuaALJ+3j7Mo681Rtzadt8NR6WrZH+eQ"
+        crossorigin="anonymous"></script>
     <style>
         :root {
             --bench-color: #ff9f43
@@ -1007,8 +1011,6 @@
             marked.setOptions({
                 gfm: true,
                 breaks: true,
-                mangle: false,
-                headerIds: false,
             });
             markedRenderer = new marked.Renderer();
             markedRenderer.link = function (href, title, text) {

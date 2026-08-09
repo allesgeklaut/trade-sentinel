@@ -25,6 +25,30 @@ docker compose up -d --build
 
 Open `http://SERVER:8010`. Altering `MARKET_DATA_PROVIDER` requires a restart: `docker compose up -d --build`.
 
+## Local development
+
+```bash
+cp .env.example .env
+python generate_icon.py        # build static/icon-180.png (PWA icon)
+uv sync                        # install dependencies
+uv run uvicorn app.main:app --reload --port 8000
+```
+
+The icon is a build artifact (gitignored); regenerate it after cloning.
+
+## CDN scripts and Subresource Integrity (SRI)
+
+The frontend loads two libraries from jsdelivr (lightweight-charts and marked). Each `<script>` tag in `static/index.html` carries an `integrity="sha384-..."` attribute — a Subresource Integrity hash. The browser refuses to execute the file if the hash doesn't match, so a compromised CDN or tampered network can't inject malicious JS.
+
+**When bumping a CDN version** you must recompute the hash, otherwise the browser silently blocks the script:
+
+```bash
+curl -s https://cdn.jsdelivr.net/npm/marked@<NEW_VERSION>/marked.min.js \
+  | openssl dgst -sha384 -binary | openssl base64 -A
+```
+
+Paste the output into the `integrity="sha384-<hash>"` attribute on the corresponding `<script>` tag. Do the same for `lightweight-charts`.
+
 ## Autocomplete and screener
 
 Autocomplete uses the selected provider. With `yfinance`, it supports fuzzy company/ticker lookup and returns canonical Yahoo symbols such as `IFX.DE`, `ASML.AS`, and `OMV.VI`. The `global-large-cap` universe mixes US, German, Dutch, French, Swiss, and Vienna listings. Press **Update** manually after markets close; it downloads and caches about two years of daily candles for each symbol, then ranks trend alignment, 20/60-day momentum, RSI, and relative volume.
