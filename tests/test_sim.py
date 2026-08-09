@@ -657,6 +657,19 @@ class TestYearLongSimulation:
         assert len(sim_snaps) == 12
         assert len(bench_snaps) == 12
 
+        # 4b. Stored created_at must be tz-aware UTC (Batch 2 convention)
+        from datetime import timezone as tz
+        for snap in sim_snaps:
+            assert snap.created_at.tzinfo is not None, \
+                "SimSnapshot.created_at must be tz-aware"
+            assert snap.created_at.utcoffset() == tz.utc.utcoffset(None), \
+                "SimSnapshot.created_at must be UTC"
+        for snap in bench_snaps:
+            assert snap.created_at.tzinfo is not None, \
+                "SimBenchmarkSnapshot.created_at must be tz-aware"
+            assert snap.created_at.utcoffset() == tz.utc.utcoffset(None), \
+                "SimBenchmarkSnapshot.created_at must be UTC"
+
         # 5. Bot made at least one trade over the year
         trades = await sim.get_trades(limit=500)
         assert len(trades) >= 1, "Bot should have made at least one trade in a year"
@@ -680,3 +693,65 @@ class TestYearLongSimulation:
         assert curve[-1]["allowance_total"] == pytest.approx(
             settings.sim_monthly_allowance * 12
         )
+
+
+# ---------------------------------------------------------------------------
+# Timezone convention (Batch 2)
+# ---------------------------------------------------------------------------
+
+class TestTimezoneConvention:
+    """Verify that sim timestamps are stored as tz-aware UTC, and the monthly
+    allowance deposit is anchored to Europe/Vienna (a calendar concept)."""
+
+    async def test_utcnow_is_tz_aware(self):
+        """sim._utcnow() must return a tz-aware UTC datetime."""
+        from datetime import timezone as tz
+        t = sim._utcnow()
+        assert t.tzinfo is not None
+        assert t.utcoffset() == tz.utc.utcoffset(None)
+
+    async def test_simtrade_created_at_is_tz_aware_utc(self, with_cash):
+        """A logged trade's created_at must be tz-aware UTC after a buy."""
+        await sim._exec_buy("AAPL", 100.0, 1000.0, "tz test")
+        async with sim.Session() as s:
+            from sqlalchemy import select as sa_select
+            trade = await s.scalar(sa_select(SimTrade).order_by(SimTrade.created_at.desc()))
+            assert trade is not None
+            assert trade.created_at.tzinfo is not None
+            from datetime import timezone as tz
+            assert trade.created_at.utcoffset() == tz.utc.utcoffset(None)
+
+    async def test_current_month_is_vienna_local(self, monkeypatch):
+        """_current_month() must return a YYYY-MM string (Vienna calendar).
+
+        This is the one intentional exception to the UTC-everywhere rule:
+        the monthly allowance deposit is a calendar-month concept, so it
+        must follow the operator's local timezone, not UTC.
+
+        We verify the boundary: 23:30 UTC on 2026-01-31 is 00:30 on
+        2026-02-01 in Vienna, so _current_month() must return '2026-02'.
+        """
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+
+        vienna = ZoneInfo("Europe/Vienna")
+        fake_utc = datetime(2026, 1, 31, 23, 30, tzinfo=timezone.utc)
+        assert fake_utc.astimezone(vienna).strftime("%Y-%m") == "2026-02"
+
+        # Freeze sim._TZ's "now" by patching datetime.now globally for the call.
+        # _current_month calls datetime.now(_TZ); we make _TZ a fake zone where
+        # "now" returns our fixed Vienna instant.
+        import app.sim as sim_mod
+        real_datetime = sim_mod.datetime
+
+        class FakeDateTime(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is not None:
+                    return fake_utc.astimezone(tz)
+                return fake_utc.replace(tzinfo=None)
+
+        monkeypatch.setattr(sim_mod, "datetime", FakeDateTime)
+        month = sim._current_month()
+        assert month == "2026-02", \
+            f"Expected Vienna-local month '2026-02' at the UTC/Vienna boundary, got '{month}'"

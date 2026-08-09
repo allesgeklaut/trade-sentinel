@@ -38,3 +38,7 @@ No live broker or order API exists. Signals and rankings are research tools, not
 ## Fix: duplicate screener symbols
 
 The screener deduplicates a universe while preserving its order before downloading data and saving results. This prevents duplicate entries such as a symbol classified in both AI and space groups from violating SQLite's `(universe, ticker)` uniqueness constraint.
+
+## Timezone convention
+
+All `created_at` / `updated_at` timestamps are stored as tz-aware UTC in SQLite. The autonomous paper-trading scheduler runs at `SIM_RUN_HOUR`:`SIM_RUN_MINUTE` **UTC** (set `22 30` to run at 22:30 UTC). The monthly allowance deposit is the one exception: it is anchored to the operator's local timezone (`Europe/Vienna` by default) so the "monthly" deposit lands on the local calendar month boundary. The frontend renders timestamps as-is (UTC ISO strings); a future enhancement could format them in the browser's local timezone.

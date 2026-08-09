@@ -51,16 +51,13 @@ _SIM_REFRESH_PERIOD = "2y"
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Used only for _current_month(): the monthly allowance is a calendar-month
+# concept, so we anchor it to the operator's local timezone (Europe/Vienna).
 _TZ = ZoneInfo("Europe/Vienna")
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _now() -> datetime:
-    """Current time as naive Vienna local time."""
-    return datetime.now(_TZ).replace(tzinfo=None)
 
 
 def _current_month() -> str:
@@ -972,8 +969,8 @@ _scheduler_task: asyncio.Task | None = None
 async def _scheduler_loop():
     """Background loop that runs the sim cycle daily at sim_run_hour UTC."""
     while True:
-        now = _now()
-        # Calculate seconds until next sim_run_hour
+        now = _utcnow()
+        # Calculate seconds until next sim_run_hour (interpreted as UTC)
         target = now.replace(hour=settings.sim_run_hour, minute=settings.sim_run_minute, second=0, microsecond=0)
         if target <= now:
             # Already past today's run hour — schedule for tomorrow
