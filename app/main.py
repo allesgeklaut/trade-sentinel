@@ -1,5 +1,6 @@
 import json, httpx
 from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
@@ -10,6 +11,8 @@ from .market import refresh, candles, search, info, provider
 from .analysis import compute, persist, history, MIN_CANDLES
 from .screener import universe_names, run, results
 from . import sim
+
+_STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 @asynccontextmanager
 async def lifespan(app):
@@ -216,4 +219,4 @@ async def sim_reset():
     """Wipe all sim tables and restart with start cash."""
     return await sim.reset_sim()
 
-app.mount('/', StaticFiles(directory='static', html=True), name='static')
+app.mount('/', StaticFiles(directory=str(_STATIC_DIR), html=True), name='static')

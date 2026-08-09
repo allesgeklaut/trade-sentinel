@@ -1164,8 +1164,8 @@
             let a = await api('watchlist');
             const names = await Promise.all(a.map(t => resolveSymbolName(t)));
             $('#watch').innerHTML = a.map((t, i) => {
-                const name = names[i] ? ` <span class="ticker-name">— ${names[i]}</span>` : '';
-                return `<div class=ticker onclick="openTicker('${t}')">${t}${name}<button onclick="event.stopPropagation();del('${t}')">x</button></div>`;
+                const name = names[i] ? ` <span class="ticker-name">— ${escapeHtml(names[i])}</span>` : '';
+                return `<div class=ticker onclick="openTicker('${escapeHtml(t)}')">${escapeHtml(t)}${name}<button onclick="event.stopPropagation();del('${escapeHtml(t)}')">x</button></div>`;
             }).join('');
             if (!current && a[0]) openTicker(a[0]);
         }
@@ -1180,14 +1180,14 @@
           <th>Ticker</th><th>Score</th><th>20d</th><th>RSI</th><th>RV</th>
         </tr>
         ${a.slice(0, screenLimit).map(x => `
-          <tr onclick="openTicker('${x.ticker}')">
+          <tr onclick="openTicker('${escapeHtml(x.ticker)}')">
             <td class="${x.trend === 'BULLISH' ? 'bullish' : ''}">
-              ${x.ticker}
+              ${escapeHtml(x.ticker)}
             </td>
-            <td>${x.score}</td>
-            <td>${x.return_20d}%</td>
-            <td>${x.rsi}</td>
-            <td>${x.relative_volume}</td>
+            <td>${escapeHtml(String(x.score))}</td>
+            <td>${escapeHtml(String(x.return_20d))}%</td>
+            <td>${escapeHtml(String(x.rsi))}</td>
+            <td>${escapeHtml(String(x.relative_volume))}</td>
           </tr>
         `).join('')}
       </table>
@@ -1242,7 +1242,7 @@
                 document.getElementById('sim-positions').innerHTML = pos.length ? `<table><tr><th>Ticker</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>P&L%</th></tr>${pos.map(p => {
                     const pnl = p.pnl_pct;
                     const cls = pnl > 0 ? 'buy' : pnl < 0 ? 'sell' : '';
-                    return `<tr><td>${p.ticker}</td><td>${p.shares}</td><td>$${p.avg_cost.toFixed(2)}</td><td>$${p.current_price.toFixed(2)}</td><td>$${p.value.toFixed(2)}</td><td class="${cls}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</td></tr>`;
+                    return `<tr><td>${escapeHtml(p.ticker)}</td><td>${escapeHtml(String(p.shares))}</td><td>$${p.avg_cost.toFixed(2)}</td><td>$${p.current_price.toFixed(2)}</td><td>$${p.value.toFixed(2)}</td><td class="${cls}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</td></tr>`;
                 }).join('')}</table>` : '<div class="sim-empty">No open positions.</div>';
             } catch (e) { document.getElementById('sim-summary').innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
@@ -1250,7 +1250,7 @@
         async function loadSimTrades() {
             try {
                 const t = await api('sim/trades?limit=50');
-                document.getElementById('sim-trades').innerHTML = t.length ? `<table><tr><th>Time</th><th>Ticker</th><th>Side</th><th>Shares</th><th>Price</th><th>Reason</th></tr>${t.map(x => `<tr><td>${x.at || ''}</td><td>${x.ticker}</td><td class="${x.side === 'BUY' ? 'buy' : 'sell'}">${x.side}</td><td>${x.shares}</td><td>$${x.price.toFixed(2)}</td><td style="text-align:left">${escapeHtml(x.reason || '')}</td></tr>`).join('')}</table>` : '<div class="sim-empty">No trades yet — run the bot to start.</div>';
+                document.getElementById('sim-trades').innerHTML = t.length ? `<table><tr><th>Time</th><th>Ticker</th><th>Side</th><th>Shares</th><th>Price</th><th>Reason</th></tr>${t.map(x => `<tr><td>${escapeHtml(x.at || '')}</td><td>${escapeHtml(x.ticker)}</td><td class="${x.side === 'BUY' ? 'buy' : 'sell'}">${escapeHtml(x.side)}</td><td>${escapeHtml(String(x.shares))}</td><td>$${x.price.toFixed(2)}</td><td style="text-align:left">${escapeHtml(x.reason || '')}</td></tr>`).join('')}</table>` : '<div class="sim-empty">No trades yet — run the bot to start.</div>';
             } catch (e) { document.getElementById('sim-trades').innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
 

@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from .db import Candle, Session
 from .config import settings
 
@@ -69,11 +70,21 @@ async def refresh(ticker, period="2y"):
         if data.get("status")=="error" or "values" not in data: raise ValueError(data.get("message","market-data response had no candles"))
         values=[{"timestamp":datetime.fromisoformat(x["datetime"]),"open":float(x["open"]),"high":float(x["high"]),"low":float(x["low"]),"close":float(x["close"]),"volume":float(x.get("volume") or 0)} for x in data["values"]]
     async with Session() as s:
-        for x in values:
-            row=await s.scalar(select(Candle).where(Candle.ticker==ticker,Candle.timestamp==x["timestamp"]))
-            if row:
-                for key in ["open","high","low","close","volume"]: setattr(row,key,x[key])
-            else: s.add(Candle(ticker=ticker,**x))
+        if values:
+            stmt = sqlite_insert(Candle).values(
+                [{"ticker": ticker, **x} for x in values]
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["ticker", "timestamp"],
+                set_={
+                    "open": stmt.excluded.open,
+                    "high": stmt.excluded.high,
+                    "low": stmt.excluded.low,
+                    "close": stmt.excluded.close,
+                    "volume": stmt.excluded.volume,
+                },
+            )
+            await s.execute(stmt)
         await s.commit()
 async def candles(ticker, period=None):
     async with Session() as s:

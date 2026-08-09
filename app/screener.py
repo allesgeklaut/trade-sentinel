@@ -5,9 +5,12 @@ from sqlalchemy import delete, select
 from .db import ScreenerResult, Session
 from .market import candles, refresh
 
-def universe_names(): return sorted(p.stem for p in Path("universes").glob("*.txt"))
+_UNIVERSES_DIR = Path(__file__).resolve().parent.parent / "universes"
+
+
+def universe_names(): return sorted(p.stem for p in _UNIVERSES_DIR.glob("*.txt"))
 def tickers(name):
-    p=Path("universes")/f"{name}.txt"
+    p=_UNIVERSES_DIR/f"{name}.txt"
     if not p.exists() or "/" in name or ".." in name: raise ValueError("Unknown universe")
     return [x.strip().upper() for x in p.read_text().splitlines() if x.strip() and not x.startswith("#")]
 def score(rows):
