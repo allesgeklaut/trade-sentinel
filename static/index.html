@@ -140,12 +140,15 @@
         }
 
         /* --- Responsive / mobile --- */
-        /* Toggle button hidden on desktop, always visible on mobile */
-        #chart-toggle {
+        /* Mobile tab switcher for the chart/chat column: instead of stacking
+           the chart (which pushes the chat far down the page) we show one
+           at a time via a two-button tab bar. */
+        #mobile-tabs {
             display: none
         }
 
-        .chart-panel.collapsed #chart {
+        .chart-panel.collapsed #chart,
+        .chat-panel.collapsed {
             display: none
         }
 
@@ -162,7 +165,26 @@
 
         @media (max-width: 900px) {
             #chart-toggle {
-                display: inline-block !important
+                display: none !important
+            }
+
+            #mobile-tabs {
+                display: flex !important;
+                gap: 6px;
+                margin-bottom: 8px
+            }
+
+            #mobile-tabs button {
+                flex: 1;
+                padding: 8px;
+                font-size: 13px;
+                border-color: #1d6030
+            }
+
+            #mobile-tabs button.tab-active {
+                background: #1d6030;
+                color: #b7ffc0;
+                border-color: #42ff72
             }
 
             #screen-details {
@@ -834,6 +856,30 @@
             .sim-grid2 {
                 grid-template-columns: 1fr
             }
+
+            #sim-view {
+                padding: 10px
+            }
+
+            #sim-chart {
+                height: 240px
+            }
+
+            .sim-section {
+                padding: 10px;
+                margin-bottom: 12px
+            }
+
+            /* Flatten nested sim-grid2 on mobile so sections don't get
+               double-nested grid gaps */
+            .sim-grid2 .sim-grid2 {
+                display: block;
+                margin-bottom: 0
+            }
+
+            .sim-grid2 .sim-grid2 > .sim-section {
+                margin-bottom: 12px
+            }
         }
 
         .bench-metric {
@@ -863,14 +909,16 @@
             <div id="watch"></div>
         </aside>
         <section>
+            <div id="mobile-tabs">
+                <button id="tab-chart" class="tab-active" onclick="mobileTab('chart')">Chart</button>
+                <button id="tab-chat" onclick="mobileTab('chat')">Chat</button>
+            </div>
             <div class="panel chart-panel"><button onclick="refreshData(this)">Refresh data</button> <button
                     onclick="startChat()">Ask
                     local LLM</button><button onclick="showExplainModal()" style="margin-left:6px">Explain This
                     Screen</button><b id="ticker"></b><span id="ticker-name" class="ticker-name-inline"></span>
                 <div id="signal"></div>
                 <div id="chart-range-bar" style="margin:8px 0;display:flex;gap:4px;flex-wrap:wrap"></div>
-                <button id="chart-toggle" onclick="toggleChart()" style="display:none;margin-top:8px">Show chart
-                    ▸</button>
                 <div id="chart"></div>
             </div>
             <div class="panel chat-panel">
@@ -1157,31 +1205,29 @@
 
         function isMobile() { return window.matchMedia('(max-width: 900px)').matches }
 
-        function toggleChart() {
-            const panel = document.querySelector('.chart-panel');
-            const btn = document.getElementById('chart-toggle');
-            if (panel.classList.contains('collapsed')) {
-                panel.classList.remove('collapsed');
-                btn.textContent = 'Hide chart ▾';
-                // re-fit chart content after it becomes visible
+        function mobileTab(tab) {
+            const chartPanel = document.querySelector('.chart-panel');
+            const chatPanel = document.querySelector('.chat-panel');
+            const tabChart = document.getElementById('tab-chart');
+            const tabChat = document.getElementById('tab-chat');
+            if (tab === 'chart') {
+                chartPanel.classList.remove('collapsed');
+                chatPanel.classList.add('collapsed');
+                tabChart.classList.add('tab-active');
+                tabChat.classList.remove('tab-active');
                 if (chart) setTimeout(() => chart.timeScale().fitContent(), 50);
             } else {
-                panel.classList.add('collapsed');
-                btn.textContent = 'Show chart ▸';
+                chartPanel.classList.add('collapsed');
+                chatPanel.classList.remove('collapsed');
+                tabChart.classList.remove('tab-active');
+                tabChat.classList.add('tab-active');
             }
         }
 
-        // On mobile, collapse the chart and screener by default so the chat is visible
+        // On mobile, show chart by default (chat is one tab-swipe away)
         if (isMobile()) {
             document.addEventListener('DOMContentLoaded', () => {
-                const panel = document.querySelector('.chart-panel');
-                const btn = document.getElementById('chart-toggle');
-                if (panel) {
-                    panel.classList.add('collapsed');
-                    btn.textContent = 'Show chart ▸';
-                }
-                const sd = document.getElementById('screen-details');
-                if (sd) sd.removeAttribute('open');
+                mobileTab('chart');
             });
         }
 
