@@ -1,0 +1,16 @@
+{
+  "name": "Trade Sentinel",
+  "short_name": "Sentinel",
+  "icons": [
+    {
+      "src": "/icon-180.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ],
+  "theme_color": "#050a07",
+  "background_color": "#050a07",
+  "display": "standalone",
+  "start_url": "/"
+}
