@@ -122,11 +122,13 @@ async def _stock_context(ticker: str) -> str:
             f"Signal: {r['action']} (strength {r['strength']}/100)\n"
             f"Reason: {r['reason']}\n"
             f"Indicators: {json.dumps(r['snapshot'])}\n"
-            f"Decision rules: BUY when close > SMA-50 > SMA-200, SMA-50 rising over 6 days, "
-            f"RSI in a fresh cross above 50 or rising in the 50-70 band (not overbought <75), "
-            f"MACD > MACD signal, and volume surge (>1.25× 20-day average). "
-            f"SELL on early exit (close < SMA-50, MACD bearish, RSI breaks below 50) or "
-            f"bearish trend (close < SMA-50 < SMA-200, SMA-50 falling). Otherwise HOLD."
+            f"Decision rules: a weighted technical score (net_score, range -100..+100) "
+            f"combines trend alignment (close vs SMA-50 vs SMA-200), SMA-50 slope, "
+            f"MACD direction, RSI momentum, distance from SMA-200, and volume. "
+            f"BUY when net_score >= +40 AND close > SMA-50 > SMA-200 AND price is >2% "
+            f"above SMA-200. SELL when net_score <= -40 AND close < SMA-50 < SMA-200 AND "
+            f"price is >2% below SMA-200. Otherwise HOLD. Volume surge is a bonus, not a "
+            f"requirement."
         )
     except ValueError:
         return (
