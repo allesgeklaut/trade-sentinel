@@ -1,4 +1,4 @@
-import json, httpx
+import json, httpx, logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
@@ -13,13 +13,18 @@ from .screener import universe_names, run, results
 from . import sim
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+logger = logging.getLogger("trade_sentinel.main")
 
 @asynccontextmanager
 async def lifespan(app):
     await init_db()
     async with Session() as s:
         for t in settings.watchlist.split(','):
-            if not await s.get(Watchlist,t.strip().upper()): s.add(Watchlist(ticker=t.strip().upper()))
+            ticker = t.strip().upper()
+            if not ticker:
+                continue
+            if not await s.get(Watchlist, ticker):
+                s.add(Watchlist(ticker=ticker))
         await s.commit()
     if settings.sim_enabled:
         sim.start_scheduler()
@@ -47,7 +52,9 @@ async def remove(ticker:str):
 @app.get('/api/info/{ticker}')
 async def ticker_info(ticker:str):
     try: return {"ticker":ticker.upper(),"name":await info(ticker.upper())}
-    except Exception: return {"ticker":ticker.upper(),"name":""}
+    except Exception as e:
+        logger.debug("info lookup failed for %s: %s", ticker.upper(), e)
+        return {"ticker":ticker.upper(),"name":""}
 
 @app.get('/api/symbols')
 async def symbols(q:str=Query(min_length=2,max_length=80)):
@@ -85,7 +92,7 @@ async def dashboard(ticker:str, period:str=None):
     r['candles'] = candles_for_chart
     return r
 @app.get('/api/screener/universes')
-async def universes(): return universe_names()
+async def list_universes(): return universe_names()
 @app.post('/api/screener/run/{universe}')
 async def screen_run(universe:str):
     try: return await run(universe)
@@ -163,6 +170,7 @@ async def chat(ticker: str, req: ChatRequest):
         text = out.get('message', {}).get('content', '') or 'No Ollama response'
         return {"text": text, "model": settings.ollama_model}
     except Exception as e:
+        logger.warning("Chat Ollama call failed for %s: %s", ticker, e)
         return {"text": f"Ollama unavailable: {e}", "model": settings.ollama_model}
 
 # =====================================================================

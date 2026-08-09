@@ -1,11 +1,13 @@
 from datetime import datetime, timezone
 from pathlib import Path
+import logging
 import pandas as pd
 from sqlalchemy import delete, select
 from .db import ScreenerResult, Session
 from .market import candles, refresh
 
 _UNIVERSES_DIR = Path(__file__).resolve().parent.parent / "universes"
+logger = logging.getLogger("trade_sentinel.screener")
 
 
 def universe_names(): return sorted(p.stem for p in _UNIVERSES_DIR.glob("*.txt"))
@@ -32,7 +34,9 @@ async def run(name):
         try:
             await refresh(symbol); out=score(await candles(symbol))
             if out: results.append((symbol,out))
-        except Exception: continue
+        except Exception as e:
+            logger.warning("screener skip %s: %s", symbol, e)
+            continue
     async with Session() as s:
         await s.execute(delete(ScreenerResult).where(ScreenerResult.universe==name))
         for symbol,x in results: s.add(ScreenerResult(universe=name,ticker=symbol,updated_at=datetime.now(timezone.utc),**x))
