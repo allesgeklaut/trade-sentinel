@@ -567,6 +567,24 @@
             text-align: right
         }
 
+        .screener-scroll {
+            max-height: 480px;
+            overflow-y: auto;
+            border: 1px solid #12351c
+        }
+
+        .screener-scroll table {
+            margin: 0
+        }
+
+        .screener-scroll thead th {
+            position: sticky;
+            top: 0;
+            background: #071009;
+            z-index: 1;
+            border-bottom: 1px solid #318e43
+        }
+
         /* Mobile: collapsible screener panel via <details> */
         .screen-panel details > summary {
             cursor: pointer;
@@ -853,7 +871,7 @@
         <aside class="panel screen-panel"><b>DISCOVER // LOCAL SCREENER</b>
             <details id="screen-details" open>
                 <summary>Screen results</summary>
-                <p><select id="universe"></select> <button onclick="runScreen()">Update</button></p><small>Ranks cached
+                <p><select id="universe"></select> <button onclick="runScreen(this)">Update</button></p><small>Ranks cached
                     daily candles by trend, 20/60d momentum, RSI and relative volume.</small>
                 <div id="screen">No screen run yet.</div>
             </details>
@@ -1109,7 +1127,6 @@
         }
     </script>
     <script>
-        let screenLimit = 20;
         let current, chart, timer, statusTimer;
         let currentRange = '6m';
         const RANGES = ['6m', '2y', '5y', '10y', 'max'];
@@ -1395,34 +1412,37 @@
                 return t > m ? t : m;
             }, 0);
             const ago = newest ? timeAgo(new Date(newest).toISOString()) : '';
+            const signalClass = (act) => ({
+                BUY: 'buy', SELL: 'sell', HOLD: 'hold', 'N/A': 'n/a'
+            }[act] || 'n/a');
             $('#screen').innerHTML =
-                `<table>
+                `<div class="screener-scroll">
+        <table>
+        <thead>
         <tr>
-          <th>Ticker</th><th>Score</th><th>20d</th><th>RSI</th><th>RV</th>
+          <th>Ticker</th><th>Signal</th><th>Score</th><th>20d</th><th>RSI</th><th>RV</th>
         </tr>
-        ${a.slice(0, screenLimit).map(x => `
+        </thead>
+        <tbody>
+        ${a.map(x => `
           <tr onclick="openTicker('${escapeHtml(x.ticker)}')">
             <td class="${x.trend === 'BULLISH' ? 'bullish' : ''}">
               ${escapeHtml(x.ticker)}
             </td>
+            <td class="${signalClass(x.action)}">${escapeHtml(x.action || 'N/A')}</td>
             <td>${escapeHtml(String(x.score))}</td>
             <td>${escapeHtml(String(x.return_20d))}%</td>
             <td>${escapeHtml(String(x.rsi))}</td>
             <td>${escapeHtml(String(x.relative_volume))}</td>
           </tr>
         `).join('')}
+        </tbody>
       </table>
-      ${a.length > screenLimit
-                    ? `<button onclick="screenLimit += 20; showScreen()">
-               Show next 20 (${screenLimit}/${a.length})
-             </button>`
-                    : ''
-                }
-      ${ago ? `<div class="screener-updated">Last update: ${escapeHtml(ago)}</div>` : ''}`;
+      </div>
+      ${ago ? `<div class="screener-updated">Last update: ${escapeHtml(ago)} (${a.length} tickers)</div>` : ''}`;
         }
 
-        async function runScreen() {
-            const btn = event.target;
+        async function runScreen(btn) {
             const orig = btn.textContent;
             btn.disabled = true; btn.textContent = 'Updating...';
             $('#screen').textContent = 'Updating universe sequentially; this downloads ~2y of daily candles per ticker. This may take several minutes.';
