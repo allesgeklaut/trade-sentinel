@@ -73,7 +73,47 @@ BESI.AS
 NEM.DE
 SOF.BR
 
+# European semiconductors, telecom infrastructure & deep tech
+NOKIA.HE
+SIA.PA
+ENR.DE
+HO.PA
+SAAB-B.ST
+
+# Data center power, cooling & energy infrastructure
+ETN
+GEV
+CEG
+VST
+
+# Industrial automation & robotics
+ABB
+TER
+ROK
+
+# Cybersecurity infrastructure
+CRWD
+PANW
+
+# Medical robotics, devices & diagnostics
+ISRG
+SYK
+MDT
+SHL.DE
+
+# AI drug discovery, genomics & mRNA oncology
+CRSP
+VEEV
+GH
+BNTX
+
 # Broad benchmarks for relative context
 QQQ
 SOXX
 SMH
+SPY
+VOO
+XLF
+XLE
+XLV
+VT
