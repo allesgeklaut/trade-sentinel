@@ -162,7 +162,7 @@ class TestRunErrorHandling:
             call_count["n"] += 1
             if ticker == "BAD":
                 raise ValueError("simulated fetch failure")
-            return [{"close": 100.0 + 0.1 * i, "volume": 1_000_000.0} for i in range(250)]
+            return [{"open": 100.0 + 0.1 * i, "high": 100.5 + 0.1 * i, "low": 99.5 + 0.1 * i, "close": 100.0 + 0.1 * i, "volume": 1_000_000.0} for i in range(250)]
 
         monkeypatch.setattr(screener, "refresh", mock_refresh)
         monkeypatch.setattr(screener, "candles", mock_candles)
@@ -179,3 +179,123 @@ class TestRunErrorHandling:
             )).all()
             assert len(rows) == 1
             assert rows[0].ticker == "GOOD"
+
+
+# ---------------------------------------------------------------------------
+# Signal column (action / strength from analysis.compute)
+# ---------------------------------------------------------------------------
+
+class TestSignalColumn:
+    async def test_run_populates_action_for_full_history(self, tmp_path, monkeypatch, mem_db):
+        """A ticker with >=206 candles should get a BUY/SELL/HOLD action + strength."""
+        monkeypatch.setattr(screener, "_UNIVERSES_DIR", tmp_path)
+        (tmp_path / "full.txt").write_text("AAPL\n")
+
+        async def mock_refresh(ticker, period="2y"):
+            pass
+
+        async def mock_candles(ticker, period=None):
+            # 250 rows is enough for compute() (needs >=206)
+            return [{"open": 100.0 + 0.1 * i, "high": 100.5 + 0.1 * i, "low": 99.5 + 0.1 * i, "close": 100.0 + 0.1 * i, "volume": 1_000_000.0} for i in range(250)]
+
+        monkeypatch.setattr(screener, "refresh", mock_refresh)
+        monkeypatch.setattr(screener, "candles", mock_candles)
+
+        result = await screener.run("full")
+        assert result["ranked"] == 1
+
+        async with mem_db() as s:
+            from sqlalchemy import select as sa_select
+            row = await s.scalar(sa_select(ScreenerResult).where(ScreenerResult.universe == "full"))
+            assert row is not None
+            assert row.action in ("BUY", "SELL", "HOLD")
+            assert row.strength is not None
+            assert 0 <= row.strength <= 100
+
+    async def test_run_marks_na_for_short_history(self, tmp_path, monkeypatch, mem_db):
+        """A ticker with <206 candles (e.g. recent IPO) should get action='N/A'."""
+        monkeypatch.setattr(screener, "_UNIVERSES_DIR", tmp_path)
+        (tmp_path / "ipo.txt").write_text("NEWIPO\n")
+
+        async def mock_refresh(ticker, period="2y"):
+            pass
+
+        async def mock_candles(ticker, period=None):
+            # 100 rows is enough for score() (>=65) but not compute() (>=206)
+            return [{"close": 100.0 + 0.1 * i, "volume": 1_000_000.0} for i in range(100)]
+
+        monkeypatch.setattr(screener, "refresh", mock_refresh)
+        monkeypatch.setattr(screener, "candles", mock_candles)
+
+        result = await screener.run("ipo")
+        assert result["ranked"] == 1
+
+        async with mem_db() as s:
+            from sqlalchemy import select as sa_select
+            row = await s.scalar(sa_select(ScreenerResult).where(ScreenerResult.universe == "ipo"))
+            assert row is not None
+            assert row.action == "N/A"
+            assert row.strength is None
+
+    async def test_results_api_includes_action_and_strength(self, tmp_path, monkeypatch, mem_db):
+        """The results() API response must include action and strength fields."""
+        monkeypatch.setattr(screener, "_UNIVERSES_DIR", tmp_path)
+        (tmp_path / "api.txt").write_text("AAPL\n")
+
+        async def mock_refresh(ticker, period="2y"):
+            pass
+
+        async def mock_candles(ticker, period=None):
+            return [{"open": 100.0 + 0.1 * i, "high": 100.5 + 0.1 * i, "low": 99.5 + 0.1 * i, "close": 100.0 + 0.1 * i, "volume": 1_000_000.0} for i in range(250)]
+
+        monkeypatch.setattr(screener, "refresh", mock_refresh)
+        monkeypatch.setattr(screener, "candles", mock_candles)
+
+        await screener.run("api")
+        out = await screener.results("api")
+        assert len(out) == 1
+        assert "action" in out[0]
+        assert "strength" in out[0]
+        assert out[0]["action"] in ("BUY", "SELL", "HOLD")
+
+
+# ---------------------------------------------------------------------------
+# init_db() ALTER TABLE migration guard (idempotent)
+# ---------------------------------------------------------------------------
+
+class TestMigrationGuard:
+    async def test_init_db_idempotent_with_new_columns(self, monkeypatch):
+        """init_db() must be safe to call twice without error, even with the
+        new action/strength columns. The ALTER TABLE guard should no-op on
+        the second call when the columns already exist."""
+        from sqlalchemy import StaticPool
+        from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+        import app.db as db_mod
+
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        monkeypatch.setattr(db_mod, "engine", engine)
+        monkeypatch.setattr(db_mod, "Session", session_factory)
+
+        # First call creates tables + adds columns
+        await db_mod.init_db()
+        # Second call should not raise (columns already exist)
+        await db_mod.init_db()
+
+        # Verify the columns exist by inserting a row with action/strength
+        async with session_factory() as s:
+            from app.db import ScreenerResult
+            from datetime import datetime, timezone
+            s.add(ScreenerResult(
+                universe="test", ticker="X", score=50.0, trend="NEUTRAL",
+                return_20d=0.0, return_60d=0.0, rsi=50.0, relative_volume=1.0,
+                close=100.0, updated_at=datetime.now(timezone.utc),
+                action="HOLD", strength=42.0,
+            ))
+            await s.commit()
+
+        await engine.dispose()

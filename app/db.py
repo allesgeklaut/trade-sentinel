@@ -88,6 +88,8 @@ class ScreenerResult(Base):
     relative_volume: Mapped[float] = mapped_column(Float)
     close: Mapped[float] = mapped_column(Float)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    action: Mapped[str | None] = mapped_column(String(8), nullable=True)  # BUY|SELL|HOLD|N/A
+    strength: Mapped[float | None] = mapped_column(Float, nullable=True)  # 0-100, None if N/A
 
 
 # =====================================================================
@@ -191,3 +193,15 @@ Session = async_sessionmaker(engine, expire_on_commit=False)
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Manual migration for screener_results: add action/strength columns
+        # for existing DBs created before these columns existed. SQLAlchemy's
+        # create_all does not alter existing tables. Idempotent: sqlite raises
+        # OperationalError if the column already exists.
+        from sqlalchemy import text
+        for col, coltype in [("action", "TEXT"), ("strength", "REAL")]:
+            try:
+                await conn.execute(
+                    text(f"ALTER TABLE screener_results ADD COLUMN {col} {coltype}")
+                )
+            except Exception:
+                pass  # column already exists — expected on subsequent starts

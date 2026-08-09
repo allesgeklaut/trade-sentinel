@@ -3,6 +3,7 @@ from pathlib import Path
 import logging
 import pandas as pd
 from sqlalchemy import delete, select
+from .analysis import compute
 from .db import ScreenerResult, Session
 from .market import candles, refresh
 
@@ -32,8 +33,21 @@ async def run(name):
     symbols=list(dict.fromkeys(tickers(name))); results=[]
     for symbol in symbols:
         try:
-            await refresh(symbol); out=score(await candles(symbol))
-            if out: results.append((symbol,out))
+            await refresh(symbol)
+            rows = await candles(symbol)
+            out = score(rows)
+            if not out: continue
+            # Attach BUY/SELL/HOLD signal from the full analysis engine.
+            # candles() already returned ~2y of data from refresh(); compute()
+            # needs >=206 rows. New IPOs with insufficient history get "N/A".
+            try:
+                r = compute(rows)
+                out["action"] = r["action"]
+                out["strength"] = r["strength"]
+            except ValueError:
+                out["action"] = "N/A"
+                out["strength"] = None
+            results.append((symbol, out))
         except Exception as e:
             logger.warning("screener skip %s: %s", symbol, e)
             continue
@@ -45,4 +59,4 @@ async def run(name):
 async def results(name):
     async with Session() as s:
         rows=(await s.scalars(select(ScreenerResult).where(ScreenerResult.universe==name).order_by(ScreenerResult.score.desc()))).all()
-        return [{"ticker":r.ticker,"score":r.score,"trend":r.trend,"return_20d":r.return_20d,"return_60d":r.return_60d,"rsi":r.rsi,"relative_volume":r.relative_volume,"close":r.close,"updated_at":r.updated_at.isoformat()} for r in rows]
+        return [{"ticker":r.ticker,"score":r.score,"trend":r.trend,"return_20d":r.return_20d,"return_60d":r.return_60d,"rsi":r.rsi,"relative_volume":r.relative_volume,"close":r.close,"updated_at":r.updated_at.isoformat(),"action":r.action,"strength":r.strength} for r in rows]
