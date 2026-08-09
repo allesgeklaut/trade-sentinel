@@ -75,7 +75,6 @@ SOF.BR
 
 # European semiconductors, telecom infrastructure & deep tech
 NOKIA.HE
-SIA.PA
 ENR.DE
 HO.PA
 SAAB-B.ST
@@ -87,7 +86,6 @@ CEG
 VST
 
 # Industrial automation & robotics
-ABB
 TER
 ROK
 
