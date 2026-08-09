@@ -140,39 +140,36 @@ class TestBearish:
 
 
 class TestEarlyExit:
-    def test_sell_signal_momentum_roll(self):
-        """An uptrend that rolls over → early exit SELL.
+    def test_single_dip_in_uptrend_is_hold(self):
+        """A single sharp drop in a strong uptrend should NOT trigger SELL.
 
-        The series has three phases:
-        1. 200 days of strong uptrend (+0.3/day) — price reaches ~160.
-        2. 100 days of flat consolidation (alternating ±0.01) — this
-           gradually decays the RSI from ~90 down to ~51 (just above 50)
-           while keeping close ≈ SMA-50.
-        3. 1 sharp drop day (-1.0) — pushes RSI below 50 for the first
-           time (satisfying the exact-cross ``breakdown`` condition),
-           close below SMA-50, and MACD below its signal line.
-
-        We need the RSI cross to happen on the *last* bar, so the flat
-        period must be long enough to bring RSI to ~51 but not below 50.
-        The second-to-last day is an up day (+0.01) so rsi_prev ≥ 50.
+        The old model sold on any day the close dipped below SMA-50 with a
+        bearish MACD. The scoring model is more conservative: a one-day dip
+        in a genuine uptrend is noise, not a trend reversal, so it stays HOLD.
         """
-
         def close_fn(i, prev):
             if i < 200:
                 return 100.0 + 0.3 * i  # strong uptrend to ~160
             if i < 300:
-                # Flat consolidation: even offsets down, odd offsets up.
-                # i=299 → offset 99 (odd) → +0.01 (up day, keeps rsi_prev ≥ 50)
                 offset = i - 200
                 return prev + (0.01 if offset % 2 == 1 else -0.01)
-            # Final sharp drop
-            return prev - 1.0
+            return prev - 1.0  # single sharp drop
 
         rows = _build_candles(301, close_fn)
         result = compute(rows)
+        assert result["action"] == "HOLD"
 
+    def test_sell_signal_death_cross(self):
+        """A steady downtrend should produce SELL under the scoring model."""
+        def close_fn(i, prev):
+            if i < 100:
+                return 200.0 - 0.01 * i  # nearly flat high
+            return 200.0 - 0.35 * (i - 100)  # steady decline
+
+        rows = _build_candles(250, close_fn)
+        result = compute(rows)
         assert result["action"] == "SELL"
-        assert "early exit" in result["reason"]
+        assert "SELL" in result["reason"]
 
 
 class TestHold:
@@ -202,7 +199,7 @@ class TestSnapshotShape:
         expected_keys = {
             "close", "sma20", "sma50", "sma200",
             "rsi", "macd", "macd_signal", "atr14",
-            "atr_stop", "atr_pct", "vol_surge", "strength",
+            "atr_stop", "atr_pct", "vol_surge", "net_score", "strength",
         }
         assert set(snap.keys()) == expected_keys
 

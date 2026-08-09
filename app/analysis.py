@@ -1,16 +1,26 @@
 """Deterministic technical analysis engine for Trade Sentinel.
 
 Computes SMA-20/50/200, RSI(14), MACD(12/26/9), ATR(14), relative volume,
-and derives a BUY / SELL / HOLD signal with a 0-100 strength score and a
-data-grounded human-readable reason.
+and derives a BUY / SELL / HOLD signal from a weighted technical score.
+
+Instead of requiring every indicator to agree (a boolean AND gate that
+almost never fires), each indicator contributes points to a bullish score
+and a bearish score (each 0-100). The net score drives the action:
+
+    net = bullish - bearish
+    BUY  when net >= +40 and price is in a genuine uptrend
+          (close > SMA-50 > SMA-200, >2% above SMA-200)
+    SELL when net <= -40 and price is in a genuine downtrend
+          (close < SMA-50 < SMA-200, >2% below SMA-200)
+    HOLD otherwise
 
 The returned dict shape (consumed by ``main.py`` and the chat system prompt):
 
     {
         "action":   "BUY" | "SELL" | "HOLD",
-        "reason":   str,            # dynamic, includes actual indicator values
-        "snapshot": dict,           # rounded indicator values + atr_stop / atr_pct / vol_surge / strength
-        "strength": int,            # 0-100
+        "reason":   str,            # dynamic, includes the net score + key values
+        "snapshot": dict,           # rounded indicator values + atr_stop / atr_pct / vol_surge / net_score / strength
+        "strength": int,            # 0-100 confidence in the action
         "candles":  list[dict],     # last 120 OHLCV rows (for charting)
     }
 """
@@ -28,6 +38,10 @@ from .db import Signal, Session
 # Minimum rows required for SMA-200 to be valid *and* for the 6-day SMA-50
 # lookback comparison to be non-NaN.  200 + 6 = 206.
 MIN_CANDLES = 206
+
+# Net-score thresholds for a decisive signal.
+BUY_THRESHOLD = 40
+SELL_THRESHOLD = -40
 
 
 def compute(rows: list[dict]) -> dict:
@@ -80,73 +94,95 @@ def compute(rows: list[dict]) -> dict:
 
     # --- momentum --------------------------------------------------------
     rsi_now = float(x.rsi)
-    rsi_prev = float(d.rsi.iloc[-2])
-    rsi_rising = rsi_now > rsi_prev
-    fresh_cross = rsi_now > 50 and rsi_prev <= 50
-    breakdown = rsi_now < 50 and rsi_prev >= 50
-    not_overbought = rsi_now < 75
-    not_oversold = rsi_now > 25
     macd_bull = bool(x.macd > x.macd_signal)
     macd_bear = bool(x.macd < x.macd_signal)
 
-    # --- decisions -------------------------------------------------------
-    bullish = (
-        trend_up
-        and sma50_rising
-        and (fresh_cross or (50 < rsi_now <= 70 and rsi_rising))
-        and macd_bull
-        and not_overbought
-        and vol_surge
-    )
-    early_exit = bool(x.close < x.sma50) and macd_bear and breakdown
-    bearish = trend_down and sma50_falling
-    sell = early_exit or bearish
+    # Distance from the 200-day baseline — distinguishes a real trend from
+    # sideways chop where the MAs are all bunched together.
+    dist_above = (x.close / x.sma200 - 1) * 100
+    dist_below = (1 - x.close / x.sma200) * 100
 
-    if bullish and not sell:
+    # --- weighted bullish score (0-100) ----------------------------------
+    bullish = 0
+    if trend_up:
+        bullish += 30
+    elif x.close > x.sma50:
+        bullish += 15
+    if sma50_rising:
+        bullish += 15
+    if macd_bull:
+        bullish += 15
+    if 50 <= rsi_now <= 70:
+        bullish += 20
+    elif 70 < rsi_now <= 80:
+        bullish += 10
+    if vol_surge and x.close > x.sma50:
+        bullish += 10
+    if dist_above > 5:
+        bullish += 10
+    elif dist_above > 2:
+        bullish += 5
+    bullish = min(bullish, 100)
+
+    # --- weighted bearish score (0-100) -----------------------------------
+    bearish = 0
+    if trend_down:
+        bearish += 30
+    elif x.close < x.sma50:
+        bearish += 15
+    if sma50_falling:
+        bearish += 15
+    if macd_bear:
+        bearish += 15
+    if rsi_now < 30:
+        bearish += 20
+    elif rsi_now < 50:
+        bearish += 10
+    if vol_surge and x.close < x.sma50:
+        bearish += 10
+    if dist_below > 5:
+        bearish += 10
+    elif dist_below > 2:
+        bearish += 5
+    bearish = min(bearish, 100)
+
+    net = bullish - bearish
+
+    # --- action: require a genuine trend so sideways chop stays HOLD ------
+    if net >= BUY_THRESHOLD and trend_up and dist_above > 2:
         action = "BUY"
-    elif sell:
+    elif net <= SELL_THRESHOLD and trend_down and dist_below > 2:
         action = "SELL"
     else:
         action = "HOLD"
 
-    # --- strength score (0-100) -----------------------------------------
-    strength = 0
-    if trend_up:
-        strength += 40
-    if sma50_rising:
-        strength += 15
-    if macd_bull:
-        strength += 15
-    if fresh_cross:
-        strength += 20
-    if vol_surge:
-        strength += 10
-    strength = min(strength, 100)
-    if action == "SELL":
-        strength = 100 - strength  # invert: a clean bearish setup scores high
+    # --- strength (0-100) -------------------------------------------------
+    if action == "BUY":
+        strength = int(round(bullish))
+    elif action == "SELL":
+        strength = int(round(bearish))
+    else:
+        strength = int(round(max(bullish, bearish)))
 
     # --- dynamic reason --------------------------------------------------
     atr_stop = float(x.close) - 2 * float(x.atr14)
     if action == "BUY":
         reason = (
-            f"BUY: close {x.close:.2f} > SMA50 {x.sma50:.2f} > SMA200 {x.sma200:.2f}; "
-            f"RSI {rsi_now:.1f} ({'cross' if fresh_cross else 'rising'}); "
-            f"MACD {x.macd:.3f} > signal {x.macd_signal:.3f}; "
-            f"vol {'surge' if vol_surge else 'normal'}; "
-            f"ATR stop ~{atr_stop:.2f}."
+            f"BUY (score {net:+.0f}): close {x.close:.2f} > SMA50 {x.sma50:.2f} > SMA200 {x.sma200:.2f}; "
+            f"RSI {rsi_now:.1f}; MACD {'bullish' if macd_bull else 'mixed'}; "
+            f"vol {'surge' if vol_surge else 'normal'}; ATR stop ~{atr_stop:.2f}."
         )
     elif action == "SELL":
         reason = (
-            f"SELL: {'early exit — ' if early_exit else ''}"
-            f"close {x.close:.2f} {'< SMA50' if trend_down else '< SMA50 (early)'} "
-            f"{x.sma50:.2f}; RSI {rsi_now:.1f}; "
-            f"MACD {x.macd:.3f} < signal {x.macd_signal:.3f}."
+            f"SELL (score {net:+.0f}): close {x.close:.2f} "
+            f"{'< SMA50' if x.close < x.sma50 else 'vs SMA50'} {x.sma50:.2f}; "
+            f"RSI {rsi_now:.1f}; MACD {'bearish' if macd_bear else 'mixed'}."
         )
     else:
         reason = (
-            f"HOLD: no complete setup. close {x.close:.2f}, "
-            f"SMA50 {x.sma50:.2f}, SMA200 {x.sma200:.2f}, "
-            f"RSI {rsi_now:.1f}, MACD {x.macd:.3f}/{x.macd_signal:.3f}."
+            f"HOLD (score {net:+.0f}): close {x.close:.2f}, SMA50 {x.sma50:.2f}, "
+            f"SMA200 {x.sma200:.2f}, RSI {rsi_now:.1f}, "
+            f"MACD {x.macd:.3f}/{x.macd_signal:.3f}."
         )
 
     # --- snapshot --------------------------------------------------------
@@ -161,13 +197,14 @@ def compute(rows: list[dict]) -> dict:
     snap["atr_stop"] = norm(atr_stop)
     snap["atr_pct"] = norm(100 * float(x.atr14) / float(x.close))
     snap["vol_surge"] = vol_surge
-    snap["strength"] = int(strength)
+    snap["net_score"] = int(net)
+    snap["strength"] = strength
 
     return {
         "action": action,
         "reason": reason,
         "snapshot": snap,
-        "strength": int(strength),
+        "strength": strength,
         "candles": rows,  # full period — market.py already sliced by range
     }
 
