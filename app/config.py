@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     watchlist: str = "AAPL,MSFT,NVDA,VOO,IFX.DE"
 
     ollama_url: str = "http://host.docker.internal:11434"
-    ollama_model: str = "qwen3.6:27b-q3_K_M"
+    ollama_model: str = ""  # set via .env, e.g. "qwen3:32b"
     ollama_timeout_seconds: float = 180.0
 
     paper_trading: bool = True
