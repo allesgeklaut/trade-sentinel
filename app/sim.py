@@ -1194,10 +1194,18 @@ _SIM_CHAT_SYSTEM_PROMPT = (
     "   {\"actions\": [{\"ticker\": \"...\", \"action\": \"BUY\"|\"SELL\", \"reason\": \"...\"}]}\n"
     "   [[/ACTION]]\n"
     "3. You may propose multiple actions in one response (e.g. sell one ticker, buy another).\n"
-    "4. The same risk management rules apply: respect min cash % and max position %.\n"
-    "5. Only propose actions you believe are justified by the signals and portfolio context.\n"
-    "6. If you do not agree with the user's request, explain why and omit the ACTION block.\n"
-    "7. Do NOT reference specific URLs in your output.\n"
+    "4. You can specify a partial position size per action using optional fields:\n"
+    "   - \"shares\": exact number of shares to trade (e.g. 3.5).\n"
+    "   - \"amount\": dollar amount to trade (e.g. 67.43). For SELL this is the"
+    " value of shares to sell; for BUY it is the dollars to invest.\n"
+    "   If neither is given, SELL sells the entire position and BUY invests the"
+    " maximum allowed by risk rules.\n"
+    "   Example: {\"actions\": [{\"ticker\": \"MDB\", \"action\": \"SELL\", \"amount\": 67.43, \"reason\": \"trim overweight\"}]}\n"
+    "5. The same risk management rules apply: respect min cash % and max position %;"
+    " the engine will clamp your requested amounts to stay within them.\n"
+    "6. Only propose actions you believe are justified by the signals and portfolio context.\n"
+    "7. If you do not agree with the user's request, explain why and omit the ACTION block.\n"
+    "8. Do NOT reference specific URLs in your output.\n"
 )
 
 
@@ -1226,7 +1234,14 @@ def _parse_action_block(text: str) -> list[dict] | None:
         reason = str(a.get("reason", "")).strip()
         if not ticker or action not in ("BUY", "SELL"):
             continue
-        valid.append({"ticker": ticker, "action": action, "reason": reason})
+        entry: dict[str, Any] = {"ticker": ticker, "action": action, "reason": reason}
+        # Optional partial-size fields (validated by the caller against the
+        # current position / cash).
+        for field in ("shares", "amount"):
+            val = a.get(field)
+            if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
+                entry[field] = float(val)
+        valid.append(entry)
     return valid if valid else None
 
 
@@ -1343,7 +1358,13 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
                 continue
 
             if act == "SELL":
-                t = await _exec_sell(ticker, price, None, f"User chat: {reason}")
+                # Optional partial size: "shares" (exact) or "amount" (dollars).
+                target_shares: float | None = None
+                if "shares" in action:
+                    target_shares = action["shares"]
+                elif "amount" in action:
+                    target_shares = action["amount"] / price
+                t = await _exec_sell(ticker, price, target_shares, f"User chat: {reason}")
                 if t:
                     executed_trades.append(t)
                     valuation = await valuate()
@@ -1364,7 +1385,17 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
                     logger.info("Sim chat BUY %s skipped: position at max", ticker)
                     continue
 
-                budget = min(acc.cash - min_cash, max_position_value - current_value)
+                max_budget = min(acc.cash - min_cash, max_position_value - current_value)
+
+                # Optional partial size: "shares" or "amount" (dollars). Clamp
+                # to the risk-limited budget so we never breach cash/position limits.
+                if "shares" in action:
+                    budget = min(max_budget, action["shares"] * price)
+                elif "amount" in action:
+                    budget = min(max_budget, action["amount"])
+                else:
+                    budget = max_budget
+
                 if budget < 1:
                     continue
 
