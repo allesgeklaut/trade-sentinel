@@ -41,6 +41,10 @@ logger = logging.getLogger("trade_sentinel.sim")
 
 # Stores the raw LLM reasoning text from the most recent _llm_decide() call.
 _last_llm_reasoning: str = ""
+# Stores the deterministic trades from the most recent hybrid cycle (for comparison).
+_last_deterministic_trades: list[dict] = []
+# Stores the parsed LLM decisions from the most recent cycle.
+_last_llm_decisions: list[dict] = []
 
 # How many candles to refresh for the sim universe (2y is a good balance
 # for indicator computation without excessive API load).
@@ -568,6 +572,8 @@ async def _llm_decide(
     if signals is None:
         signals = {}
 
+    global _last_llm_reasoning
+
     context = _build_llm_context(valuation, deterministic_trades, signals, news)
     url = settings.ollama_url.rstrip("/") + "/api/chat"
     timeout = httpx.Timeout(
@@ -588,10 +594,46 @@ async def _llm_decide(
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, json=payload)
-            resp.raise_for_status()
+            # Don't use raise_for_status() — Ollama may return non-200 with
+            # useful JSON we can still inspect. Match the dashboard chat approach.
             data = resp.json()
     except Exception as e:
-        logger.warning("LLM decide failed (%s); falling back to deterministic", e)
+        err_detail = f"{type(e).__name__}: {e}"
+        if hasattr(e, 'response'):
+            try:
+                err_detail += f" | status={e.response.status_code} body={e.response.text[:300]}"
+            except Exception:
+                pass
+        logger.warning("LLM decide failed [%s] (url=%s, model=%s); falling back to deterministic",
+                       err_detail, url, settings.ollama_model)
+        _last_llm_reasoning = (
+            f"[LLM UNAVAILABLE — fell back to deterministic]\n"
+            f"Error: {err_detail}\n"
+            f"Ollama URL: {url}\n"
+            f"Model: {settings.ollama_model}\n\n"
+            f"Deterministic trades were executed instead:"
+        ) + ("\n" + "\n".join(
+            f"  - {t['ticker']} {t['side']} ×{t.get('shares', '?')} @ {t.get('price', '?'):.2f} — {t.get('reason', '')}"
+            for t in deterministic_trades
+        ) if deterministic_trades else "\n  (no deterministic trades either)")
+        return list(deterministic_trades)
+
+    # Check for Ollama error response (non-200 or error field in JSON)
+    resp_status = resp.status_code if hasattr(resp, 'status_code') else '?'
+    if resp_status != 200:
+        err_body = json.dumps(data)[:500] if data else getattr(resp, 'text', '')[:500]
+        logger.warning("LLM decide got HTTP %s: %s; falling back to deterministic", resp_status, err_body)
+        _last_llm_reasoning = (
+            f"[LLM ERROR — fell back to deterministic]\n"
+            f"HTTP {resp_status} from Ollama\n"
+            f"Response: {err_body}\n"
+            f"Ollama URL: {url}\n"
+            f"Model: {settings.ollama_model}\n\n"
+            f"Deterministic trades were executed instead:"
+        ) + ("\n" + "\n".join(
+            f"  - {t['ticker']} {t['side']} ×{t.get('shares', '?')} @ {t.get('price', '?'):.2f} — {t.get('reason', '')}"
+            for t in deterministic_trades
+        ) if deterministic_trades else "\n  (no deterministic trades either)")
         return list(deterministic_trades)
 
     # Ollama chat response: data["message"]["content"]
@@ -602,7 +644,6 @@ async def _llm_decide(
         pass
 
     # Store raw LLM reasoning for display in the frontend
-    global _last_llm_reasoning
     _last_llm_reasoning = content
 
     decisions = _parse_llm_decisions(content)
@@ -718,6 +759,8 @@ async def run_cycle() -> dict[str, Any]:
 
     This is called by the scheduler or the manual trigger endpoint.
     """
+    global _last_deterministic_trades
+
     # 1. Deposit allowance (if new month)
     allowance_result = await deposit_allowance()
 
@@ -759,6 +802,7 @@ async def run_cycle() -> dict[str, Any]:
         signals = await _gather_signals(tickers)
         news = await _gather_news(signals)
         trades = await _llm_decide(valuation, deterministic_trades, signals, news)
+        _last_deterministic_trades = deterministic_trades
     else:
         logger.warning("Unknown strategy '%s', falling back to deterministic", strategy)
         trades = await _deterministic_decide(valuation)
@@ -796,6 +840,85 @@ async def run_cycle() -> dict[str, Any]:
 def get_last_llm_reasoning() -> str:
     """Return the raw LLM reasoning text from the most recent sim cycle."""
     return _last_llm_reasoning
+
+
+def get_last_llm_summary() -> dict[str, Any]:
+    """Return a structured reasoning summary for the frontend.
+
+    Parses the raw LLM JSON and compares it against the deterministic
+    trades to highlight where the LLM changed the plan. Returns:
+    - raw: the full raw LLM text
+    - changes: decisions where the LLM diverged from deterministic
+    - confirmations: decisions where the LLM agreed with deterministic
+    - holds: HOLD decisions (abbreviated)
+    - deterministic_trades: what the deterministic engine proposed
+    """
+    global _last_llm_decisions
+
+    raw = _last_llm_reasoning
+    is_fallback = raw.startswith("[LLM UNAVAILABLE")
+    decisions = _parse_llm_decisions(raw) or []
+    _last_llm_decisions = decisions
+
+    # Build a lookup of what the deterministic engine proposed per ticker
+    det_by_ticker: dict[str, dict] = {}
+    for t in _last_deterministic_trades:
+        det_by_ticker[t["ticker"]] = t
+
+    changes: list[dict] = []
+    confirmations: list[dict] = []
+    holds: list[dict] = []
+
+    for d in decisions:
+        ticker = d["ticker"]
+        action = d["action"]
+        reason = d["reason"]
+        det = det_by_ticker.get(ticker)
+
+        if action == "HOLD":
+            holds.append({"ticker": ticker, "reason": reason})
+            continue
+
+        if det:
+            det_side = det["side"]
+            if action == det_side:
+                confirmations.append({
+                    "ticker": ticker, "action": action, "reason": reason,
+                    "det_reason": det.get("reason", ""),
+                })
+            else:
+                changes.append({
+                    "ticker": ticker, "action": action, "reason": reason,
+                    "det_action": det_side, "det_reason": det.get("reason", ""),
+                    "change_type": "override",
+                })
+        else:
+            # LLM proposed something the deterministic engine didn't
+            changes.append({
+                "ticker": ticker, "action": action, "reason": reason,
+                "det_action": None, "det_reason": None,
+                "change_type": "new",
+            })
+
+    # Also check tickers where deterministic proposed a trade but LLM didn't mention them
+    decision_tickers = {d["ticker"] for d in decisions}
+    for ticker, det in det_by_ticker.items():
+        if ticker not in decision_tickers:
+            changes.append({
+                "ticker": ticker, "action": "HOLD",
+                "reason": "LLM did not mention this ticker",
+                "det_action": det["side"], "det_reason": det.get("reason", ""),
+                "change_type": "dropped",
+            })
+
+    return {
+        "raw": raw,
+        "deterministic_trades": _last_deterministic_trades,
+        "changes": changes,
+        "confirmations": confirmations,
+        "holds": holds,
+        "fallback": is_fallback,
+    }
 
 
 async def get_trades(limit: int = 100) -> list[dict]:
@@ -1051,3 +1174,225 @@ def stop_scheduler():
     if _scheduler_task and not _scheduler_task.done():
         _scheduler_task.cancel()
     _scheduler_task = None
+
+
+# ---------------------------------------------------------------------------
+# Interactive LLM chat (sim portfolio manager)
+# ---------------------------------------------------------------------------
+
+_SIM_CHAT_SYSTEM_PROMPT = (
+    "You are a portfolio manager for a paper-trading simulation bot. "
+    "The user can chat with you about the current portfolio and ask you "
+    "to take actions. You have access to the current portfolio state, "
+    "technical signals, and recent news.\n"
+    "\n"
+    "Rules:\n"
+    "1. You can discuss the portfolio, explain your decisions, and answer questions.\n"
+    "2. If the user asks you to take an action (e.g. \"sell X to buy Y\"), include "
+    "a SPECIAL ACTION block at the end of your response in this format:\n"
+    "   [[ACTION]]\n"
+    "   {\"actions\": [{\"ticker\": \"...\", \"action\": \"BUY\"|\"SELL\", \"reason\": \"...\"}]}\n"
+    "   [[/ACTION]]\n"
+    "3. You may propose multiple actions in one response (e.g. sell one ticker, buy another).\n"
+    "4. The same risk management rules apply: respect min cash % and max position %.\n"
+    "5. Only propose actions you believe are justified by the signals and portfolio context.\n"
+    "6. If you do not agree with the user's request, explain why and omit the ACTION block.\n"
+    "7. Do NOT reference specific URLs in your output.\n"
+)
+
+
+def _parse_action_block(text: str) -> list[dict] | None:
+    """Extract a [[ACTION]]...[[/ACTION]] JSON block from LLM text."""
+    if not text:
+        return None
+    start = text.find("[[ACTION]]")
+    end = text.find("[[/ACTION]]")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    json_str = text[start + len("[[ACTION]]"):end].strip()
+    try:
+        parsed = json.loads(json_str)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    actions = parsed.get("actions", [])
+    if not isinstance(actions, list):
+        return None
+    valid = []
+    for a in actions:
+        if not isinstance(a, dict):
+            continue
+        ticker = a.get("ticker", "").upper().strip()
+        action = str(a.get("action", "")).upper().strip()
+        reason = str(a.get("reason", "")).strip()
+        if not ticker or action not in ("BUY", "SELL"):
+            continue
+        valid.append({"ticker": ticker, "action": action, "reason": reason})
+    return valid if valid else None
+
+
+async def _build_sim_chat_context() -> str:
+    """Build context for the sim chat: portfolio + signals + last reasoning."""
+    valuation = await valuate()
+    tickers = await _candidate_tickers()
+    signals = await _gather_signals(tickers)
+
+    lines: list[str] = []
+    lines.append("## Current Portfolio State")
+    lines.append(f"Cash: {valuation['cash']:.2f}")
+    lines.append(f"Positions value: {valuation['positions_value']:.2f}")
+    lines.append(f"Total equity: {valuation['total_equity']:.2f}")
+    lines.append(f"Allowance total: {valuation['allowance_total']:.2f}")
+    lines.append(f"Strategy: {settings.sim_strategy}")
+    lines.append(f"Max position %: {settings.sim_max_position_pct}")
+    lines.append(f"Min cash %: {settings.sim_min_cash_pct}")
+    lines.append("")
+
+    if valuation["positions"]:
+        lines.append("Open positions:")
+        for p in valuation["positions"]:
+            lines.append(
+                f"  - {p['ticker']}: {p['shares']} shares @ avg {p['avg_cost']:.2f} "
+                f"| current {p['current_price']:.2f} | value {p['value']:.2f} "
+                f"| P&L {p['pnl_pct']:+.2f}%"
+            )
+    else:
+        lines.append("Open positions: none")
+    lines.append("")
+
+    # Signals summary (only tickers with non-HOLD or in portfolio)
+    portfolio_tickers = {p["ticker"] for p in valuation["positions"]}
+    interesting = {
+        t: sig for t, sig in signals.items()
+        if sig["action"] != "HOLD" or t in portfolio_tickers
+    }
+    if interesting:
+        lines.append("## Signals (interesting tickers)")
+        for ticker, sig in sorted(interesting.items()):
+            snap = sig.get("snapshot", {})
+            lines.append(
+                f"  {ticker}: {sig['action']} (strength {sig['strength']}) "
+                f"| RSI {snap.get('rsi', 0):.1f} | MACD {snap.get('macd', 0):.3f} "
+                f"| close {snap.get('close', 0):.2f}"
+            )
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+async def sim_chat(messages: list[dict]) -> dict[str, Any]:
+    """Interactive chat with the sim portfolio manager LLM.
+
+    Sends the conversation along with portfolio context to the LLM.
+    If the LLM includes an [[ACTION]] block, executes the proposed trades.
+    Returns the text response and any executed trades.
+    """
+    context = await _build_sim_chat_context()
+    url = settings.ollama_url.rstrip("/") + "/api/chat"
+    timeout = httpx.Timeout(
+        connect=10.0,
+        read=settings.ollama_timeout_seconds,
+        write=30.0,
+        pool=10.0,
+    )
+    payload = {
+        "model": settings.ollama_model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": _SIM_CHAT_SYSTEM_PROMPT},
+            {"role": "user", "content": context},
+        ] + messages,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.warning("Sim chat LLM call failed: %s", e)
+        return {"text": f"LLM unavailable: {e}", "trades": [], "actions_executed": False}
+
+    content = data.get("message", {}).get("content", "") or data.get("response", "")
+
+    # Check for action block
+    actions = _parse_action_block(content)
+    executed_trades: list[dict] = []
+
+    if actions:
+        # Strip the action block from the visible text
+        display_text = content
+        start = content.find("[[ACTION]]")
+        end = content.find("[[/ACTION]]")
+        if start != -1 and end != -1:
+            display_text = (content[:start] + content[end + len("[[/ACTION]]"):]).strip()
+
+        # Execute the proposed actions
+        valuation = await valuate()
+        total_equity = valuation["total_equity"]
+        min_cash = total_equity * (settings.sim_min_cash_pct / 100)
+        max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+
+        for action in actions:
+            ticker = action["ticker"]
+            act = action["action"]
+            reason = action["reason"]
+
+            price = await _latest_close(ticker)
+            if price is None or price <= 0:
+                logger.warning("Sim chat action skipped %s: no price", ticker)
+                continue
+
+            if act == "SELL":
+                t = await _exec_sell(ticker, price, None, f"User chat: {reason}")
+                if t:
+                    executed_trades.append(t)
+                    valuation = await valuate()
+                    total_equity = valuation["total_equity"]
+                    min_cash = total_equity * (settings.sim_min_cash_pct / 100)
+                    max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+
+            elif act == "BUY":
+                acc = await _account()
+                if acc.cash < min_cash:
+                    logger.info("Sim chat BUY %s skipped: cash %.2f < min_cash %.2f", ticker, acc.cash, min_cash)
+                    continue
+
+                async with Session() as s:
+                    pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
+                current_value = (pos.shares * price) if pos else 0
+                if current_value >= max_position_value:
+                    logger.info("Sim chat BUY %s skipped: position at max", ticker)
+                    continue
+
+                budget = min(acc.cash - min_cash, max_position_value - current_value)
+                if budget < 1:
+                    continue
+
+                t = await _exec_buy(ticker, price, budget, f"User chat: {reason}")
+                if t:
+                    executed_trades.append(t)
+                    valuation = await valuate()
+                    total_equity = valuation["total_equity"]
+                    min_cash = total_equity * (settings.sim_min_cash_pct / 100)
+                    max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+
+        # Take a snapshot after chat-driven trades
+        if executed_trades:
+            post_val = await valuate()
+            async with Session() as s:
+                snap = SimSnapshot(
+                    cash=post_val["cash"],
+                    positions_value=post_val["positions_value"],
+                    total_equity=post_val["total_equity"],
+                    allowance_total=post_val["allowance_total"],
+                )
+                s.add(snap)
+                await s.commit()
+
+        return {
+            "text": display_text,
+            "trades": executed_trades,
+            "actions_executed": True,
+        }
+
+    return {"text": content, "trades": [], "actions_executed": False}

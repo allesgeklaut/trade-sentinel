@@ -229,8 +229,30 @@ async def sim_run():
 
 @app.get('/api/sim/reasoning')
 async def sim_reasoning():
-    """Return the raw LLM reasoning text from the most recent sim cycle."""
-    return {"reasoning": sim._last_llm_reasoning}
+    """Return structured LLM reasoning summary from the most recent sim cycle."""
+    return sim.get_last_llm_summary()
+
+@app.get('/api/sim/raw_reasoning')
+async def sim_raw_reasoning():
+    """Return the raw LLM reasoning text (for debugging/full text view)."""
+    return {"reasoning": sim.get_last_llm_reasoning()}
+
+@app.post('/api/sim/chat')
+async def sim_chat_endpoint(req: ChatRequest):
+    """Interactive chat with the sim portfolio manager LLM.
+
+    If the LLM proposes actions, they are executed immediately.
+    """
+    if not req.messages:
+        raise HTTPException(400, "messages must not be empty")
+    # Sanitise: keep only the last 20 messages, only role/content, only known roles
+    history_msgs = []
+    for m in req.messages[-20:]:
+        if m.role in ('user', 'assistant') and m.content.strip():
+            history_msgs.append({"role": m.role, "content": m.content})
+    if not history_msgs:
+        raise HTTPException(400, "no valid messages")
+    return await sim.sim_chat(history_msgs)
 
 @app.post('/api/sim/reset')
 async def sim_reset():
