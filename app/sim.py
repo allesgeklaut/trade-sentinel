@@ -401,6 +401,10 @@ _LLM_SYSTEM_PROMPT = (
     "3. Respect risk management: do not buy if cash is too low; do not over-"
     "concentrate in a single ticker.\n"
     "4. Decisions must be grounded in the provided signals and indicators.\n"
+    "5. You may receive recent news headlines for supplementary context. News "
+    "can explain *why* indicators are moving, but do not make trades based on "
+    "news alone — the technical signals and risk rules take priority. Never "
+    "reference specific URLs in your output.\n"
     "\n"
     "Return ONLY a JSON array of objects with the fields:\n"
     '  "ticker": string, "action": "BUY"|"SELL"|"HOLD", "reason": string\n'
@@ -413,8 +417,15 @@ def _build_llm_context(
     valuation: dict[str, Any],
     deterministic_trades: list[dict],
     signals: dict[str, dict],
+    news: dict[str, list[dict]] | None = None,
 ) -> str:
-    """Build the compact context string sent to the LLM."""
+    """Build the compact context string sent to the LLM.
+
+    ``news`` is an optional dict of ``{"market": [...], "TICKER": [...]}``
+    headline lists. If empty or None, the news section is omitted.
+    """
+    from .news import format_news_for_context, format_market_news_for_context
+
     lines: list[str] = []
 
     # --- Portfolio state ---
@@ -454,6 +465,20 @@ def _build_llm_context(
     else:
         lines.append("(no signals available)")
     lines.append("")
+
+    # --- Recent news (optional, supplementary) ---
+    if news:
+        lines.append("## Recent News (supplementary context — do not trade on news alone)")
+        market_hl = news.get("market", [])
+        if market_hl:
+            lines.append(format_market_news_for_context(market_hl))
+        for ticker in sorted(news.keys()):
+            if ticker == "market":
+                continue
+            hl = news.get(ticker, [])
+            if hl:
+                lines.append(format_news_for_context(ticker, hl))
+        lines.append("")
 
     # --- Deterministic candidate trades ---
     lines.append("## Deterministic Candidate Trades")
@@ -527,12 +552,14 @@ async def _llm_decide(
     valuation: dict[str, Any],
     deterministic_trades: list[dict],
     signals: dict[str, dict] | None = None,
+    news: dict[str, list[dict]] | None = None,
 ) -> list[dict]:
     """Hybrid strategy: let an LLM review/adjust deterministic candidates.
 
     Builds a structured context with the portfolio state, deterministic
-    candidates, and signal summaries, asks the LLM for a JSON array of
-    decisions, then executes each BUY/SELL through the same exec helpers.
+    candidates, signal summaries, and optional recent news, asks the LLM for
+    a JSON array of decisions, then executes each BUY/SELL through the same
+    exec helpers.
 
     If the LLM call fails or the response can't be parsed, falls back to the
     deterministic trades.
@@ -541,7 +568,7 @@ async def _llm_decide(
     if signals is None:
         signals = {}
 
-    context = _build_llm_context(valuation, deterministic_trades, signals)
+    context = _build_llm_context(valuation, deterministic_trades, signals, news)
     url = settings.ollama_url.rstrip("/") + "/api/chat"
     timeout = httpx.Timeout(
         connect=10.0,
@@ -664,6 +691,28 @@ async def _gather_signals(tickers: list[str]) -> dict[str, dict]:
     return signals
 
 
+def _top_news_candidates(signals: dict[str, dict], limit: int = 10) -> list[str]:
+    """Return the tickers most relevant for news: those with BUY/SELL signals
+    or the highest strength HOLDs. Limits network calls per sim cycle."""
+    ranked = sorted(
+        signals.items(),
+        key=lambda x: (x[1]["action"] != "HOLD", x[1]["strength"]),
+        reverse=True,
+    )
+    return [t for t, _ in ranked[:limit]]
+
+
+async def _gather_news(signals: dict[str, dict]) -> dict[str, list[dict]]:
+    """Fetch news for the top candidate tickers + market-wide news.
+
+    Returns ``{}`` if SearXNG is disabled or no news is found.
+    """
+    from .news import gather_news_for_candidates
+
+    candidates = _top_news_candidates(signals)
+    return await gather_news_for_candidates(candidates, include_market=True)
+
+
 async def run_cycle() -> dict[str, Any]:
     """Run one full sim cycle: deposit allowance → refresh → decide → snapshot.
 
@@ -700,14 +749,16 @@ async def run_cycle() -> dict[str, Any]:
     elif strategy == "llm":
         # Pure LLM: let the model decide entirely from portfolio context + signals
         signals = await _gather_signals(tickers)
-        trades = await _llm_decide(valuation, [], signals)
+        news = await _gather_news(signals)
+        trades = await _llm_decide(valuation, [], signals, news)
     elif strategy == "hybrid":
         # Hybrid: run deterministic first, then let LLM review/adjust
         deterministic_trades = await _deterministic_decide(valuation)
         # Recompute valuation after deterministic trades changed the portfolio
         valuation = await valuate()
         signals = await _gather_signals(tickers)
-        trades = await _llm_decide(valuation, deterministic_trades, signals)
+        news = await _gather_news(signals)
+        trades = await _llm_decide(valuation, deterministic_trades, signals, news)
     else:
         logger.warning("Unknown strategy '%s', falling back to deterministic", strategy)
         trades = await _deterministic_decide(valuation)

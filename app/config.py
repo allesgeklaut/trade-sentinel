@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     ollama_model: str = ""  # set via .env, e.g. "qwen3:32b"
     ollama_timeout_seconds: float = 180.0
 
+    # --- SearXNG news search (optional) -------------------------------
+    searxng_url: str = ""  # e.g. "http://192.168.0.46:8081"; empty = disabled
+    searxng_timeout: float = 10.0
+
     paper_trading: bool = True
 
     # --- Autonomous paper-trading simulation -----------------------------
