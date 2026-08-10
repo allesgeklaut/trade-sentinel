@@ -11,6 +11,7 @@ from .market import refresh, candles, search, info, provider
 from .analysis import compute, persist, history, MIN_CANDLES
 from .screener import universe_names, run, results
 from . import sim
+from . import news as news_mod
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 logger = logging.getLogger("trade_sentinel.main")
@@ -113,6 +114,11 @@ class ChatRequest(BaseModel):
 async def _stock_context(ticker: str) -> str:
     """Build a system prompt with deterministic stock data so the LLM has facts to chat about."""
     rows = await candles(ticker)
+    headlines = await news_mod.search_ticker_news(ticker)
+    news_section = ""
+    if headlines:
+        news_lines = "\n".join(f"- {h['title']}" for h in headlines[:3])
+        news_section = f"\nRecent news (supplementary context):\n{news_lines}\n"
     try:
         r = compute(rows)
         return (
@@ -129,6 +135,7 @@ async def _stock_context(ticker: str) -> str:
             f"above SMA-200. SELL when net_score <= -40 AND close < SMA-50 < SMA-200 AND "
             f"price is >2% below SMA-200. Otherwise HOLD. Volume surge is a bonus, not a "
             f"requirement."
+            f"{news_section}"
         )
     except ValueError:
         return (
@@ -137,6 +144,7 @@ async def _stock_context(ticker: str) -> str:
             f"({len(rows)} candles available, need {MIN_CANDLES}). "
             f"Be transparent about this limitation. You can discuss what you know, "
             f"but do not fabricate indicator values or signals."
+            f"{news_section}"
         )
 
 @app.post('/api/chat/{ticker}')
