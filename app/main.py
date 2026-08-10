@@ -241,18 +241,35 @@ async def sim_raw_reasoning():
 async def sim_chat_endpoint(req: ChatRequest):
     """Interactive chat with the sim portfolio manager LLM.
 
-    If the LLM proposes actions, they are executed immediately.
+    The server keeps the full conversation history in the DB, so the client
+    only needs to send the new user message for this turn. If the LLM proposes
+    actions, they are executed immediately.
     """
     if not req.messages:
         raise HTTPException(400, "messages must not be empty")
-    # Sanitise: keep only the last 20 messages, only role/content, only known roles
-    history_msgs = []
-    for m in req.messages[-20:]:
+    # Send only this turn's new messages to sim_chat — it merges them with
+    # the persisted history itself.
+    new_msgs = []
+    for m in req.messages[-1:]:
         if m.role in ('user', 'assistant') and m.content.strip():
-            history_msgs.append({"role": m.role, "content": m.content})
-    if not history_msgs:
+            new_msgs.append({"role": m.role, "content": m.content})
+    if not new_msgs:
         raise HTTPException(400, "no valid messages")
-    return await sim.sim_chat(history_msgs)
+    return await sim.sim_chat(new_msgs)
+
+
+@app.get('/api/sim/chat/history')
+async def sim_chat_history():
+    """Return the persisted sim portfolio-manager conversation history."""
+    return await sim.get_chat_history()
+
+
+@app.delete('/api/sim/chat/history')
+async def sim_chat_history_clear():
+    """Clear the persisted sim portfolio-manager conversation history."""
+    await sim.clear_chat_history()
+    return {"ok": True}
+
 
 @app.post('/api/sim/reset')
 async def sim_reset():
