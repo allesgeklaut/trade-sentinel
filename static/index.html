@@ -1004,6 +1004,25 @@
                 <div id="sim-reasoning"
                     style="white-space:pre-wrap;word-wrap:break-word;max-height:400px;overflow-y:auto;font-size:13px;line-height:1.5">
                 </div>
+                <details style="margin-top:8px">
+                    <summary style="cursor:pointer;color:#7aaa81;font-size:12px">Show raw LLM output</summary>
+                    <div id="sim-raw-reasoning"
+                        style="white-space:pre-wrap;word-wrap:break-word;max-height:300px;overflow-y:auto;font-size:12px;color:#7aaa81;margin-top:6px">
+                    </div>
+                </details>
+            </div>
+            <div class="sim-section">
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">CHAT WITH PORTFOLIO MANAGER</h3>
+                <div class="ai-hint" style="margin-bottom:8px">Ask the LLM to explain decisions, or request actions like "sell AMZN to buy NVDA". If the LLM agrees, trades execute immediately (respecting risk limits).</div>
+                <div id="sim-chat-thread" class="ai-thread" style="max-height:320px">
+                    <div class="ai-empty">Start a conversation with the portfolio manager.</div>
+                </div>
+                <form id="sim-chat-form" class="ai-form" onsubmit="return sendSimChat(event)">
+                    <input id="sim-chat-input" autocomplete="off" placeholder="Ask the portfolio manager…" disabled>
+                    <button id="sim-chat-send" type="submit" disabled>Send</button>
+                    <button id="sim-chat-stop" type="button" onclick="stopSimChat()" disabled>Stop</button>
+                </form>
+                <div id="sim-chat-trades" style="margin-top:6px"></div>
             </div>
     </section>
     <div id="explain-backdrop-container">
@@ -1643,13 +1662,64 @@
             try {
                 const r = await api('sim/reasoning');
                 const el = document.getElementById('sim-reasoning');
-                if (!r.reasoning) { el.innerHTML = '<div class="sim-empty">No LLM reasoning captured yet — run the bot in LLM or hybrid mode.</div>'; return; }
-                el.innerHTML = escapeHtml(r.reasoning);
+                const rawEl = document.getElementById('sim-raw-reasoning');
+                if (!r.raw && !r.changes && !r.confirmations) {
+                    el.innerHTML = '<div class="sim-empty">No LLM reasoning captured yet — run the bot in LLM or hybrid mode.</div>';
+                    return;
+                }
+                if (r.fallback) {
+                    // LLM was unavailable — show the fallback message
+                    el.innerHTML = '\u003cdiv style="color:#ff5c70;font-size:13px;margin-bottom:8px"\u003e⚠ LLM was unavailable — ran deterministic only\u003c/div\u003e' + escapeHtml(r.raw || '');
+                    if (rawEl) rawEl.textContent = r.raw || '';
+                    return;
+                }
+                let html = '';
+                // Changes (LLM diverged from deterministic)
+                if (r.changes && r.changes.length) {
+                    html += '<div style="margin-bottom:12px"><span style="color:#ff5c70;font-size:12px;text-transform:uppercase">⚠ LLM changed the plan</span></div>';
+                    html += '<table style="width:100%;font-size:12px">';
+                    html += '<thead><tr><th style="text-align:left">Ticker</th><th>LLM</th><th>Det.</th><th style="text-align:left">Reason</th></tr></thead><tbody>';
+                    for (const c of r.changes) {
+                        const changeLabel = c.change_type === 'override' ? '🔄 Override'
+                            : c.change_type === 'new' ? '➕ New'
+                            : c.change_type === 'dropped' ? '⏭ Dropped' : '';
+                        const actClass = c.action === 'BUY' ? 'buy' : c.action === 'SELL' ? 'sell' : 'hold';
+                        const detLabel = c.det_action || '—';
+                        const detClass = detLabel === 'BUY' ? 'buy' : detLabel === 'SELL' ? 'sell' : '';
+                        html += `<tr><td><b>${escapeHtml(c.ticker)}</b><small style="display:block;color:#7aaa81">${changeLabel}</small></td><td class="${actClass}">${escapeHtml(c.action)}</td><td class="${detClass}">${escapeHtml(detLabel)}</td><td style="text-align:left;font-size:11px">${escapeHtml(c.reason)}</td></tr>`;
+                    }
+                    html += '</tbody></table>';
+                }
+                // Confirmations (LLM agreed with deterministic)
+                if (r.confirmations && r.confirmations.length) {
+                    html += '<div style="margin:12px 0 4px"><span style="color:#42ff72;font-size:12px;text-transform:uppercase">✓ Confirmed by LLM</span></div>';
+                    for (const c of r.confirmations) {
+                        const actClass = c.action === 'BUY' ? 'buy' : 'sell';
+                        html += `<div style="font-size:12px;padding:3px 0"><b class="${actClass}">${escapeHtml(c.action)}</b> <b>${escapeHtml(c.ticker)}</b> — <span style="color:#7aaa81">${escapeHtml(c.reason)}</span></div>`;
+                    }
+                }
+                // Holds (abbreviated — just count)
+                if (r.holds && r.holds.length) {
+                    html += `<div style="margin:12px 0 4px;color:#ffd65c;font-size:12px;text-transform:uppercase">⊙ ${r.holds.length} HOLD</div>`;
+                    html += '<div style="font-size:11px;color:#7aaa81;line-height:1.6">' + r.holds.map(h => escapeHtml(h.ticker)).join(' · ') + '</div>';
+                }
+                // If nothing interesting happened
+                if (!r.changes?.length && !r.confirmations?.length && !r.holds?.length) {
+                    html += '<div class="sim-empty">No decisions parsed from LLM output.</div>';
+                }
+                el.innerHTML = html;
+                // Raw output
+                if (rawEl) rawEl.textContent = r.raw || '';
             } catch (e) { document.getElementById('sim-reasoning').innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
 
         async function loadSimAll() {
             loadSimStatus(); loadSimTrades(); loadSimEquity(); loadSimAllowances(); loadSimBenchmark(); loadSimReasoning();
+            // Enable sim chat when sim view loads
+            const chatInput = document.getElementById('sim-chat-input');
+            const chatSend = document.getElementById('sim-chat-send');
+            if (chatInput) { chatInput.disabled = false; }
+            if (chatSend) { chatSend.disabled = false; }
         }
 
         async function runSim() {
@@ -1665,6 +1735,89 @@
             if (!confirm('Reset simulation? This clears all trades, positions, and equity history.')) return;
             try { await api('sim/reset', { method: 'POST' }); } catch (e) { /* ignore */ }
             loadSimAll();
+        }
+
+        // --- Sim portfolio manager chat ---
+        const simChatState = { messages: [], busy: false };
+        let simChatAbort = null;
+
+        function setSimChatEnabled(enabled) {
+            const input = document.getElementById('sim-chat-input');
+            const send = document.getElementById('sim-chat-send');
+            const stop = document.getElementById('sim-chat-stop');
+            if (!input) return;
+            input.disabled = !enabled || simChatState.busy;
+            send.disabled = !enabled || simChatState.busy;
+            stop.disabled = !enabled || !simChatState.busy;
+        }
+
+        function renderSimChat() {
+            const thread = document.getElementById('sim-chat-thread');
+            if (!thread) return;
+            if (simChatState.messages.length === 0) {
+                thread.innerHTML = '<div class="ai-empty">Start a conversation with the portfolio manager.</div>';
+                return;
+            }
+            const nearBottom = (thread.scrollHeight - thread.scrollTop - thread.clientHeight) < 50;
+            thread.innerHTML = simChatState.messages.map(m => {
+                if (m.role === 'assistant' && typeof marked !== 'undefined') {
+                    const html = marked.parse(m.content, { renderer: markedRenderer });
+                    return '<div class="ai-msg ' + m.role + '">' + html + '</div>';
+                }
+                return '<div class="ai-msg ' + m.role + '">' + escapeHtml(m.content) + '</div>';
+            }).join('');
+            if (nearBottom) thread.scrollTop = thread.scrollHeight;
+        }
+
+        function showSimChatTrades(trades) {
+            const el = document.getElementById('sim-chat-trades');
+            if (!el || !trades || !trades.length) { if (el) el.innerHTML = ''; return; }
+            el.innerHTML = '<div style="font-size:12px;color:#42ff72;margin-bottom:4px">Trades executed:</div>' +
+                trades.map(t => '<div style="font-size:12px;padding:2px 0"><b class="' + (t.side === 'BUY' ? 'buy' : 'sell') + '">' + t.side + '</b> ' + escapeHtml(t.ticker) + ' \u00d7' + t.shares + ' @ $' + t.price.toFixed(2) + '</div>').join('');
+        }
+
+        async function sendSimChat(ev) {
+            ev.preventDefault();
+            if (simChatState.busy) return;
+            const input = document.getElementById('sim-chat-input');
+            const text = input.value.trim();
+            if (!text) return;
+            input.value = '';
+            simChatAbort = new AbortController();
+            simChatState.busy = true;
+            setSimChatEnabled(true);
+            simChatState.messages.push({ role: 'user', content: text });
+            renderSimChat();
+            try {
+                const resp = await fetch('/api/sim/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ messages: simChatState.messages }),
+                    signal: simChatAbort.signal,
+                });
+                if (!resp.ok) throw Error(await resp.text());
+                const data = await resp.json();
+                simChatState.messages.push({ role: 'assistant', content: data.text });
+                showSimChatTrades(data.trades);
+                if (data.actions_executed && data.trades && data.trades.length) {
+                    loadSimStatus(); loadSimTrades(); loadSimEquity();
+                }
+            } catch (e) {
+                if (e.name === 'AbortError') {
+                    simChatState.messages.push({ role: 'assistant', content: 'Request stopped.' });
+                } else {
+                    simChatState.messages.push({ role: 'assistant', content: 'Error: ' + e.message });
+                }
+            } finally {
+                simChatState.busy = false;
+                simChatAbort = null;
+                setSimChatEnabled(true);
+                renderSimChat();
+            }
+        }
+
+        function stopSimChat() {
+            if (simChatAbort) { simChatAbort.abort(); simChatAbort = null; }
         }
     </script>
 </body>
