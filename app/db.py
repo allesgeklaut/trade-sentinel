@@ -185,6 +185,21 @@ class SimBenchmarkSnapshot(Base):
     allowance_total: Mapped[float] = mapped_column(Float, default=0)
 
 
+class SimChatMessage(Base):
+    """Persistent conversation history for the sim portfolio-manager chat.
+
+    Stored so the active chat session survives page reloads and the LLM can
+    be fed the full prior context on every turn.
+    """
+
+    __tablename__ = "sim_chat_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    role: Mapped[str] = mapped_column(String(16))  # user | assistant
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+
 
 engine = create_async_engine(settings.database_url)
 Session = async_sessionmaker(engine, expire_on_commit=False)

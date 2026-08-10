@@ -29,6 +29,7 @@ from .db import (
     SimAllowance,
     SimBenchmarkAccount,
     SimBenchmarkSnapshot,
+    SimChatMessage,
     SimPosition,
     SimSnapshot,
     SimTrade,
@@ -732,6 +733,47 @@ async def _gather_signals(tickers: list[str]) -> dict[str, dict]:
     return signals
 
 
+# ---------------------------------------------------------------------------
+# Persistent chat history for the sim portfolio manager
+# ---------------------------------------------------------------------------
+
+async def _chat_history(limit: int = 20) -> list[dict]:
+    """Return the persisted sim chat history, oldest-first."""
+    async with Session() as s:
+        rows = (
+            await s.scalars(
+                select(SimChatMessage)
+                .order_by(SimChatMessage.created_at.asc())
+                .limit(limit)
+            )
+        ).all()
+        return [{"role": r.role, "content": r.content} for r in rows]
+
+
+async def _append_chat_message(role: str, content: str) -> None:
+    """Persist a single sim chat message."""
+    async with Session() as s:
+        s.add(SimChatMessage(role=role, content=content))
+        await s.commit()
+
+
+async def _clear_chat_history() -> None:
+    """Delete all persisted sim chat messages."""
+    async with Session() as s:
+        await s.execute(delete(SimChatMessage))
+        await s.commit()
+
+
+async def get_chat_history(limit: int = 40) -> list[dict]:
+    """Public: return the persisted sim portfolio-manager chat history."""
+    return await _chat_history(limit=limit)
+
+
+async def clear_chat_history() -> None:
+    """Public: clear the persisted sim portfolio-manager chat history."""
+    await _clear_chat_history()
+
+
 def _top_news_candidates(signals: dict[str, dict], limit: int = 10) -> list[str]:
     """Return the tickers most relevant for news: those with BUY/SELL signals
     or the highest strength HOLDs. Limits network calls per sim cycle."""
@@ -1245,8 +1287,24 @@ def _parse_action_block(text: str) -> list[dict] | None:
     return valid if valid else None
 
 
+async def _gather_sim_chat_news(limit: int = 6) -> dict[str, list[dict]]:
+    """Fetch recent SearXNG news for the held tickers + market for the sim chat.
+
+    Returns ``{}`` if SearXNG is disabled or nothing is found. Limited to the
+    first ``limit`` held tickers so repeated chat turns stay cheap (results are
+    cached in news.py for 4h anyway).
+    """
+    from .news import gather_news_for_candidates
+
+    valuation = await valuate()
+    portfolio_tickers = [p["ticker"] for p in valuation["positions"]][:limit]
+    if not portfolio_tickers:
+        return {}
+    return await gather_news_for_candidates(portfolio_tickers, include_market=True)
+
+
 async def _build_sim_chat_context() -> str:
-    """Build context for the sim chat: portfolio + signals + last reasoning."""
+    """Build context for the sim chat: portfolio + signals + recent news."""
     valuation = await valuate()
     tickers = await _candidate_tickers()
     signals = await _gather_signals(tickers)
@@ -1291,16 +1349,57 @@ async def _build_sim_chat_context() -> str:
             )
     lines.append("")
 
+    # Recent news (supplementary, via SearXNG). The system prompt promises the
+    # LLM access to recent news — actually deliver it here so it can answer
+    # "what's the latest on X" questions from real headlines.
+    try:
+        news = await _gather_sim_chat_news()
+        if news:
+            from .news import format_news_for_context, format_market_news_for_context
+            lines.append("## Recent News (supplementary context — do not trade on news alone)")
+            market_hl = news.get("market", [])
+            if market_hl:
+                lines.append(format_market_news_for_context(market_hl))
+            for ticker in sorted(news.keys()):
+                if ticker == "market":
+                    continue
+                hl = news.get(ticker, [])
+                if hl:
+                    lines.append(format_news_for_context(ticker, hl))
+            lines.append("")
+    except Exception as e:
+        logger.warning("sim chat news gather failed: %s", e)
+
     return "\n".join(lines)
 
 
 async def sim_chat(messages: list[dict]) -> dict[str, Any]:
     """Interactive chat with the sim portfolio manager LLM.
 
-    Sends the conversation along with portfolio context to the LLM.
+    ``messages`` is the list of NEW messages for this turn (typically just the
+    user's latest message). The full prior conversation is loaded from
+    persistent storage, merged, sent to the LLM, and the new messages are
+    saved so the thread survives page reloads.
+
     If the LLM includes an [[ACTION]] block, executes the proposed trades.
-    Returns the text response and any executed trades.
+    Returns the text response, any executed trades, and the full history.
     """
+    # Load persisted history and fold in this turn's incoming messages.
+    history = await _chat_history(limit=40)
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if not content or role not in ("user", "assistant"):
+            continue
+        history.append({"role": role, "content": content})
+        if role == "user":
+            await _append_chat_message("user", content)
+
+    if not history:
+        return {"text": "No messages to send.", "trades": [], "actions_executed": False, "history": []}
+
     context = await _build_sim_chat_context()
     url = settings.ollama_url.rstrip("/") + "/api/chat"
     timeout = httpx.Timeout(
@@ -1315,7 +1414,7 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
         "messages": [
             {"role": "system", "content": _SIM_CHAT_SYSTEM_PROMPT},
             {"role": "user", "content": context},
-        ] + messages,
+        ] + history,
     }
 
     try:
@@ -1325,9 +1424,15 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
             data = resp.json()
     except Exception as e:
         logger.warning("Sim chat LLM call failed: %s", e)
-        return {"text": f"LLM unavailable: {e}", "trades": [], "actions_executed": False}
+        return {"text": f"LLM unavailable: {e}", "trades": [], "actions_executed": False, "history": history}
 
     content = data.get("message", {}).get("content", "") or data.get("response", "")
+
+    # Persist the assistant reply so the thread survives reloads and the LLM
+    # gets full prior context on the next turn.
+    if content:
+        await _append_chat_message("assistant", content)
+        history.append({"role": "assistant", "content": content})
 
     # Check for action block
     actions = _parse_action_block(content)
@@ -1424,6 +1529,7 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
             "text": display_text,
             "trades": executed_trades,
             "actions_executed": True,
+            "history": history,
         }
 
-    return {"text": content, "trades": [], "actions_executed": False}
+    return {"text": content, "trades": [], "actions_executed": False, "history": history}

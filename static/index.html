@@ -1021,6 +1021,7 @@
                     <input id="sim-chat-input" autocomplete="off" placeholder="Ask the portfolio manager…" disabled>
                     <button id="sim-chat-send" type="submit" disabled>Send</button>
                     <button id="sim-chat-stop" type="button" onclick="stopSimChat()" disabled>Stop</button>
+                    <button type="button" onclick="clearSimChatHistory()" title="Clear conversation history">Clear</button>
                 </form>
                 <div id="sim-chat-trades" style="margin-top:6px"></div>
             </div>
@@ -1715,11 +1716,34 @@
 
         async function loadSimAll() {
             loadSimStatus(); loadSimTrades(); loadSimEquity(); loadSimAllowances(); loadSimBenchmark(); loadSimReasoning();
+            loadSimChatHistory();
             // Enable sim chat when sim view loads
             const chatInput = document.getElementById('sim-chat-input');
             const chatSend = document.getElementById('sim-chat-send');
             if (chatInput) { chatInput.disabled = false; }
             if (chatSend) { chatSend.disabled = false; }
+        }
+
+        async function loadSimChatHistory() {
+            // Restore the persisted conversation so the thread survives reloads.
+            try {
+                const resp = await fetch('/api/sim/chat/history');
+                if (!resp.ok) return;
+                const history = await resp.json();
+                simChatState.messages = Array.isArray(history) ? history : [];
+            } catch (e) {
+                simChatState.messages = [];
+            }
+            renderSimChat();
+        }
+
+        async function clearSimChatHistory() {
+            if (!confirm('Clear the portfolio manager conversation history?')) return;
+            try {
+                await fetch('/api/sim/chat/history', { method: 'DELETE' });
+            } catch (e) { /* ignore */ }
+            simChatState.messages = [];
+            renderSimChat();
         }
 
         async function runSim() {
@@ -1789,10 +1813,12 @@
             simChatState.messages.push({ role: 'user', content: text });
             renderSimChat();
             try {
+                // Send only the new message — the server persists history and
+                // merges it with prior context on its side.
                 const resp = await fetch('/api/sim/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ messages: simChatState.messages }),
+                    body: JSON.stringify({ messages: [{ role: 'user', content: text }] }),
                     signal: simChatAbort.signal,
                 });
                 if (!resp.ok) throw Error(await resp.text());
