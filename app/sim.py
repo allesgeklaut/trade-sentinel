@@ -444,6 +444,8 @@ def _build_llm_context(
     lines.append(f"Positions value: {valuation['positions_value']:.2f}")
     lines.append(f"Total equity: {valuation['total_equity']:.2f}")
     lines.append(f"Cumulative allowance deposited: {valuation['allowance_total']:.2f}")
+    lines.append(f"Min cash to keep ({settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
+    lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
     lines.append("")
 
     if valuation["positions"]:
@@ -1334,6 +1336,8 @@ async def _build_sim_chat_context() -> str:
     lines.append(f"Strategy: {settings.sim_strategy}")
     lines.append(f"Max position %: {settings.sim_max_position_pct}")
     lines.append(f"Min cash %: {settings.sim_min_cash_pct}")
+    lines.append(f"Min cash to keep ({settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
+    lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
     lines.append("")
 
     if valuation["positions"]:
