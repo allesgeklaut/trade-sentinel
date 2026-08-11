@@ -445,6 +445,40 @@ class TestParseLLMDecisions:
         # All entries filtered out → None
         assert result is None
 
+    def test_partial_size_fields(self):
+        """Optional 'shares'/'amount' fields should be extracted and normalized."""
+        content = json.dumps([
+            {"ticker": "MDB", "action": "SELL", "amount": 67.43, "reason": "trim"},
+            {"ticker": "ANET", "action": "SELL", "shares": 3.5, "reason": "trim"},
+            {"ticker": "SPY", "action": "BUY", "amount": 500, "reason": "diversify"},
+            {"ticker": "X", "action": "SELL", "shares": 3, "amount": 100, "reason": "both"},
+        ])
+        result = sim._parse_llm_decisions(content)
+        assert result is not None
+        assert len(result) == 4
+        assert result[0]["amount"] == pytest.approx(67.43)
+        assert "shares" not in result[0]
+        assert result[1]["shares"] == pytest.approx(3.5)
+        assert "amount" not in result[1]
+        assert result[2]["amount"] == pytest.approx(500.0)
+        assert result[3]["shares"] == pytest.approx(3.0)
+        assert result[3]["amount"] == pytest.approx(100.0)
+
+    def test_invalid_size_fields_ignored(self):
+        """Non-positive or non-numeric size fields should be dropped."""
+        content = json.dumps([
+            {"ticker": "A", "action": "SELL", "amount": -5, "reason": "neg"},
+            {"ticker": "B", "action": "SELL", "shares": 0, "reason": "zero"},
+            {"ticker": "C", "action": "SELL", "amount": "lots", "reason": "str"},
+            {"ticker": "D", "action": "SELL", "amount": True, "reason": "bool"},
+        ])
+        result = sim._parse_llm_decisions(content)
+        assert result is not None
+        assert len(result) == 4
+        for r in result:
+            assert "shares" not in r
+            assert "amount" not in r
+
 
 class TestBuildLLMContext:
     def test_context_includes_portfolio(self):

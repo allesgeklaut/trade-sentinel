@@ -415,9 +415,20 @@ _LLM_SYSTEM_PROMPT = (
     "can explain *why* indicators are moving, but do not make trades based on "
     "news alone — the technical signals and risk rules take priority. Never "
     "reference specific URLs in your output.\n"
+    "7. You may specify a partial position size per action using optional fields:\n"
+    "   - \"shares\": exact number of shares to trade (e.g. 3.5).\n"
+    "   - \"amount\": dollar amount to trade (e.g. 67.43). For SELL this is the"
+    " value of shares to sell; for BUY it is the dollars to invest.\n"
+    "   If neither is given, SELL sells the entire position and BUY invests the"
+    " maximum allowed by risk rules.\n"
+    "8. IMPORTANT: if the goal is to trim a position down to the max position % "
+    "(e.g. it is overweight), you MUST include an exact \"shares\" or \"amount\" "
+    "so only the excess is sold. Never sell the whole position just to trim it — "
+    "compute the amount that brings the position to the cap and sell only that.\n"
     "\n"
     "Return ONLY a JSON array of objects with the fields:\n"
-    '  "ticker": string, "action": "BUY"|"SELL"|"HOLD", "reason": string\n'
+    '  "ticker": string, "action": "BUY"|"SELL"|"HOLD", "reason": string, '
+    '"shares"?: number, "amount"?: number\n'
     "\n"
     "No markdown, no code fences, no prose — just the JSON array.\n"
 )
@@ -556,7 +567,14 @@ def _parse_llm_decisions(content: str) -> list[dict] | None:
         reason = str(d.get("reason", "")).strip()
         if not ticker or action not in ("BUY", "SELL", "HOLD"):
             continue
-        valid.append({"ticker": ticker, "action": action, "reason": reason})
+        entry: dict[str, Any] = {"ticker": ticker, "action": action, "reason": reason}
+        # Optional partial-size fields (validated by the caller against the
+        # current position / cash).
+        for field in ("shares", "amount"):
+            val = d.get(field)
+            if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
+                entry[field] = float(val)
+        valid.append(entry)
     return valid if valid else None
 
 
@@ -695,6 +713,14 @@ async def _llm_decide(
                 continue
 
             budget = min(acc.cash - min_cash, max_position_value - current_value)
+
+            # Optional partial size: "shares" or "amount" (dollars). Clamp
+            # to the risk-limited budget so we never breach cash/position limits.
+            if "shares" in decision:
+                budget = min(budget, decision["shares"] * price)
+            elif "amount" in decision:
+                budget = min(budget, decision["amount"])
+
             if budget < 1:
                 logger.info("LLM BUY %s skipped: budget %.2f < $1", ticker, budget)
                 continue
@@ -709,7 +735,13 @@ async def _llm_decide(
                 max_position_value = total_equity * (settings.sim_max_position_pct / 100)
 
         elif action == "SELL":
-            t = await _exec_sell(ticker, price, None, f"LLM: {reason}")
+            # Optional partial size: "shares" (exact) or "amount" (dollars).
+            target_shares: float | None = None
+            if "shares" in decision:
+                target_shares = decision["shares"]
+            elif "amount" in decision:
+                target_shares = decision["amount"] / price
+            t = await _exec_sell(ticker, price, target_shares, f"LLM: {reason}")
             if t:
                 executed.append(t)
                 valuation = await valuate()
@@ -1259,10 +1291,14 @@ _SIM_CHAT_SYSTEM_PROMPT = (
     "   Example: {\"actions\": [{\"ticker\": \"MDB\", \"action\": \"SELL\", \"amount\": 67.43, \"reason\": \"trim overweight\"}]}\n"
     "5. The same risk management rules apply: respect min cash % and max position %;"
     " the engine will clamp your requested amounts to stay within them.\n"
-    "6. Only propose actions you believe are justified by the signals and portfolio context.\n"
-    "7. If you do not agree with the user's request, explain why and omit the ACTION block.\n"
-    "8. Do NOT reference specific URLs in your output.\n"
-    "9. The \"Last Sim Cycle Decisions\" section in your context lists decisions "
+    "6. IMPORTANT: if the goal is to trim a position down to the max position % "
+    "(e.g. it is overweight), you MUST include an exact \"shares\" or \"amount\" "
+    "so only the excess is sold. Never sell the whole position just to trim it — "
+    "compute the amount that brings the position to the cap and sell only that.\n"
+    "7. Only propose actions you believe are justified by the signals and portfolio context.\n"
+    "8. If you do not agree with the user's request, explain why and omit the ACTION block.\n"
+    "9. Do NOT reference specific URLs in your output.\n"
+    "10. The \"Last Sim Cycle Decisions\" section in your context lists decisions "
     "that were already executed by the simulation. Treat them as historical — "
     "when asked about them, explain them, but do NOT include them as new actions "
     "unless the user explicitly asks you to take a new trade.\n"
