@@ -558,6 +558,11 @@ def _parse_llm_decisions(content: str) -> list[dict] | None:
     if not isinstance(decisions, list):
         return None
 
+    # An explicitly empty array is a valid decision: the LLM chose to do
+    # nothing. Return [] so the caller doesn't treat it as a parse failure.
+    if not decisions:
+        return []
+
     # Validate / normalize entries
     valid = []
     for d in decisions:

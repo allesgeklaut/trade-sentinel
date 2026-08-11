@@ -465,6 +465,13 @@ class TestParseLLMDecisions:
         assert result[3]["shares"] == pytest.approx(3.0)
         assert result[3]["amount"] == pytest.approx(100.0)
 
+    def test_empty_array_is_valid(self):
+        """An explicitly empty JSON array is a valid 'do nothing' decision."""
+        content = json.dumps([])
+        result = sim._parse_llm_decisions(content)
+        # Empty list, not None — distinguishes 'do nothing' from a parse failure
+        assert result == []
+
     def test_invalid_size_fields_ignored(self):
         """Non-positive or non-numeric size fields should be dropped."""
         content = json.dumps([
@@ -594,6 +601,59 @@ class TestLLMDecide:
             msft = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "MSFT"))
             assert msft is not None
             assert msft.shares > 0
+
+    async def test_unparseable_decision_falls_back(self, with_cash, monkeypatch):
+        """A genuinely unparseable response (not an empty array) should fall
+        back to the deterministic candidate trades."""
+        # LLM returns garbage that isn't a JSON array.
+        self._fake_http(monkeypatch, "I am not JSON")
+
+        async def fake_close(ticker):
+            return 100.0
+        monkeypatch.setattr(sim, "_latest_close", fake_close)
+
+        valuation = {
+            "cash": 10000.0, "positions_value": 0.0, "total_equity": 10000.0,
+            "allowance_total": 10000.0, "positions": [],
+        }
+        deterministic = [
+            {"ticker": "AAPL", "side": "BUY", "shares": 5, "price": 100.0, "reason": "det"},
+        ]
+        executed = await sim._llm_decide(valuation, deterministic, {})
+
+        # Fell back: the deterministic trade list is returned as-is (execution
+        # of the fallback happens in the caller), not dropped.
+        assert len(executed) == 1
+        assert executed[0]["ticker"] == "AAPL"
+        assert executed[0]["side"] == "BUY"
+        assert executed[0] is deterministic[0]
+
+    async def test_empty_decisions_do_not_fall_back(self, with_cash, monkeypatch):
+        """An empty [] decision should execute no trades, not fall back to
+        deterministic candidates."""
+        await sim._exec_buy("AAPL", 100.0, 2000.0, "seed")  # 20 shares
+
+        # LLM returns an empty array → decide to do nothing.
+        self._fake_http(monkeypatch, json.dumps([]))
+
+        async def fake_close(ticker):
+            return 100.0
+        monkeypatch.setattr(sim, "_latest_close", fake_close)
+
+        valuation = {
+            "cash": 10000.0, "positions_value": 2000.0, "total_equity": 12000.0,
+            "allowance_total": 10000.0, "positions": [],
+        }
+        executed = await sim._llm_decide(valuation, [], {})
+
+        # No trades executed, no fallback triggered
+        assert executed == []
+
+        async with sim.Session() as s:
+            from sqlalchemy import select as sa_select
+            pos = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "AAPL"))
+            assert pos is not None  # position untouched
+            assert pos.shares == pytest.approx(20.0, abs=0.001)
 
     async def test_sell_without_size_sells_entire_position(self, with_cash, monkeypatch):
         """A SELL with no size field sells the whole position (default)."""
