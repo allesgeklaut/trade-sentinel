@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 from sqlalchemy import StaticPool
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -519,6 +520,109 @@ class TestBuildLLMContext:
         ctx = sim._build_llm_context(val, trades, {})
         assert "AMD" in ctx
         assert "strong momentum" in ctx
+
+
+class TestLLMDecide:
+    """Integration tests for _llm_decide: LLM decisions → executed trades.
+
+    Mocks the Ollama HTTP call and _latest_close so no network is needed.
+    """
+
+    def _fake_http(self, monkeypatch, content: str):
+        """Replace httpx.AsyncClient with a fake returning ``content``."""
+        class FakeResponse:
+            status_code = 200
+            def json(self):
+                return {"message": {"content": content}}
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            async def post(self, *a, **k):
+                return FakeResponse()
+
+        monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    async def test_fractional_sell_and_clamped_buy(self, with_cash, monkeypatch):
+        """A SELL with 'amount' sells only that value; a BUY is clamped to budget."""
+        # Seed a position: 30 shares of AAPL @ 100 = $3000
+        await sim._exec_buy("AAPL", 100.0, 3000.0, "seed")
+
+        # LLM returns: sell $500 of AAPL, buy $99999 of MSFT (clamped by cash).
+        decisions = json.dumps([
+            {"ticker": "AAPL", "action": "SELL", "amount": 500.0, "reason": "trim"},
+            {"ticker": "MSFT", "action": "BUY", "amount": 99999.0, "reason": "diversify"},
+        ])
+        self._fake_http(monkeypatch, decisions)
+
+        # Prices: AAPL @ 100, MSFT @ 50
+        async def fake_close(ticker):
+            return {"AAPL": 100.0, "MSFT": 50.0}.get(ticker)
+        monkeypatch.setattr(sim, "_latest_close", fake_close)
+
+        valuation = {
+            "cash": 10000.0, "positions_value": 3000.0, "total_equity": 13000.0,
+            "allowance_total": 10000.0, "positions": [],
+        }
+        executed = await sim._llm_decide(valuation, [], {})
+
+        # Two trades executed
+        assert len(executed) == 2
+
+        # Fractional SELL: $500 / $100 = 5 shares sold, 25 remain
+        sell = next(t for t in executed if t["ticker"] == "AAPL")
+        assert sell["side"] == "SELL"
+        assert sell["shares"] == pytest.approx(5.0, abs=0.001)
+
+        # BUY clamped: cash after sell = 10000 + 500 = 10500; min_cash = 5% of
+        # equity. Budget = min(cash - min_cash, max_position - current).
+        buy = next(t for t in executed if t["ticker"] == "MSFT")
+        assert buy["side"] == "BUY"
+        # MSFT @ 50 → shares = budget / 50
+        assert buy["shares"] > 0
+
+        async with sim.Session() as s:
+            from sqlalchemy import select as sa_select
+            aapl = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "AAPL"))
+            assert aapl is not None
+            assert aapl.shares == pytest.approx(25.0, abs=0.001)  # 30 - 5
+
+            msft = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "MSFT"))
+            assert msft is not None
+            assert msft.shares > 0
+
+    async def test_sell_without_size_sells_entire_position(self, with_cash, monkeypatch):
+        """A SELL with no size field sells the whole position (default)."""
+        await sim._exec_buy("AAPL", 100.0, 2000.0, "seed")  # 20 shares
+
+        decisions = json.dumps([
+            {"ticker": "AAPL", "action": "SELL", "reason": "exit"},
+        ])
+        self._fake_http(monkeypatch, decisions)
+
+        async def fake_close(ticker):
+            return 100.0
+        monkeypatch.setattr(sim, "_latest_close", fake_close)
+
+        valuation = {
+            "cash": 10000.0, "positions_value": 2000.0, "total_equity": 12000.0,
+            "allowance_total": 10000.0, "positions": [],
+        }
+        executed = await sim._llm_decide(valuation, [], {})
+
+        assert len(executed) == 1
+        assert executed[0]["ticker"] == "AAPL"
+        assert executed[0]["side"] == "SELL"
+        assert executed[0]["shares"] == pytest.approx(20.0, abs=0.001)
+
+        async with sim.Session() as s:
+            from sqlalchemy import select as sa_select
+            pos = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "AAPL"))
+            assert pos is None  # fully sold
 
 
 # ---------------------------------------------------------------------------
