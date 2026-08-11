@@ -738,16 +738,20 @@ async def _gather_signals(tickers: list[str]) -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 
 async def _chat_history(limit: int = 20) -> list[dict]:
-    """Return the persisted sim chat history, oldest-first."""
+    """Return the persisted sim chat history, oldest-first.
+
+    Selects the most recent ``limit`` messages (newest-first) then reverses
+    them so the returned list is in chronological order.
+    """
     async with Session() as s:
         rows = (
             await s.scalars(
                 select(SimChatMessage)
-                .order_by(SimChatMessage.created_at.asc())
+                .order_by(SimChatMessage.created_at.desc())
                 .limit(limit)
             )
         ).all()
-        return [{"role": r.role, "content": r.content} for r in rows]
+        return [{"role": r.role, "content": r.content} for r in reversed(rows)]
 
 
 async def _append_chat_message(role: str, content: str) -> None:
@@ -831,11 +835,13 @@ async def run_cycle() -> dict[str, Any]:
     strategy = settings.sim_strategy.lower()
     if strategy == "deterministic":
         trades = await _deterministic_decide(valuation)
+        _last_deterministic_trades = trades
     elif strategy == "llm":
         # Pure LLM: let the model decide entirely from portfolio context + signals
         signals = await _gather_signals(tickers)
         news = await _gather_news(signals)
         trades = await _llm_decide(valuation, [], signals, news)
+        _last_deterministic_trades = []
     elif strategy == "hybrid":
         # Hybrid: run deterministic first, then let LLM review/adjust
         deterministic_trades = await _deterministic_decide(valuation)
@@ -848,6 +854,7 @@ async def run_cycle() -> dict[str, Any]:
     else:
         logger.warning("Unknown strategy '%s', falling back to deterministic", strategy)
         trades = await _deterministic_decide(valuation)
+        _last_deterministic_trades = trades
 
     # 5. Snapshot for equity curve
     post_valuation = await valuate()
@@ -1428,24 +1435,26 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
 
     content = data.get("message", {}).get("content", "") or data.get("response", "")
 
-    # Persist the assistant reply so the thread survives reloads and the LLM
-    # gets full prior context on the next turn.
-    if content:
-        await _append_chat_message("assistant", content)
-        history.append({"role": "assistant", "content": content})
-
     # Check for action block
     actions = _parse_action_block(content)
     executed_trades: list[dict] = []
 
+    # Strip the action block from the visible text so it isn't shown to the
+    # user or persisted into history.
+    display_text = content
     if actions:
-        # Strip the action block from the visible text
-        display_text = content
         start = content.find("[[ACTION]]")
         end = content.find("[[/ACTION]]")
         if start != -1 and end != -1:
             display_text = (content[:start] + content[end + len("[[/ACTION]]"):]).strip()
 
+    # Persist the assistant reply so the thread survives reloads and the LLM
+    # gets full prior context on the next turn.
+    if display_text:
+        await _append_chat_message("assistant", display_text)
+        history.append({"role": "assistant", "content": display_text})
+
+    if actions:
         # Execute the proposed actions
         valuation = await valuate()
         total_equity = valuation["total_equity"]
@@ -1532,4 +1541,4 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
             "history": history,
         }
 
-    return {"text": content, "trades": [], "actions_executed": False, "history": history}
+    return {"text": display_text, "trades": [], "actions_executed": False, "history": history}
