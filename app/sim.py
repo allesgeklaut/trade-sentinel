@@ -405,8 +405,13 @@ _LLM_SYSTEM_PROMPT = (
     "BUY, downgrade a BUY to HOLD, or reject a SELL.\n"
     "3. Respect risk management: do not buy if cash is too low; do not over-"
     "concentrate in a single ticker.\n"
-    "4. Decisions must be grounded in the provided signals and indicators.\n"
-    "5. You may receive recent news headlines for supplementary context. News "
+    "4. If you want to buy a ticker but cash is too low, you may sell an existing "
+    "position to free up cash — but only when the position you would sell is "
+    "weaker (e.g. a SELL signal, a losing/overweight position, or a HOLD with "
+    "poorer indicators) than the one you want to buy. List the SELL before the "
+    "BUY in your output so the sale executes first.\n"
+    "5. Decisions must be grounded in the provided signals and indicators.\n"
+    "6. You may receive recent news headlines for supplementary context. News "
     "can explain *why* indicators are moving, but do not make trades based on "
     "news alone — the technical signals and risk rules take priority. Never "
     "reference specific URLs in your output.\n"
@@ -1255,6 +1260,10 @@ _SIM_CHAT_SYSTEM_PROMPT = (
     "6. Only propose actions you believe are justified by the signals and portfolio context.\n"
     "7. If you do not agree with the user's request, explain why and omit the ACTION block.\n"
     "8. Do NOT reference specific URLs in your output.\n"
+    "9. The \"Last Sim Cycle Decisions\" section in your context lists decisions "
+    "that were already executed by the simulation. Treat them as historical — "
+    "when asked about them, explain them, but do NOT include them as new actions "
+    "unless the user explicitly asks you to take a new trade.\n"
 )
 
 
@@ -1376,6 +1385,27 @@ async def _build_sim_chat_context() -> str:
             lines.append("")
     except Exception as e:
         logger.warning("sim chat news gather failed: %s", e)
+
+    # Last sim cycle decision (from the most recent _llm_decide run).
+    # Included so the chat can answer questions about why the bot traded.
+    # Marked as already-executed historical decisions — the LLM should not
+    # re-propose them as new ACTIONs.
+    if _last_llm_decisions or _last_deterministic_trades:
+        lines.append("## Last Sim Cycle Decisions (already executed — informational)")
+        if _last_deterministic_trades:
+            lines.append("Deterministic engine proposed:")
+            for t in _last_deterministic_trades:
+                lines.append(
+                    f"  - {t['ticker']} {t['side']} ×{t.get('shares', '?')} @ "
+                    f"{t.get('price', '?'):.2f} — {t.get('reason', '')}"
+                )
+        if _last_llm_decisions:
+            lines.append("LLM decided:")
+            for d in _last_llm_decisions:
+                lines.append(
+                    f"  - {d['ticker']}: {d['action']} — {d['reason']}"
+                )
+        lines.append("")
 
     return "\n".join(lines)
 
