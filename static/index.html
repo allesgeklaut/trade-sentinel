@@ -953,8 +953,10 @@
         <aside class="panel screen-panel"><b>DISCOVER // LOCAL SCREENER</b>
             <details id="screen-details" open>
                 <summary>Screen results</summary>
-                <p><select id="universe"></select> <button onclick="runScreen(this)">Update</button></p><small>Ranks cached
-                    daily candles by trend, 20/60d momentum, RSI and relative volume.</small>
+                <p><select id="universe"></select> <button onclick="runScreen(this)">Update</button>
+                <button onclick="refreshUniverse(this)" title="Only fetch tickers with missing or stale data">Refresh</button>
+                <button onclick="loadDeepHistory(this)" title="Fetch 10y of history for optimization/backtest">Load 10y</button></p><small>Ranks cached
+                    daily candles by trend, 20/60d momentum, RSI and relative volume. <b>Update</b> re-downloads ~2y and re-ranks. <b>Refresh</b> only fills gaps. <b>Load 10y</b> fetches deep history for backtesting.</small>
                 <div id="screen">No screen run yet.</div>
             </details>
         </aside>
@@ -1548,6 +1550,39 @@
             try {
                 let x = await api('screener/run/' + $('#universe').value, { method: 'POST' });
                 setStatus(`SCREENED ${x.ranked}/${x.processed}`, true);
+                showScreen();
+            } catch (e) {
+                $('#screen').textContent = e.message;
+                setStatus(e.message, false);
+            } finally {
+                btn.disabled = false; btn.textContent = orig;
+            }
+        }
+
+        async function refreshUniverse(btn) {
+            const orig = btn.textContent;
+            btn.disabled = true; btn.textContent = 'Refreshing...';
+            $('#screen').textContent = 'Refreshing — only fetching tickers with missing or stale data...';
+            try {
+                let x = await api('screener/refresh/' + $('#universe').value, { method: 'POST' });
+                setStatus(`REFRESHED ${x.refreshed}/${x.total} (${x.skipped} fresh, ${x.errors.length} errors)`, x.errors.length === 0);
+                showScreen();
+            } catch (e) {
+                $('#screen').textContent = e.message;
+                setStatus(e.message, false);
+            } finally {
+                btn.disabled = false; btn.textContent = orig;
+            }
+        }
+
+        async function loadDeepHistory(btn) {
+            if (!confirm('Fetch 10 years of daily candles for all tickers in this universe? This may take 10-15 minutes.')) return;
+            const orig = btn.textContent;
+            btn.disabled = true; btn.textContent = 'Loading 10y...';
+            $('#screen').textContent = 'Loading 10y of history per ticker. This may take 10-15 minutes...';
+            try {
+                let x = await api('screener/load_deep/' + $('#universe').value, { method: 'POST' });
+                setStatus(`LOADED 10y: ${x.loaded}/${x.total} (${x.errors.length} errors)`, x.errors.length === 0);
                 showScreen();
             } catch (e) {
                 $('#screen').textContent = e.message;

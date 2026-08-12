@@ -196,6 +196,10 @@ class ReplayParams:
     use_atr_stop: bool = True
     monthly_allowance: float = settings.sim_monthly_allowance
     start_cash: float = settings.sim_start_cash
+    # Regime filter: when enabled, new BUYs are blocked while the market
+    # benchmark is below its 200-day SMA (broad-market downtrend).
+    regime_filter: bool = False
+    regime_ticker: str = "URTH"
 
 
 @dataclass
@@ -260,6 +264,31 @@ async def _load_series(tickers: list[str]) -> dict[str, pd.DataFrame]:
     return series
 
 
+async def _load_regime(ticker: str) -> dict[str, bool]:
+    """Load the market regime state per day.
+
+    Returns a dict mapping ``"YYYY-MM-DD"`` → ``True`` if the market is in an
+    uptrend (close > SMA200) on that day, ``False`` otherwise. Used by the
+    regime filter to block new BUYs during broad-market downtrends.
+    """
+    async with Session() as s:
+        rows = (
+            await s.scalars(
+                select(Candle).where(Candle.ticker == ticker).order_by(Candle.timestamp)
+            )
+        ).all()
+    if len(rows) < MIN_CANDLES:
+        logger.warning("Regime ticker %s has only %d candles; regime filter disabled", ticker, len(rows))
+        return {}
+    df = pd.DataFrame([{
+        "time": r.timestamp.strftime("%Y-%m-%d"),
+        "close": r.close,
+    } for r in rows])
+    df["sma200"] = df["close"].rolling(200).mean()
+    df["uptrend"] = df["close"] > df["sma200"]
+    return {row.time: bool(row.uptrend) for row in df.itertuples(index=False) if pd.notna(row.sma200)}
+
+
 def _candidate_tickers() -> list[str]:
     if settings.sim_universe.lower() == "watchlist":
         # Watchlist lives in the DB; fall back to universe file for the tool.
@@ -286,11 +315,14 @@ def _row_strength(row: dict, action: str) -> int:
 
 
 def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
-            start: str | None = None, end: str | None = None) -> ReplayResult:
+            start: str | None = None, end: str | None = None,
+            regime: dict[str, bool] | None = None) -> ReplayResult:
     """Run the deterministic strategy over the precomputed series.
 
     ``start``/``end`` are inclusive date strings (YYYY-MM-DD) used to bound
-    the replay window (e.g. a walk-forward test window).
+    the replay window (e.g. a walk-forward test window). ``regime`` is an
+    optional day→uptrend map; when provided and ``params.regime_filter`` is
+    set, new BUYs are blocked on days where the market is not in an uptrend.
     """
     # Build a global timeline of all trading days across tickers.
     all_days: set[str] = set()
@@ -373,13 +405,22 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
         max_position_value = total_equity * (params.max_position_pct / 100)
 
         # --- BUY phase ---
-        buy_candidates = [
-            (t, by_time[t][day]) for t in by_time
-            if day in by_time[t] and _row_action(by_time[t][day], params) == "BUY"
-        ]
-        buy_candidates.sort(key=lambda x: _row_strength(x[1], "BUY"), reverse=True)
+        # Regime filter: block new BUYs when the broad market is below its
+        # 200-day SMA. SELLs and ATR stops still execute (we manage risk on
+        # the way down, we just don't add new exposure).
+        market_ok = True
+        if params.regime_filter and regime is not None:
+            market_ok = regime.get(day, True)
 
-        if not buy_candidates:
+        buy_candidates = []
+        if market_ok:
+            buy_candidates = [
+                (t, by_time[t][day]) for t in by_time
+                if day in by_time[t] and _row_action(by_time[t][day], params) == "BUY"
+            ]
+            buy_candidates.sort(key=lambda x: _row_strength(x[1], "BUY"), reverse=True)
+
+        if not buy_candidates and market_ok:
             hold_candidates = [
                 (t, by_time[t][day]) for t in by_time
                 if day in by_time[t]
@@ -428,16 +469,21 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
 # Parameter sweep + walk-forward
 # ---------------------------------------------------------------------------
 
-def _param_grid() -> list[ReplayParams]:
-    """A small grid over the tunable thresholds."""
+def _param_grid(regime_filter: bool = False) -> list[ReplayParams]:
+    """Grid over the tunable thresholds and risk parameters."""
     grid = []
     for buy in (30, 40, 50):
         for sell in (-50, -40, -30):
             for relaxed in (35, 40, 45):
-                grid.append(ReplayParams(
-                    buy_threshold=buy, sell_threshold=sell,
-                    relaxed_hold_strength=relaxed,
-                ))
+                for max_pos in (10, 15, 20):
+                    for atr in (True, False):
+                        grid.append(ReplayParams(
+                            buy_threshold=buy, sell_threshold=sell,
+                            relaxed_hold_strength=relaxed,
+                            max_position_pct=max_pos,
+                            use_atr_stop=atr,
+                            regime_filter=regime_filter,
+                        ))
     return grid
 
 
@@ -457,23 +503,27 @@ def _score(result: ReplayResult) -> float:
     return result.total_return_pct - 0.5 * result.max_drawdown_pct
 
 
-def _run_sweep(series: dict[str, pd.DataFrame], start: str, end: str) -> list[tuple[ReplayParams, ReplayResult]]:
+def _run_sweep(series: dict[str, pd.DataFrame], start: str, end: str,
+               regime: dict[str, bool] | None = None,
+               regime_filter: bool = False) -> list[tuple[ReplayParams, ReplayResult]]:
     results = []
-    for params in _param_grid():
-        res = _replay(series, params, start=start, end=end)
+    for params in _param_grid(regime_filter=regime_filter):
+        res = _replay(series, params, start=start, end=end, regime=regime)
         results.append((params, res))
     results.sort(key=lambda x: _score(x[1]), reverse=True)
     return results
 
 
 def _walk_forward(series: dict[str, pd.DataFrame], days: list[str],
-                  train_days: int, test_days: int) -> list[dict]:
+                  train_days: int, test_days: int,
+                  regime: dict[str, bool] | None = None,
+                  regime_filter: bool = False) -> list[dict]:
     """Run walk-forward: fit best params on each train window, score on test."""
     windows = []
     for train_s, train_e, test_s, test_e in _split_windows(days, train_days, test_days):
-        sweep = _run_sweep(series, train_s, train_e)
+        sweep = _run_sweep(series, train_s, train_e, regime=regime, regime_filter=regime_filter)
         best_params, _ = sweep[0]
-        test_res = _replay(series, best_params, start=test_s, end=test_e)
+        test_res = _replay(series, best_params, start=test_s, end=test_e, regime=regime)
         windows.append({
             "train": f"{train_s}..{train_e}",
             "test": f"{test_s}..{test_e}",
@@ -481,6 +531,8 @@ def _walk_forward(series: dict[str, pd.DataFrame], days: list[str],
                 "buy_threshold": best_params.buy_threshold,
                 "sell_threshold": best_params.sell_threshold,
                 "relaxed_hold_strength": best_params.relaxed_hold_strength,
+                "max_position_pct": best_params.max_position_pct,
+                "use_atr_stop": best_params.use_atr_stop,
             },
             "train_score": round(_score(sweep[0][1]), 2),
             "train_return_pct": round(sweep[0][1].total_return_pct, 2),
@@ -517,19 +569,34 @@ async def _main(args: argparse.Namespace) -> None:
 
     all_days = sorted(set().union(*(set(df["time"]) for df in series.values())))
 
+    # Load the market regime series if the regime filter is enabled.
+    regime: dict[str, bool] | None = None
+    if getattr(args, "regime", False):
+        regime_ticker = getattr(args, "regime_ticker", "URTH")
+        logger.info("Loading regime series for %s...", regime_ticker)
+        regime = await _load_regime(regime_ticker)
+        logger.info("Loaded regime for %d days", len(regime))
+
     if args.command == "backtest":
-        res = _replay(series, ReplayParams(), start=args.start, end=args.end)
-        _print_result(res, "Backtest (current rules)")
+        params = ReplayParams(regime_filter=getattr(args, "regime", False))
+        res = _replay(series, params, start=args.start, end=args.end, regime=regime)
+        label = "Backtest (current rules)"
+        if params.regime_filter:
+            label += " + regime filter"
+        _print_result(res, label)
         if args.trades:
             for t in res.trades:
                 print(f"  {t['side']:<4} {t['ticker']:<8} {t['shares']:>10.4f} @ {t['price']:>10.2f} — {t['reason']}")
 
     elif args.command == "sweep":
-        sweep = _run_sweep(series, args.start, args.end)
+        regime_on = getattr(args, "regime", False)
+        sweep = _run_sweep(series, args.start, args.end, regime=regime, regime_filter=regime_on)
         print(f"\n=== Parameter sweep ({args.start}..{args.end}) — top 10 ===")
         for params, res in sweep[:10]:
             print(f"  buy={params.buy_threshold:<3} sell={params.sell_threshold:<4} "
-                  f"relaxed={params.relaxed_hold_strength:<3} "
+                  f"relaxed={params.relaxed_hold_strength:<3} maxpos={params.max_position_pct:<3}% "
+                  f"atr={'on' if params.use_atr_stop else 'off':<3} "
+                  f"regime={'on' if params.regime_filter else 'off':<3} "
                   f"→ ret {res.total_return_pct:+7.2f}%  dd {res.max_drawdown_pct:5.2f}%  "
                   f"sharpe {res.sharpe:5.2f}  trades {res.n_trades}")
 
@@ -540,7 +607,8 @@ async def _main(args: argparse.Namespace) -> None:
             walk_days = [d for d in walk_days if d >= args.start]
         if args.end:
             walk_days = [d for d in walk_days if d <= args.end]
-        windows = _walk_forward(series, walk_days, args.train_days, args.test_days)
+        windows = _walk_forward(series, walk_days, args.train_days, args.test_days,
+                                regime=regime, regime_filter=getattr(args, "regime", False))
         print(f"\n=== Walk-forward (train {args.train_days}d / test {args.test_days}d) ===")
         for w in windows:
             print(f"  train {w['train']} → test {w['test']}: "
@@ -562,16 +630,22 @@ def _build_parser() -> argparse.ArgumentParser:
     b.add_argument("--start", default=None, help="YYYY-MM-DD inclusive start")
     b.add_argument("--end", default=None, help="YYYY-MM-DD inclusive end")
     b.add_argument("--trades", action="store_true", help="Print every trade")
+    b.add_argument("--regime", action="store_true", help="Enable market regime filter (block BUYs when market < SMA200)")
+    b.add_argument("--regime-ticker", default="URTH", help="Benchmark ticker for the regime filter")
 
     s = sub.add_parser("sweep", help="Grid-search thresholds")
     s.add_argument("--start", default=None)
     s.add_argument("--end", default=None)
+    s.add_argument("--regime", action="store_true", help="Enable market regime filter")
+    s.add_argument("--regime-ticker", default="URTH", help="Benchmark ticker for the regime filter")
 
     w = sub.add_parser("walkforward", help="Walk-forward fit/test")
     w.add_argument("--train-days", type=int, default=504)
     w.add_argument("--test-days", type=int, default=126)
     w.add_argument("--start", default=None, help="YYYY-MM-DD inclusive start of the walk")
     w.add_argument("--end", default=None, help="YYYY-MM-DD inclusive end of the walk")
+    w.add_argument("--regime", action="store_true", help="Enable market regime filter")
+    w.add_argument("--regime-ticker", default="URTH", help="Benchmark ticker for the regime filter")
 
     return p
 
