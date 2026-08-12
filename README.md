@@ -63,6 +63,29 @@ No live broker or order API exists. Signals and rankings are research tools, not
 
 The screener deduplicates a universe while preserving its order before downloading data and saving results. This prevents duplicate entries such as a symbol classified in both AI and space groups from violating SQLite's `(universe, ticker)` uniqueness constraint.
 
+## Walk-forward optimization / backtest tool
+
+`app/optimize.py` is a **separate, read-only** analysis tool that replays the deterministic strategy against stored historical candles and reports how well a given parameter set would have performed. It never touches the live sim account, positions, or trades.
+
+The DB lives in the Docker volume, so run it inside the container (use the venv python):
+
+```bash
+# Score the current rules on stored history
+docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize backtest --end 2026-08-11
+
+# Grid-search the thresholds (buy/sell/relaxed-hold strength)
+docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize sweep --start 2025-01-01 --end 2026-08-11
+
+# Walk-forward: fit best params on each train window, score on the following test window
+docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize walkforward --train-days 504 --test-days 126 --start 2024-01-01 --end 2026-08-11
+```
+
+Common flags: `--start`/`--end` (YYYY-MM-DD, inclusive) bound the window; `backtest --trades` prints every trade. The walk-forward spans the full candle history by default, which can be slow — bound it with `--start`/`--end` to recent, data-dense history.
+
+**How it works:** indicator series are precomputed once per ticker (vectorized, mirroring `analysis.compute`), then the replay runs the deterministic SELL/ATR-stop/BUY/relaxed-HOLD logic over a paper portfolio with monthly allowance deposits, producing an equity curve, return, Sharpe, and max drawdown. The sweep varies `buy_threshold`, `sell_threshold`, and `relaxed_hold_strength`; walk-forward fits on each train window and reports out-of-sample test results to detect overfitting/regime change.
+
+**Caveats:** this is a no-fees, no-slippage, fractional-share paper backtest — treat absolute returns/drawdowns skeptically. The walk-forward *relative* comparison across windows is the more meaningful signal.
+
 ## Timezone convention
 
 All `created_at` / `updated_at` timestamps are stored as tz-aware UTC in SQLite. The autonomous paper-trading scheduler runs at `SIM_RUN_HOUR`:`SIM_RUN_MINUTE` **UTC** (set `22 30` to run at 22:30 UTC). The monthly allowance deposit is the one exception: it is anchored to the operator's local timezone (`Europe/Vienna` by default) so the "monthly" deposit lands on the local calendar month boundary. The frontend renders timestamps as-is (UTC ISO strings); a future enhancement could format them in the browser's local timezone.
