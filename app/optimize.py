@@ -23,14 +23,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import itertools
-import json
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import select
 
@@ -46,13 +43,18 @@ logger = logging.getLogger("trade_sentinel.optimize")
 # Vectorized indicator / signal series
 # ---------------------------------------------------------------------------
 
+def _np_where(cond, a, b):
+    """Element-wise where that tolerates NaN conditions (treats NaN as False)."""
+    return pd.Series(np.where(cond.fillna(False), a, b), index=cond.index)
+
+
 def _signal_series(rows: list[dict]) -> pd.DataFrame:
-    """Compute the per-day signal series for a ticker's candle history.
+    """Compute the per-day indicator series for a ticker's candle history.
 
     Mirrors ``analysis.compute`` but returns a DataFrame with one row per
-    candle (oldest-first) carrying the fields the deterministic strategy needs:
-    action, strength, atr_stop, close. This lets the replay index into the
-    series per-day instead of recomputing indicators every day.
+    candle (oldest-first) carrying the raw scoring components (net, bullish,
+    bearish, trend flags, distance from SMA200, ATR stop, close) so the replay
+    can derive the action/strength per-parameter-set without recomputing.
     """
     d = pd.DataFrame(rows)
     c = d.close
@@ -93,21 +95,21 @@ def _signal_series(rows: list[dict]) -> pd.DataFrame:
     dist_below = (1 - c / d.sma200) * 100
 
     bullish = pd.Series(0.0, index=d.index)
-    bullish += np_where(trend_up, 30, np_where(c > d.sma50, 15, 0))
-    bullish += np_where(sma50_rising, 15, 0)
-    bullish += np_where(macd_bull, 15, 0)
-    bullish += np_where((rsi_now >= 50) & (rsi_now <= 70), 20, np_where((rsi_now > 70) & (rsi_now <= 80), 10, 0))
-    bullish += np_where(vol_surge & (c > d.sma50), 10, 0)
-    bullish += np_where(dist_above > 5, 10, np_where(dist_above > 2, 5, 0))
+    bullish += _np_where(trend_up, 30, _np_where(c > d.sma50, 15, 0))
+    bullish += _np_where(sma50_rising, 15, 0)
+    bullish += _np_where(macd_bull, 15, 0)
+    bullish += _np_where((rsi_now >= 50) & (rsi_now <= 70), 20, _np_where((rsi_now > 70) & (rsi_now <= 80), 10, 0))
+    bullish += _np_where(vol_surge & (c > d.sma50), 10, 0)
+    bullish += _np_where(dist_above > 5, 10, _np_where(dist_above > 2, 5, 0))
     bullish = bullish.clip(upper=100)
 
     bearish = pd.Series(0.0, index=d.index)
-    bearish += np_where(trend_down, 30, np_where(c < d.sma50, 15, 0))
-    bearish += np_where(sma50_falling, 15, 0)
-    bearish += np_where(macd_bear, 15, 0)
-    bearish += np_where(rsi_now < 30, 20, np_where(rsi_now < 50, 10, 0))
-    bearish += np_where(vol_surge & (c < d.sma50), 10, 0)
-    bearish += np_where(dist_below > 5, 10, np_where(dist_below > 2, 5, 0))
+    bearish += _np_where(trend_down, 30, _np_where(c < d.sma50, 15, 0))
+    bearish += _np_where(sma50_falling, 15, 0)
+    bearish += _np_where(macd_bear, 15, 0)
+    bearish += _np_where(rsi_now < 30, 20, _np_where(rsi_now < 50, 10, 0))
+    bearish += _np_where(vol_surge & (c < d.sma50), 10, 0)
+    bearish += _np_where(dist_below > 5, 10, _np_where(dist_below > 2, 5, 0))
     bearish = bearish.clip(upper=100)
 
     net = bullish - bearish
@@ -127,12 +129,6 @@ def _signal_series(rows: list[dict]) -> pd.DataFrame:
         "atr_stop": atr_stop,
     })
     return out
-
-
-def np_where(cond, a, b):
-    """Element-wise where that tolerates NaN conditions (treats NaN as False)."""
-    import numpy as np
-    return pd.Series(np.where(cond.fillna(False), a, b), index=cond.index)
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +482,8 @@ def _walk_forward(series: dict[str, pd.DataFrame], days: list[str],
                 "sell_threshold": best_params.sell_threshold,
                 "relaxed_hold_strength": best_params.relaxed_hold_strength,
             },
-            "train_return_pct": round(_score(sweep[0][1]), 2),
+            "train_score": round(_score(sweep[0][1]), 2),
+            "train_return_pct": round(sweep[0][1].total_return_pct, 2),
             "test_return_pct": round(test_res.total_return_pct, 2),
             "test_sharpe": round(test_res.sharpe, 2),
             "test_max_dd_pct": round(test_res.max_drawdown_pct, 2),
@@ -547,7 +544,7 @@ async def _main(args: argparse.Namespace) -> None:
         print(f"\n=== Walk-forward (train {args.train_days}d / test {args.test_days}d) ===")
         for w in windows:
             print(f"  train {w['train']} → test {w['test']}: "
-                  f"params {w['best_params']} | train {w['train_return_pct']:+6.2f}% | "
+                  f"params {w['best_params']} | train {w['train_return_pct']:+6.2f}% (score {w['train_score']:+.1f}) | "
                   f"test {w['test_return_pct']:+6.2f}% (sharpe {w['test_sharpe']:.2f}, "
                   f"dd {w['test_max_dd_pct']:.2f}%, {w['test_n_trades']} trades)")
         if windows:
