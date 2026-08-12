@@ -1,0 +1,88 @@
+# Diversified universe for walk-forward optimization and backtesting.
+# Spans multiple sectors to reduce concentration risk. Yahoo Finance symbols.
+# Research universe only: inclusion is not a recommendation.
+
+# --- Semiconductors and AI compute (retained from global-large-cap) ---
+NVDA
+AMD
+AVGO
+TSM
+MSFT
+GOOGL
+AMZN
+META
+
+# --- Healthcare and pharma ---
+LLY
+JNJ
+UNH
+PFE
+MRK
+ABT
+TMO
+
+# --- Financials ---
+JPM
+BAC
+GS
+V
+MA
+BLK
+
+# --- Consumer staples and discretionary ---
+WMT
+PG
+COST
+KO
+PEP
+HD
+MCD
+
+# --- Energy and commodities ---
+XOM
+CVX
+SLB
+GOLD
+FCX
+
+# --- Utilities and real estate ---
+NEE
+DUK
+AMT
+PLD
+
+# --- Industrials and defense ---
+CAT
+UNP
+HON
+LMT
+RTX
+
+# --- Broad sector ETFs (low-correlation anchors) ---
+SPY
+XLV
+XLF
+XLE
+XLK
+XLU
+XLI
+XLP
+XLRE
+VNQ
+GLD
+TLT
+
+# --- International diversification ---
+URTH
+EEM
+EWG
+EWQ
+
+# --- European large caps (uncorrelated to US tech) ---
+SAP.DE
+SIE.DE
+IFX.DE
+ASML.AS
+AI.PA
+NESN.SW
+NOVO-B.CO

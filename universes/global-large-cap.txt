@@ -1,5 +1,6 @@
 # Yahoo Finance symbols. Global AI, semiconductors, cloud/compute, robotics,
-# space/connectivity and selected recent IPOs. One canonical Yahoo symbol per line.
+# space/connectivity, selected recent IPOs, and diversifying sectors.
+# One canonical Yahoo symbol per line.
 # Research universe only: inclusion is not a recommendation.
 
 # AI compute, semiconductors and networking
@@ -12,12 +13,8 @@ MU
 ARM
 MRVL
 QCOM
-INTC
-SMCI
 ANET
 VRT
-CORZ
-NBIS
 
 # Hyperscalers and AI platforms
 MSFT
@@ -25,7 +22,6 @@ GOOGL
 AMZN
 META
 ORCL
-IBM
 PLTR
 NOW
 CRM
@@ -40,18 +36,14 @@ SOUN
 PATH
 UPST
 TEM
-BBAI
 RGTI
 IONQ
-QBTS
 RKLB
 
 # AI infrastructure and recent AI-focused IPOs
 CRWV
 FIG
 CRCL
-CHYM
-ETOR
 
 # Space, connectivity and defence technology
 SPCX
@@ -105,6 +97,36 @@ VEEV
 GH
 BNTX
 
+# --- Diversifying sectors (added to reduce concentration risk) ---
+
+# Healthcare and pharma
+LLY
+JNJ
+UNH
+PFE
+TMO
+
+# Financials
+JPM
+GS
+V
+BLK
+
+# Consumer staples and discretionary
+WMT
+PG
+COST
+KO
+HD
+
+# Energy
+XOM
+CVX
+
+# Utilities and broad bonds
+NEE
+TLT
+
 # Broad benchmarks for relative context
 QQQ
 SOXX
@@ -114,4 +136,5 @@ VOO
 XLF
 XLE
 XLV
+XLU
 VT
