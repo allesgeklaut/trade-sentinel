@@ -1,10 +1,10 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import logging
 import pandas as pd
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from .analysis import compute
-from .db import ScreenerResult, Session
+from .db import Candle, ScreenerResult, Session
 from .market import candles, refresh
 
 _UNIVERSES_DIR = Path(__file__).resolve().parent.parent / "universes"
@@ -60,3 +60,61 @@ async def results(name):
     async with Session() as s:
         rows=(await s.scalars(select(ScreenerResult).where(ScreenerResult.universe==name).order_by(ScreenerResult.score.desc()))).all()
         return [{"ticker":r.ticker,"score":r.score,"trend":r.trend,"return_20d":r.return_20d,"return_60d":r.return_60d,"rsi":r.rsi,"relative_volume":r.relative_volume,"close":r.close,"updated_at":r.updated_at.isoformat(),"action":r.action,"strength":r.strength} for r in rows]
+
+
+async def refresh_incremental(name: str, max_age_days: int = 3) -> dict:
+    """Incrementally refresh candle data for a universe.
+
+    Only fetches tickers that are missing from the DB or whose latest candle
+    is older than *max_age_days*. Already-fresh tickers are skipped to avoid
+    redundant network calls. Does NOT re-run the screener ranking.
+    """
+    symbols = list(dict.fromkeys(tickers(name)))
+    refreshed = 0
+    skipped = 0
+    errors: list[str] = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+
+    for symbol in symbols:
+        try:
+            async with Session() as s:
+                latest = await s.scalar(
+                    select(func.max(Candle.timestamp)).where(Candle.ticker == symbol)
+                )
+            if latest is not None and latest.replace(tzinfo=timezone.utc) >= cutoff:
+                skipped += 1
+                continue
+            await refresh(symbol, "2y")
+            refreshed += 1
+        except Exception as e:
+            errors.append(f"{symbol}: {e}")
+            logger.warning("incremental refresh skip %s: %s", symbol, e)
+
+    logger.info("Incremental refresh %s: %d refreshed, %d skipped, %d errors",
+                name, refreshed, skipped, len(errors))
+    return {"universe": name, "refreshed": refreshed, "skipped": skipped,
+            "errors": errors, "total": len(symbols)}
+
+
+async def load_deep_history(name: str, period: str = "10y") -> dict:
+    """Fetch deep candle history for all tickers in a universe.
+
+    Used to backfill data for walk-forward optimization and the regime filter.
+    Fetches *period* (default 10y) for every ticker, overwriting existing
+    candles via upsert. Does NOT re-run the screener ranking.
+    """
+    symbols = list(dict.fromkeys(tickers(name)))
+    loaded = 0
+    errors: list[str] = []
+
+    for symbol in symbols:
+        try:
+            await refresh(symbol, period)
+            loaded += 1
+        except Exception as e:
+            errors.append(f"{symbol}: {e}")
+            logger.warning("deep load skip %s: %s", symbol, e)
+
+    logger.info("Deep load %s (%s): %d loaded, %d errors", name, period, loaded, len(errors))
+    return {"universe": name, "period": period, "loaded": loaded,
+            "errors": errors, "total": len(symbols)}

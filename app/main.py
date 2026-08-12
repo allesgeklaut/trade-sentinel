@@ -9,7 +9,7 @@ from .config import settings
 from .db import Watchlist, Session, init_db
 from .market import refresh, candles, search, info, provider
 from .analysis import compute, persist, history, MIN_CANDLES
-from .screener import universe_names, run, results
+from .screener import universe_names, run, results, refresh_incremental, load_deep_history
 from . import sim
 from . import news as news_mod
 
@@ -98,6 +98,16 @@ async def list_universes(): return universe_names()
 async def screen_run(universe:str):
     try: return await run(universe)
     except ValueError as e: raise HTTPException(404,str(e))
+@app.post('/api/screener/refresh/{universe}')
+async def screen_refresh(universe: str):
+    """Incrementally refresh candle data — only fetches tickers with missing or stale data."""
+    try: return await refresh_incremental(universe)
+    except ValueError as e: raise HTTPException(404, str(e))
+@app.post('/api/screener/load_deep/{universe}')
+async def screen_load_deep(universe: str, period: str = '10y'):
+    """Fetch deep history (default 10y) for all tickers — for optimization/backtest."""
+    try: return await load_deep_history(universe, period)
+    except ValueError as e: raise HTTPException(404, str(e))
 @app.get('/api/screener/{universe}')
 async def screen_results(universe:str):
     try:
