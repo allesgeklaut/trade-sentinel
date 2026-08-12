@@ -140,6 +140,7 @@ class PaperPortfolio:
     cash: float
     positions: dict[str, float] = field(default_factory=dict)  # ticker -> shares
     avg_cost: dict[str, float] = field(default_factory=dict)
+    peak_price: dict[str, float] = field(default_factory=dict)  # ticker -> highest close since buy
     trades: list[dict] = field(default_factory=list)
 
     def buy(self, ticker: str, price: float, budget: float, reason: str) -> None:
@@ -159,6 +160,7 @@ class PaperPortfolio:
         else:
             self.positions[ticker] = shares
             self.avg_cost[ticker] = price
+            self.peak_price[ticker] = price
         self.trades.append({"ticker": ticker, "side": "BUY", "shares": shares,
                             "price": price, "reason": reason})
 
@@ -173,8 +175,16 @@ class PaperPortfolio:
         if self.positions[ticker] <= 0.0001:
             del self.positions[ticker]
             del self.avg_cost[ticker]
+            self.peak_price.pop(ticker, None)
         self.trades.append({"ticker": ticker, "side": "SELL", "shares": sell_shares,
                             "price": price, "reason": reason})
+
+    def update_peaks(self, prices: dict[str, float]) -> None:
+        """Update the peak-price tracker for held positions."""
+        for ticker in self.positions:
+            price = prices.get(ticker)
+            if price is not None and price > self.peak_price.get(ticker, 0):
+                self.peak_price[ticker] = price
 
     def equity(self, prices: dict[str, float]) -> float:
         pos_value = sum(shares * prices.get(t, 0) for t, shares in self.positions.items())
@@ -194,6 +204,7 @@ class ReplayParams:
     relaxed_hold_strength: int = 40
     relaxed_hold_limit: int = 3
     use_atr_stop: bool = True
+    trailing_stop_pct: float = 0.0  # 0 = disabled; e.g. 15 = sell if price drops 15% from peak
     monthly_allowance: float = settings.sim_monthly_allowance
     start_cash: float = settings.sim_start_cash
     # Regime filter: when enabled, new BUYs are blocked while the market
@@ -385,6 +396,9 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
         min_cash = total_equity * (params.min_cash_pct / 100)
         max_position_value = total_equity * (params.max_position_pct / 100)
 
+        # Update peak prices for trailing stop tracking.
+        pf.update_peaks(prices)
+
         # --- SELL phase ---
         for ticker in list(pf.positions.keys()):
             row = by_time.get(ticker, {}).get(day)
@@ -394,7 +408,17 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
             action = _row_action(row, params)
             if action == "SELL":
                 pf.sell(ticker, price, None, f"SELL signal (strength {_row_strength(row, action)})")
-            elif params.use_atr_stop:
+                continue
+            # Trailing stop: sell if price has dropped trailing_stop_pct from
+            # its peak since the position was opened.
+            if params.trailing_stop_pct > 0:
+                peak = pf.peak_price.get(ticker, price)
+                stop_level = peak * (1 - params.trailing_stop_pct / 100)
+                if price <= stop_level:
+                    pf.sell(ticker, price, None,
+                            f"Trailing stop: {price:.2f} <= {stop_level:.2f} (peak {peak:.2f}, -{params.trailing_stop_pct}%)")
+                    continue
+            if params.use_atr_stop:
                 atr_stop = row["atr_stop"]
                 if atr_stop is not None and price < atr_stop:
                     pf.sell(ticker, price, None, f"ATR stop hit: {price:.2f} < {atr_stop:.2f}")
@@ -470,20 +494,25 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
 # ---------------------------------------------------------------------------
 
 def _param_grid(regime_filter: bool = False) -> list[ReplayParams]:
-    """Grid over the tunable thresholds and risk parameters."""
+    """Grid over the tunable thresholds and risk parameters.
+
+    Focused grid: sweeps the highest-impact levers (trailing stop, sell
+    threshold, buy threshold, max position) while holding the lower-impact
+    ones fixed to keep the combinatorics manageable.
+    """
     grid = []
     for buy in (30, 40, 50):
-        for sell in (-50, -40, -30):
-            for relaxed in (35, 40, 45):
+        for sell in (-50, -40, -30, -20):
+            for trail in (0.0, 10.0, 15.0, 20.0, 25.0):
                 for max_pos in (10, 15, 20):
-                    for atr in (True, False):
-                        grid.append(ReplayParams(
-                            buy_threshold=buy, sell_threshold=sell,
-                            relaxed_hold_strength=relaxed,
-                            max_position_pct=max_pos,
-                            use_atr_stop=atr,
-                            regime_filter=regime_filter,
-                        ))
+                    grid.append(ReplayParams(
+                        buy_threshold=buy, sell_threshold=sell,
+                        relaxed_hold_strength=40,
+                        max_position_pct=max_pos,
+                        use_atr_stop=False,  # proved ineffective in testing
+                        trailing_stop_pct=trail,
+                        regime_filter=regime_filter,
+                    ))
     return grid
 
 
@@ -594,9 +623,7 @@ async def _main(args: argparse.Namespace) -> None:
         print(f"\n=== Parameter sweep ({args.start}..{args.end}) — top 10 ===")
         for params, res in sweep[:10]:
             print(f"  buy={params.buy_threshold:<3} sell={params.sell_threshold:<4} "
-                  f"relaxed={params.relaxed_hold_strength:<3} maxpos={params.max_position_pct:<3}% "
-                  f"atr={'on' if params.use_atr_stop else 'off':<3} "
-                  f"regime={'on' if params.regime_filter else 'off':<3} "
+                  f"trail={params.trailing_stop_pct:>4.0f}% maxpos={params.max_position_pct:<3}% "
                   f"→ ret {res.total_return_pct:+7.2f}%  dd {res.max_drawdown_pct:5.2f}%  "
                   f"sharpe {res.sharpe:5.2f}  trades {res.n_trades}")
 
