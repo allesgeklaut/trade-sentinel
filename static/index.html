@@ -1491,6 +1491,7 @@
         async function loadUniverses() {
             let u = await api('screener/universes');
             $('#universe').innerHTML = u.map(x => `<option>${escapeHtml(x)}</option>`).join('');
+            $('#universe').value = 'global-large-cap';
             showScreen();
         }
         function timeAgo(iso) {
