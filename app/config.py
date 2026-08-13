@@ -4,7 +4,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:////data/trading.db"
     market_data_provider: str = "yfinance"
     twelve_data_api_key: str = ""
-    watchlist: str = "AAPL,MSFT,NVDA,VOO,IFX.DE"
+    watchlist: str = "AAPL,MSFT,NVDA,IFX.DE"
 
     ollama_url: str = "http://host.docker.internal:11434"
     ollama_model: str = ""  # set via .env, e.g. "qwen3:32b"
