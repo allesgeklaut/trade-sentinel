@@ -139,6 +139,42 @@ No option is steuereinfach. Self-declaration in the Austrian Steuererklärung
 is unavoidable for any broker with an API. The differentiator is therefore
 **which exchanges are executable**, not the tax treatment.
 
+## Notification-driven manual execution (recommended alternative)
+
+Because the bot trades **at most once per day** at the scheduled hour, there is
+no need for sub-second automated execution. A lighter-weight pattern avoids the
+broker-API / steuereinfach tradeoff entirely:
+
+1. The sim runs as usual and computes the trade it *would* make (ticker, side,
+   shares, reason).
+2. Instead of (or in addition to) executing on a broker API, it sends a push
+   notification with the trade details via **ntfy**
+   (<https://ntfy.sh> — self-hostable in one container, or free hosted tier).
+3. The operator receives the notification on their phone and executes the
+   trade manually on a **steuereinfach** Austrian broker (Flatex AT, Trade
+   Republic, etc.) — minutes later, not seconds.
+
+**Why this fits this app:**
+- Keeps KESt automation (the manual broker handles tax at source; no
+  self-declaration needed).
+- No broker API integration to build, maintain, or break — just an outbound
+  `httpx.post` (~5 lines in `app/sim.py`).
+- Adds a **human sanity-check** before real money moves, which is desirable for
+  a research/paper system that could have bugs.
+- The signal quality is what matters; the execution is trivial once a day.
+
+**Tradeoffs vs. full API automation:**
+- ~30 seconds of manual work per trade day. Negligible for a once-daily cadence.
+- Loses "fully autonomous while I sleep" — but gains a human gate before real
+  money moves.
+- Fractional-share precision between sim and broker won't match exactly, but at
+  once-daily close-price trades this is a rounding concern, not a real one.
+
+This decouples the research/signal layer (the app) from the execution layer
+(the broker) and sidesteps the API-vs-tax dilemma entirely. The sim already
+computes the exact trade payload; the notification is just the delivery
+channel.
+
 ## Note on the sim's fee model
 
 The current simulation charges **no commission and no fees** — a reasonable
