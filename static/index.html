@@ -31,6 +31,43 @@
             font: 14px ui-monospace, monospace
         }
 
+        .ptr-indicator {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 0;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            background: #071009;
+            color: #42ff72;
+            font-size: 13px;
+            z-index: 1000;
+            transition: height .15s ease
+        }
+
+        .ptr-indicator.ptr-visible {
+            height: 48px;
+            border-bottom: 1px solid #1d6030
+        }
+
+        .ptr-indicator.ptr-refreshing #ptr-arrow {
+            animation: ptr-spin .8s linear infinite
+        }
+
+        .ptr-indicator.ptr-ready #ptr-arrow {
+            transform: rotate(180deg)
+        }
+
+        @keyframes ptr-spin {
+            to {
+                transform: rotate(360deg)
+            }
+        }
+
         header,
         main {
             max-width: 1400px;
@@ -910,6 +947,7 @@
 </head>
 
 <body>
+    <div id="ptr-indicator" class="ptr-indicator"><span id="ptr-arrow">↓</span><span id="ptr-text">Pull to refresh</span></div>
     <header><b>TRADE SENTINEL // PAPER-ONLY RESEARCH TERMINAL</b>
         <div class="nav-toggle"><button id="nav-dashboard" class="nav-active"
                 onclick="showView('dashboard')">Dashboard</button><button id="nav-sim"
@@ -1241,6 +1279,122 @@
         const symbolNameCache = {};
 
         function isMobile() { return window.matchMedia('(max-width: 900px)').matches }
+
+        // --- Pull-to-refresh (mobile only) ---
+        const ptr = {
+            startY: 0,
+            dy: 0,
+            pulling: false,
+            refreshing: false,
+            threshold: 70,
+        };
+
+        function ptrSet(state) {
+            const el = document.getElementById('ptr-indicator');
+            const arrow = document.getElementById('ptr-arrow');
+            const text = document.getElementById('ptr-text');
+            el.classList.toggle('ptr-visible', state !== 'hidden');
+            el.classList.toggle('ptr-ready', state === 'ready');
+            el.classList.toggle('ptr-refreshing', state === 'refreshing');
+            if (state === 'refreshing') {
+                arrow.textContent = '⟳';
+                text.textContent = 'Refreshing…';
+            } else if (state === 'ready') {
+                arrow.textContent = '↑';
+                text.textContent = 'Release to refresh';
+            } else {
+                arrow.textContent = '↓';
+                text.textContent = 'Pull to refresh';
+            }
+        }
+
+        function ptrReset() {
+            ptr.pulling = false;
+            ptr.refreshing = false;
+            ptr.dy = 0;
+            const el = document.getElementById('ptr-indicator');
+            el.style.height = '';
+            ptrSet('hidden');
+        }
+
+        async function ptrDoRefresh() {
+            if (ptr.refreshing) return;
+            ptr.refreshing = true;
+            ptrSet('refreshing');
+            try {
+                const dash = document.getElementById('dashboard-view');
+                const sim = document.getElementById('sim-view');
+                if (dash.style.display !== 'none') {
+                    if (current) {
+                        await refreshData({ textContent: 'Refresh data', disabled: false });
+                    } else {
+                        await Promise.all([loadWatch(), showScreen()]);
+                    }
+                } else if (sim.classList.contains('active')) {
+                    await loadSimAll();
+                }
+                // Success — show confirmation briefly so the completed refresh is obvious
+                const el = document.getElementById('ptr-indicator');
+                const arrow = document.getElementById('ptr-arrow');
+                const text = document.getElementById('ptr-text');
+                el.classList.remove('ptr-refreshing', 'ptr-ready');
+                el.classList.add('ptr-visible');
+                el.style.height = '48px';
+                arrow.textContent = '✓';
+                text.textContent = 'Updated';
+                await new Promise(r => setTimeout(r, 1200));
+                ptrReset();
+            } catch (e) {
+                const el = document.getElementById('ptr-indicator');
+                const arrow = document.getElementById('ptr-arrow');
+                const text = document.getElementById('ptr-text');
+                el.classList.remove('ptr-refreshing', 'ptr-ready');
+                el.classList.add('ptr-visible');
+                el.style.height = '48px';
+                arrow.textContent = '✕';
+                text.textContent = 'Refresh failed';
+                await new Promise(r => setTimeout(r, 1200));
+                setStatus(e.message, false);
+                ptrReset();
+            }
+        }
+
+        if (isMobile()) {
+            document.addEventListener('touchstart', e => {
+                if (ptr.refreshing) return;
+                if (window.scrollY > 0) return;
+                ptr.startY = e.touches[0].clientY;
+                ptr.pulling = true;
+            }, { passive: true });
+
+            document.addEventListener('touchmove', e => {
+                if (!ptr.pulling || ptr.refreshing) return;
+                const dy = e.touches[0].clientY - ptr.startY;
+                if (dy <= 0 || window.scrollY > 0) {
+                    ptrSet('hidden');
+                    return;
+                }
+                ptr.dy = dy;
+                const el = document.getElementById('ptr-indicator');
+                el.style.height = Math.min(dy * 0.5, 48) + 'px';
+                el.classList.add('ptr-visible');
+                ptrSet(dy >= ptr.threshold ? 'ready' : 'pulling');
+            }, { passive: true });
+
+            document.addEventListener('touchend', () => {
+                if (!ptr.pulling || ptr.refreshing) return;
+                const el = document.getElementById('ptr-indicator');
+                el.style.height = '';
+                const dy = ptr.dy || 0;
+                ptr.pulling = false;
+                ptr.dy = 0;
+                if (dy >= ptr.threshold) {
+                    ptrDoRefresh();
+                } else {
+                    ptrReset();
+                }
+            }, { passive: true });
+        }
 
         function mobileTab(tab) {
             const chartPanel = document.querySelector('.chart-panel');
