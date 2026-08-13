@@ -1802,30 +1802,29 @@
             } catch (e) { document.getElementById('sim-trades').innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
 
-        function loadSimEquity() {
-            Promise.all([
+        async function loadSimEquity() {
+            const [snaps, bench] = await Promise.all([
                 api('sim/equity?limit=365').catch(() => null),
-                api('sim/benchmark').catch(() => null)
-            ]).then(([snaps, bench]) => {
-                if (simChart) { simChart.remove(); simChart = null; }
-                if (!snaps || !snaps.length) {
-                    document.getElementById('sim-chart').innerHTML = '<div class="sim-empty">No data yet — run the bot to start tracking.</div>';
-                    return;
-                }
-                document.getElementById('sim-chart').innerHTML = '';
-                simChart = LightweightCharts.createChart(document.getElementById('sim-chart'), {
-                    height: 320, layout: { background: { color: '#071009' }, textColor: '#b7ffc0' },
-                    grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } },
-                    timeScale: { timeVisible: true, secondsVisible: false }
-                });
-                const line = simChart.addLineSeries({ color: '#42ff72', lineWidth: 2 });
-                line.setData(snaps.map(s => ({ time: Math.floor(new Date(s.at).getTime() / 1000), value: s.total_equity })));
-                if (bench && bench.equity_curve && bench.equity_curve.length) {
-                    const benchLine = simChart.addLineSeries({ color: '#ff9f43', lineWidth: 2 });
-                    benchLine.setData(bench.equity_curve.map(s => ({ time: Math.floor(new Date(s.at).getTime() / 1000), value: s.total_equity })));
-                }
-                simChart.timeScale().fitContent();
-            }).catch(e => { document.getElementById('sim-chart').innerHTML = 'Error: ' + escapeHtml(e.message); });
+                api('sim/benchmark').catch(() => null),
+            ]);
+            if (simChart) { simChart.remove(); simChart = null; }
+            if (!snaps || !snaps.length) {
+                document.getElementById('sim-chart').innerHTML = '<div class="sim-empty">No data yet — run the bot to start tracking.</div>';
+                return;
+            }
+            document.getElementById('sim-chart').innerHTML = '';
+            simChart = LightweightCharts.createChart(document.getElementById('sim-chart'), {
+                height: 320, layout: { background: { color: '#071009' }, textColor: '#b7ffc0' },
+                grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } },
+                timeScale: { timeVisible: true, secondsVisible: false }
+            });
+            const line = simChart.addLineSeries({ color: '#42ff72', lineWidth: 2 });
+            line.setData(snaps.map(s => ({ time: Math.floor(new Date(s.at).getTime() / 1000), value: s.total_equity })));
+            if (bench && bench.equity_curve && bench.equity_curve.length) {
+                const benchLine = simChart.addLineSeries({ color: '#ff9f43', lineWidth: 2 });
+                benchLine.setData(bench.equity_curve.map(s => ({ time: Math.floor(new Date(s.at).getTime() / 1000), value: s.total_equity })));
+            }
+            simChart.timeScale().fitContent();
         }
 
         async function loadSimBenchmark() {
