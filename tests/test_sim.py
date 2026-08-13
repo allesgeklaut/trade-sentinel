@@ -1153,6 +1153,28 @@ class TestParseActionBlock:
         assert result is not None
         assert result[0]["amount"] == pytest.approx(100.0)
 
+    def test_use_reserve_flag_parsed(self):
+        """use_reserve: true should be passed through on a BUY action."""
+        text = (
+            '[[ACTION]]\n'
+            '{"actions": [{"ticker": "AAPL", "action": "BUY", "use_reserve": true, "reason": "dry powder"}]}\n'
+            '[[/ACTION]]'
+        )
+        result = sim._parse_action_block(text)
+        assert result is not None
+        assert result[0]["use_reserve"] is True
+
+    def test_use_reserve_false_not_set(self):
+        """use_reserve absent or false should not add the flag."""
+        text = (
+            '[[ACTION]]\n'
+            '{"actions": [{"ticker": "AAPL", "action": "BUY", "reason": "normal buy"}]}\n'
+            '[[/ACTION]]'
+        )
+        result = sim._parse_action_block(text)
+        assert result is not None
+        assert "use_reserve" not in result[0]
+
 
 # ---------------------------------------------------------------------------
 # Chat-driven trade execution (sim_chat)
@@ -1534,6 +1556,95 @@ class TestSimChatPartialBuy:
         assert len(result["trades"]) == 1
         # max_position = 15% of $10,000 = $1,500 → 15 shares at $100
         assert result["trades"][0]["shares"] == pytest.approx(15.0, abs=0.001)
+
+
+class TestSimChatReserveOverride:
+    """Tests that sim_chat can spend the cash reserve only with use_reserve."""
+
+    async def test_buy_without_reserve_is_clamped(self, with_cash, monkeypatch):
+        """A normal BUY (no use_reserve) cannot spend below the 5% cash floor."""
+        # Raise max position so the cash floor is the only clamp in play.
+        monkeypatch.setattr(settings, "sim_max_position_pct", 100.0)
+
+        async def mock_close(ticker):
+            return 100.0 if ticker == "AAPL" else None
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+
+        async def mock_context():
+            return "mock context"
+        monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
+
+        llm_response_text = (
+            '[[ACTION]]\n'
+            '{"actions": [{"ticker": "AAPL", "action": "BUY", "reason": "dip"}]}\n'
+            '[[/ACTION]]'
+        )
+
+        class MockResponse:
+            status_code = 200
+            def raise_for_status(self):
+                pass
+            def json(self):
+                return {"message": {"content": llm_response_text}}
+
+        class MockClient:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                pass
+            async def post(self, url, json=None):
+                return MockResponse()
+
+        monkeypatch.setattr(sim.httpx, "AsyncClient", lambda **kw: MockClient())
+
+        result = await sim.sim_chat([{"role": "user", "content": "buy AAPL"}])
+
+        assert result["actions_executed"] is True
+        assert len(result["trades"]) == 1
+        # min_cash = 5% of $10,000 = $500 → budget = $9,500 → 95 shares @ $100
+        assert result["trades"][0]["shares"] == pytest.approx(95.0, abs=0.001)
+
+    async def test_buy_with_reserve_spends_dry_powder(self, with_cash, monkeypatch):
+        """A BUY with use_reserve=true can spend below the cash floor (to $0)."""
+        monkeypatch.setattr(settings, "sim_max_position_pct", 100.0)
+
+        async def mock_close(ticker):
+            return 100.0 if ticker == "AAPL" else None
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+
+        async def mock_context():
+            return "mock context"
+        monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
+
+        llm_response_text = (
+            '[[ACTION]]\n'
+            '{"actions": [{"ticker": "AAPL", "action": "BUY", "use_reserve": true, "reason": "spend dry powder"}]}\n'
+            '[[/ACTION]]'
+        )
+
+        class MockResponse:
+            status_code = 200
+            def raise_for_status(self):
+                pass
+            def json(self):
+                return {"message": {"content": llm_response_text}}
+
+        class MockClient:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                pass
+            async def post(self, url, json=None):
+                return MockResponse()
+
+        monkeypatch.setattr(sim.httpx, "AsyncClient", lambda **kw: MockClient())
+
+        result = await sim.sim_chat([{"role": "user", "content": "spend the dry powder on AAPL"}])
+
+        assert result["actions_executed"] is True
+        assert len(result["trades"]) == 1
+        # floor = $0 → budget = $10,000 → 100 shares @ $100
+        assert result["trades"][0]["shares"] == pytest.approx(100.0, abs=0.001)
 
 
 class TestSimChatMultipleActions:

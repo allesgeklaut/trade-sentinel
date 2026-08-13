@@ -1308,6 +1308,11 @@ _SIM_CHAT_SYSTEM_PROMPT = (
     "   Example: {\"actions\": [{\"ticker\": \"MDB\", \"action\": \"SELL\", \"amount\": 67.43, \"reason\": \"trim overweight\"}]}\n"
     "5. The same risk management rules apply: respect min cash % and max position %;"
     " the engine will clamp your requested amounts to stay within them.\n"
+    "   EXCEPTION: if the user EXPLICITLY asks to spend the cash reserve / dry"
+    " powder / remaining cash / \"all available cash\", set \"use_reserve\": true"
+    " on that BUY action. This lets the buy spend below the normal min-cash floor"
+    " (down to zero cash). Use it only when the user clearly requests it — never"
+    " on your own initiative.\n"
     "6. The max position % is a buy-time sizing limit, not a ceiling to enforce "
     "on exits. Do NOT sell a position just because its price rose above it — let "
     "winners run. Only trim a position (with an exact \"shares\" or \"amount\", or "
@@ -1355,6 +1360,9 @@ def _parse_action_block(text: str) -> list[dict] | None:
             val = a.get(field)
             if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
                 entry[field] = float(val)
+        # Optional override: user explicitly authorised spending the cash reserve.
+        if a.get("use_reserve") is True:
+            entry["use_reserve"] = True
         valid.append(entry)
     return valid if valid else None
 
@@ -1576,8 +1584,13 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
 
             elif act == "BUY":
                 acc = await _account()
-                if acc.cash < min_cash:
-                    logger.info("Sim chat BUY %s skipped: cash %.2f < min_cash %.2f", ticker, acc.cash, min_cash)
+                # Normally the cash reserve is a hard floor. The user can
+                # explicitly authorise spending it via "use_reserve": true in
+                # the chat action — then we allow buying down to zero cash.
+                floor = 0.0 if action.get("use_reserve") else min_cash
+                if acc.cash < floor:
+                    logger.info("Sim chat BUY %s skipped: cash %.2f < floor %.2f (reserve override=%s)",
+                                ticker, acc.cash, floor, bool(action.get("use_reserve")))
                     continue
 
                 async with Session() as s:
@@ -1587,7 +1600,7 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
                     logger.info("Sim chat BUY %s skipped: position at max", ticker)
                     continue
 
-                max_budget = min(acc.cash - min_cash, max_position_value - current_value)
+                max_budget = min(acc.cash - floor, max_position_value - current_value)
 
                 # Optional partial size: "shares" or "amount" (dollars). Clamp
                 # to the risk-limited budget so we never breach cash/position limits.
@@ -1601,7 +1614,8 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
                 if budget < 1:
                     continue
 
-                t = await _exec_buy(ticker, price, budget, f"User chat: {reason}")
+                override_tag = " [reserve spent]" if action.get("use_reserve") else ""
+                t = await _exec_buy(ticker, price, budget, f"User chat:{override_tag} {reason}")
                 if t:
                     executed_trades.append(t)
                     valuation = await valuate()
