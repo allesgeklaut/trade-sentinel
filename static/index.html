@@ -1317,6 +1317,17 @@
             ptrSet('hidden');
         }
 
+        function ptrShowResult(ok, label) {
+            const el = document.getElementById('ptr-indicator');
+            const arrow = document.getElementById('ptr-arrow');
+            const text = document.getElementById('ptr-text');
+            el.classList.remove('ptr-refreshing', 'ptr-ready');
+            el.classList.add('ptr-visible');
+            el.style.height = '48px';
+            arrow.textContent = ok ? '✓' : '✕';
+            text.textContent = label;
+        }
+
         async function ptrDoRefresh() {
             if (ptr.refreshing) return;
             ptr.refreshing = true;
@@ -1325,34 +1336,24 @@
                 const dash = document.getElementById('dashboard-view');
                 const sim = document.getElementById('sim-view');
                 if (dash.style.display !== 'none') {
-                    if (current) {
-                        await refreshData({ textContent: 'Refresh data', disabled: false });
-                    } else {
-                        await Promise.all([loadWatch(), showScreen()]);
-                    }
+                    // Refresh candle data for ALL watchlist tickers, then re-render.
+                    const r = await api('refresh-watchlist?period=2y', { method: 'POST' });
+                    await Promise.all([loadWatch(), showScreen()]);
+                    const n = r.refreshed.length, errs = r.errors.length;
+                    ptrShowResult(errs === 0,
+                        errs ? `${n} updated, ${errs} failed` : `${n} tickers updated`);
                 } else if (sim.classList.contains('active')) {
+                    // Refresh candle data for sim holdings + benchmark, then re-read valuations.
+                    const r = await api('sim/refresh?period=2y', { method: 'POST' });
                     await loadSimAll();
+                    const n = r.refreshed.length, errs = r.errors.length;
+                    ptrShowResult(errs === 0,
+                        errs ? `${n} updated, ${errs} failed` : `Sim updated (${n} tickers)`);
                 }
-                // Success — show confirmation briefly so the completed refresh is obvious
-                const el = document.getElementById('ptr-indicator');
-                const arrow = document.getElementById('ptr-arrow');
-                const text = document.getElementById('ptr-text');
-                el.classList.remove('ptr-refreshing', 'ptr-ready');
-                el.classList.add('ptr-visible');
-                el.style.height = '48px';
-                arrow.textContent = '✓';
-                text.textContent = 'Updated';
                 await new Promise(r => setTimeout(r, 1200));
                 ptrReset();
             } catch (e) {
-                const el = document.getElementById('ptr-indicator');
-                const arrow = document.getElementById('ptr-arrow');
-                const text = document.getElementById('ptr-text');
-                el.classList.remove('ptr-refreshing', 'ptr-ready');
-                el.classList.add('ptr-visible');
-                el.style.height = '48px';
-                arrow.textContent = '✕';
-                text.textContent = 'Refresh failed';
+                ptrShowResult(false, 'Refresh failed');
                 await new Promise(r => setTimeout(r, 1200));
                 setStatus(e.message, false);
                 ptrReset();
@@ -1905,8 +1906,11 @@
         }
 
         async function loadSimAll() {
-            loadSimStatus(); loadSimTrades(); loadSimEquity(); loadSimAllowances(); loadSimBenchmark(); loadSimReasoning();
-            loadSimChatHistory();
+            await Promise.all([
+                loadSimStatus(), loadSimTrades(), loadSimEquity(),
+                loadSimAllowances(), loadSimBenchmark(), loadSimReasoning(),
+                loadSimChatHistory(),
+            ]);
             // Enable sim chat when sim view loads
             const chatInput = document.getElementById('sim-chat-input');
             const chatSend = document.getElementById('sim-chat-send');

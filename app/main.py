@@ -66,6 +66,31 @@ async def symbols(q:str=Query(min_length=2,max_length=80)):
 async def fetch(ticker:str, period:str=None):
     try: await refresh(ticker.upper(), period); return {"ok":True}
     except Exception as e: raise HTTPException(400,str(e))
+
+@app.post('/api/refresh-watchlist')
+async def refresh_watchlist(period: str = "2y"):
+    """Refresh candle data for every watchlist ticker. Returns per-ticker status."""
+    async with Session() as s:
+        tickers = [x.ticker for x in (await s.scalars(select(Watchlist).order_by(Watchlist.ticker))).all()]
+    refreshed, errors = [], []
+    for t in tickers:
+        try:
+            await refresh(t, period); refreshed.append(t)
+        except Exception as e:
+            errors.append(f"{t}: {e}"); logger.warning("watchlist refresh %s failed: %s", t, e)
+    return {"refreshed": refreshed, "errors": errors, "total": len(tickers)}
+
+@app.post('/api/sim/refresh')
+async def sim_refresh(period: str = "2y"):
+    """Refresh candle data for all sim holdings + benchmark so valuations use live prices."""
+    tickers = await sim.held_tickers()
+    refreshed, errors = [], []
+    for t in tickers:
+        try:
+            await refresh(t, period); refreshed.append(t)
+        except Exception as e:
+            errors.append(f"{t}: {e}"); logger.warning("sim refresh %s failed: %s", t, e)
+    return {"refreshed": refreshed, "errors": errors, "total": len(tickers)}
 @app.get('/api/dashboard/{ticker}')
 async def dashboard(ticker:str, period:str=None):
     # Always fetch the full cached dataset — indicators need >=206 candles

@@ -77,6 +77,17 @@ async def _latest_close(ticker: str) -> float | None:
     return float(rows[-1]["close"])
 
 
+async def held_tickers() -> list[str]:
+    """Tickers currently held in the sim portfolio, plus the benchmark ticker."""
+    async with Session() as s:
+        positions = (await s.scalars(select(SimPosition).order_by(SimPosition.ticker))).all()
+    tickers = [p.ticker for p in positions]
+    if settings.sim_benchmark_enabled and settings.sim_benchmark_ticker:
+        if settings.sim_benchmark_ticker not in tickers:
+            tickers.append(settings.sim_benchmark_ticker)
+    return tickers
+
+
 async def _account() -> SimAccount:
     """Return the singleton SimAccount row, creating it if necessary."""
     async with Session() as s:
