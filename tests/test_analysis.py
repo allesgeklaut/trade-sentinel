@@ -199,7 +199,7 @@ class TestSnapshotShape:
         expected_keys = {
             "close", "sma20", "sma50", "sma200",
             "rsi", "macd", "macd_signal", "macd_hist", "atr14", "adx",
-            "atr_stop", "atr_pct", "vol_surge", "net_score", "strength",
+            "atr_stop", "atr_pct", "vol_surge", "weekly_trend_up", "net_score", "strength",
         }
         assert set(snap.keys()) == expected_keys
 

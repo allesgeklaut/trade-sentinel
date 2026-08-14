@@ -328,6 +328,7 @@ def compute(rows: list[dict]) -> dict:
     snap["atr_stop"] = norm(atr_stop)
     snap["atr_pct"] = norm(100 * float(x.atr14) / float(x.close))
     snap["vol_surge"] = vol_surge
+    snap["weekly_trend_up"] = weekly_trend_up
     snap["net_score"] = int(net)
     snap["strength"] = strength
 
