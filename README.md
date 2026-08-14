@@ -86,6 +86,20 @@ Common flags: `--start`/`--end` (YYYY-MM-DD, inclusive) bound the window; `backt
 
 **Caveats:** this is a no-fees, no-slippage, fractional-share paper backtest — treat absolute returns/drawdowns skeptically. The walk-forward *relative* comparison across windows is the more meaningful signal.
 
+### LLM benchmark (`llm-benchmark`)
+
+Probes whether the configured LLM would have turned the deterministic model's worst decisions. It replays the deterministic strategy over stored history, scores every trade by its 20-trading-day forward outcome (a BUY is bad when the price then fell; a SELL/stop-out is bad when the price then rallied), picks the 8 worst mistakes plus 2 control cases where the model was clearly right, reconstructs the exact indicator snapshot and portfolio state at each decision point, and sends each to the LLM using the *same* hybrid-sim system prompt and JSON format — then reports whether the LLM agreed, turned to HOLD, or flipped the call.
+
+```bash
+# Preview which cases would be probed (no LLM call, no tokens)
+docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize llm-benchmark --start 2024-01-01 --end 2026-07-15 --skip-llm
+
+# Run the probe (~10 LLM calls — one per selected case)
+docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize llm-benchmark --start 2024-01-01 --end 2026-07-15
+```
+
+`--end` defaults to `2026-08-11` (leaving a 20-day forward buffer to judge the last trades). Tune `--n-worst`, `--n-control`, and `--forward-days` to control token spend. Raw LLM reasoning for each case is dumped to `/tmp/llm_benchmark_reasoning.json` for inspection. The benchmark is read-only and never touches the live sim account.
+
 ## Timezone convention
 
 All `created_at` / `updated_at` timestamps are stored as tz-aware UTC in SQLite. The autonomous paper-trading scheduler runs at `SIM_RUN_HOUR`:`SIM_RUN_MINUTE` **UTC** (set `22 30` to run at 22:30 UTC). The monthly allowance deposit is the one exception: it is anchored to the operator's local timezone (`Europe/Vienna` by default) so the "monthly" deposit lands on the local calendar month boundary. The frontend renders timestamps as-is (UTC ISO strings); a future enhancement could format them in the browser's local timezone.

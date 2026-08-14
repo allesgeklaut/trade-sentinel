@@ -17,8 +17,12 @@ from app.optimize import (
     _replay,
     _row_action,
     _row_strength,
+    _select_cases,
     _signal_series,
     _split_windows,
+    _trade_outcomes,
+    _reconstruct_portfolio_states,
+    TradeCase,
 )
 
 
@@ -152,3 +156,149 @@ class TestReplay:
                                            relaxed_hold_strength=100))
         # High thresholds + no relaxed fallback → nothing qualifies.
         assert res.n_trades == 0
+
+
+class TestReplayTradeDates:
+    """The replay stamps a `date` on every trade so the benchmark can locate
+    the decision day without price-matching."""
+
+    def test_trades_carry_a_date(self):
+        series = {"UP": _signal_series(_gen_candles(100.0, 0.01, seed=1))}
+        res = _replay(series, ReplayParams(start_cash=10000.0, monthly_allowance=0.0))
+        assert res.n_trades > 0
+        for t in res.trades:
+            assert "date" in t and t["date"]
+            # Date is a YYYY-MM-DD string within the generated range.
+            assert t["date"] >= "2025-01-01"
+
+
+class TestTradeOutcomes:
+    def test_buy_outcome_is_forward_return(self):
+        # A BUY at 100 that closes at 120 twenty days later → +20% outcome,
+        # badness -20 (a *good* buy).
+        df = _signal_series(_gen_candles(100.0, 0.01, seed=1))
+        trades = [{"ticker": "UP", "side": "BUY", "shares": 1.0, "price": df["close"].iloc[100],
+                   "reason": "BUY", "date": df["time"].iloc[100]}]
+        cases = _trade_outcomes({"UP": df}, trades, forward_days=20)
+        assert len(cases) == 1
+        c = cases[0]
+        assert c.det_side == "BUY"
+        assert c.outcome_pct > 0          # price rose over the window
+        assert c.badness == -c.outcome_pct  # badness is negative for a good buy
+
+    def test_sell_outcome_badness_signs_flipped(self):
+        # A SELL before a rally is *bad*: outcome positive, badness positive.
+        df = _signal_series(_gen_candles(100.0, 0.01, seed=1))
+        trades = [{"ticker": "UP", "side": "SELL", "shares": 1.0, "price": df["close"].iloc[100],
+                   "reason": "SELL", "date": df["time"].iloc[100]}]
+        cases = _trade_outcomes({"UP": df}, trades, forward_days=20)
+        c = cases[0]
+        assert c.outcome_pct > 0
+        assert c.badness == c.outcome_pct   # positive badness = bad sell
+
+    def test_missing_date_is_skipped(self):
+        df = _signal_series(_gen_candles(100.0, 0.01, seed=1))
+        trades = [{"ticker": "UP", "side": "BUY", "shares": 1.0, "price": 100.0,
+                   "reason": "BUY", "date": "1999-01-01"}]  # not in the series
+        assert _trade_outcomes({"UP": df}, trades) == []
+
+    def test_position_before_is_attached(self):
+        # A SELL that closes a prior BUY should carry position_before.
+        df = _signal_series(_gen_candles(100.0, 0.01, seed=1))
+        buy_date = df["time"].iloc[100]
+        sell_date = df["time"].iloc[130]
+        trades = [
+            {"ticker": "UP", "side": "BUY", "shares": 2.0, "price": df["close"].iloc[100],
+             "reason": "BUY", "date": buy_date},
+            {"ticker": "UP", "side": "SELL", "shares": 2.0, "price": df["close"].iloc[130],
+             "reason": "SELL", "date": sell_date},
+        ]
+        cases = _trade_outcomes({"UP": df}, trades, forward_days=20)
+        # BUY first → no prior position; SELL → prior position present.
+        assert cases[0].position_before is None
+        assert cases[1].position_before is not None
+        assert cases[1].position_before["shares"] == 2.0
+
+
+class TestReconstructPortfolioStates:
+    def test_buy_decreases_cash_and_opens_position(self):
+        states = _reconstruct_portfolio_states(
+            [{"ticker": "A", "side": "BUY", "shares": 1.0, "price": 50.0,
+              "reason": "", "date": "2025-01-15"}],
+            start_cash=1000.0, monthly_allowance=0.0,
+        )
+        assert states[0]["cash"] == 1000.0          # before the trade
+        assert states[0]["positions"] == []         # nothing held yet
+        assert states[0]["total_equity"] == 1000.0
+
+    def test_sell_closing_position_shows_it_before(self):
+        states = _reconstruct_portfolio_states(
+            [
+                {"ticker": "A", "side": "BUY", "shares": 2.0, "price": 50.0,
+                 "reason": "", "date": "2025-01-15"},
+                {"ticker": "A", "side": "SELL", "shares": 2.0, "price": 60.0,
+                 "reason": "", "date": "2025-02-15"},
+            ],
+            start_cash=1000.0, monthly_allowance=0.0,
+        )
+        # Before the SELL, A was held (2 shares @ 50), valued at the SELL price.
+        assert states[1]["positions"][0]["ticker"] == "A"
+        assert states[1]["positions"][0]["shares"] == 2.0
+
+    def test_monthly_allowance_deposited_once_per_month(self):
+        states = _reconstruct_portfolio_states(
+            [
+                {"ticker": "A", "side": "BUY", "shares": 1.0, "price": 10.0,
+                 "reason": "", "date": "2025-01-10"},
+                {"ticker": "A", "side": "BUY", "shares": 1.0, "price": 10.0,
+                 "reason": "", "date": "2025-01-20"},
+                {"ticker": "A", "side": "BUY", "shares": 1.0, "price": 10.0,
+                 "reason": "", "date": "2025-02-05"},
+            ],
+            start_cash=0.0, monthly_allowance=1000.0,
+        )
+        # Jan trades see one 1000 deposit; the Feb trade sees a second one.
+        assert states[0]["cash"] == 1000.0
+        assert states[1]["cash"] == 990.0   # 1000 - 10 (first buy applied)
+        assert states[2]["cash"] == 1980.0  # 990 + 1000 (Feb) - 10 (third buy)
+
+
+class TestSelectCases:
+    def _case(self, ticker, side, outcome, date="2025-01-01"):
+        badness = -outcome if side == "BUY" else outcome
+        return TradeCase(date=date, ticker=ticker, det_side=side, det_reason="",
+                         entry_price=100.0, forward_close=100.0 * (1 + outcome / 100),
+                         outcome_pct=outcome, badness=badness)
+
+    def test_worst_cases_first(self):
+        cases = [
+            self._case("A", "BUY", -10),    # badness +10
+            self._case("B", "SELL", 30),    # badness +30
+            self._case("C", "BUY", -50),    # badness +50 (worst)
+        ]
+        picked = _select_cases(cases, n_worst=3, n_control=0)
+        assert [c.ticker for c in picked] == ["C", "B", "A"]
+
+    def test_controls_flagged_and_from_low_badness(self):
+        cases = [
+            self._case("A", "BUY", -10),    # badness +10
+            self._case("B", "SELL", 30),    # badness +30
+            self._case("C", "BUY", 50, date="2025-02-01"),   # badness -50 (best → control)
+        ]
+        picked = _select_cases(cases, n_worst=2, n_control=1)
+        controls = [c for c in picked if c.is_control]
+        assert len(controls) == 1
+        assert controls[0].ticker == "C"
+
+    def test_dedupes_by_ticker(self):
+        # Two bad trades on A — only A's worst should be picked once.
+        cases = [
+            self._case("A", "BUY", -20, date="2025-01-01"),
+            self._case("A", "BUY", -40, date="2025-02-01"),
+            self._case("B", "SELL", 30),
+        ]
+        picked = _select_cases(cases, n_worst=3, n_control=0)
+        # A appears only once (its -40 trade), B once.
+        tickers = [c.ticker for c in picked]
+        assert tickers.count("A") == 1
+        assert "B" in tickers
