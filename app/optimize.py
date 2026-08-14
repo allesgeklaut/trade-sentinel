@@ -573,7 +573,7 @@ def _param_grid(regime_filter: bool = False) -> list[ReplayParams]:
     grid = []
     for buy in (40, 50):
         for sell in (-40, -30):
-            for max_pos in (5, 10):
+            for max_pos in (10,):
                     for stop_type, stop_pct, stop_atr, risk_pct, sector_pct, pf_stop, max_n in risk_configs:
                         grid.append(ReplayParams(
                             buy_threshold=buy, sell_threshold=sell,
