@@ -51,7 +51,7 @@ class TestSignalSeries:
         df = _signal_series(_gen_candles(100.0, 0.001))
         for col in ("time", "close", "net", "bullish", "bearish",
                     "trend_up", "trend_down", "dist_above", "dist_below",
-                    "atr_stop"):
+                    "atr_stop", "weekly_trend_up"):
             assert col in df.columns
         assert len(df) == 500
 
@@ -68,22 +68,32 @@ class TestSignalSeries:
 class TestRowAction:
     def test_buy_requires_trend_and_distance(self):
         row = {"net": 50, "trend_up": True, "dist_above": 5,
-               "trend_down": False, "dist_below": 0}
+               "trend_down": False, "dist_below": 0, "weekly_trend_up": True}
         assert _row_action(row, ReplayParams(buy_threshold=40, sell_threshold=-40)) == "BUY"
 
     def test_buy_blocked_without_trend(self):
         row = {"net": 50, "trend_up": False, "dist_above": 5,
-               "trend_down": False, "dist_below": 0}
+               "trend_down": False, "dist_below": 0, "weekly_trend_up": True}
         assert _row_action(row, ReplayParams()) == "HOLD"
+
+    def test_buy_blocked_by_weekly_trend(self):
+        row = {"net": 50, "trend_up": True, "dist_above": 5,
+               "trend_down": False, "dist_below": 0, "weekly_trend_up": False}
+        assert _row_action(row, ReplayParams(buy_threshold=40, sell_threshold=-40)) == "HOLD"
 
     def test_sell(self):
         row = {"net": -50, "trend_up": False, "dist_above": 0,
-               "trend_down": True, "dist_below": 5}
+               "trend_down": True, "dist_below": 5, "weekly_trend_up": True}
+        assert _row_action(row, ReplayParams()) == "SELL"
+
+    def test_sell_not_blocked_by_weekly_trend(self):
+        row = {"net": -50, "trend_up": False, "dist_above": 0,
+               "trend_down": True, "dist_below": 5, "weekly_trend_up": False}
         assert _row_action(row, ReplayParams()) == "SELL"
 
     def test_threshold_respected(self):
         row = {"net": 30, "trend_up": True, "dist_above": 5,
-               "trend_down": False, "dist_below": 0}
+               "trend_down": False, "dist_below": 0, "weekly_trend_up": True}
         # buy_threshold=40 → 30 is not enough → HOLD
         assert _row_action(row, ReplayParams(buy_threshold=40)) == "HOLD"
         # buy_threshold=20 → 30 qualifies → BUY

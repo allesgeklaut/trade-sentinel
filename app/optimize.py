@@ -289,6 +289,7 @@ def _row_action(row: dict, params: ReplayParams) -> str:
         row["net"], row["trend_up"], row["trend_down"],
         row["dist_above"], row["dist_below"],
         params.buy_threshold, params.sell_threshold,
+        row.get("weekly_trend_up", True),
     )
 
 
@@ -337,6 +338,7 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
                 "dist_below": float(row.dist_below),
                 "atr_stop": None if pd.isna(row.atr_stop) else float(row.atr_stop),
                 "atr14": float(row.atr14) if not pd.isna(row.atr14) else None,
+                "weekly_trend_up": bool(row.weekly_trend_up) if not pd.isna(row.weekly_trend_up) else True,
             }
             for row in df.itertuples(index=False)
         }
