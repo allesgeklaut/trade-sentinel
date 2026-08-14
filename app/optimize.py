@@ -53,9 +53,11 @@ class PaperPortfolio:
     positions: dict[str, float] = field(default_factory=dict)  # ticker -> shares
     avg_cost: dict[str, float] = field(default_factory=dict)
     peak_price: dict[str, float] = field(default_factory=dict)  # ticker -> highest close since buy
+    stop_price: dict[str, float] = field(default_factory=dict)  # ticker -> frozen initial stop
     trades: list[dict] = field(default_factory=list)
 
-    def buy(self, ticker: str, price: float, budget: float, reason: str) -> None:
+    def buy(self, ticker: str, price: float, budget: float, reason: str,
+            stop: float | None = None) -> None:
         if budget < 1 or price <= 0:
             return
         shares = round(budget / price, 4)
@@ -73,6 +75,8 @@ class PaperPortfolio:
             self.positions[ticker] = shares
             self.avg_cost[ticker] = price
             self.peak_price[ticker] = price
+            if stop is not None:
+                self.stop_price[ticker] = stop
         self.trades.append({"ticker": ticker, "side": "BUY", "shares": shares,
                             "price": price, "reason": reason})
 
@@ -88,6 +92,7 @@ class PaperPortfolio:
             del self.positions[ticker]
             del self.avg_cost[ticker]
             self.peak_price.pop(ticker, None)
+            self.stop_price.pop(ticker, None)
         self.trades.append({"ticker": ticker, "side": "SELL", "shares": sell_shares,
                             "price": price, "reason": reason})
 
@@ -123,6 +128,56 @@ class ReplayParams:
     # benchmark is below its 200-day SMA (broad-market downtrend).
     regime_filter: bool = False
     regime_ticker: str = "URTH"
+    # --- Risk management (industry-standard trend-following controls) ---
+    # Initial stop loss: frozen at entry, not updated daily. Prevents
+    # catastrophic losses before the SELL signal (death cross) fires.
+    #   "none"   = disabled
+    #   "percent" = entry_price * (1 - stop_pct/100)
+    #   "atr"    = entry_price - stop_atr_mult * ATR_at_entry
+    stop_type: str = "none"
+    stop_pct: float = 15.0         # percentage drop from entry (stop_type="percent")
+    stop_atr_mult: float = 2.0     # ATR multiple (stop_type="atr")
+    # Risk-based position sizing: risk this % of equity per trade, sized
+    # by stop distance. 0 = use flat max_position_pct.
+    risk_pct: float = 0.0
+    # Sector diversification cap: max % of equity in any one sector. 0 = disabled.
+    max_sector_pct: float = 0.0
+
+
+# Sector groupings for the global-large-cap universe. Used by the sector
+# diversification cap to prevent correlated positions from concentrating risk.
+SECTORS: dict[str, set[str]] = {
+    "semiconductors": {"NVDA", "AMD", "AVGO", "TSM", "ASML.AS", "MU", "ARM",
+                       "MRVL", "QCOM", "ANET", "SOXX", "SMH", "IFX.DE",
+                       "BESI.AS", "NEM.DE", "NOKIA.HE", "ENR.DE", "TER"},
+    "hyperscalers": {"MSFT", "GOOGL", "AMZN", "META", "ORCL", "PLTR", "NOW",
+                     "CRM", "ADBE", "SNOW", "DDOG", "MDB", "AI", "SOUN",
+                     "PATH", "UPST", "TEM", "RGTI", "IONQ", "RKLB", "CRWV",
+                     "FIG", "CRCL"},
+    "european_tech": {"SAP.DE", "SIE.DE", "AMS.MC", "DSY.PA", "AI.PA",
+                     "HO.PA", "SAAB-B.ST", "SOF.BR"},
+    "space_defense": {"SPCX", "ASTS", "LUNR", "RDW", "KTOS", "PL", "IRDM"},
+    "data_center_energy": {"ETN", "GEV", "CEG", "VST", "VRT"},
+    "industrial": {"ROK"},
+    "cybersecurity": {"CRWD", "PANW"},
+    "medical": {"ISRG", "SYK", "MDT", "SHL.DE", "CRSP", "VEEV", "GH", "BNTX"},
+    "pharma": {"LLY", "JNJ", "UNH", "PFE", "TMO", "XLV"},
+    "financials": {"JPM", "GS", "V", "BLK", "XLF"},
+    "consumer": {"WMT", "PG", "COST", "KO", "HD", "XLP"},
+    "energy": {"XOM", "CVX", "XLE"},
+    "utilities_bonds": {"NEE", "TLT", "XLU"},
+    "broad_etf": {"QQQ", "SPY", "VOO", "VT", "URTH"},
+}
+
+_TICKER_SECTOR: dict[str, str] = {}
+for _sector, _tickers in SECTORS.items():
+    for _t in _tickers:
+        _TICKER_SECTOR[_t] = _sector
+
+
+def _sector_of(ticker: str) -> str:
+    """Return the sector group for a ticker, or 'other' if unknown."""
+    return _TICKER_SECTOR.get(ticker, "other")
 
 
 @dataclass
@@ -274,6 +329,7 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
                 "dist_above": float(row.dist_above),
                 "dist_below": float(row.dist_below),
                 "atr_stop": None if pd.isna(row.atr_stop) else float(row.atr_stop),
+                "atr14": float(row.atr14) if not pd.isna(row.atr14) else None,
             }
             for row in df.itertuples(index=False)
         }
@@ -319,6 +375,14 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
             if action == "SELL":
                 pf.sell(ticker, price, None, f"SELL signal (strength {_row_strength(row, action)})")
                 continue
+            # Initial stop loss (frozen at entry): exits before the slow
+            # death-cross SELL signal catches up, limiting catastrophic losses.
+            if params.stop_type != "none" and ticker in pf.stop_price:
+                sp = pf.stop_price[ticker]
+                if price <= sp:
+                    pf.sell(ticker, price, None,
+                            f"Initial stop: {price:.2f} <= {sp:.2f}")
+                    continue
             # Trailing stop: sell if price has dropped trailing_stop_pct from
             # its peak since the position was opened.
             if params.trailing_stop_pct > 0:
@@ -371,10 +435,54 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
             current_value = pf.positions.get(ticker, 0) * price
             if current_value >= max_position_value:
                 continue
+
+            # Sector diversification cap: limit total exposure per sector
+            # to prevent correlated positions from concentrating risk.
+            if params.max_sector_pct > 0:
+                sector = _sector_of(ticker)
+                sector_value = sum(
+                    pf.positions.get(t, 0) * prices.get(t, 0)
+                    for t in pf.positions
+                    if _sector_of(t) == sector
+                )
+                sector_cap = total_equity * (params.max_sector_pct / 100)
+                if sector_value >= sector_cap:
+                    continue
+
             budget = min(pf.cash - min_cash, max_position_value - current_value)
+
+            # Risk-based position sizing: size by stop distance so each
+            # trade risks a fixed % of equity (industry-standard 1% rule).
+            if params.risk_pct > 0 and params.stop_type != "none":
+                atr = row.get("atr14")
+                if params.stop_type == "atr" and atr and atr > 0:
+                    stop = price - params.stop_atr_mult * atr
+                elif params.stop_type == "percent":
+                    stop = price * (1 - params.stop_pct / 100)
+                else:
+                    stop = 0
+                if stop > 0 and price > stop:
+                    risk_amount = total_equity * (params.risk_pct / 100)
+                    risk_per_share = price - stop
+                    if risk_per_share > 0:
+                        budget_by_risk = (risk_amount / risk_per_share) * price
+                        budget = min(budget, budget_by_risk)
+
             if budget < 1:
                 continue
-            pf.buy(ticker, price, budget, f"BUY signal (strength {_row_strength(row, 'BUY')})")
+
+            # Compute frozen stop for this entry
+            entry_stop = None
+            if params.stop_type == "percent":
+                entry_stop = price * (1 - params.stop_pct / 100)
+            elif params.stop_type == "atr":
+                atr = row.get("atr14")
+                if atr and atr > 0:
+                    entry_stop = price - params.stop_atr_mult * atr
+
+            pf.buy(ticker, price, budget,
+                   f"BUY signal (strength {_row_strength(row, 'BUY')})",
+                   stop=entry_stop)
 
         # Record equity.
         total_equity = pf.equity(prices)
@@ -406,23 +514,46 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
 def _param_grid(regime_filter: bool = False) -> list[ReplayParams]:
     """Grid over the tunable thresholds and risk parameters.
 
-    Focused grid: sweeps the highest-impact levers (trailing stop, sell
-    threshold, buy threshold, max position) while holding the lower-impact
-    ones fixed to keep the combinatorics manageable.
+    Sweeps the highest-impact levers: buy/sell thresholds, trailing stop,
+    max position, initial stop type, risk sizing, and sector cap. The
+    risk management params (stop_type, risk_pct, max_sector_pct) are swept
+    as a small set of proven configurations to keep the grid manageable.
     """
+    # Risk management configurations (proven configs from A/B testing).
+    # Each tuple: (stop_type, stop_pct, stop_atr_mult, risk_pct, max_sector_pct)
+    risk_configs = [
+        # No risk management (baseline)
+        ("none", 0, 0, 0, 0),
+        # 15% initial stop only
+        ("percent", 15, 0, 0, 0),
+        # 15% stop + 1% risk sizing
+        ("percent", 15, 0, 1.0, 0),
+        # 15% stop + 1% risk + 25% sector cap (best overall)
+        ("percent", 15, 0, 1.0, 25),
+        # 2x ATR stop + 1% risk
+        ("atr", 0, 2.0, 1.0, 0),
+        # 2x ATR stop + 1% risk + 25% sector cap
+        ("atr", 0, 2.0, 1.0, 25),
+    ]
     grid = []
-    for buy in (30, 40, 50):
-        for sell in (-50, -40, -30, -20):
-            for trail in (0.0, 10.0, 15.0, 20.0, 25.0):
-                for max_pos in (10, 15, 20):
-                    grid.append(ReplayParams(
-                        buy_threshold=buy, sell_threshold=sell,
-                        relaxed_hold_strength=40,
-                        max_position_pct=max_pos,
-                        use_atr_stop=False,  # proved ineffective in testing
-                        trailing_stop_pct=trail,
-                        regime_filter=regime_filter,
-                    ))
+    for buy in (40, 50):
+        for sell in (-40, -30):
+            for trail in (0.0, 15.0):
+                for max_pos in (15, 20):
+                    for stop_type, stop_pct, stop_atr, risk_pct, sector_pct in risk_configs:
+                        grid.append(ReplayParams(
+                            buy_threshold=buy, sell_threshold=sell,
+                            relaxed_hold_strength=40,
+                            max_position_pct=max_pos,
+                            use_atr_stop=False,
+                            trailing_stop_pct=trail,
+                            regime_filter=regime_filter,
+                            stop_type=stop_type,
+                            stop_pct=stop_pct,
+                            stop_atr_mult=stop_atr,
+                            risk_pct=risk_pct,
+                            max_sector_pct=sector_pct,
+                        ))
     return grid
 
 
@@ -475,11 +606,13 @@ def _walk_forward(series: dict[str, pd.DataFrame], days: list[str],
         best_params, best_train = sweep[0]
         test_res = _replay(series, best_params, start=test_s, end=test_e, regime=regime)
         elapsed = time.time() - t0
-        logger.info("Window %d/%d done in %.0fs: buy=%d sell=%d trail=%.0f maxpos=%d | "
+        logger.info("Window %d/%d done in %.0fs: buy=%d sell=%d trail=%.0f maxpos=%d "
+                    "stop=%s risk=%.1f%% sector=%.0f%% | "
                     "train %+.1f%% → test %+.1f%% (sharpe %.2f, dd %.1f%%, %d trades)",
                     w_idx, total, elapsed,
                     best_params.buy_threshold, best_params.sell_threshold,
                     best_params.trailing_stop_pct, best_params.max_position_pct,
+                    best_params.stop_type, best_params.risk_pct, best_params.max_sector_pct,
                     best_train.total_return_pct, test_res.total_return_pct,
                     test_res.sharpe, test_res.max_drawdown_pct, test_res.n_trades)
         windows.append({
@@ -491,6 +624,10 @@ def _walk_forward(series: dict[str, pd.DataFrame], days: list[str],
                 "relaxed_hold_strength": best_params.relaxed_hold_strength,
                 "max_position_pct": best_params.max_position_pct,
                 "use_atr_stop": best_params.use_atr_stop,
+                "stop_type": best_params.stop_type,
+                "stop_pct": best_params.stop_pct,
+                "risk_pct": best_params.risk_pct,
+                "max_sector_pct": best_params.max_sector_pct,
             },
             "train_score": round(_score(sweep[0][1]), 2),
             "train_return_pct": round(sweep[0][1].total_return_pct, 2),
@@ -553,6 +690,7 @@ async def _main(args: argparse.Namespace) -> None:
         for params, res in sweep[:10]:
             print(f"  buy={params.buy_threshold:<3} sell={params.sell_threshold:<4} "
                   f"trail={params.trailing_stop_pct:>4.0f}% maxpos={params.max_position_pct:<3}% "
+                  f"stop={params.stop_type:<7} risk={params.risk_pct:.1f}% sec={params.max_sector_pct:>2.0f}% "
                   f"→ ret {res.total_return_pct:+7.2f}%  dd {res.max_drawdown_pct:5.2f}%  "
                   f"sharpe {res.sharpe:5.2f}  trades {res.n_trades}")
 
