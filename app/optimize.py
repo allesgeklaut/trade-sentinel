@@ -167,7 +167,9 @@ async def _load_series(tickers: list[str]) -> dict[str, pd.DataFrame]:
     """Load and precompute the signal series for each ticker."""
     series: dict[str, pd.DataFrame] = {}
     async with Session() as s:
-        for t in tickers:
+        for idx, t in enumerate(tickers):
+            if idx and idx % 10 == 0:
+                logger.info("Loading series... %d/%d", idx, len(tickers))
             rows = (
                 await s.scalars(
                     select(Candle).where(Candle.ticker == t).order_by(Candle.timestamp)
@@ -443,8 +445,11 @@ def _score(result: ReplayResult) -> float:
 def _run_sweep(series: dict[str, pd.DataFrame], start: str, end: str,
                regime: dict[str, bool] | None = None,
                regime_filter: bool = False) -> list[tuple[ReplayParams, ReplayResult]]:
+    grid = _param_grid(regime_filter=regime_filter)
     results = []
-    for params in _param_grid(regime_filter=regime_filter):
+    for idx, params in enumerate(grid):
+        if idx and idx % 20 == 0:
+            logger.info("  sweep %s..%s: %d/%d params", start, end, idx, len(grid))
         res = _replay(series, params, start=start, end=end, regime=regime)
         results.append((params, res))
     results.sort(key=lambda x: _score(x[1]), reverse=True)
@@ -456,11 +461,27 @@ def _walk_forward(series: dict[str, pd.DataFrame], days: list[str],
                   regime: dict[str, bool] | None = None,
                   regime_filter: bool = False) -> list[dict]:
     """Run walk-forward: fit best params on each train window, score on test."""
+    import time
+
+    splits = list(_split_windows(days, train_days, test_days))
+    total = len(splits)
+    logger.info("Walk-forward: %d windows (train %dd / test %dd)", total, train_days, test_days)
     windows = []
-    for train_s, train_e, test_s, test_e in _split_windows(days, train_days, test_days):
+    for w_idx, (train_s, train_e, test_s, test_e) in enumerate(splits, 1):
+        t0 = time.time()
+        logger.info("Window %d/%d: train %s..%s → test %s..%s",
+                    w_idx, total, train_s, train_e, test_s, test_e)
         sweep = _run_sweep(series, train_s, train_e, regime=regime, regime_filter=regime_filter)
-        best_params, _ = sweep[0]
+        best_params, best_train = sweep[0]
         test_res = _replay(series, best_params, start=test_s, end=test_e, regime=regime)
+        elapsed = time.time() - t0
+        logger.info("Window %d/%d done in %.0fs: buy=%d sell=%d trail=%.0f maxpos=%d | "
+                    "train %+.1f%% → test %+.1f%% (sharpe %.2f, dd %.1f%%, %d trades)",
+                    w_idx, total, elapsed,
+                    best_params.buy_threshold, best_params.sell_threshold,
+                    best_params.trailing_stop_pct, best_params.max_position_pct,
+                    best_train.total_return_pct, test_res.total_return_pct,
+                    test_res.sharpe, test_res.max_drawdown_pct, test_res.n_trades)
         windows.append({
             "train": f"{train_s}..{train_e}",
             "test": f"{test_s}..{test_e}",
