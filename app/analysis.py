@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import desc, select
 
@@ -44,18 +45,31 @@ BUY_THRESHOLD = 40
 SELL_THRESHOLD = -40
 
 
-def compute(rows: list[dict]) -> dict:
-    """Compute indicators and derive a BUY/SELL/HOLD signal from OHLCV rows.
+def _np_where(cond, a, b):
+    """Element-wise where that tolerates NaN conditions (treats NaN as False)."""
+    return pd.Series(np.where(cond.fillna(False), a, b), index=cond.index)
 
-    ``rows`` must be a list of dicts with keys: timestamp, open, high, low,
-    close, volume — ordered oldest-first.
+
+def signal_series(rows: list[dict]) -> pd.DataFrame:
+    """Compute the per-day indicator + scoring series for a ticker's candles.
+
+    Returns a DataFrame with one row per candle (oldest-first) carrying the
+    raw indicator values and scoring components (net, bullish, bearish, trend
+    flags, distance from SMA200, ATR stop, close, time) so callers can derive
+    action/strength per-parameter-set without recomputing.
+
+    This is the single source of truth for the scoring logic: ``compute``
+    reads its last row and the optimize walk-forward replay iterates every
+    row, so both share the exact same weights.
     """
-    if len(rows) < MIN_CANDLES:
-        raise ValueError(f"Need at least {MIN_CANDLES} daily candles, got {len(rows)}")
-
     d = pd.DataFrame(rows)
     c = d.close
     vol = d.volume
+
+    # Normalize a time column: accept "time", "timestamp", or synthesize a
+    # positional index when neither is present (compute() never needed one).
+    if "time" not in d.columns:
+        d["time"] = d["timestamp"] if "timestamp" in d.columns else d.index.astype(str)
 
     # --- moving averages -------------------------------------------------
     d["sma20"] = c.rolling(20).mean()
@@ -80,92 +94,121 @@ def compute(rows: list[dict]) -> dict:
     ).max(axis=1)
     d["atr14"] = tr.rolling(14).mean()
 
-    x = d.iloc[-1]
+    avg_vol_20 = vol.rolling(20).mean()
+    vol_surge = (vol > 1.25 * avg_vol_20) & (avg_vol_20 > 0)
 
-    # --- volume ----------------------------------------------------------
-    avg_vol_20 = vol.tail(20).mean()
-    vol_surge = bool(x.volume > 1.25 * avg_vol_20) if avg_vol_20 > 0 else False
+    trend_up = (c > d.sma50) & (d.sma50 > d.sma200)
+    trend_down = (c < d.sma50) & (d.sma50 < d.sma200)
+    sma50_rising = d.sma50 > d.sma50.shift(5)
+    sma50_falling = d.sma50 < d.sma50.shift(5)
 
-    # --- trend -----------------------------------------------------------
-    trend_up = bool(x.close > x.sma50 > x.sma200)
-    trend_down = bool(x.close < x.sma50 < x.sma200)
-    sma50_rising = bool(x.sma50 > d.sma50.iloc[-6])
-    sma50_falling = bool(x.sma50 < d.sma50.iloc[-6])
+    rsi_now = d.rsi
+    macd_bull = d.macd > d.macd_signal
+    macd_bear = d.macd < d.macd_signal
 
-    # --- momentum --------------------------------------------------------
+    dist_above = (c / d.sma200 - 1) * 100
+    dist_below = (1 - c / d.sma200) * 100
+
+    # --- weighted bullish score (0-100) ----------------------------------
+    bullish = pd.Series(0.0, index=d.index)
+    bullish += _np_where(trend_up, 30, _np_where(c > d.sma50, 15, 0))
+    bullish += _np_where(sma50_rising, 15, 0)
+    bullish += _np_where(macd_bull, 15, 0)
+    bullish += _np_where((rsi_now >= 50) & (rsi_now <= 70), 20, _np_where((rsi_now > 70) & (rsi_now <= 80), 10, 0))
+    bullish += _np_where(vol_surge & (c > d.sma50), 10, 0)
+    bullish += _np_where(dist_above > 5, 10, _np_where(dist_above > 2, 5, 0))
+    bullish = bullish.clip(upper=100)
+
+    # --- weighted bearish score (0-100) -----------------------------------
+    bearish = pd.Series(0.0, index=d.index)
+    bearish += _np_where(trend_down, 30, _np_where(c < d.sma50, 15, 0))
+    bearish += _np_where(sma50_falling, 15, 0)
+    bearish += _np_where(macd_bear, 15, 0)
+    bearish += _np_where(rsi_now < 30, 20, _np_where(rsi_now < 50, 10, 0))
+    bearish += _np_where(vol_surge & (c < d.sma50), 10, 0)
+    bearish += _np_where(dist_below > 5, 10, _np_where(dist_below > 2, 5, 0))
+    bearish = bearish.clip(upper=100)
+
+    net = bullish - bearish
+    atr_stop = c - 2 * d.atr14
+
+    return pd.DataFrame({
+        "time": d["time"],
+        "close": c,
+        "sma20": d.sma20,
+        "sma50": d.sma50,
+        "sma200": d.sma200,
+        "rsi": d.rsi,
+        "macd": d.macd,
+        "macd_signal": d.macd_signal,
+        "atr14": d.atr14,
+        "vol_surge": vol_surge,
+        "net": net,
+        "bullish": bullish,
+        "bearish": bearish,
+        "trend_up": trend_up,
+        "trend_down": trend_down,
+        "dist_above": dist_above,
+        "dist_below": dist_below,
+        "atr_stop": atr_stop,
+    })
+
+
+def decide_action(net, trend_up, trend_down, dist_above, dist_below,
+                  buy_threshold, sell_threshold) -> str:
+    """Derive BUY/SELL/HOLD from the net score and trend guards.
+
+    Requires a genuine trend (and >2% distance from SMA200) so sideways chop
+    stays HOLD. Shared by ``compute`` and the optimize replay.
+    """
+    if net >= buy_threshold and trend_up and dist_above > 2:
+        return "BUY"
+    if net <= sell_threshold and trend_down and dist_below > 2:
+        return "SELL"
+    return "HOLD"
+
+
+def strength_for(action: str, bullish: float, bearish: float) -> int:
+    """Derive the 0-100 confidence for an action. Shared scoring helper."""
+    if action == "BUY":
+        return int(round(bullish))
+    if action == "SELL":
+        return int(round(bearish))
+    return int(round(max(bullish, bearish)))
+
+
+def compute(rows: list[dict]) -> dict:
+    """Compute indicators and derive a BUY/SELL/HOLD signal from OHLCV rows.
+
+    ``rows`` must be a list of dicts with keys: timestamp, open, high, low,
+    close, volume — ordered oldest-first.
+    """
+    if len(rows) < MIN_CANDLES:
+        raise ValueError(f"Need at least {MIN_CANDLES} daily candles, got {len(rows)}")
+
+    df = signal_series(rows)
+    x = df.iloc[-1]
+
+    trend_up = bool(x.trend_up)
+    trend_down = bool(x.trend_down)
     rsi_now = float(x.rsi)
     macd_bull = bool(x.macd > x.macd_signal)
     macd_bear = bool(x.macd < x.macd_signal)
+    vol_surge = bool(x.vol_surge)
 
-    # Distance from the 200-day baseline — distinguishes a real trend from
-    # sideways chop where the MAs are all bunched together.
-    dist_above = (x.close / x.sma200 - 1) * 100
-    dist_below = (1 - x.close / x.sma200) * 100
+    net = float(x.net)
+    bullish = float(x.bullish)
+    bearish = float(x.bearish)
+    dist_above = float(x.dist_above)
+    dist_below = float(x.dist_below)
 
-    # --- weighted bullish score (0-100) ----------------------------------
-    bullish = 0
-    if trend_up:
-        bullish += 30
-    elif x.close > x.sma50:
-        bullish += 15
-    if sma50_rising:
-        bullish += 15
-    if macd_bull:
-        bullish += 15
-    if 50 <= rsi_now <= 70:
-        bullish += 20
-    elif 70 < rsi_now <= 80:
-        bullish += 10
-    if vol_surge and x.close > x.sma50:
-        bullish += 10
-    if dist_above > 5:
-        bullish += 10
-    elif dist_above > 2:
-        bullish += 5
-    bullish = min(bullish, 100)
+    action = decide_action(net, trend_up, trend_down, dist_above, dist_below,
+                           BUY_THRESHOLD, SELL_THRESHOLD)
+    strength = strength_for(action, bullish, bearish)
 
-    # --- weighted bearish score (0-100) -----------------------------------
-    bearish = 0
-    if trend_down:
-        bearish += 30
-    elif x.close < x.sma50:
-        bearish += 15
-    if sma50_falling:
-        bearish += 15
-    if macd_bear:
-        bearish += 15
-    if rsi_now < 30:
-        bearish += 20
-    elif rsi_now < 50:
-        bearish += 10
-    if vol_surge and x.close < x.sma50:
-        bearish += 10
-    if dist_below > 5:
-        bearish += 10
-    elif dist_below > 2:
-        bearish += 5
-    bearish = min(bearish, 100)
-
-    net = bullish - bearish
-
-    # --- action: require a genuine trend so sideways chop stays HOLD ------
-    if net >= BUY_THRESHOLD and trend_up and dist_above > 2:
-        action = "BUY"
-    elif net <= SELL_THRESHOLD and trend_down and dist_below > 2:
-        action = "SELL"
-    else:
-        action = "HOLD"
-
-    # --- strength (0-100) -------------------------------------------------
-    if action == "BUY":
-        strength = int(round(bullish))
-    elif action == "SELL":
-        strength = int(round(bearish))
-    else:
-        strength = int(round(max(bullish, bearish)))
+    atr_stop = float(x.atr_stop)
 
     # --- dynamic reason --------------------------------------------------
-    atr_stop = float(x.close) - 2 * float(x.atr14)
     if action == "BUY":
         reason = (
             f"BUY (score {net:+.0f}): close {x.close:.2f} > SMA50 {x.sma50:.2f} > SMA200 {x.sma200:.2f}; "
@@ -193,7 +236,7 @@ def compute(rows: list[dict]) -> dict:
             return None
         return None if pd.isna(v) else round(v, 2)
 
-    snap = {k: norm(x.get(k)) for k in ["close", "sma20", "sma50", "sma200", "rsi", "macd", "macd_signal", "atr14"]}
+    snap = {k: norm(x[k]) for k in ["close", "sma20", "sma50", "sma200", "rsi", "macd", "macd_signal", "atr14"]}
     snap["atr_stop"] = norm(atr_stop)
     snap["atr_pct"] = norm(100 * float(x.atr14) / float(x.close))
     snap["vol_surge"] = vol_surge
