@@ -1280,8 +1280,8 @@ async def _run_llm_benchmark(
     print(header)
     print("-" * len(header))
     turned = 0
-    saved = 0      # LLM turned a bad call in the right direction
-    harmed = 0     # LLM turned a good (control) call in the wrong direction
+    saved = 0      # LLM turned a call the deterministic model got wrong (badness > 0)
+    harmed = 0     # LLM turned a call the deterministic model got right (badness < 0)
     for r in rows:
         c = r["case"]
         tag = "CONTROL" if c.is_control else "WORST"
@@ -1291,15 +1291,17 @@ async def _run_llm_benchmark(
               f"{c.outcome_pct:>+7.2f}% {llm:<7} {r['verdict']:<18} {reason}")
         if r["verdict"] not in ("agreed", "no-decision"):
             turned += 1
-            # Did the turn help? For a WORST case, turning to HOLD or the
-            # opposite side avoids the bad trade → "saved". For a CONTROL,
-            # turning away from a right call → "harmed".
-            if c.is_control:
-                harmed += 1
-            else:
+            # A turn helps when the deterministic call was wrong (badness > 0:
+            # the forward outcome went against the decision). It harms when the
+            # deterministic call was right (badness < 0: the outcome confirmed
+            # it). This is based on the actual outcome, not the tag, so it's
+            # correct even when --n-worst extends into cases the model got right.
+            if c.badness > 0:
                 saved += 1
+            else:
+                harmed += 1
     print(f"\n  LLM turned {turned}/{len(rows)} decisions "
-          f"(saved {saved} bad calls, harmed {harmed} control calls).")
+          f"(saved {saved}, harmed {harmed}).")
     # Token-budget note: each probe is a single small user message + the fixed
     # system prompt, so the total cost is ~ len(rows) round-trips.
 
