@@ -195,6 +195,21 @@ def signal_series(rows: list[dict]) -> pd.DataFrame:
     net = bullish - bearish
     atr_stop = c - 2 * d.atr14
 
+    # --- weekly trend (multi-timeframe confirmation) ----------------------
+    # Resample daily close to weekly (Friday) for a slower trend filter.
+    # BUYs are gated on weekly close > weekly SMA-50 so we don't buy into
+    # bear-market rallies. Defaults to True when there aren't enough weekly
+    # bars yet (no gate — let the daily signal drive).
+    _dt_index = pd.DatetimeIndex(pd.to_datetime(d["time"], format="ISO8601", errors="coerce"))
+    _weekly_close = c.set_axis(_dt_index).resample("W-FRI").last()
+    _weekly_sma50 = _weekly_close.rolling(50).mean()
+    _wc_daily = _weekly_close.reindex(_dt_index, method="ffill")
+    _ws50_daily = _weekly_sma50.reindex(_dt_index, method="ffill")
+    d["weekly_trend_up"] = _wc_daily > _ws50_daily
+    d["weekly_trend_up"] = d["weekly_trend_up"].where(
+        _ws50_daily.notna(), True
+    )
+
     return pd.DataFrame({
         "time": d["time"],
         "close": c,
@@ -216,17 +231,23 @@ def signal_series(rows: list[dict]) -> pd.DataFrame:
         "dist_above": dist_above,
         "dist_below": dist_below,
         "atr_stop": atr_stop,
+        "weekly_trend_up": d["weekly_trend_up"],
     })
 
 
 def decide_action(net, trend_up, trend_down, dist_above, dist_below,
-                  buy_threshold, sell_threshold) -> str:
+                  buy_threshold, sell_threshold,
+                  weekly_trend_up: bool = True) -> str:
     """Derive BUY/SELL/HOLD from the net score and trend guards.
 
     Requires a genuine trend (and >2% distance from SMA200) so sideways chop
     stays HOLD. Shared by ``compute`` and the optimize replay.
+
+    ``weekly_trend_up`` gates BUYs: when False, the weekly chart is in a
+    downtrend and daily BUY signals are suppressed (multi-timeframe filter).
+    SELLs are not gated — we always manage risk on the way down.
     """
-    if net >= buy_threshold and trend_up and dist_above > 2:
+    if net >= buy_threshold and trend_up and dist_above > 2 and weekly_trend_up:
         return "BUY"
     if net <= sell_threshold and trend_down and dist_below > 2:
         return "SELL"
@@ -256,6 +277,7 @@ def compute(rows: list[dict]) -> dict:
 
     trend_up = bool(x.trend_up)
     trend_down = bool(x.trend_down)
+    weekly_trend_up = bool(x.weekly_trend_up) if hasattr(x, "weekly_trend_up") and not pd.isna(x.weekly_trend_up) else True
     rsi_now = float(x.rsi)
     adx_now = float(x.adx)
     macd_bull = bool(x.macd > x.macd_signal)
@@ -269,7 +291,7 @@ def compute(rows: list[dict]) -> dict:
     dist_below = float(x.dist_below)
 
     action = decide_action(net, trend_up, trend_down, dist_above, dist_below,
-                           BUY_THRESHOLD, SELL_THRESHOLD)
+                           BUY_THRESHOLD, SELL_THRESHOLD, weekly_trend_up)
     strength = strength_for(action, bullish, bearish)
 
     atr_stop = float(x.atr_stop)
@@ -319,7 +341,7 @@ def compute(rows: list[dict]) -> dict:
 
 
 async def persist(ticker: str, result: dict) -> bool:
-    """Persist a signal, skipping if identical to the most recent one.
+    """Persist a signal, skipping if the action hasn't changed.
 
     Returns ``True`` if a new row was inserted, ``False`` if deduplicated.
     """
@@ -330,11 +352,7 @@ async def persist(ticker: str, result: dict) -> bool:
             .order_by(desc(Signal.created_at))
             .limit(1)
         )
-        if (
-            last
-            and last.action == result["action"]
-            and last.reason == result["reason"]
-        ):
+        if last and last.action == result["action"]:
             return False
         s.add(
             Signal(

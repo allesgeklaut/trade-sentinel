@@ -162,7 +162,19 @@ class TestRunErrorHandling:
             call_count["n"] += 1
             if ticker == "BAD":
                 raise ValueError("simulated fetch failure")
-            return [{"open": 100.0 + 0.1 * i, "high": 100.5 + 0.1 * i, "low": 99.5 + 0.1 * i, "close": 100.0 + 0.1 * i, "volume": 1_000_000.0} for i in range(250)]
+            from datetime import datetime, timedelta
+            base = datetime(2022, 1, 3)
+            return [
+                {
+                    "timestamp": (base + timedelta(days=i)).strftime("%Y-%m-%d"),
+                    "open": 100.0 + 0.1 * i,
+                    "high": 100.5 + 0.1 * i,
+                    "low": 99.5 + 0.1 * i,
+                    "close": 100.0 + 0.1 * i,
+                    "volume": 1_000_000.0,
+                }
+                for i in range(250)
+            ]
 
         monkeypatch.setattr(screener, "refresh", mock_refresh)
         monkeypatch.setattr(screener, "candles", mock_candles)
@@ -195,8 +207,21 @@ class TestSignalColumn:
             pass
 
         async def mock_candles(ticker, period=None):
-            # 250 rows is enough for compute() (needs >=206)
-            return [{"open": 100.0 + 0.1 * i, "high": 100.5 + 0.1 * i, "low": 99.5 + 0.1 * i, "close": 100.0 + 0.1 * i, "volume": 1_000_000.0} for i in range(250)]
+            # 250 rows is enough for compute() (needs >=206). Include timestamps
+            # because the weekly trend filter parses the time column.
+            from datetime import datetime, timedelta
+            base = datetime(2022, 1, 3)
+            return [
+                {
+                    "timestamp": (base + timedelta(days=i)).strftime("%Y-%m-%d"),
+                    "open": 100.0 + 0.1 * i,
+                    "high": 100.5 + 0.1 * i,
+                    "low": 99.5 + 0.1 * i,
+                    "close": 100.0 + 0.1 * i,
+                    "volume": 1_000_000.0,
+                }
+                for i in range(250)
+            ]
 
         monkeypatch.setattr(screener, "refresh", mock_refresh)
         monkeypatch.setattr(screener, "candles", mock_candles)
@@ -246,7 +271,19 @@ class TestSignalColumn:
             pass
 
         async def mock_candles(ticker, period=None):
-            return [{"open": 100.0 + 0.1 * i, "high": 100.5 + 0.1 * i, "low": 99.5 + 0.1 * i, "close": 100.0 + 0.1 * i, "volume": 1_000_000.0} for i in range(250)]
+            from datetime import datetime, timedelta
+            base = datetime(2022, 1, 3)
+            return [
+                {
+                    "timestamp": (base + timedelta(days=i)).strftime("%Y-%m-%d"),
+                    "open": 100.0 + 0.1 * i,
+                    "high": 100.5 + 0.1 * i,
+                    "low": 99.5 + 0.1 * i,
+                    "close": 100.0 + 0.1 * i,
+                    "volume": 1_000_000.0,
+                }
+                for i in range(250)
+            ]
 
         monkeypatch.setattr(screener, "refresh", mock_refresh)
         monkeypatch.setattr(screener, "candles", mock_candles)

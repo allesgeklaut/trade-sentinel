@@ -1436,6 +1436,9 @@ class TestSimChatPartialBuy:
 
     async def test_buy_with_shares(self, with_cash, monkeypatch):
         """BUY with 'shares' should buy at most that many shares (clamped to budget)."""
+        # Raise max position % so the requested 15 shares aren't cash/max-clamped.
+        monkeypatch.setattr(settings, "sim_max_position_pct", 30.0)
+
         async def mock_close(ticker):
             return 100.0 if ticker == "AAPL" else None
         monkeypatch.setattr(sim, "_latest_close", mock_close)
@@ -1477,8 +1480,8 @@ class TestSimChatPartialBuy:
     async def test_buy_amount_clamped_to_max_budget(self, with_cash, monkeypatch):
         """BUY 'amount' exceeding the risk-limited budget should be clamped."""
         # Cash = $10,000, min_cash = 5% = $500, so max spend = $9,500
-        # max_position = 15% of $10,000 = $1,500
-        # Requesting $5,000 should be clamped to $1,500
+        # max_position = 10% of $10,000 = $1,000
+        # Requesting $5,000 should be clamped to $1,000
         async def mock_close(ticker):
             return 100.0 if ticker == "AAPL" else None
         monkeypatch.setattr(sim, "_latest_close", mock_close)
@@ -1514,8 +1517,8 @@ class TestSimChatPartialBuy:
 
         assert result["actions_executed"] is True
         assert len(result["trades"]) == 1
-        # max_position = 15% of $10,000 = $1,500 → 15 shares at $100
-        assert result["trades"][0]["shares"] == pytest.approx(15.0, abs=0.001)
+        # max_position = 10% of $10,000 = $1,000 → 10 shares at $100
+        assert result["trades"][0]["shares"] == pytest.approx(10.0, abs=0.001)
 
     async def test_buy_without_amount_uses_max_budget(self, with_cash, monkeypatch):
         """BUY without 'amount' or 'shares' should use the max allowed budget."""
@@ -1554,8 +1557,8 @@ class TestSimChatPartialBuy:
 
         assert result["actions_executed"] is True
         assert len(result["trades"]) == 1
-        # max_position = 15% of $10,000 = $1,500 → 15 shares at $100
-        assert result["trades"][0]["shares"] == pytest.approx(15.0, abs=0.001)
+        # max_position = 10% of $10,000 = $1,000 → 10 shares at $100
+        assert result["trades"][0]["shares"] == pytest.approx(10.0, abs=0.001)
 
 
 class TestSimChatReserveOverride:
