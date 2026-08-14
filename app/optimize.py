@@ -23,10 +23,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import math
 from dataclasses import dataclass, field
+from typing import Any
 
+import httpx
 import pandas as pd
 from sqlalchemy import select
 
@@ -57,7 +60,7 @@ class PaperPortfolio:
     trades: list[dict] = field(default_factory=list)
 
     def buy(self, ticker: str, price: float, budget: float, reason: str,
-            stop: float | None = None) -> None:
+            stop: float | None = None, date: str = "") -> None:
         if budget < 1 or price <= 0:
             return
         shares = round(budget / price, 4)
@@ -78,9 +81,10 @@ class PaperPortfolio:
             if stop is not None:
                 self.stop_price[ticker] = stop
         self.trades.append({"ticker": ticker, "side": "BUY", "shares": shares,
-                            "price": price, "reason": reason})
+                            "price": price, "reason": reason, "date": date})
 
-    def sell(self, ticker: str, price: float, shares: float | None, reason: str) -> None:
+    def sell(self, ticker: str, price: float, shares: float | None, reason: str,
+             date: str = "") -> None:
         if ticker not in self.positions or self.positions[ticker] <= 0:
             return
         sell_shares = self.positions[ticker] if shares is None else min(shares, self.positions[ticker])
@@ -94,7 +98,7 @@ class PaperPortfolio:
             self.peak_price.pop(ticker, None)
             self.stop_price.pop(ticker, None)
         self.trades.append({"ticker": ticker, "side": "SELL", "shares": sell_shares,
-                            "price": price, "reason": reason})
+                            "price": price, "reason": reason, "date": date})
 
     def update_peaks(self, prices: dict[str, float]) -> None:
         """Update the peak-price tracker for held positions."""
@@ -386,7 +390,8 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
                         if price > 0:
                             pf.sell(ticker, price, None,
                                     f"Portfolio stop: equity {total_equity:.0f} "
-                                    f"is -{dd:.1f}% from peak {portfolio_peak:.0f}")
+                                    f"is -{dd:.1f}% from peak {portfolio_peak:.0f}",
+                                    date=day)
                     risk_off = True
             elif risk_off and dd < params.portfolio_stop_pct / 2:
                 # Re-engage when drawdown recovers to half the stop level.
@@ -406,7 +411,7 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
             price = row["close"]
             action = _row_action(row, params)
             if action == "SELL":
-                pf.sell(ticker, price, None, f"SELL signal (strength {_row_strength(row, action)})")
+                pf.sell(ticker, price, None, f"SELL signal (strength {_row_strength(row, action)})", date=day)
                 continue
             # Initial stop loss (frozen at entry): exits before the slow
             # death-cross SELL signal catches up, limiting catastrophic losses.
@@ -414,7 +419,7 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
                 sp = pf.stop_price[ticker]
                 if price <= sp:
                     pf.sell(ticker, price, None,
-                            f"Initial stop: {price:.2f} <= {sp:.2f}")
+                            f"Initial stop: {price:.2f} <= {sp:.2f}", date=day)
                     continue
             # Trailing stop: sell if price has dropped trailing_stop_pct from
             # its peak since the position was opened.
@@ -423,12 +428,13 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
                 stop_level = peak * (1 - params.trailing_stop_pct / 100)
                 if price <= stop_level:
                     pf.sell(ticker, price, None,
-                            f"Trailing stop: {price:.2f} <= {stop_level:.2f} (peak {peak:.2f}, -{params.trailing_stop_pct}%)")
+                            f"Trailing stop: {price:.2f} <= {stop_level:.2f} (peak {peak:.2f}, -{params.trailing_stop_pct}%)",
+                            date=day)
                     continue
             if params.use_atr_stop:
                 atr_stop = row["atr_stop"]
                 if atr_stop is not None and price < atr_stop:
-                    pf.sell(ticker, price, None, f"ATR stop hit: {price:.2f} < {atr_stop:.2f}")
+                    pf.sell(ticker, price, None, f"ATR stop hit: {price:.2f} < {atr_stop:.2f}", date=day)
 
         # Recompute equity after sells.
         total_equity = pf.equity(prices)
@@ -518,7 +524,7 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
 
             pf.buy(ticker, price, budget,
                    f"BUY signal (strength {_row_strength(row, 'BUY')})",
-                   stop=entry_stop)
+                   stop=entry_stop, date=day)
 
         # Record equity.
         total_equity = pf.equity(prices)
@@ -685,6 +691,521 @@ def _walk_forward(series: dict[str, pd.DataFrame], days: list[str],
 
 
 # ---------------------------------------------------------------------------
+# LLM benchmark: would the LLM have turned the deterministic model's bad calls?
+# ---------------------------------------------------------------------------
+
+# Forward window (trading days) used to judge whether a deterministic trade was
+# "bad" in hindsight. A BUY is bad when the price fell over this window; a SELL
+# / stop-out is bad when the price recovered over it.
+_BENCH_FORWARD_DAYS = 20
+# How many worst-mistake cases to probe, and how many control cases (deterministic
+# was right) to include so we can see whether the LLM blindly overrides good calls.
+_BENCH_N_WORST = 8
+_BENCH_N_CONTROL = 2
+
+
+@dataclass
+class TradeCase:
+    """A single deterministic decision probed against the LLM.
+
+    ``outcome_pct`` is the forward return after the decision (negative is bad
+    for a BUY, positive is bad for a SELL). ``badness`` is a single number that
+    is large when the decision was clearly wrong (signed so the worst mistakes
+    sort first): for a BUY it's ``-forward_return``; for a SELL it's
+    ``+forward_return``. A control case is simply a trade whose ``badness`` is
+    close to zero or the opposite sign.
+
+    ``position_before`` is the position held in this ticker just before the
+    trade (shares + avg cost), reconstructed from the trade stream, so the LLM
+    probe can be shown truthful portfolio context (e.g. a SELL really was
+    closing a position, not acting on a bare signal).
+    """
+    date: str
+    ticker: str
+    det_side: str              # "BUY" | "SELL" (SELL covers signal + stop exits)
+    det_reason: str
+    entry_price: float
+    forward_close: float | None  # close N trading days later (None if window truncated)
+    outcome_pct: float          # forward return over the window
+    badness: float              # signed: higher = worse deterministic call
+    position_before: dict[str, float] | None = None  # {"shares":..,"avg_cost":..} or None
+    portfolio_state: dict[str, Any] | None = None     # full ledger just before the trade
+    is_control: bool = False
+
+
+def _reconstruct_portfolio_states(
+    trades: list[dict],
+    start_cash: float = settings.sim_start_cash,
+    monthly_allowance: float = settings.sim_monthly_allowance,
+) -> list[dict[str, Any]]:
+    """Reconstruct the full portfolio state just before each chronological trade.
+
+    Walks the trade stream maintaining cash + a {ticker: {shares, avg_cost}}
+    ledger, depositing the monthly allowance on the first trade of each month,
+    so the LLM probe sees the same portfolio context the live engine had.
+    Returns one state dict per trade (aligned 1:1 with ``trades``):
+        {"cash": float, "positions": [{"ticker","shares","avg_cost","value"}],
+         "total_equity": float, "positions_value": float}
+    Equity is valued at each trade's price (close on the decision day) — an
+    approximation for other tickers, but accurate for the decision ticker.
+    """
+    cash = start_cash
+    ledger: dict[str, dict[str, float]] = {}
+    last_month: str | None = None
+    states: list[dict[str, Any]] = []
+    for tr in trades:
+        date = tr.get("date") or ""
+        month = date[:7]
+        if month != last_month:
+            cash += monthly_allowance
+            last_month = month
+
+        # Value the decision ticker at the trade price; other held tickers are
+        # approximated at their last known trade price (good enough for context).
+        prices: dict[str, float] = {}
+        for t, pos in ledger.items():
+            prices[t] = pos.get("_last_price", pos["avg_cost"])
+        prices[tr["ticker"]] = tr["price"]
+
+        positions = []
+        positions_value = 0.0
+        for t, pos in ledger.items():
+            price = prices.get(t, pos["avg_cost"])
+            value = pos["shares"] * price
+            positions_value += value
+            positions.append({"ticker": t, "shares": pos["shares"],
+                              "avg_cost": pos["avg_cost"], "value": value})
+        states.append({
+            "cash": cash, "positions": positions,
+            "positions_value": positions_value,
+            "total_equity": cash + positions_value,
+        })
+
+        # Apply the trade to the ledger.
+        side = tr["side"]
+        shares = tr["shares"]
+        price = tr["price"]
+        ticker = tr["ticker"]
+        if side == "BUY":
+            cost = shares * price
+            if ticker in ledger:
+                old = ledger[ticker]
+                total = old["shares"] + shares
+                ledger[ticker] = {
+                    "shares": total,
+                    "avg_cost": (old["shares"] * old["avg_cost"] + cost) / total,
+                    "_last_price": price,
+                }
+            else:
+                ledger[ticker] = {"shares": shares, "avg_cost": price, "_last_price": price}
+            cash -= cost
+        else:  # SELL
+            if ticker in ledger:
+                cash += shares * price
+                remaining = ledger[ticker]["shares"] - shares
+                if remaining <= 0.0001:
+                    ledger.pop(ticker, None)
+                else:
+                    ledger[ticker]["shares"] = remaining
+                    ledger[ticker]["_last_price"] = price
+    return states
+
+
+def _trade_outcomes(
+    series: dict[str, pd.DataFrame],
+    trades: list[dict],
+    forward_days: int = _BENCH_FORWARD_DAYS,
+) -> list[TradeCase]:
+    """Score each replay trade by its forward price action.
+
+    For a BUY, ``outcome_pct`` is the N-day forward return (bad if negative).
+    For a SELL, ``outcome_pct`` is also the N-day forward return (bad if
+    positive — we sold right before a rally). ``badness`` is signed so the
+    worst mistakes sort first: BUY badness = -outcome, SELL badness = +outcome.
+
+    Trades carry a ``date`` field (stamped by the replay loop) used to locate
+    the decision day in the ticker's series. ``position_before`` is filled from
+    ``_reconstruct_positions`` so the LLM probe gets truthful context.
+    """
+    closes: dict[str, dict[str, float]] = {}
+    for t, df in series.items():
+        closes[t] = {row.time: float(row.close) for row in df.itertuples(index=False)}
+
+    portfolio_states = _reconstruct_portfolio_states(trades)
+    cases: list[TradeCase] = []
+    for tr, state in zip(trades, portfolio_states):
+        ticker = tr["ticker"]
+        side = tr["side"]
+        price = tr["price"]
+        date = tr.get("date") or ""
+        cmap = closes.get(ticker)
+        if cmap is None or date not in cmap:
+            continue
+
+        # Forward N trading days within THIS ticker's calendar.
+        dates = sorted(cmap.keys())
+        i = dates.index(date)
+        j = min(i + forward_days, len(dates) - 1)
+        fwd = cmap[dates[j]]
+        outcome = (fwd / price - 1) * 100 if price > 0 else 0.0
+        badness = -outcome if side == "BUY" else outcome
+        # Position in this ticker just before the trade.
+        pos_before = next(
+            ({"shares": p["shares"], "avg_cost": p["avg_cost"]}
+             for p in state["positions"] if p["ticker"] == ticker),
+            None,
+        )
+        cases.append(TradeCase(
+            date=date, ticker=ticker, det_side=side,
+            det_reason=tr.get("reason", ""),
+            entry_price=price, forward_close=fwd,
+            outcome_pct=outcome, badness=badness,
+            position_before=pos_before,
+            portfolio_state=state,
+        ))
+    return cases
+
+
+def _select_cases(
+    cases: list[TradeCase],
+    n_worst: int = _BENCH_N_WORST,
+    n_control: int = _BENCH_N_CONTROL,
+) -> list[TradeCase]:
+    """Pick the worst deterministic mistakes plus a few control cases.
+
+    Worst cases = highest ``badness``. Controls = deterministic calls that were
+    clearly right (lowest ``badness``, i.e. the model's call aligned with what
+    happened next). Both groups are de-duplicated by ticker so the probe covers
+    breadth rather than hammering one name. Controls are flagged so the report
+    can distinguish them.
+    """
+    by_ticker: dict[str, list[TradeCase]] = {}
+    for c in cases:
+        by_ticker.setdefault(c.ticker, []).append(c)
+
+    worst: list[TradeCase] = []
+    for ticker, group in by_ticker.items():
+        group.sort(key=lambda c: c.badness, reverse=True)
+        worst.append(group[0])  # each ticker's worst single decision
+    worst.sort(key=lambda c: c.badness, reverse=True)
+
+    controls: list[TradeCase] = []
+    for ticker, group in by_ticker.items():
+        group.sort(key=lambda c: c.badness)  # lowest badness = decision was right
+        controls.append(group[0])
+    controls.sort(key=lambda c: c.badness)
+
+    picked: list[TradeCase] = []
+    seen: set[str] = set()
+    for c in worst:
+        if len(picked) >= n_worst:
+            break
+        if c.ticker in seen:
+            continue
+        seen.add(c.ticker)
+        picked.append(c)
+    n_before_ctl = len(picked)
+    for c in controls:
+        if len(picked) - n_before_ctl >= n_control:
+            break
+        if c.ticker in seen:
+            continue
+        seen.add(c.ticker)
+        c.is_control = True
+        picked.append(c)
+    return picked
+
+
+def _snapshot_for_day(df: pd.DataFrame, date: str) -> dict[str, Any]:
+    """Reconstruct the analysis.compute() snapshot for a given trading day.
+
+    Mirrors analysis.compute's snapshot dict (close, sma*, rsi, macd, adx,
+    atr_stop, net_score, strength, weekly_trend_up, vol_surge) so the LLM is
+    shown exactly what the live hybrid engine would show it.
+    """
+    i = df.index[df["time"] == date].tolist()
+    if not i:
+        raise KeyError(f"{date} not in series")
+    x = df.iloc[i[0]]
+
+    def norm(v):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        return None if pd.isna(v) else round(v, 2)
+
+    net = float(x.net)
+    bullish = float(x.bullish)
+    bearish = float(x.bearish)
+    action = decide_action(
+        net, bool(x.trend_up), bool(x.trend_down),
+        float(x.dist_above), float(x.dist_below),
+        ReplayParams().buy_threshold, ReplayParams().sell_threshold,
+        bool(x.weekly_trend_up) if not pd.isna(x.weekly_trend_up) else True,
+    )
+    strength = strength_for(action, bullish, bearish)
+    snap = {k: norm(x[k]) for k in
+            ["close", "sma20", "sma50", "sma200", "rsi",
+             "macd", "macd_signal", "macd_hist", "atr14", "adx"]}
+    snap["atr_stop"] = norm(x.atr_stop)
+    snap["atr_pct"] = norm(100 * float(x.atr14) / float(x.close)) if float(x.close) else None
+    snap["vol_surge"] = bool(x.vol_surge)
+    snap["weekly_trend_up"] = bool(x.weekly_trend_up) if not pd.isna(x.weekly_trend_up) else True
+    snap["net_score"] = int(net)
+    snap["strength"] = strength
+    return {"action": action, "reason": "", "snapshot": snap, "strength": strength}
+
+
+def _build_llm_probe_context(case: TradeCase, snapshot: dict[str, Any]) -> str:
+    """Build the user-message context for a single decision probe.
+
+    Mirrors the compact signal summary from sim._build_llm_context but for one
+    ticker / one day, with the reconstructed portfolio state (cash, equity,
+    open positions) and the deterministic decision stated plainly so the LLM
+    can confirm or override it. The portfolio state is reconstructed from the
+    trade stream so it reflects what the engine actually held at the time.
+    """
+    snap = snapshot["snapshot"]
+    det = case.det_side
+    state = case.portfolio_state or {
+        "cash": 0.0, "positions": [], "positions_value": 0.0, "total_equity": 0.0,
+    }
+    equity = state["total_equity"]
+    cash = state["cash"]
+    lines = [
+        "## Decision Probe (single ticker, one historical day)",
+        f"Deterministic engine proposed: {det} — {case.det_reason}",
+        "",
+        "## Portfolio context (reconstructed at the decision time)",
+        f"Cash: {cash:.2f}",
+        f"Positions value: {state['positions_value']:.2f}",
+        f"Total equity: {equity:.2f}",
+        f"Min cash (5%): {equity * 0.05:.2f} | Max position (10%): {equity * 0.10:.2f} | Max positions: 10",
+        f"Stop loss: 15% (frozen at entry; ATR stop also applies)",
+        "",
+    ]
+    if state["positions"]:
+        lines.append("Open positions:")
+        for p in state["positions"]:
+            lines.append(
+                f"  - {p['ticker']}: {p['shares']:.4f} shares @ avg {p['avg_cost']:.2f} "
+                f"| value {p['value']:.2f}"
+            )
+    else:
+        lines.append("Open positions: none")
+    # Be explicit about the decision ticker's existing position.
+    if case.position_before:
+        pb = case.position_before
+        lines.append(
+            f"Existing position in {case.ticker}: {pb['shares']:.4f} shares @ avg {pb['avg_cost']:.2f}"
+        )
+    else:
+        lines.append(f"Existing position in {case.ticker}: none")
+    lines += [
+        "",
+        "## Signals",
+        f"{'ticker':<10} {'action':<6} {'strength':>8} "
+        f"{'close':>10} {'rsi':>6} {'adx':>5} {'wk':>3} {'macd':>10}",
+        f"{case.ticker:<10} {snapshot['action']:<6} {snapshot['strength']:>8} "
+        f"{snap.get('close', 0):>10.2f} {snap.get('rsi', 0):>6.1f} "
+        f"{snap.get('adx', 0):>5.0f} "
+        f"{'up' if snap.get('weekly_trend_up') else 'dn':>3} "
+        f"{snap.get('macd', 0):>10.3f}",
+        "",
+        "## Deterministic Candidate Trades",
+        f"  - {case.ticker} {det} (strength {snapshot['strength']}) — {case.det_reason}",
+        "",
+        "## Your Decision",
+        "Return ONLY a JSON array of objects: "
+        '{"ticker": "...", "action": "BUY|SELL|HOLD", "reason": "..."}. '
+        "No markdown, no prose.",
+    ]
+    return "\n".join(lines)
+
+
+async def _llm_probe(case: TradeCase, snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Send one decision probe to the configured Ollama model.
+
+    Reuses the live hybrid sim's system prompt and JSON-array format so the
+    benchmark reflects production behaviour. Returns the raw content, the
+    parsed decision (if any), and a status flag.
+    """
+    # Imported here to avoid a circular import at module load (sim imports
+    # analysis; optimize imports analysis). sim only needs to be present at
+    # call time.
+    from .sim import _LLM_SYSTEM_PROMPT, _parse_llm_decisions
+
+    context = _build_llm_probe_context(case, snapshot)
+    url = settings.ollama_url.rstrip("/") + "/api/chat"
+    timeout = httpx.Timeout(connect=10.0, read=settings.ollama_timeout_seconds,
+                            write=30.0, pool=10.0)
+    payload = {
+        "model": settings.ollama_model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+            {"role": "user", "content": context},
+        ],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(url, json=payload)
+            data = resp.json()
+    except Exception as e:
+        return {"raw": "", "decision": None, "status": f"error: {type(e).__name__}: {e}"}
+
+    status_code = resp.status_code if hasattr(resp, "status_code") else "?"
+    if status_code != 200:
+        body = json.dumps(data)[:300] if data else ""
+        return {"raw": "", "decision": None, "status": f"http {status_code}: {body}"}
+
+    content = (data.get("message", {}) or {}).get("content", "") or data.get("response", "")
+    decisions = _parse_llm_decisions(content)
+    picked = None
+    if decisions:
+        # Take the decision matching this ticker (case-insensitive); fall back
+        # to the first if the model returned only one.
+        for d in decisions:
+            if d["ticker"].upper() == case.ticker.upper():
+                picked = d
+                break
+        if picked is None and len(decisions) == 1:
+            picked = decisions[0]
+    return {"raw": content, "decision": picked, "status": "ok"}
+
+
+def _llm_turned(det_side: str, llm_action: str | None) -> str:
+    """Classify the LLM's verdict vs the deterministic decision."""
+    if llm_action is None:
+        return "no-decision"
+    if llm_action == det_side:
+        return "agreed"
+    if llm_action == "HOLD":
+        return "turned-to-HOLD"
+    # BUY vs SELL flip
+    return f"turned-to-{llm_action}"
+
+
+async def _run_llm_benchmark(
+    series: dict[str, pd.DataFrame],
+    start: str | None,
+    end: str | None,
+    n_worst: int = _BENCH_N_WORST,
+    n_control: int = _BENCH_N_CONTROL,
+    forward_days: int = _BENCH_FORWARD_DAYS,
+    skip_llm: bool = False,
+) -> None:
+    """Run the full LLM-vs-deterministic benchmark and print a report.
+
+    ``skip_llm`` runs only the deterministic replay + case selection and prints
+    the candidates without calling the LLM — useful for previewing which cases
+    would be probed before spending tokens.
+    """
+    params = ReplayParams()
+    res = _replay(series, params, start=start, end=end)
+    print(f"\n=== Deterministic backtest ({start or 'start'}..{end or 'end'}) ===")
+    print(f"  Trades: {res.n_trades} | Return: {res.total_return_pct:+.2f}% | "
+          f"Max DD: {res.max_drawdown_pct:.2f}% | Sharpe: {res.sharpe:.2f}")
+
+    if not res.trades:
+        print("No trades to benchmark.")
+        return
+
+    cases = _trade_outcomes(series, res.trades, forward_days=forward_days)
+    if not cases:
+        print("Could not score any trades (no forward price data).")
+        return
+    picked = _select_cases(cases, n_worst=n_worst, n_control=n_control)
+    print(f"\n=== Selected {len(picked)} cases "
+          f"({sum(1 for c in picked if not c.is_control)} worst + "
+          f"{sum(1 for c in picked if c.is_control)} control) "
+          f"| forward window = {forward_days}d ===")
+    for c in picked:
+        tag = "CONTROL" if c.is_control else "WORST"
+        print(f"  [{tag}] {c.date} {c.ticker:<8} {c.det_side:<5} @ {c.entry_price:>9.2f} "
+              f"→ {c.forward_close:>9.2f} ({c.outcome_pct:+6.2f}% over {forward_days}d) "
+              f"| badness {c.badness:+6.2f} | {c.det_reason}")
+
+    if skip_llm:
+        print("\n--skip-llm set; not calling the LLM. Re-run without it to probe.")
+        return
+
+    if not settings.ollama_model:
+        print("\nOLLAMA_MODEL not configured; cannot probe the LLM.")
+        return
+
+    print(f"\n=== Probing LLM ({settings.ollama_model}) ... ===")
+    rows: list[dict[str, Any]] = []
+    for idx, c in enumerate(picked, 1):
+        df = series.get(c.ticker)
+        if df is None:
+            print(f"  [{idx}/{len(picked)}] {c.ticker} {c.date}: no series, skipped")
+            continue
+        try:
+            snapshot = _snapshot_for_day(df, c.date)
+        except KeyError as e:
+            print(f"  [{idx}/{len(picked)}] {c.ticker} {c.date}: {e}")
+            continue
+        print(f"  [{idx}/{len(picked)}] {c.ticker} {c.date} "
+              f"(det={c.det_side}, fwd {c.outcome_pct:+.2f}%) ...", end=" ", flush=True)
+        probe = await _llm_probe(c, snapshot)
+        llm_action = (probe["decision"] or {}).get("action") if probe["decision"] else None
+        llm_reason = (probe["decision"] or {}).get("reason", "") if probe["decision"] else ""
+        verdict = _llm_turned(c.det_side, llm_action)
+        print(verdict)
+        rows.append({
+            "case": c, "snapshot": snapshot, "probe": probe,
+            "llm_action": llm_action, "llm_reason": llm_reason, "verdict": verdict,
+        })
+
+    # --- Final report ----------------------------------------------------
+    print(f"\n=== LLM benchmark report ({len(rows)}/{len(picked)} probed) ===")
+    header = (f"{'date':<12} {'ticker':<9} {'tag':<8} {'det':<5} {'fwd%':>7} "
+              f"{'llm':<7} {'verdict':<18} reason")
+    print(header)
+    print("-" * len(header))
+    turned = 0
+    saved = 0      # LLM turned a bad call in the right direction
+    harmed = 0     # LLM turned a good (control) call in the wrong direction
+    for r in rows:
+        c = r["case"]
+        tag = "CONTROL" if c.is_control else "WORST"
+        llm = r["llm_action"] or "-"
+        reason = (r["llm_reason"][:60] + "…") if len(r["llm_reason"]) > 61 else r["llm_reason"]
+        print(f"{c.date:<12} {c.ticker:<9} {tag:<8} {c.det_side:<5} "
+              f"{c.outcome_pct:>+7.2f}% {llm:<7} {r['verdict']:<18} {reason}")
+        if r["verdict"] not in ("agreed", "no-decision"):
+            turned += 1
+            # Did the turn help? For a WORST case, turning to HOLD or the
+            # opposite side avoids the bad trade → "saved". For a CONTROL,
+            # turning away from a right call → "harmed".
+            if c.is_control:
+                harmed += 1
+            else:
+                saved += 1
+    print(f"\n  LLM turned {turned}/{len(rows)} decisions "
+          f"(saved {saved} bad calls, harmed {harmed} control calls).")
+    # Token-budget note: each probe is a single small user message + the fixed
+    # system prompt, so the total cost is ~ len(rows) round-trips.
+
+    # Dump raw LLM reasoning to a JSON file for later inspection.
+    out_path = "/tmp/llm_benchmark_reasoning.json"
+    try:
+        with open(out_path, "w") as f:
+            json.dump([{
+                "date": r["case"].date, "ticker": r["case"].ticker,
+                "det_side": r["case"].det_side, "outcome_pct": r["case"].outcome_pct,
+                "is_control": r["case"].is_control,
+                "llm_action": r["llm_action"], "verdict": r["verdict"],
+                "raw": r["probe"]["raw"],
+            } for r in rows], f, indent=2)
+        print(f"  Raw LLM reasoning written to {out_path}")
+    except OSError as e:
+        print(f"  (could not write reasoning file: {e})")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -760,6 +1281,13 @@ async def _main(args: argparse.Namespace) -> None:
             print(f"  Mean OOS return: {sum(oos)/len(oos):+.2f}%  "
                   f"Positive windows: {sum(1 for r in oos if r > 0)}/{len(oos)}")
 
+    elif args.command == "llm-benchmark":
+        await _run_llm_benchmark(
+            series, start=args.start, end=args.end,
+            n_worst=args.n_worst, n_control=args.n_control,
+            forward_days=args.forward_days, skip_llm=args.skip_llm,
+        )
+
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Walk-forward optimization for the deterministic strategy")
@@ -785,6 +1313,20 @@ def _build_parser() -> argparse.ArgumentParser:
     w.add_argument("--end", default=None, help="YYYY-MM-DD inclusive end of the walk")
     w.add_argument("--regime", action="store_true", help="Enable market regime filter")
     w.add_argument("--regime-ticker", default="URTH", help="Benchmark ticker for the regime filter")
+
+    lb = sub.add_parser("llm-benchmark",
+                        help="Probe whether the LLM would turn the deterministic model's worst calls")
+    lb.add_argument("--start", default=None, help="YYYY-MM-DD inclusive start of the replay window")
+    lb.add_argument("--end", default="2026-08-11",
+                    help="YYYY-MM-DD inclusive end (default 2026-08-11 to leave a 20d forward buffer)")
+    lb.add_argument("--n-worst", type=int, default=_BENCH_N_WORST,
+                    help=f"Number of worst deterministic mistakes to probe (default {_BENCH_N_WORST})")
+    lb.add_argument("--n-control", type=int, default=_BENCH_N_CONTROL,
+                    help=f"Number of control (deterministic-was-right) cases (default {_BENCH_N_CONTROL})")
+    lb.add_argument("--forward-days", type=int, default=_BENCH_FORWARD_DAYS,
+                    help=f"Trading days of forward price action used to judge a trade (default {_BENCH_FORWARD_DAYS})")
+    lb.add_argument("--skip-llm", action="store_true",
+                    help="Select and print the candidate cases without calling the LLM (token-free preview)")
 
     return p
 
