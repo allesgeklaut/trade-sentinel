@@ -22,8 +22,10 @@ class Settings(BaseSettings):
     sim_start_cash: float = 0.0
     sim_universe: str = "global-large-cap"
     sim_strategy: str = "deterministic"  # deterministic | llm | hybrid
-    sim_max_position_pct: float = 15.0
+    sim_max_position_pct: float = 10.0
     sim_min_cash_pct: float = 5.0
+    sim_max_positions: int = 10
+    sim_stop_pct: float = 15.0
     sim_run_hour: int = 22
     sim_run_minute: int = 30
 
