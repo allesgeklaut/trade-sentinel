@@ -27,108 +27,20 @@ import logging
 import math
 from dataclasses import dataclass, field
 
-import numpy as np
 import pandas as pd
 from sqlalchemy import select
 
-from .analysis import MIN_CANDLES
+from .analysis import (
+    MIN_CANDLES,
+    decide_action,
+    signal_series as _signal_series,
+    strength_for,
+)
 from .config import settings
 from .db import Candle, Session
 from .screener import tickers as universe_tickers
 
 logger = logging.getLogger("trade_sentinel.optimize")
-
-
-# ---------------------------------------------------------------------------
-# Vectorized indicator / signal series
-# ---------------------------------------------------------------------------
-
-def _np_where(cond, a, b):
-    """Element-wise where that tolerates NaN conditions (treats NaN as False)."""
-    return pd.Series(np.where(cond.fillna(False), a, b), index=cond.index)
-
-
-def _signal_series(rows: list[dict]) -> pd.DataFrame:
-    """Compute the per-day indicator series for a ticker's candle history.
-
-    Mirrors ``analysis.compute`` but returns a DataFrame with one row per
-    candle (oldest-first) carrying the raw scoring components (net, bullish,
-    bearish, trend flags, distance from SMA200, ATR stop, close) so the replay
-    can derive the action/strength per-parameter-set without recomputing.
-    """
-    d = pd.DataFrame(rows)
-    c = d.close
-    vol = d.volume
-
-    d["sma20"] = c.rolling(20).mean()
-    d["sma50"] = c.rolling(50).mean()
-    d["sma200"] = c.rolling(200).mean()
-
-    delta = c.diff()
-    up = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
-    down = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
-    d["rsi"] = 100 - 100 / (1 + up / down)
-
-    d["macd"] = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
-    d["macd_signal"] = d.macd.ewm(span=9, adjust=False).mean()
-
-    prev = c.shift()
-    tr = pd.concat(
-        [d.high - d.low, (d.high - prev).abs(), (d.low - prev).abs()],
-        axis=1,
-    ).max(axis=1)
-    d["atr14"] = tr.rolling(14).mean()
-
-    avg_vol_20 = vol.rolling(20).mean()
-    vol_surge = (vol > 1.25 * avg_vol_20) & (avg_vol_20 > 0)
-
-    trend_up = (c > d.sma50) & (d.sma50 > d.sma200)
-    trend_down = (c < d.sma50) & (d.sma50 < d.sma200)
-    sma50_rising = d.sma50 > d.sma50.shift(5)
-    sma50_falling = d.sma50 < d.sma50.shift(5)
-
-    rsi_now = d.rsi
-    macd_bull = d.macd > d.macd_signal
-    macd_bear = d.macd < d.macd_signal
-
-    dist_above = (c / d.sma200 - 1) * 100
-    dist_below = (1 - c / d.sma200) * 100
-
-    bullish = pd.Series(0.0, index=d.index)
-    bullish += _np_where(trend_up, 30, _np_where(c > d.sma50, 15, 0))
-    bullish += _np_where(sma50_rising, 15, 0)
-    bullish += _np_where(macd_bull, 15, 0)
-    bullish += _np_where((rsi_now >= 50) & (rsi_now <= 70), 20, _np_where((rsi_now > 70) & (rsi_now <= 80), 10, 0))
-    bullish += _np_where(vol_surge & (c > d.sma50), 10, 0)
-    bullish += _np_where(dist_above > 5, 10, _np_where(dist_above > 2, 5, 0))
-    bullish = bullish.clip(upper=100)
-
-    bearish = pd.Series(0.0, index=d.index)
-    bearish += _np_where(trend_down, 30, _np_where(c < d.sma50, 15, 0))
-    bearish += _np_where(sma50_falling, 15, 0)
-    bearish += _np_where(macd_bear, 15, 0)
-    bearish += _np_where(rsi_now < 30, 20, _np_where(rsi_now < 50, 10, 0))
-    bearish += _np_where(vol_surge & (c < d.sma50), 10, 0)
-    bearish += _np_where(dist_below > 5, 10, _np_where(dist_below > 2, 5, 0))
-    bearish = bearish.clip(upper=100)
-
-    net = bullish - bearish
-
-    atr_stop = c - 2 * d.atr14
-
-    out = pd.DataFrame({
-        "time": d["time"],
-        "close": c,
-        "net": net,
-        "bullish": bullish,
-        "bearish": bearish,
-        "trend_up": trend_up,
-        "trend_down": trend_down,
-        "dist_above": dist_above,
-        "dist_below": dist_below,
-        "atr_stop": atr_stop,
-    })
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -309,20 +221,16 @@ def _candidate_tickers() -> list[str]:
 
 def _row_action(row: dict, params: ReplayParams) -> str:
     """Derive the BUY/SELL/HOLD action for a row under the given thresholds."""
-    if row["net"] >= params.buy_threshold and row["trend_up"] and row["dist_above"] > 2:
-        return "BUY"
-    if row["net"] <= params.sell_threshold and row["trend_down"] and row["dist_below"] > 2:
-        return "SELL"
-    return "HOLD"
+    return decide_action(
+        row["net"], row["trend_up"], row["trend_down"],
+        row["dist_above"], row["dist_below"],
+        params.buy_threshold, params.sell_threshold,
+    )
 
 
 def _row_strength(row: dict, action: str) -> int:
     """Derive the 0-100 strength for a row under the given action."""
-    if action == "BUY":
-        return int(round(row["bullish"]))
-    if action == "SELL":
-        return int(round(row["bearish"]))
-    return int(round(max(row["bullish"], row["bearish"])))
+    return strength_for(action, row["bullish"], row["bearish"])
 
 
 def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
