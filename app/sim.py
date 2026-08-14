@@ -426,6 +426,50 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
 # Hybrid / LLM strategy
 # ---------------------------------------------------------------------------
 
+# Shared methodology block injected into both the autonomous-decide and the
+# interactive-chat system prompts. Keeps the two LLMs' reasoning aligned with
+# the deterministic engine's indicator interpretation without exposing the
+# exact scoring weights (so tuning the weights doesn't drift the prompts).
+_SIM_METHODOLOGY = (
+    "## How to read the signals\n"
+    "The snapshot each ticker carries these indicators. Use them to rank "
+    "candidates and to judge whether a position should be kept, trimmed, or "
+    "sold when the user asks you to clean up or rebalance the portfolio:\n"
+    "  - **action / strength**: the deterministic engine's BUY/SELL/HOLD call "
+    "and a 0-100 confidence (strength = the bullish or bearish score). Higher "
+    "strength = stronger signal. Rank candidates by strength when choosing "
+    "what to buy or what to keep.\n"
+    "  - **close vs sma50 vs sma200**: a genuine uptrend needs close > sma50 > "
+    "sma200 (downtrend is the mirror). Price stuck between the MAs = sideways / "
+    "HOLD.\n"
+    "  - **adx** (ADX-14): trend *strength*. ADX > 25 = strong, clean trend; "
+    "ADX < 20 = weak/choppy. A BUY with high ADX is far more trustworthy than "
+    "one with low ADX. When trimming a portfolio down to a position cap, prefer "
+    "keeping positions with higher ADX over equal-strength low-ADX ones.\n"
+    "  - **rsi** (RSI-14): momentum. 40-55 and rising = pullback turning up "
+    "(good entry). 55-65 = moderately strong. > 70 = overbought (the engine "
+    "penalizes it — don't chase). < 30 = oversold (the engine penalizes "
+    "bearishness there too). Use RSI to avoid buying overbought names and to "
+    "spot ones turning up from a pullback.\n"
+    "  - **macd / macd_signal / macd_hist**: momentum. macd > macd_signal = "
+    "bullish; the *histogram* (macd_hist) rising = momentum is turning up, not "
+    "just already up. A rising histogram is a better confirmation than the laggy "
+    "boolean crossover alone.\n"
+    "  - **weekly_trend_up** (when provided): the slower weekly-chart filter. "
+    "A daily BUY is only valid when the weekly chart is also up (weekly close > "
+    "weekly SMA-50). A daily BUY against a down weekly trend is a bear-market "
+    "rally — avoid it.\n"
+    "  - **vol_surge**: a confirmation bonus, not a primary driver.\n"
+    "  - **atr_stop**: trailing-volatility stop. Price below it = the trend "
+    "broke.\n"
+    "\n"
+    "When the portfolio holds more positions than the max-positions cap (or the "
+    "user asks to clean up / trim / take profits), sell the weakest first: "
+    "lowest strength, SELL signals, low ADX, RSI overbought, or price below its "
+    "ATR stop — and keep the highest-strength, highest-ADX, still-in-uptrend "
+    "names.\n"
+)
+
 _LLM_SYSTEM_PROMPT = (
     "You are a disciplined portfolio manager reviewing deterministic technical "
     "signals for a paper-trading simulation.\n"
@@ -435,29 +479,36 @@ _LLM_SYSTEM_PROMPT = (
     "Your job: review the deterministic trade candidates and the signals, then "
     "return your own decisions.\n"
     "\n"
+    + _SIM_METHODOLOGY +
     "Rules:\n"
-    "1. For each candidate ticker you may decide BUY, SELL, or HOLD.\n"
     "2. You may also adjust the deterministic candidates: upgrade a HOLD to a "
     "BUY, downgrade a BUY to HOLD, or reject a SELL.\n"
     "3. Respect risk management: do not buy if cash is too low; do not over-"
-    "concentrate in a single ticker.\n"
-    "4. If you want to buy a ticker but cash is too low, you may sell an existing "
+    "concentrate in a single ticker. The engine caps the number of open "
+    "positions (it stops buying once the max position count is reached), so "
+    "prioritize the strongest candidates.\n"
+    "4. The engine enforces an initial stop loss (a fixed % below the entry "
+    "price) and an ATR-based trailing stop: positions that hit either are "
+    "auto-sold by the deterministic layer. Do not be surprised if a position "
+    "disappears between cycles — that is the stop loss, not a decision you "
+    "need to replicate.\n"
+    "5. If you want to buy a ticker but cash is too low, you may sell an existing "
     "position to free up cash — but only when the position you would sell is "
     "weaker (e.g. a SELL signal, a losing/overweight position, or a HOLD with "
     "poorer indicators) than the one you want to buy. List the SELL before the "
     "BUY in your output so the sale executes first.\n"
-    "5. Decisions must be grounded in the provided signals and indicators.\n"
-    "6. You may receive recent news headlines for supplementary context. News "
+    "6. Decisions must be grounded in the provided signals and indicators.\n"
+    "7. You may receive recent news headlines for supplementary context. News "
     "can explain *why* indicators are moving, but do not make trades based on "
     "news alone — the technical signals and risk rules take priority. Never "
     "reference specific URLs in your output.\n"
-    "7. You may specify a partial position size per action using optional fields:\n"
+    "8. You may specify a partial position size per action using optional fields:\n"
     "   - \"shares\": exact number of shares to trade (e.g. 3.5).\n"
     "   - \"amount\": dollar amount to trade (e.g. 67.43). For SELL this is the"
     " value of shares to sell; for BUY it is the dollars to invest.\n"
     "   If neither is given, SELL sells the entire position and BUY invests the"
     " maximum allowed by risk rules.\n"
-    "8. The max position % is a buy-time sizing limit, not a ceiling to enforce "
+    "9. The max position % is a buy-time sizing limit, not a ceiling to enforce "
     "on exits. Do NOT sell a position just because its price rose above it — "
     "let winners run. Only trim a position (with an exact \"shares\" or \"amount\", "
     "or the whole position) when it is genuinely overweight and you have a "
@@ -494,6 +545,8 @@ def _build_llm_context(
     lines.append(f"Cumulative allowance deposited: {valuation['allowance_total']:.2f}")
     lines.append(f"Min cash to keep ({settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
     lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
+    lines.append(f"Max open positions: {settings.sim_max_positions}")
+    lines.append(f"Stop loss: {settings.sim_stop_pct:.0f}% (frozen at entry; ATR stop also applies)")
     lines.append("")
 
     if valuation["positions"]:
@@ -513,14 +566,15 @@ def _build_llm_context(
     if signals:
         lines.append(
             f"{'ticker':<10} {'action':<6} {'strength':>8} "
-            f"{'close':>10} {'rsi':>6} {'macd':>10}"
+            f"{'close':>10} {'rsi':>6} {'adx':>5} {'wk':>3} {'macd':>10}"
         )
         for ticker, sig in sorted(signals.items()):
             snap = sig.get("snapshot", {})
+            wk = "up" if snap.get("weekly_trend_up") else "dn"
             lines.append(
                 f"{ticker:<10} {sig['action']:<6} {sig['strength']:>8} "
                 f"{snap.get('close', 0):>10.2f} {snap.get('rsi', 0):>6.1f} "
-                f"{snap.get('macd', 0):>10.3f}"
+                f"{snap.get('adx', 0):>5.0f} {wk:>3} {snap.get('macd', 0):>10.3f}"
             )
     else:
         lines.append("(no signals available)")
@@ -1316,6 +1370,7 @@ _SIM_CHAT_SYSTEM_PROMPT = (
     "to take actions. You have access to the current portfolio state, "
     "technical signals, and recent news.\n"
     "\n"
+    + _SIM_METHODOLOGY +
     "Rules:\n"
     "1. You can discuss the portfolio, explain your decisions, and answer questions.\n"
     "2. If the user asks you to take an action (e.g. \"sell X to buy Y\"), include "
@@ -1331,22 +1386,29 @@ _SIM_CHAT_SYSTEM_PROMPT = (
     "   If neither is given, SELL sells the entire position and BUY invests the"
     " maximum allowed by risk rules.\n"
     "   Example: {\"actions\": [{\"ticker\": \"MDB\", \"action\": \"SELL\", \"amount\": 67.43, \"reason\": \"trim overweight\"}]}\n"
-    "5. The same risk management rules apply: respect min cash % and max position %;"
-    " the engine will clamp your requested amounts to stay within them.\n"
+    "5. The same risk management rules apply: respect min cash %, max position %,"
+    " and the max open-positions count; the engine will clamp your requested"
+    " amounts to stay within them and will refuse a BUY that would exceed the"
+    " position count cap.\n"
     "   EXCEPTION: if the user EXPLICITLY asks to spend the cash reserve / dry"
     " powder / remaining cash / \"all available cash\", set \"use_reserve\": true"
     " on that BUY action. This lets the buy spend below the normal min-cash floor"
     " (down to zero cash). Use it only when the user clearly requests it — never"
     " on your own initiative.\n"
-    "6. The max position % is a buy-time sizing limit, not a ceiling to enforce "
+    "6. The engine enforces an initial stop loss (a fixed % below the entry price)"
+    " and an ATR-based trailing stop on every position. Positions that hit either"
+    " are auto-sold by the deterministic layer, so if the user asks why a position"
+    " vanished it was likely stopped out — explain that rather than proposing to"
+    " re-buy it unless the user explicitly asks.\n"
+    "7. The max position % is a buy-time sizing limit, not a ceiling to enforce "
     "on exits. Do NOT sell a position just because its price rose above it — let "
     "winners run. Only trim a position (with an exact \"shares\" or \"amount\", or "
     "the whole position) when it is genuinely overweight and you have a clearly "
     "better use for that capital, such as buying a stronger opportunity.\n"
-    "7. Only propose actions you believe are justified by the signals and portfolio context.\n"
-    "8. If you do not agree with the user's request, explain why and omit the ACTION block.\n"
-    "9. Do NOT reference specific URLs in your output.\n"
-    "10. The \"Last Sim Cycle Decisions\" section in your context lists decisions "
+    "8. Only propose actions you believe are justified by the signals and portfolio context.\n"
+    "9. If you do not agree with the user's request, explain why and omit the ACTION block.\n"
+    "10. Do NOT reference specific URLs in your output.\n"
+    "11. The \"Last Sim Cycle Decisions\" section in your context lists decisions "
     "that were already executed by the simulation. Treat them as historical — "
     "when asked about them, explain them, but do NOT include them as new actions "
     "unless the user explicitly asks you to take a new trade.\n"
@@ -1423,6 +1485,8 @@ async def _build_sim_chat_context() -> str:
     lines.append(f"Strategy: {settings.sim_strategy}")
     lines.append(f"Max position %: {settings.sim_max_position_pct}")
     lines.append(f"Min cash %: {settings.sim_min_cash_pct}")
+    lines.append(f"Max open positions: {settings.sim_max_positions}")
+    lines.append(f"Stop loss: {settings.sim_stop_pct:.0f}% (frozen at entry; ATR stop also applies)")
     lines.append(f"Min cash to keep ({settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
     lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
     lines.append("")
@@ -1449,9 +1513,11 @@ async def _build_sim_chat_context() -> str:
         lines.append("## Signals (interesting tickers)")
         for ticker, sig in sorted(interesting.items()):
             snap = sig.get("snapshot", {})
+            wk = "up" if snap.get("weekly_trend_up") else "dn"
             lines.append(
                 f"  {ticker}: {sig['action']} (strength {sig['strength']}) "
-                f"| RSI {snap.get('rsi', 0):.1f} | MACD {snap.get('macd', 0):.3f} "
+                f"| RSI {snap.get('rsi', 0):.1f} | ADX {snap.get('adx', 0):.0f} "
+                f"| wk {wk} | MACD {snap.get('macd', 0):.3f} "
                 f"| close {snap.get('close', 0):.2f}"
             )
     lines.append("")
