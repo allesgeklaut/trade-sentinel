@@ -14,6 +14,7 @@ import pytest
 from app import optimize
 from app.optimize import (
     ReplayParams,
+    _is_stop_out,
     _replay,
     _row_action,
     _row_strength,
@@ -262,6 +263,23 @@ class TestReconstructPortfolioStates:
         assert states[1]["cash"] == 990.0   # 1000 - 10 (first buy applied)
         assert states[2]["cash"] == 1980.0  # 990 + 1000 (Feb) - 10 (third buy)
 
+    def test_allowance_catches_up_across_skip_months(self):
+        # Sparse trades: one in Jan, the next in Apr. The replay deposits on
+        # the first trading day of every month, so the Apr trade must have
+        # accumulated Jan+Feb+Mar+Apr = 4 allowances (3 catch-up + its own).
+        states = _reconstruct_portfolio_states(
+            [
+                {"ticker": "A", "side": "BUY", "shares": 1.0, "price": 10.0,
+                 "reason": "", "date": "2025-01-10"},
+                {"ticker": "A", "side": "BUY", "shares": 1.0, "price": 10.0,
+                 "reason": "", "date": "2025-04-10"},
+            ],
+            start_cash=0.0, monthly_allowance=1000.0,
+        )
+        assert states[0]["cash"] == 1000.0          # Jan: first deposit
+        # Before the Apr buy: 990 (after Jan buy) + 3000 (Feb,Mar,Apr) = 3990
+        assert states[1]["cash"] == 3990.0
+
 
 class TestSelectCases:
     def _case(self, ticker, side, outcome, date="2025-01-01"):
@@ -302,3 +320,23 @@ class TestSelectCases:
         tickers = [c.ticker for c in picked]
         assert tickers.count("A") == 1
         assert "B" in tickers
+
+
+class TestIsStopOut:
+    def test_initial_stop(self):
+        assert _is_stop_out("Initial stop: 71.88 <= 72.87")
+
+    def test_atr_stop(self):
+        assert _is_stop_out("ATR stop hit: 24.61 < 25.00")
+
+    def test_trailing_stop(self):
+        assert _is_stop_out("Trailing stop: 30.00 <= 32.00 (peak 40.00, -20%)")
+
+    def test_portfolio_stop(self):
+        assert _is_stop_out("Portfolio stop: equity 100 is -20% from peak 125")
+
+    def test_signal_sell_is_not_a_stop(self):
+        assert not _is_stop_out("SELL signal (strength 57)")
+
+    def test_buy_is_not_a_stop(self):
+        assert not _is_stop_out("BUY signal (strength 67)")

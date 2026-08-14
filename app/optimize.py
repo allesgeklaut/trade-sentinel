@@ -756,9 +756,20 @@ def _reconstruct_portfolio_states(
     for tr in trades:
         date = tr.get("date") or ""
         month = date[:7]
-        if month != last_month:
+        # Deposit the allowance for every month between the last seen month
+        # and this trade's month. The replay deposits on the first trading
+        # day of *every* month, so with sparse trades we must catch up the
+        # skipped months — otherwise cash drifts negative and the LLM probe
+        # sees an unrealistic portfolio.
+        if last_month is not None and month > last_month:
+            y0, m0 = int(last_month[:4]), int(last_month[5:7])
+            y1, m1 = int(month[:4]), int(month[5:7])
+            months_between = (y1 - y0) * 12 + (m1 - m0)
+            cash += monthly_allowance * months_between
+        elif last_month is None:
+            # First trade: deposit one allowance for its month.
             cash += monthly_allowance
-            last_month = month
+        last_month = month
 
         # Value the decision ticker at the trade price; other held tickers are
         # approximated at their last known trade price (good enough for context).
@@ -957,7 +968,46 @@ def _snapshot_for_day(df: pd.DataFrame, date: str) -> dict[str, Any]:
     return {"action": action, "reason": "", "snapshot": snap, "strength": strength}
 
 
-def _build_llm_probe_context(case: TradeCase, snapshot: dict[str, Any]) -> str:
+def _live_sim_params() -> ReplayParams:
+    """ReplayParams mirroring the live sim's risk configuration.
+
+    The benchmark must replay with the same risk rules the live
+    ``_deterministic_decide`` applies (initial stop, ATR stop, max-positions
+    cap, position-size and cash-floor limits), otherwise the reconstructed
+    portfolio state won't match what the engine would actually have held — and
+    the LLM probe would be judged against context the engine never produced
+    (e.g. a 29-position portfolio judged against a 10-position cap).
+    """
+    return ReplayParams(
+        max_positions=settings.sim_max_positions,
+        max_position_pct=settings.sim_max_position_pct,
+        min_cash_pct=settings.sim_min_cash_pct,
+        # The live sim applies a frozen initial stop (sim_stop_pct) plus the
+        # ATR trailing stop on every cycle; mirror that here so the trade list
+        # and portfolio state reflect production behaviour.
+        stop_type="percent",
+        stop_pct=settings.sim_stop_pct,
+        use_atr_stop=True,
+    )
+
+
+def _is_stop_out(reason: str) -> bool:
+    """True if a deterministic SELL was an automatic stop, not a signal-driven decision.
+
+    The replay stamps these reasons (see the SELL phase in ``_replay``):
+      - "Initial stop: ..."   (frozen % stop)
+      - "ATR stop hit: ..."    (trailing-volatility stop)
+      - "Trailing stop: ..."  (% from peak)
+      - "Portfolio stop: ..." (circuit breaker)
+    Signal-driven SELLs say "SELL signal (strength ...)".
+    """
+    r = reason.lower()
+    return any(r.startswith(p) for p in
+               ("initial stop", "atr stop", "trailing stop", "portfolio stop"))
+
+
+def _build_llm_probe_context(case: TradeCase, snapshot: dict[str, Any],
+                             params: ReplayParams | None = None) -> str:
     """Build the user-message context for a single decision probe.
 
     Mirrors the compact signal summary from sim._build_llm_context but for one
@@ -965,24 +1015,49 @@ def _build_llm_probe_context(case: TradeCase, snapshot: dict[str, Any]) -> str:
     open positions) and the deterministic decision stated plainly so the LLM
     can confirm or override it. The portfolio state is reconstructed from the
     trade stream so it reflects what the engine actually held at the time.
+
+    Stop-out SELLs are framed as "the stop is about to fire — hold through it
+    or let it sell?" rather than as a completed decision, so the LLM can
+    exercise judgement on whether the shakeout is justified (e.g. RSI oversold
+    + weekly trend still up) instead of deferring to the auto-sell rule.
     """
     snap = snapshot["snapshot"]
     det = case.det_side
+    p = params or _live_sim_params()
     state = case.portfolio_state or {
         "cash": 0.0, "positions": [], "positions_value": 0.0, "total_equity": 0.0,
     }
     equity = state["total_equity"]
     cash = state["cash"]
+    max_pos_str = "unlimited" if p.max_positions <= 0 else str(p.max_positions)
+    stop_out = det == "SELL" and _is_stop_out(case.det_reason)
     lines = [
         "## Decision Probe (single ticker, one historical day)",
-        f"Deterministic engine proposed: {det} — {case.det_reason}",
+    ]
+    if stop_out:
+        lines.append(
+            f"The deterministic engine's stop-loss is about to fire on {case.ticker}: "
+            f"{case.det_reason}"
+        )
+        lines.append(
+            "The stop is an automatic rule — your job is to decide whether to "
+            "OVERRIDE it (HOLD) or let it execute (SELL). Consider whether the "
+            "indicators suggest the position is about to recover (e.g. RSI "
+            "oversold and turning up, weekly trend still up, MACD histogram "
+            "rising) or whether the trend really is broken."
+        )
+    else:
+        lines.append(f"Deterministic engine proposed: {det} — {case.det_reason}")
+    lines += [
         "",
         "## Portfolio context (reconstructed at the decision time)",
         f"Cash: {cash:.2f}",
         f"Positions value: {state['positions_value']:.2f}",
         f"Total equity: {equity:.2f}",
-        f"Min cash (5%): {equity * 0.05:.2f} | Max position (10%): {equity * 0.10:.2f} | Max positions: 10",
-        f"Stop loss: 15% (frozen at entry; ATR stop also applies)",
+        f"Open positions: {len(state['positions'])}/{max_pos_str}",
+        f"Min cash ({p.min_cash_pct:g}%): {equity * p.min_cash_pct / 100:.2f} | "
+        f"Max position ({p.max_position_pct:g}%): {equity * p.max_position_pct / 100:.2f}",
+        f"Stop loss: {p.stop_pct:g}% (frozen at entry; ATR stop also applies)",
         "",
     ]
     if state["positions"]:
@@ -1014,7 +1089,16 @@ def _build_llm_probe_context(case: TradeCase, snapshot: dict[str, Any]) -> str:
         f"{snap.get('macd', 0):>10.3f}",
         "",
         "## Deterministic Candidate Trades",
-        f"  - {case.ticker} {det} (strength {snapshot['strength']}) — {case.det_reason}",
+    ]
+    if stop_out:
+        lines.append(
+            f"  - {case.ticker} SELL (stop about to fire) — {case.det_reason}"
+        )
+    else:
+        lines.append(
+            f"  - {case.ticker} {det} (strength {snapshot['strength']}) — {case.det_reason}"
+        )
+    lines += [
         "",
         "## Your Decision",
         "Return ONLY a JSON array of objects: "
@@ -1024,19 +1108,39 @@ def _build_llm_probe_context(case: TradeCase, snapshot: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-async def _llm_probe(case: TradeCase, snapshot: dict[str, Any]) -> dict[str, Any]:
+async def _llm_probe(case: TradeCase, snapshot: dict[str, Any],
+                     params: ReplayParams | None = None) -> dict[str, Any]:
     """Send one decision probe to the configured Ollama model.
 
     Reuses the live hybrid sim's system prompt and JSON-array format so the
     benchmark reflects production behaviour. Returns the raw content, the
-    parsed decision (if any), and a status flag.
+    parsed decision (if any), and a status flag. ``params`` is forwarded to
+    the context builder so the risk limits shown match the replay that
+    produced the trade.
+
+    For stop-out cases, a short addendum is appended to the system prompt
+    allowing the LLM to override the auto-sell (which the live prompt's rule 4
+    otherwise forbids), since the whole point of probing a stop shakeout is to
+    ask whether holding through it would have been better.
     """
     # Imported here to avoid a circular import at module load (sim imports
     # analysis; optimize imports analysis). sim only needs to be present at
     # call time.
     from .sim import _LLM_SYSTEM_PROMPT, _parse_llm_decisions
 
-    context = _build_llm_probe_context(case, snapshot)
+    system_prompt = _LLM_SYSTEM_PROMPT
+    if _is_stop_out(case.det_reason):
+        system_prompt += (
+            "\n\nBENCHMARK OVERRIDE: rule 4 is relaxed for this probe. The "
+            "stop is about to fire but has NOT executed yet — you may answer "
+            "HOLD to override it and keep the position, or SELL to let it "
+            "execute. Base your choice on the indicators: hold through the "
+            "stop when the trend is merely pausing (RSI oversold and turning "
+            "up, weekly trend still up, MACD histogram rising), let it sell "
+            "when the trend really is broken."
+        )
+
+    context = _build_llm_probe_context(case, snapshot, params=params)
     url = settings.ollama_url.rstrip("/") + "/api/chat"
     timeout = httpx.Timeout(connect=10.0, read=settings.ollama_timeout_seconds,
                             write=30.0, pool=10.0)
@@ -1044,7 +1148,7 @@ async def _llm_probe(case: TradeCase, snapshot: dict[str, Any]) -> dict[str, Any
         "model": settings.ollama_model,
         "stream": False,
         "messages": [
-            {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": context},
         ],
     }
@@ -1101,12 +1205,22 @@ async def _run_llm_benchmark(
     ``skip_llm`` runs only the deterministic replay + case selection and prints
     the candidates without calling the LLM — useful for previewing which cases
     would be probed before spending tokens.
+
+    The replay uses ``_live_sim_params`` (the live sim's risk configuration:
+    max-positions cap, initial + ATR stops, position/cash limits) so the
+    reconstructed portfolio state matches what the engine would actually have
+    held, and the LLM is judged against truthful context.
     """
-    params = ReplayParams()
+    params = _live_sim_params()
     res = _replay(series, params, start=start, end=end)
     print(f"\n=== Deterministic backtest ({start or 'start'}..{end or 'end'}) ===")
     print(f"  Trades: {res.n_trades} | Return: {res.total_return_pct:+.2f}% | "
           f"Max DD: {res.max_drawdown_pct:.2f}% | Sharpe: {res.sharpe:.2f}")
+    print(f"  Risk config: max_positions={params.max_positions}, "
+          f"stop={params.stop_type} {params.stop_pct:g}%, "
+          f"atr_stop={params.use_atr_stop}, "
+          f"max_pos_pct={params.max_position_pct:g}%, "
+          f"min_cash_pct={params.min_cash_pct:g}%")
 
     if not res.trades:
         print("No trades to benchmark.")
@@ -1149,7 +1263,7 @@ async def _run_llm_benchmark(
             continue
         print(f"  [{idx}/{len(picked)}] {c.ticker} {c.date} "
               f"(det={c.det_side}, fwd {c.outcome_pct:+.2f}%) ...", end=" ", flush=True)
-        probe = await _llm_probe(c, snapshot)
+        probe = await _llm_probe(c, snapshot, params=params)
         llm_action = (probe["decision"] or {}).get("action") if probe["decision"] else None
         llm_reason = (probe["decision"] or {}).get("reason", "") if probe["decision"] else ""
         verdict = _llm_turned(c.det_side, llm_action)
