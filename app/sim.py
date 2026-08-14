@@ -288,12 +288,15 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
 
     SELL logic:
       - Sell any position whose signal is SELL.
+      - Sell any position whose price drops below the initial stop
+        (entry price × (1 - sim_stop_pct/100), frozen at buy time).
       - Sell any position whose current price drops below ATR stop (from snapshot).
 
     BUY logic:
       - Among candidates with BUY signal, rank by strength.
       - Buy the top candidate if cash > min_cash_pct of total equity and the
         position wouldn't exceed max_position_pct of total equity.
+      - Stop opening new positions once sim_max_positions is reached.
     """
     trades: list[dict] = []
     tickers = await _candidate_tickers()
@@ -314,6 +317,7 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
 
     min_cash = total_equity * (settings.sim_min_cash_pct / 100)
     max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+    stop_pct = settings.sim_stop_pct
 
     # --- SELL phase ---
     async with Session() as s:
@@ -327,6 +331,19 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
 
         if sig and sig["action"] == "SELL":
             t = await _exec_sell(pos.ticker, price, None, sig["reason"])
+            if t:
+                trades.append(t)
+            continue
+
+        # Initial stop loss (frozen at entry): sell if price has dropped
+        # sim_stop_pct from the average entry cost.
+        stop_price = pos.avg_cost * (1 - stop_pct / 100)
+        if price <= stop_price:
+            t = await _exec_sell(
+                pos.ticker, price, None,
+                f"Initial stop: price {price:.2f} <= {stop_price:.2f} "
+                f"(entry {pos.avg_cost:.2f}, -{stop_pct:.0f}%)",
+            )
             if t:
                 trades.append(t)
             continue
@@ -351,6 +368,9 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
         max_position_value = total_equity * (settings.sim_max_position_pct / 100)
 
     # --- BUY phase ---
+    async with Session() as s:
+        open_count = await s.scalar(select(func.count()).select_from(SimPosition))
+
     buy_candidates = [
         (t, sig) for t, sig in signals.items()
         if sig["action"] == "BUY"
@@ -375,6 +395,10 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
         if acc.cash < min_cash:
             break  # not enough cash to keep buffer
 
+        # Max open positions: stop buying if we already hold too many.
+        if open_count >= settings.sim_max_positions:
+            break
+
         price = await _latest_close(ticker)
         if price is None or price <= 0:
             continue
@@ -393,6 +417,7 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
         t = await _exec_buy(ticker, price, budget, sig["reason"])
         if t:
             trades.append(t)
+            open_count += 1
 
     return trades
 

@@ -142,6 +142,13 @@ class ReplayParams:
     risk_pct: float = 0.0
     # Sector diversification cap: max % of equity in any one sector. 0 = disabled.
     max_sector_pct: float = 0.0
+    # Portfolio-level circuit breaker: if total equity drops this % from its
+    # peak, sell all positions and block new BUYs for the rest of the window.
+    # 0 = disabled. e.g. 20 = deleverage when portfolio is down 20% from peak.
+    portfolio_stop_pct: float = 0.0
+    # Max simultaneous open positions. 0 = unlimited. Forces diversification
+    # so no single crash can sink the portfolio.
+    max_positions: int = 0
 
 
 # Sector groupings for the global-large-cap universe. Used by the sector
@@ -339,6 +346,8 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
     daily_returns: list[float] = []
     prev_equity: float | None = None
     last_deposit_month: str | None = None
+    portfolio_peak: float = 0.0     # highest equity seen (for portfolio stop)
+    risk_off: bool = False          # circuit breaker active (no new BUYs)
 
     for day in days:
         # Monthly allowance deposit (first trading day of a new month).
@@ -358,6 +367,28 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
         if total_equity <= 0:
             equity_curve.append({"time": day, "equity": 0.0})
             continue
+
+        # Track portfolio peak for circuit breaker.
+        if total_equity > portfolio_peak:
+            portfolio_peak = total_equity
+
+        # Portfolio-level circuit breaker: if equity has dropped
+        # portfolio_stop_pct from its peak, sell everything and go risk-off.
+        if params.portfolio_stop_pct > 0 and portfolio_peak > 0:
+            dd = (portfolio_peak - total_equity) / portfolio_peak * 100
+            if dd >= params.portfolio_stop_pct:
+                if not risk_off:
+                    # Sell all positions immediately.
+                    for ticker in list(pf.positions.keys()):
+                        price = prices.get(ticker, 0)
+                        if price > 0:
+                            pf.sell(ticker, price, None,
+                                    f"Portfolio stop: equity {total_equity:.0f} "
+                                    f"is -{dd:.1f}% from peak {portfolio_peak:.0f}")
+                    risk_off = True
+            elif risk_off and dd < params.portfolio_stop_pct / 2:
+                # Re-engage when drawdown recovers to half the stop level.
+                risk_off = False
 
         min_cash = total_equity * (params.min_cash_pct / 100)
         max_position_value = total_equity * (params.max_position_pct / 100)
@@ -406,9 +437,9 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
         # Regime filter: block new BUYs when the broad market is below its
         # 200-day SMA. SELLs and ATR stops still execute (we manage risk on
         # the way down, we just don't add new exposure).
-        market_ok = True
+        market_ok = not risk_off
         if params.regime_filter and regime is not None:
-            market_ok = regime.get(day, True)
+            market_ok = market_ok and regime.get(day, True)
 
         buy_candidates = []
         if market_ok:
@@ -430,6 +461,9 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
 
         for ticker, row in buy_candidates:
             if pf.cash < min_cash:
+                break
+            # Max open positions: stop buying if we already hold too many.
+            if params.max_positions > 0 and len(pf.positions) >= params.max_positions:
                 break
             price = row["close"]
             current_value = pf.positions.get(ticker, 0) * price
@@ -520,39 +554,41 @@ def _param_grid(regime_filter: bool = False) -> list[ReplayParams]:
     as a small set of proven configurations to keep the grid manageable.
     """
     # Risk management configurations (proven configs from A/B testing).
-    # Each tuple: (stop_type, stop_pct, stop_atr_mult, risk_pct, max_sector_pct)
+    # Each tuple: (stop_type, stop_pct, stop_atr_mult, risk_pct, max_sector_pct,
+    #              portfolio_stop_pct, max_positions)
     risk_configs = [
-        # No risk management (baseline)
-        ("none", 0, 0, 0, 0),
-        # 15% initial stop only
-        ("percent", 15, 0, 0, 0),
-        # 15% stop + 1% risk sizing
-        ("percent", 15, 0, 1.0, 0),
-        # 15% stop + 1% risk + 25% sector cap (best overall)
-        ("percent", 15, 0, 1.0, 25),
-        # 2x ATR stop + 1% risk
-        ("atr", 0, 2.0, 1.0, 0),
-        # 2x ATR stop + 1% risk + 25% sector cap
-        ("atr", 0, 2.0, 1.0, 25),
+        # No risk management (baseline — lets optimizer compare)
+        ("none", 0, 0, 0, 0, 0, 0),
+        # 15% stop + 1% risk + 20% sector cap + max 10 positions (diversified)
+        ("percent", 15, 0, 1.0, 20, 0, 10),
+        # 15% stop + 1% risk + 20% sector cap + max 10 + 20% portfolio stop
+        ("percent", 15, 0, 1.0, 20, 20, 10),
+        # 15% stop + 1% risk + 15% sector cap + max 20 positions (less concentrated)
+        ("percent", 15, 0, 1.0, 15, 0, 20),
+        # 2x ATR stop + 1% risk + 20% sector cap + max 10 positions
+        ("atr", 0, 2.0, 1.0, 20, 0, 10),
+        # 2x ATR stop + 1% risk + 20% sector cap + max 10 + 20% portfolio stop
+        ("atr", 0, 2.0, 1.0, 20, 20, 10),
     ]
     grid = []
     for buy in (40, 50):
         for sell in (-40, -30):
-            for trail in (0.0, 15.0):
-                for max_pos in (15, 20):
-                    for stop_type, stop_pct, stop_atr, risk_pct, sector_pct in risk_configs:
+            for max_pos in (5, 10):
+                    for stop_type, stop_pct, stop_atr, risk_pct, sector_pct, pf_stop, max_n in risk_configs:
                         grid.append(ReplayParams(
                             buy_threshold=buy, sell_threshold=sell,
                             relaxed_hold_strength=40,
                             max_position_pct=max_pos,
                             use_atr_stop=False,
-                            trailing_stop_pct=trail,
+                            trailing_stop_pct=0,
                             regime_filter=regime_filter,
                             stop_type=stop_type,
                             stop_pct=stop_pct,
                             stop_atr_mult=stop_atr,
                             risk_pct=risk_pct,
                             max_sector_pct=sector_pct,
+                            portfolio_stop_pct=pf_stop,
+                            max_positions=max_n,
                         ))
     return grid
 
@@ -568,9 +604,13 @@ def _split_windows(days: list[str], train_days: int, test_days: int):
 
 
 def _score(result: ReplayResult) -> float:
-    """Composite score used to pick the 'best' params on a train window."""
-    # Prefer higher return, penalize drawdown. Sharpe is secondary.
-    return result.total_return_pct - 0.5 * result.max_drawdown_pct
+    """Composite score used to pick the 'best' params on a train window.
+
+    Heavily penalizes drawdown (2x) so the optimizer prefers risk-controlled
+    configs over high-return/high-drawdown ones. A config returning +50% with
+    95% drawdown scores -140, while +30% return with 20% drawdown scores -10.
+    """
+    return result.total_return_pct - 2.0 * result.max_drawdown_pct
 
 
 def _run_sweep(series: dict[str, pd.DataFrame], start: str, end: str,
@@ -607,12 +647,13 @@ def _walk_forward(series: dict[str, pd.DataFrame], days: list[str],
         test_res = _replay(series, best_params, start=test_s, end=test_e, regime=regime)
         elapsed = time.time() - t0
         logger.info("Window %d/%d done in %.0fs: buy=%d sell=%d trail=%.0f maxpos=%d "
-                    "stop=%s risk=%.1f%% sector=%.0f%% | "
+                    "stop=%s risk=%.1f%% sector=%.0f%% pf_stop=%.0f%% maxn=%d | "
                     "train %+.1f%% → test %+.1f%% (sharpe %.2f, dd %.1f%%, %d trades)",
                     w_idx, total, elapsed,
                     best_params.buy_threshold, best_params.sell_threshold,
                     best_params.trailing_stop_pct, best_params.max_position_pct,
                     best_params.stop_type, best_params.risk_pct, best_params.max_sector_pct,
+                    best_params.portfolio_stop_pct, best_params.max_positions,
                     best_train.total_return_pct, test_res.total_return_pct,
                     test_res.sharpe, test_res.max_drawdown_pct, test_res.n_trades)
         windows.append({
@@ -628,6 +669,8 @@ def _walk_forward(series: dict[str, pd.DataFrame], days: list[str],
                 "stop_pct": best_params.stop_pct,
                 "risk_pct": best_params.risk_pct,
                 "max_sector_pct": best_params.max_sector_pct,
+                "portfolio_stop_pct": best_params.portfolio_stop_pct,
+                "max_positions": best_params.max_positions,
             },
             "train_score": round(_score(sweep[0][1]), 2),
             "train_return_pct": round(sweep[0][1].total_return_pct, 2),
