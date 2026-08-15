@@ -371,9 +371,13 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
     async with Session() as s:
         open_count = await s.scalar(select(func.count()).select_from(SimPosition))
 
+    max_run_5d = settings.sim_max_run_5d
     buy_candidates = [
         (t, sig) for t, sig in signals.items()
         if sig["action"] == "BUY"
+        and not (max_run_5d > 0
+                 and sig["snapshot"].get("run_5d") is not None
+                 and sig["snapshot"]["run_5d"] > max_run_5d)
     ]
     buy_candidates.sort(key=lambda x: x[1]["strength"], reverse=True)
 
@@ -384,6 +388,9 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
         hold_candidates = [
             (t, sig) for t, sig in signals.items()
             if sig["action"] == "HOLD" and sig["strength"] >= 40
+            and not (max_run_5d > 0
+                     and sig["snapshot"].get("run_5d") is not None
+                     and sig["snapshot"]["run_5d"] > max_run_5d)
         ]
         hold_candidates.sort(key=lambda x: x[1]["strength"], reverse=True)
         buy_candidates = hold_candidates[:3]  # limit relaxed buys

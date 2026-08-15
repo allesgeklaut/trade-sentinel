@@ -59,7 +59,7 @@ class TestSignalSeries:
         for col in ("time", "close", "net", "bullish", "bearish",
                     "trend_up", "trend_down", "dist_above", "dist_below",
                     "atr_stop", "weekly_trend_up",
-                    "rsi_3d_change", "macd_hist_3d_change"):
+                    "rsi_3d_change", "macd_hist_3d_change", "run_5d"):
             assert col in df.columns
         assert len(df) == 500
 
