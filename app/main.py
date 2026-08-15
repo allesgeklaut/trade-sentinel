@@ -1,4 +1,4 @@
-import json, httpx, logging
+import json, logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
@@ -12,6 +12,7 @@ from .analysis import compute, persist, history, MIN_CANDLES
 from .screener import universe_names, run, results, refresh_incremental, load_deep_history
 from . import sim
 from . import news as news_mod
+from . import llm as llm_mod
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 logger = logging.getLogger("trade_sentinel.main")
@@ -199,26 +200,44 @@ async def chat(ticker: str, req: ChatRequest):
         raise HTTPException(400, "no valid messages")
     system_prompt = await _stock_context(ticker)
     try:
-        timeout = httpx.Timeout(
-            connect=10.0,
-            read=settings.ollama_timeout_seconds,
-            write=30.0,
-            pool=10.0,
-        )
-        async with httpx.AsyncClient(timeout=timeout) as c:
-            out = (await c.post(
-                settings.ollama_url.rstrip('/') + '/api/chat',
-                json={
-                    "model": settings.ollama_model,
-                    "messages": [{"role": "system", "content": system_prompt}] + history_msgs,
-                    "stream": False,
-                },
-            )).json()
-        text = out.get('message', {}).get('content', '') or 'No Ollama response'
-        return {"text": text, "model": settings.ollama_model}
+        out = await llm_mod.chat([{"role": "system", "content": system_prompt}] + history_msgs)
+        return {"text": out["text"], "model": out["model"] or await llm_mod.current_model_label()}
     except Exception as e:
-        logger.warning("Chat Ollama call failed for %s: %s", ticker, e)
-        return {"text": f"Ollama unavailable: {e}", "model": settings.ollama_model}
+        logger.warning("Chat LLM call failed for %s: %s", ticker, e)
+        return {"text": f"LLM unavailable: {e}", "model": await llm_mod.current_model_label()}
+
+# =====================================================================
+# LLM backend / model management
+# =====================================================================
+
+class LLMSelectRequest(BaseModel):
+    backend: str
+    model: str | None = None
+
+@app.get('/api/llm/status')
+async def llm_status():
+    """List all configured LLM backends, the models each serves, and the active one."""
+    backends = await llm_mod.list_backends()
+    active = await llm_mod.current_backend()
+    return {
+        "backends": backends,
+        "active_backend": active.get("name", ""),
+        "active_model": active.get("model", ""),
+    }
+
+@app.post('/api/llm/select')
+async def llm_select(req: LLMSelectRequest):
+    """Switch the active LLM backend and optionally the model within it
+    (persisted across restarts)."""
+    try:
+        match = await llm_mod.select_backend(req.backend, req.model)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return {
+        "ok": True,
+        "backend": match["name"],
+        "model": match["model"],
+    }
 
 # =====================================================================
 # Autonomous paper-trading simulation endpoints
