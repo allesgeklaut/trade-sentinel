@@ -484,19 +484,29 @@ _SIM_METHODOLOGY = (
     "  - **atr_stop**: trailing-volatility stop. Price below it = the trend "
     "broke.\n"
     "\n"
+    "## GATING deterministic BUYs\n"
+    "The deterministic BUY signal (net score >= +40 + uptrend confirmed) fires "
+    "on any ticker in an uptrend, even when the entry is overextended. Downgrade "
+    "a BUY to HOLD when ANY of these signal the entry is too late:\n"
+    "  - **run_5d > 15%**: price already spiked more than 15% in the last 5 "
+    "days — you are chasing a short-term spike that is prone to reversion.\n"
+    "  - **RSI > 70 AND rsi_3d_change < 0**: overbought and turning down — "
+    "momentum is fading at the top.\n"
+    "  - **ADX < 15**: no real trend, just noise — the signal is not reliable.\n"
+    "Downgrading a BUY to HOLD is the highest-impact decision you can make: "
+    "backtesting showed avoiding 4 catastrophic entries (each losing 15-38% "
+    "within 20 days) outweighs missing 8 good entries, for a net +5% return "
+    "improvement.\n"
+    "\n"
     "## GATING deterministic SELLs\n"
-    "When reviewing a deterministic SELL candidate, do not rubber-stamp it. "
-    "The deterministic SELL signal (net score <= -40 + downtrend confirmed) "
-    "fires on any pullback that briefly crosses below SMA50, not just on real "
-    "trend breaks. Override it to HOLD when ALL of these hold:\n"
-    "  1. weekly_trend_up is True (the weekly chart is still in an uptrend), AND\n"
-    "  2. rsi_3d_change is positive OR macd_hist_3d_change is positive (RSI or "
-    "MACD histogram is turning up — the pullback is ending, not deepening).\n"
-    "  RSI does not need to be deeply oversold to justify holding — a positive "
-    "rsi_3d_change at RSI 35-45 is a stronger recovery signal than a static RSI "
-    "below 30 with no upward turn. Let the SELL execute only when the weekly "
-    "trend is down, or both rsi_3d_change and macd_hist_3d_change are negative "
-    "(the pullback is accelerating into a real downtrend).\n"
+    "The deterministic SELL signal fires on any pullback that briefly crosses "
+    "below SMA50, not just on real trend breaks. You may override it to HOLD, "
+    "but be conservative: holding traps capital that could be redeployed. Only "
+    "override when ALL of these hold:\n"
+    "  1. weekly_trend_up is True, AND\n"
+    "  2. rsi_3d_change is positive OR macd_hist_3d_change is positive.\n"
+    "When in doubt, let the SELL execute — the capital will be redeployed into "
+    "the next BUY signal.\n"
     "\n"
     "When the portfolio holds more positions than the max-positions cap (or the "
     "user asks to clean up / trim / take profits), sell the weakest first: "
@@ -516,8 +526,11 @@ _LLM_SYSTEM_PROMPT = (
     "\n"
     + _SIM_METHODOLOGY +
     "Rules:\n"
-    "2. You may also adjust the deterministic candidates: upgrade a HOLD to a "
-    "BUY, downgrade a BUY to HOLD, or reject a SELL.\n"
+    "2. Your primary job is to downgrade overextended BUYs to HOLD. See the "
+    "GATING deterministic BUYs section above. This is the highest-impact "
+    "decision you make — avoiding catastrophic entries outweighs everything "
+    "else. You may also reject a SELL, but be conservative (see GATING "
+    "deterministic SELLs).\n"
     "3. Respect risk management: do not buy if cash is too low; do not over-"
     "concentrate in a single ticker. The engine caps the number of open "
     "positions (it stops buying once the max position count is reached), so "
@@ -527,11 +540,13 @@ _LLM_SYSTEM_PROMPT = (
     "auto-sold by the deterministic layer. Do not be surprised if a position "
     "disappears between cycles — that is the stop loss, not a decision you "
     "need to replicate.\n"
-    "5. If you want to buy a ticker but cash is too low, you may sell an existing "
-    "position to free up cash — but only when the position you would sell is "
-    "weaker (e.g. a SELL signal, a losing/overweight position, or a HOLD with "
-    "poorer indicators) than the one you want to buy. List the SELL before the "
-    "BUY in your output so the sale executes first.\n"
+    "5. Do NOT sell a position to free up cash for another BUY. Selling one "
+    "ticker to buy another is portfolio churn — backtesting proved this "
+    "reduces returns because the \"stronger opportunity\" has the same "
+    "indicator profile as the position being sold. Only SELL when the "
+    "deterministic engine proposes a SELL and you agree, or when a position "
+    "is clearly broken (price below ATR stop, SELL signal with weekly trend "
+    "down).\n"
     "6. Decisions must be grounded in the provided signals and indicators.\n"
     "7. You may receive recent news headlines for supplementary context. News "
     "can explain *why* indicators are moving, but do not make trades based on "
@@ -545,12 +560,15 @@ _LLM_SYSTEM_PROMPT = (
     " maximum allowed by risk rules.\n"
     "9. The max position % is a buy-time sizing limit, not a ceiling to enforce "
     "on exits. Do NOT sell a position just because its price rose above it — "
-    "let winners run. Only trim a position (with an exact \"shares\" or \"amount\", "
-    "or the whole position) when it is genuinely overweight and you have a "
-    "clearly better use for that capital, such as buying a stronger opportunity.\n"
+    "let winners run.\n"
+    "10. When the portfolio holds more positions than the max-positions cap, "
+    "sell the weakest first: lowest strength, SELL signals, low ADX, RSI "
+    "overbought, or price below its ATR stop — and keep the highest-strength, "
+    "highest-ADX, still-in-uptrend names. But do not sell just to rotate into "
+    "a different ticker with similar indicators.\n"
     "\n"
     "Return ONLY a JSON array of objects with the fields:\n"
-    '  "ticker": string, "action": "BUY"|"SELL"|"HOLD", "reason": string, '
+    '  "ticker": string, "action": "BUY"|"SELL|HOLD", "reason": string, '
     '"shares"?: number, "amount"?: number\n'
     "\n"
     "No markdown, no code fences, no prose — just the JSON array.\n"
@@ -601,21 +619,23 @@ def _build_llm_context(
     if signals:
         lines.append(
             f"{'ticker':<10} {'action':<6} {'strength':>8} "
-            f"{'close':>10} {'rsi':>6} {'rsiΔ3':>6} {'adx':>5} {'wk':>3} {'macd':>10} {'mhΔ3':>7}"
+            f"{'close':>10} {'rsi':>6} {'rsiΔ3':>6} {'adx':>5} {'wk':>3} {'macd':>10} {'mhΔ3':>7} {'run5d':>6}"
         )
         for ticker, sig in sorted(signals.items()):
             snap = sig.get("snapshot", {})
             wk = "up" if snap.get("weekly_trend_up") else "dn"
             rsi_d = snap.get("rsi_3d_change")
             mh_d = snap.get("macd_hist_3d_change")
+            run5 = snap.get("run_5d")
             rsi_d_s = f"{rsi_d:+.1f}" if rsi_d is not None else "  -  "
             mh_d_s = f"{mh_d:+.2f}" if mh_d is not None else "  -  "
+            run5_s = f"{run5:+.1f}%" if run5 is not None else "  -  "
             lines.append(
                 f"{ticker:<10} {sig['action']:<6} {sig['strength']:>8} "
                 f"{snap.get('close', 0):>10.2f} {snap.get('rsi', 0):>6.1f} "
                 f"{rsi_d_s:>6} "
                 f"{snap.get('adx', 0):>5.0f} {wk:>3} "
-                f"{snap.get('macd', 0):>10.3f} {mh_d_s:>7}"
+                f"{snap.get('macd', 0):>10.3f} {mh_d_s:>7} {run5_s:>6}"
             )
     else:
         lines.append("(no signals available)")
@@ -1444,8 +1464,7 @@ _SIM_CHAT_SYSTEM_PROMPT = (
     "7. The max position % is a buy-time sizing limit, not a ceiling to enforce "
     "on exits. Do NOT sell a position just because its price rose above it — let "
     "winners run. Only trim a position (with an exact \"shares\" or \"amount\", or "
-    "the whole position) when it is genuinely overweight and you have a clearly "
-    "better use for that capital, such as buying a stronger opportunity.\n"
+    "the whole position) when it is genuinely overweight and the user asks you to.\n"
     "8. Only propose actions you believe are justified by the signals and portfolio context.\n"
     "9. If you do not agree with the user's request, explain why and omit the ACTION block.\n"
     "10. Do NOT reference specific URLs in your output.\n"
@@ -1453,6 +1472,11 @@ _SIM_CHAT_SYSTEM_PROMPT = (
     "that were already executed by the simulation. Treat them as historical — "
     "when asked about them, explain them, but do NOT include them as new actions "
     "unless the user explicitly asks you to take a new trade.\n"
+    "12. Be cautious about selling one ticker to buy another (portfolio rotation). "
+    "Backtesting showed this reduces returns because tickers with similar "
+    "indicator profiles tend to perform similarly — the \"stronger opportunity\" "
+    "is rarely actually stronger. If the user asks for a swap, explain the risk "
+    "and only proceed if they insist.\n"
 )
 
 
@@ -1555,10 +1579,16 @@ async def _build_sim_chat_context() -> str:
         for ticker, sig in sorted(interesting.items()):
             snap = sig.get("snapshot", {})
             wk = "up" if snap.get("weekly_trend_up") else "dn"
+            rsi_d = snap.get("rsi_3d_change")
+            mh_d = snap.get("macd_hist_3d_change")
+            run5 = snap.get("run_5d")
+            rsi_d_s = f" | rsiΔ3 {rsi_d:+.1f}" if rsi_d is not None else ""
+            mh_d_s = f" | mhΔ3 {mh_d:+.2f}" if mh_d is not None else ""
+            run5_s = f" | run5d {run5:+.1f}%" if run5 is not None else ""
             lines.append(
                 f"  {ticker}: {sig['action']} (strength {sig['strength']}) "
-                f"| RSI {snap.get('rsi', 0):.1f} | ADX {snap.get('adx', 0):.0f} "
-                f"| wk {wk} | MACD {snap.get('macd', 0):.3f} "
+                f"| RSI {snap.get('rsi', 0):.1f}{rsi_d_s} | ADX {snap.get('adx', 0):.0f} "
+                f"| wk {wk} | MACD {snap.get('macd', 0):.3f}{mh_d_s}{run5_s} "
                 f"| close {snap.get('close', 0):.2f}"
             )
     lines.append("")
