@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from app import optimize
+from app.analysis import compute
 from app.optimize import (
     ReplayParams,
     _is_stop_out,
@@ -20,6 +21,7 @@ from app.optimize import (
     _row_strength,
     _select_cases,
     _signal_series,
+    _snapshot_for_day,
     _split_windows,
     _trade_outcomes,
     _reconstruct_portfolio_states,
@@ -172,6 +174,41 @@ class TestReplayTradeDates:
             assert "date" in t and t["date"]
             # Date is a YYYY-MM-DD string within the generated range.
             assert t["date"] >= "2025-01-01"
+
+
+class TestSnapshotForDay:
+    """_snapshot_for_day must produce the same snapshot as analysis.compute()
+    so the benchmark feeds the LLM identical fields the live sim does."""
+
+    def test_matches_compute_on_last_row(self):
+        candles = _gen_candles(100.0, 0.01, seed=1)
+        df = _signal_series(candles)
+        last_date = df["time"].iloc[-1]
+
+        probe = _snapshot_for_day(df, last_date)
+        live = compute(candles)
+
+        assert set(probe["snapshot"].keys()) == set(live["snapshot"].keys())
+        for k in live["snapshot"]:
+            assert probe["snapshot"][k] == live["snapshot"][k], f"field {k} differs"
+        assert probe["action"] == live["action"]
+        assert probe["strength"] == live["strength"]
+
+    def test_works_on_arbitrary_day(self):
+        df = _signal_series(_gen_candles(100.0, 0.01, seed=1))
+        mid_date = df["time"].iloc[250]
+        result = _snapshot_for_day(df, mid_date)
+        assert "snapshot" in result
+        snap = result["snapshot"]
+        assert snap["close"] is not None
+        assert snap["rsi"] is not None
+        assert snap["rsi_3d_change"] is not None
+        assert snap["macd_hist_3d_change"] is not None
+
+    def test_raises_on_missing_date(self):
+        df = _signal_series(_gen_candles(100.0, 0.01, seed=1))
+        with pytest.raises(KeyError):
+            _snapshot_for_day(df, "1999-01-01")
 
 
 class TestTradeOutcomes:
