@@ -37,6 +37,7 @@ from .analysis import (
     MIN_CANDLES,
     decide_action,
     signal_series as _signal_series,
+    snapshot_from_row,
     strength_for,
 )
 from .config import settings
@@ -930,44 +931,34 @@ def _select_cases(
 def _snapshot_for_day(df: pd.DataFrame, date: str) -> dict[str, Any]:
     """Reconstruct the analysis.compute() snapshot for a given trading day.
 
-    Mirrors analysis.compute's snapshot dict (close, sma*, rsi, macd, adx,
-    atr_stop, net_score, strength, weekly_trend_up, vol_surge,
-    rsi_3d_change, macd_hist_3d_change) so the LLM is shown exactly what the
-    live hybrid engine would show it, including the momentum trend fields.
+    Uses ``snapshot_from_row`` (the single source of truth for the snapshot
+    shape shared with ``analysis.compute``) so the benchmark always shows the
+    LLM the same fields the live hybrid engine does — no drift.
     """
     i = df.index[df["time"] == date].tolist()
     if not i:
         raise KeyError(f"{date} not in series")
     x = df.iloc[i[0]]
 
-    def norm(v):
-        try:
-            v = float(v)
-        except (TypeError, ValueError):
-            return None
-        return None if pd.isna(v) else round(v, 2)
-
     net = float(x.net)
     bullish = float(x.bullish)
     bearish = float(x.bearish)
+    trend_up = bool(x.trend_up)
+    trend_down = bool(x.trend_down)
+    weekly_trend_up = bool(x.weekly_trend_up) if not pd.isna(x.weekly_trend_up) else True
+    vol_surge = bool(x.vol_surge)
+    dist_above = float(x.dist_above)
+    dist_below = float(x.dist_below)
+    atr_stop = float(x.atr_stop)
+
     action = decide_action(
-        net, bool(x.trend_up), bool(x.trend_down),
-        float(x.dist_above), float(x.dist_below),
+        net, trend_up, trend_down, dist_above, dist_below,
         ReplayParams().buy_threshold, ReplayParams().sell_threshold,
-        bool(x.weekly_trend_up) if not pd.isna(x.weekly_trend_up) else True,
+        weekly_trend_up,
     )
     strength = strength_for(action, bullish, bearish)
-    snap = {k: norm(x[k]) for k in
-            ["close", "sma20", "sma50", "sma200", "rsi",
-             "macd", "macd_signal", "macd_hist", "atr14", "adx"]}
-    snap["atr_stop"] = norm(x.atr_stop)
-    snap["atr_pct"] = norm(100 * float(x.atr14) / float(x.close)) if float(x.close) else None
-    snap["vol_surge"] = bool(x.vol_surge)
-    snap["weekly_trend_up"] = bool(x.weekly_trend_up) if not pd.isna(x.weekly_trend_up) else True
-    snap["net_score"] = int(net)
-    snap["strength"] = strength
-    snap["rsi_3d_change"] = norm(x.rsi_3d_change)
-    snap["macd_hist_3d_change"] = norm(x.macd_hist_3d_change)
+    snap = snapshot_from_row(x, net, bullish, bearish, strength,
+                             weekly_trend_up, vol_surge, atr_stop)
     return {"action": action, "reason": "", "snapshot": snap, "strength": strength}
 
 

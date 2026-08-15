@@ -275,6 +275,37 @@ def strength_for(action: str, bullish: float, bearish: float) -> int:
     return int(round(max(bullish, bearish)))
 
 
+def snapshot_from_row(x, net: float, bullish: float, bearish: float,
+                      strength: int, weekly_trend_up: bool,
+                      vol_surge: bool, atr_stop: float) -> dict:
+    """Build the snapshot dict from a signal_series row + derived values.
+
+    Single source of truth for the snapshot shape — used by ``compute``
+    (last row) and by ``optimize._snapshot_for_day`` (arbitrary row), so the
+    benchmark and the live sim always see the same fields. If a field is added
+    here it automatically appears in both places.
+    """
+    def norm(v):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        return None if pd.isna(v) else round(v, 2)
+
+    snap = {k: norm(x[k]) for k in
+            ["close", "sma20", "sma50", "sma200", "rsi",
+             "macd", "macd_signal", "macd_hist", "atr14", "adx"]}
+    snap["atr_stop"] = norm(atr_stop)
+    snap["atr_pct"] = norm(100 * float(x.atr14) / float(x.close))
+    snap["vol_surge"] = vol_surge
+    snap["weekly_trend_up"] = weekly_trend_up
+    snap["net_score"] = int(net)
+    snap["strength"] = strength
+    snap["rsi_3d_change"] = norm(x.rsi_3d_change)
+    snap["macd_hist_3d_change"] = norm(x.macd_hist_3d_change)
+    return snap
+
+
 def compute(rows: list[dict]) -> dict:
     """Compute indicators and derive a BUY/SELL/HOLD signal from OHLCV rows.
 
@@ -328,26 +359,8 @@ def compute(rows: list[dict]) -> dict:
             f"MACD {x.macd:.3f}/{x.macd_signal:.3f}."
         )
 
-    # --- snapshot --------------------------------------------------------
-    def norm(v):
-        try:
-            v = float(v)
-        except (TypeError, ValueError):
-            return None
-        return None if pd.isna(v) else round(v, 2)
-
-    snap = {k: norm(x[k]) for k in ["close", "sma20", "sma50", "sma200", "rsi", "macd", "macd_signal", "macd_hist", "atr14", "adx"]}
-    snap["atr_stop"] = norm(atr_stop)
-    snap["atr_pct"] = norm(100 * float(x.atr14) / float(x.close))
-    snap["vol_surge"] = vol_surge
-    snap["weekly_trend_up"] = weekly_trend_up
-    snap["net_score"] = int(net)
-    snap["strength"] = strength
-    # Momentum trend (3-day net change): lets the LLM see whether RSI / MACD
-    # histogram are turning up (pullback ending) or still falling (downtrend
-    # deepening) — not just the point value.
-    snap["rsi_3d_change"] = norm(x.rsi_3d_change)
-    snap["macd_hist_3d_change"] = norm(x.macd_hist_3d_change)
+    snap = snapshot_from_row(x, net, bullish, bearish, strength,
+                             weekly_trend_up, vol_surge, atr_stop)
 
     return {
         "action": action,
