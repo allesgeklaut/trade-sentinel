@@ -931,8 +931,9 @@ def _snapshot_for_day(df: pd.DataFrame, date: str) -> dict[str, Any]:
     """Reconstruct the analysis.compute() snapshot for a given trading day.
 
     Mirrors analysis.compute's snapshot dict (close, sma*, rsi, macd, adx,
-    atr_stop, net_score, strength, weekly_trend_up, vol_surge) so the LLM is
-    shown exactly what the live hybrid engine would show it.
+    atr_stop, net_score, strength, weekly_trend_up, vol_surge,
+    rsi_3d_change, macd_hist_3d_change) so the LLM is shown exactly what the
+    live hybrid engine would show it, including the momentum trend fields.
     """
     i = df.index[df["time"] == date].tolist()
     if not i:
@@ -965,6 +966,8 @@ def _snapshot_for_day(df: pd.DataFrame, date: str) -> dict[str, Any]:
     snap["weekly_trend_up"] = bool(x.weekly_trend_up) if not pd.isna(x.weekly_trend_up) else True
     snap["net_score"] = int(net)
     snap["strength"] = strength
+    snap["rsi_3d_change"] = norm(x.rsi_3d_change)
+    snap["macd_hist_3d_change"] = norm(x.macd_hist_3d_change)
     return {"action": action, "reason": "", "snapshot": snap, "strength": strength}
 
 
@@ -1081,12 +1084,22 @@ def _build_llm_probe_context(case: TradeCase, snapshot: dict[str, Any],
         "",
         "## Signals",
         f"{'ticker':<10} {'action':<6} {'strength':>8} "
-        f"{'close':>10} {'rsi':>6} {'adx':>5} {'wk':>3} {'macd':>10}",
+        f"{'close':>10} {'rsi':>6} {'rsiΔ3':>6} {'adx':>5} {'wk':>3} "
+        f"{'macd':>10} {'mhΔ3':>7}",
+    ]
+    rsi_d = snap.get("rsi_3d_change")
+    mh_d = snap.get("macd_hist_3d_change")
+    rsi_d_s = f"{rsi_d:+.1f}" if rsi_d is not None else "  -  "
+    mh_d_s = f"{mh_d:+.2f}" if mh_d is not None else "  -  "
+    lines.append(
         f"{case.ticker:<10} {snapshot['action']:<6} {snapshot['strength']:>8} "
         f"{snap.get('close', 0):>10.2f} {snap.get('rsi', 0):>6.1f} "
+        f"{rsi_d_s:>6} "
         f"{snap.get('adx', 0):>5.0f} "
         f"{'up' if snap.get('weekly_trend_up') else 'dn':>3} "
-        f"{snap.get('macd', 0):>10.3f}",
+        f"{snap.get('macd', 0):>10.3f} {mh_d_s:>7}"
+    )
+    lines += [
         "",
         "## Deterministic Candidate Trades",
     ]
