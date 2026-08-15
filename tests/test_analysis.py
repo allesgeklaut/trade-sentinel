@@ -200,7 +200,7 @@ class TestSnapshotShape:
             "close", "sma20", "sma50", "sma200",
             "rsi", "macd", "macd_signal", "macd_hist", "atr14", "adx",
             "atr_stop", "atr_pct", "vol_surge", "weekly_trend_up", "net_score", "strength",
-            "rsi_3d_change", "macd_hist_3d_change",
+            "rsi_3d_change", "macd_hist_3d_change", "run_5d",
         }
         assert set(snap.keys()) == expected_keys
 

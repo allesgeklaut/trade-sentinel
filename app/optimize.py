@@ -154,6 +154,10 @@ class ReplayParams:
     # Max simultaneous open positions. 0 = unlimited. Forces diversification
     # so no single crash can sink the portfolio.
     max_positions: int = 0
+    # Max 5-day run-up allowed before blocking a BUY. 0 = disabled.
+    # e.g. 15 = don't buy if price has risen more than 15% in the last 5 days
+    # (chasing a short-term spike that's prone to reversion).
+    max_run_5d: float = 0.0
 
 
 # Sector groupings for the global-large-cap universe. Used by the sector
@@ -217,14 +221,43 @@ def _sharpe(daily_returns: list[float]) -> float:
     return (mean / std) * math.sqrt(252)
 
 
-def _max_drawdown(equity: list[float]) -> float:
-    peak = -math.inf
+def _max_drawdown(equity: list[float], invested: list[float] | None = None) -> float:
+    """Max peak-to-trough drawdown as a percentage.
+
+    If ``invested`` (cumulative capital deposited so far per day) is provided,
+    the drawdown is measured on the **return ratio** (equity / invested) rather
+    than raw equity. This neutralises the growing capital base from monthly
+    DCA deposits — a 10% drawdown means the portfolio lost 10% of *its current
+    capital base*, not that the equity dropped from a late peak to an early
+    low point. Without this, a DCA backtest reports absurd drawdowns like 95%
+    because the equity naturally grows over time from deposits alone.
+    """
+    if invested is None:
+        # Fixed-capital backtest: drawdown on raw equity.
+        peak = -math.inf
+        max_dd = 0.0
+        for e in equity:
+            if e > peak:
+                peak = e
+            if peak > 0:
+                dd = (peak - e) / peak * 100
+                if dd > max_dd:
+                    max_dd = dd
+        return max_dd
+    # DCA backtest: drawdown on the return ratio (equity / invested).
+    # This is a time-weighted measure: if equity is 105% of invested and
+    # drops to 95% of invested, that's a ~9.5% drawdown regardless of how
+    # much capital has been deposited.
+    peak_ratio = -math.inf
     max_dd = 0.0
-    for e in equity:
-        if e > peak:
-            peak = e
-        if peak > 0:
-            dd = (peak - e) / peak * 100
+    for e, inv in zip(equity, invested):
+        if inv <= 0:
+            continue
+        ratio = e / inv
+        if ratio > peak_ratio:
+            peak_ratio = ratio
+        if peak_ratio > 0:
+            dd = (peak_ratio - ratio) / peak_ratio * 100
             if dd > max_dd:
                 max_dd = dd
     return max_dd
@@ -344,35 +377,49 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
                 "atr_stop": None if pd.isna(row.atr_stop) else float(row.atr_stop),
                 "atr14": float(row.atr14) if not pd.isna(row.atr14) else None,
                 "weekly_trend_up": bool(row.weekly_trend_up) if not pd.isna(row.weekly_trend_up) else True,
+                "run_5d": None if pd.isna(row.run_5d) else float(row.run_5d),
             }
             for row in df.itertuples(index=False)
         }
 
     pf = PaperPortfolio(cash=params.start_cash)
     equity_curve: list[dict] = []
+    invested_curve: list[float] = []  # cumulative capital deposited per day
     daily_returns: list[float] = []
     prev_equity: float | None = None
     last_deposit_month: str | None = None
     portfolio_peak: float = 0.0     # highest equity seen (for portfolio stop)
     risk_off: bool = False          # circuit breaker active (no new BUYs)
+    cumulative_invested = params.start_cash
+
+    last_known_prices: dict[str, float] = {}  # carry forward for missing-data days
 
     for day in days:
         # Monthly allowance deposit (first trading day of a new month).
         month = day[:7]
         if month != last_deposit_month:
             pf.cash += params.monthly_allowance
+            cumulative_invested += params.monthly_allowance
             last_deposit_month = month
 
-        # Prices for this day across all tickers.
+        # Prices for this day across all tickers. Carry forward the last known
+        # close when a ticker has no data on this day (e.g. US holidays where
+        # European markets are open). Without this, positions are priced at 0
+        # on sparse-data days, producing fake 95% drawdowns.
         prices: dict[str, float] = {}
         for t, idx in by_time.items():
             row = idx.get(day)
             if row is not None:
-                prices[t] = row["close"]
+                p = row["close"]
+                prices[t] = p
+                last_known_prices[t] = p
+            elif t in last_known_prices:
+                prices[t] = last_known_prices[t]
 
         total_equity = pf.equity(prices)
         if total_equity <= 0:
             equity_curve.append({"time": day, "equity": 0.0})
+            invested_curve.append(cumulative_invested)
             continue
 
         # Track portfolio peak for circuit breaker.
@@ -455,6 +502,9 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
             buy_candidates = [
                 (t, by_time[t][day]) for t in by_time
                 if day in by_time[t] and _row_action(by_time[t][day], params) == "BUY"
+                and not (params.max_run_5d > 0
+                         and by_time[t][day].get("run_5d") is not None
+                         and by_time[t][day]["run_5d"] > params.max_run_5d)
             ]
             buy_candidates.sort(key=lambda x: _row_strength(x[1], "BUY"), reverse=True)
 
@@ -464,6 +514,9 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
                 if day in by_time[t]
                 and _row_action(by_time[t][day], params) == "HOLD"
                 and _row_strength(by_time[t][day], "HOLD") >= params.relaxed_hold_strength
+                and not (params.max_run_5d > 0
+                         and by_time[t][day].get("run_5d") is not None
+                         and by_time[t][day]["run_5d"] > params.max_run_5d)
             ]
             hold_candidates.sort(key=lambda x: _row_strength(x[1], "HOLD"), reverse=True)
             buy_candidates = hold_candidates[:params.relaxed_hold_limit]
@@ -530,6 +583,7 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
         # Record equity.
         total_equity = pf.equity(prices)
         equity_curve.append({"time": day, "equity": round(total_equity, 2)})
+        invested_curve.append(cumulative_invested)
         if prev_equity is not None and prev_equity > 0:
             daily_returns.append(total_equity / prev_equity - 1)
         prev_equity = total_equity
@@ -545,7 +599,7 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
         final_equity=final_equity,
         total_return_pct=total_return_pct,
         sharpe=_sharpe(daily_returns),
-        max_drawdown_pct=_max_drawdown([e["equity"] for e in equity_curve]),
+        max_drawdown_pct=_max_drawdown([e["equity"] for e in equity_curve], invested_curve),
         n_trades=len(pf.trades),
     )
 
@@ -584,21 +638,23 @@ def _param_grid(regime_filter: bool = False) -> list[ReplayParams]:
         for sell in (-40, -30):
             for max_pos in (10,):
                     for stop_type, stop_pct, stop_atr, risk_pct, sector_pct, pf_stop, max_n in risk_configs:
-                        grid.append(ReplayParams(
-                            buy_threshold=buy, sell_threshold=sell,
-                            relaxed_hold_strength=40,
-                            max_position_pct=max_pos,
-                            use_atr_stop=False,
-                            trailing_stop_pct=0,
-                            regime_filter=regime_filter,
-                            stop_type=stop_type,
-                            stop_pct=stop_pct,
-                            stop_atr_mult=stop_atr,
-                            risk_pct=risk_pct,
-                            max_sector_pct=sector_pct,
-                            portfolio_stop_pct=pf_stop,
-                            max_positions=max_n,
-                        ))
+                        for max_run_5d in (0, 12, 15, 20):
+                            grid.append(ReplayParams(
+                                buy_threshold=buy, sell_threshold=sell,
+                                relaxed_hold_strength=40,
+                                max_position_pct=max_pos,
+                                use_atr_stop=False,
+                                trailing_stop_pct=0,
+                                regime_filter=regime_filter,
+                                stop_type=stop_type,
+                                stop_pct=stop_pct,
+                                stop_atr_mult=stop_atr,
+                                risk_pct=risk_pct,
+                                max_sector_pct=sector_pct,
+                                portfolio_stop_pct=pf_stop,
+                                max_positions=max_n,
+                                max_run_5d=max_run_5d,
+                            ))
     return grid
 
 
@@ -656,13 +712,14 @@ def _walk_forward(series: dict[str, pd.DataFrame], days: list[str],
         test_res = _replay(series, best_params, start=test_s, end=test_e, regime=regime)
         elapsed = time.time() - t0
         logger.info("Window %d/%d done in %.0fs: buy=%d sell=%d trail=%.0f maxpos=%d "
-                    "stop=%s risk=%.1f%% sector=%.0f%% pf_stop=%.0f%% maxn=%d | "
+                    "stop=%s risk=%.1f%% sector=%.0f%% pf_stop=%.0f%% maxn=%d run5d=%.0f | "
                     "train %+.1f%% → test %+.1f%% (sharpe %.2f, dd %.1f%%, %d trades)",
                     w_idx, total, elapsed,
                     best_params.buy_threshold, best_params.sell_threshold,
                     best_params.trailing_stop_pct, best_params.max_position_pct,
                     best_params.stop_type, best_params.risk_pct, best_params.max_sector_pct,
                     best_params.portfolio_stop_pct, best_params.max_positions,
+                    best_params.max_run_5d,
                     best_train.total_return_pct, test_res.total_return_pct,
                     test_res.sharpe, test_res.max_drawdown_pct, test_res.n_trades)
         windows.append({
@@ -680,6 +737,7 @@ def _walk_forward(series: dict[str, pd.DataFrame], days: list[str],
                 "max_sector_pct": best_params.max_sector_pct,
                 "portfolio_stop_pct": best_params.portfolio_stop_pct,
                 "max_positions": best_params.max_positions,
+                "max_run_5d": best_params.max_run_5d,
             },
             "train_score": round(_score(sweep[0][1]), 2),
             "train_return_pct": round(sweep[0][1].total_return_pct, 2),
@@ -1377,6 +1435,7 @@ async def _main(args: argparse.Namespace) -> None:
             print(f"  buy={params.buy_threshold:<3} sell={params.sell_threshold:<4} "
                   f"trail={params.trailing_stop_pct:>4.0f}% maxpos={params.max_position_pct:<3}% "
                   f"stop={params.stop_type:<7} risk={params.risk_pct:.1f}% sec={params.max_sector_pct:>2.0f}% "
+                  f"run5d={params.max_run_5d:>2.0f}% "
                   f"→ ret {res.total_return_pct:+7.2f}%  dd {res.max_drawdown_pct:5.2f}%  "
                   f"sharpe {res.sharpe:5.2f}  trades {res.n_trades}")
 

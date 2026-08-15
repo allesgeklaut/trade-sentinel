@@ -205,6 +205,11 @@ def signal_series(rows: list[dict]) -> pd.DataFrame:
     rsi_3d_change = rsi_now - rsi_now.shift(3)
     macd_hist_3d_change = macd_hist - macd_hist.shift(3)
 
+    # --- short-term run-up (how much price moved in the last 5 days) ------
+    # Used as a buy-time overextension guard: buying after a +15% spike in
+    # 5 days is chasing — the entry is late and prone to a short-term reversion.
+    run_5d = (c / c.shift(5) - 1) * 100
+
     # --- weekly trend (multi-timeframe confirmation) ----------------------
     # Resample daily close to weekly (Friday) for a slower trend filter.
     # BUYs are gated on weekly close > weekly SMA-50 so we don't buy into
@@ -244,6 +249,7 @@ def signal_series(rows: list[dict]) -> pd.DataFrame:
         "weekly_trend_up": d["weekly_trend_up"],
         "rsi_3d_change": rsi_3d_change,
         "macd_hist_3d_change": macd_hist_3d_change,
+        "run_5d": run_5d,
     })
 
 
@@ -303,6 +309,7 @@ def snapshot_from_row(x, net: float, bullish: float, bearish: float,
     snap["strength"] = strength
     snap["rsi_3d_change"] = norm(x.rsi_3d_change)
     snap["macd_hist_3d_change"] = norm(x.macd_hist_3d_change)
+    snap["run_5d"] = norm(x.run_5d)
     return snap
 
 

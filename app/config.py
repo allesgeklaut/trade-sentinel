@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     sim_min_cash_pct: float = 5.0
     sim_max_positions: int = 10
     sim_stop_pct: float = 15.0
+    sim_max_run_5d: float = 12.0  # block BUYs after a 5-day run-up > this % (0 = disabled)
     sim_run_hour: int = 22
     sim_run_minute: int = 30
 
