@@ -195,6 +195,16 @@ def signal_series(rows: list[dict]) -> pd.DataFrame:
     net = bullish - bearish
     atr_stop = c - 2 * d.atr14
 
+    # --- momentum trend (direction of change, for the LLM exit-gating) ----
+    # 3-day net change: positive = rising, negative = falling. Exposed in the
+    # compute() snapshot so the LLM can see whether RSI / MACD histogram are
+    # turning up (a pullback ending) or still falling (a downtrend deepening),
+    # not just the point value. This lets the LLM distinguish "RSI 38 and
+    # falling" from "RSI 38 and turning up" — the key signal it was missing
+    # when gating SELLs.
+    rsi_3d_change = rsi_now - rsi_now.shift(3)
+    macd_hist_3d_change = macd_hist - macd_hist.shift(3)
+
     # --- weekly trend (multi-timeframe confirmation) ----------------------
     # Resample daily close to weekly (Friday) for a slower trend filter.
     # BUYs are gated on weekly close > weekly SMA-50 so we don't buy into
@@ -232,6 +242,8 @@ def signal_series(rows: list[dict]) -> pd.DataFrame:
         "dist_below": dist_below,
         "atr_stop": atr_stop,
         "weekly_trend_up": d["weekly_trend_up"],
+        "rsi_3d_change": rsi_3d_change,
+        "macd_hist_3d_change": macd_hist_3d_change,
     })
 
 
@@ -331,6 +343,11 @@ def compute(rows: list[dict]) -> dict:
     snap["weekly_trend_up"] = weekly_trend_up
     snap["net_score"] = int(net)
     snap["strength"] = strength
+    # Momentum trend (3-day net change): lets the LLM see whether RSI / MACD
+    # histogram are turning up (pullback ending) or still falling (downtrend
+    # deepening) — not just the point value.
+    snap["rsi_3d_change"] = norm(x.rsi_3d_change)
+    snap["macd_hist_3d_change"] = norm(x.macd_hist_3d_change)
 
     return {
         "action": action,
