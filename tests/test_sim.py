@@ -1227,7 +1227,7 @@ class TestSimChatPartialSell:
             async def post(self, url, json=None):
                 return MockResponse()
 
-        monkeypatch.setattr(sim.httpx, "AsyncClient", lambda **kw: MockClient())
+        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
 
         result = await sim.sim_chat([{"role": "user", "content": "trim AAPL by $3000"}])
 
@@ -1280,7 +1280,7 @@ class TestSimChatPartialSell:
             async def post(self, url, json=None):
                 return MockResponse()
 
-        monkeypatch.setattr(sim.httpx, "AsyncClient", lambda **kw: MockClient())
+        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
 
         result = await sim.sim_chat([{"role": "user", "content": "sell 25 shares of AAPL"}])
 
@@ -1328,7 +1328,7 @@ class TestSimChatPartialSell:
             async def post(self, url, json=None):
                 return MockResponse()
 
-        monkeypatch.setattr(sim.httpx, "AsyncClient", lambda **kw: MockClient())
+        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
 
         result = await sim.sim_chat([{"role": "user", "content": "sell all AAPL"}])
 
@@ -1374,7 +1374,7 @@ class TestSimChatPartialSell:
             async def post(self, url, json=None):
                 return MockResponse()
 
-        monkeypatch.setattr(sim.httpx, "AsyncClient", lambda **kw: MockClient())
+        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
 
         result = await sim.sim_chat([{"role": "user", "content": "sell AAPL"}])
 
@@ -1422,7 +1422,7 @@ class TestSimChatPartialBuy:
             async def post(self, url, json=None):
                 return MockResponse()
 
-        monkeypatch.setattr(sim.httpx, "AsyncClient", lambda **kw: MockClient())
+        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
 
         result = await sim.sim_chat([{"role": "user", "content": "buy $2000 of AAPL"}])
 
@@ -1468,7 +1468,7 @@ class TestSimChatPartialBuy:
             async def post(self, url, json=None):
                 return MockResponse()
 
-        monkeypatch.setattr(sim.httpx, "AsyncClient", lambda **kw: MockClient())
+        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
 
         result = await sim.sim_chat([{"role": "user", "content": "buy 15 shares of AAPL"}])
 
@@ -1511,7 +1511,7 @@ class TestSimChatPartialBuy:
             async def post(self, url, json=None):
                 return MockResponse()
 
-        monkeypatch.setattr(sim.httpx, "AsyncClient", lambda **kw: MockClient())
+        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
 
         result = await sim.sim_chat([{"role": "user", "content": "buy $5000 of AAPL"}])
 
@@ -1551,7 +1551,7 @@ class TestSimChatPartialBuy:
             async def post(self, url, json=None):
                 return MockResponse()
 
-        monkeypatch.setattr(sim.httpx, "AsyncClient", lambda **kw: MockClient())
+        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
 
         result = await sim.sim_chat([{"role": "user", "content": "buy AAPL"}])
 
@@ -1598,7 +1598,7 @@ class TestSimChatReserveOverride:
             async def post(self, url, json=None):
                 return MockResponse()
 
-        monkeypatch.setattr(sim.httpx, "AsyncClient", lambda **kw: MockClient())
+        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
 
         result = await sim.sim_chat([{"role": "user", "content": "buy AAPL"}])
 
@@ -1640,7 +1640,7 @@ class TestSimChatReserveOverride:
             async def post(self, url, json=None):
                 return MockResponse()
 
-        monkeypatch.setattr(sim.httpx, "AsyncClient", lambda **kw: MockClient())
+        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
 
         result = await sim.sim_chat([{"role": "user", "content": "spend the dry powder on AAPL"}])
 
@@ -1696,7 +1696,7 @@ class TestSimChatMultipleActions:
             async def post(self, url, json=None):
                 return MockResponse()
 
-        monkeypatch.setattr(sim.httpx, "AsyncClient", lambda **kw: MockClient())
+        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
 
         result = await sim.sim_chat([{"role": "user", "content": "trim MDB to buy SPY"}])
 
@@ -1734,7 +1734,7 @@ class TestSimChatMultipleActions:
             async def post(self, url, json=None):
                 return MockResponse()
 
-        monkeypatch.setattr(sim.httpx, "AsyncClient", lambda **kw: MockClient())
+        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
 
         result = await sim.sim_chat([{"role": "user", "content": "what do you think?"}])
 

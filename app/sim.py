@@ -18,12 +18,11 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
 
-import httpx
-
 from sqlalchemy import delete, func, select
 
 from .analysis import compute
 from .config import settings
+from . import llm as llm_mod
 from .db import (
     SimAccount,
     SimAllowance,
@@ -758,28 +757,14 @@ async def _llm_decide(
     global _last_llm_reasoning
 
     context = _build_llm_context(valuation, deterministic_trades, signals, news)
-    url = settings.ollama_url.rstrip("/") + "/api/chat"
-    timeout = httpx.Timeout(
-        connect=10.0,
-        read=settings.ollama_timeout_seconds,
-        write=30.0,
-        pool=10.0,
-    )
-    payload = {
-        "model": settings.ollama_model,
-        "stream": False,
-        "messages": [
-            {"role": "system", "content": _LLM_SYSTEM_PROMPT},
-            {"role": "user", "content": context},
-        ],
-    }
+    backend = await llm_mod.current_backend()
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(url, json=payload)
-            # Don't use raise_for_status() — Ollama may return non-200 with
-            # useful JSON we can still inspect. Match the dashboard chat approach.
-            data = resp.json()
+        out = await llm_mod.chat([
+            {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+            {"role": "user", "content": context},
+        ])
+        content = out["text"]
     except Exception as e:
         err_detail = f"{type(e).__name__}: {e}"
         if hasattr(e, 'response'):
@@ -787,44 +772,19 @@ async def _llm_decide(
                 err_detail += f" | status={e.response.status_code} body={e.response.text[:300]}"
             except Exception:
                 pass
-        logger.warning("LLM decide failed [%s] (url=%s, model=%s); falling back to deterministic",
-                       err_detail, url, settings.ollama_model)
+        logger.warning("LLM decide failed [%s] (backend=%s, model=%s); falling back to deterministic",
+                       err_detail, backend.get("name", "?"), backend.get("model", "?"))
         _last_llm_reasoning = (
             f"[LLM UNAVAILABLE — fell back to deterministic]\n"
             f"Error: {err_detail}\n"
-            f"Ollama URL: {url}\n"
-            f"Model: {settings.ollama_model}\n\n"
+            f"Backend: {backend.get('name', '?')}\n"
+            f"Model: {backend.get('model', '?')}\n\n"
             f"Deterministic trades were executed instead:"
         ) + ("\n" + "\n".join(
             f"  - {t['ticker']} {t['side']} ×{t.get('shares', '?')} @ {t.get('price', '?'):.2f} — {t.get('reason', '')}"
             for t in deterministic_trades
         ) if deterministic_trades else "\n  (no deterministic trades either)")
         return list(deterministic_trades)
-
-    # Check for Ollama error response (non-200 or error field in JSON)
-    resp_status = resp.status_code if hasattr(resp, 'status_code') else '?'
-    if resp_status != 200:
-        err_body = json.dumps(data)[:500] if data else getattr(resp, 'text', '')[:500]
-        logger.warning("LLM decide got HTTP %s: %s; falling back to deterministic", resp_status, err_body)
-        _last_llm_reasoning = (
-            f"[LLM ERROR — fell back to deterministic]\n"
-            f"HTTP {resp_status} from Ollama\n"
-            f"Response: {err_body}\n"
-            f"Ollama URL: {url}\n"
-            f"Model: {settings.ollama_model}\n\n"
-            f"Deterministic trades were executed instead:"
-        ) + ("\n" + "\n".join(
-            f"  - {t['ticker']} {t['side']} ×{t.get('shares', '?')} @ {t.get('price', '?'):.2f} — {t.get('reason', '')}"
-            for t in deterministic_trades
-        ) if deterministic_trades else "\n  (no deterministic trades either)")
-        return list(deterministic_trades)
-
-    # Ollama chat response: data["message"]["content"]
-    content = ""
-    try:
-        content = data.get("message", {}).get("content", "") or data.get("response", "")
-    except (AttributeError, TypeError):
-        pass
 
     # Store raw LLM reasoning for display in the frontend
     _last_llm_reasoning = content
@@ -1666,32 +1626,17 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
         return {"text": "No messages to send.", "trades": [], "actions_executed": False, "history": []}
 
     context = await _build_sim_chat_context()
-    url = settings.ollama_url.rstrip("/") + "/api/chat"
-    timeout = httpx.Timeout(
-        connect=10.0,
-        read=settings.ollama_timeout_seconds,
-        write=30.0,
-        pool=10.0,
-    )
-    payload = {
-        "model": settings.ollama_model,
-        "stream": False,
-        "messages": [
-            {"role": "system", "content": _SIM_CHAT_SYSTEM_PROMPT},
-            {"role": "user", "content": context},
-        ] + history,
-    }
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+        out = await llm_mod.chat([
+            {"role": "system", "content": _SIM_CHAT_SYSTEM_PROMPT},
+            {"role": "user", "content": context},
+        ] + history)
     except Exception as e:
         logger.warning("Sim chat LLM call failed: %s", e)
         return {"text": f"LLM unavailable: {e}", "trades": [], "actions_executed": False, "history": history}
 
-    content = data.get("message", {}).get("content", "") or data.get("response", "")
+    content = out["text"]
 
     # Check for action block
     actions = _parse_action_block(content)

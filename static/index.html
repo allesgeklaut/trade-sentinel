@@ -827,6 +827,15 @@
             border-color: #42ff72
         }
 
+        #llm-model {
+            background: #09140c;
+            color: #b7ffc0;
+            border: 1px solid #318e43;
+            padding: 6px 8px;
+            font-size: 12px;
+            max-width: 320px
+        }
+
         #sim-view {
             display: none;
             max-width: 1400px;
@@ -952,6 +961,9 @@
         <div class="nav-toggle"><button id="nav-dashboard" class="nav-active"
                 onclick="showView('dashboard')">Dashboard</button><button id="nav-sim"
                 onclick="showView('sim')">Simulation</button></div><span id="status">loading</span>
+        <select id="llm-model" title="Active LLM backend / model" onchange="switchLLMModel()">
+            <option value="">loading models…</option>
+        </select>
     </header>
     <main id="dashboard-view">
         <aside class="panel">
@@ -1459,6 +1471,73 @@
             return r.json();
         }
 
+        // --- LLM backend / model switcher ---
+        let llmBackends = [];
+
+        async function loadLLMModels() {
+            const sel = document.getElementById('llm-model');
+            try {
+                const st = await api('llm/status');
+                llmBackends = st.backends || [];
+                sel.innerHTML = '';
+                for (const b of llmBackends) {
+                    const opts = [];
+                    if (b.models && b.models.length) {
+                        for (const m of b.models) {
+                            opts.push(`<option value="${escapeHtml(b.name)}::${escapeHtml(m)}">${escapeHtml(b.name)} · ${escapeHtml(m)}</option>`);
+                        }
+                    } else {
+                        opts.push(`<option value="${escapeHtml(b.name)}::">${escapeHtml(b.name)} · ${escapeHtml(b.model || '(default)')}</option>`);
+                    }
+                    const grp = `<optgroup label="${escapeHtml(b.name)}">${opts.join('')}</optgroup>`;
+                    const frag = document.createElement('template');
+                    frag.innerHTML = grp;
+                    sel.appendChild(frag.content);
+                }
+                const active = st.active_backend;
+                const activeModel = st.active_model;
+                let found = false;
+                for (const opt of sel.options) {
+                    const [bName, bModel] = opt.value.split('::');
+                    if (bName === active) {
+                        if (bModel === activeModel) {
+                            opt.selected = true;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found && llmBackends.length) {
+                    sel.selectedIndex = 0;
+                }
+                if (!llmBackends.length) {
+                    sel.innerHTML = '<option value="">no LLM backends</option>';
+                }
+            } catch (e) {
+                sel.innerHTML = '<option value="">LLM: ' + escapeHtml(e.message) + '</option>';
+            }
+        }
+
+        async function switchLLMModel() {
+            const sel = document.getElementById('llm-model');
+            const val = sel.value;
+            const sep = val.indexOf('::');
+            const backend = sep === -1 ? val : val.slice(0, sep);
+            const model = sep === -1 ? '' : val.slice(sep + 2);
+            if (!backend) return;
+            try {
+                await api('llm/select', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ backend, model }),
+                });
+                setStatus('LLM switched to ' + backend + (model ? ' · ' + model : ''), true);
+            } catch (e) {
+                setStatus('LLM switch failed: ' + e.message, false);
+                loadLLMModels();
+            }
+        }
+
         async function resolveSymbolName(ticker) {
             const key = ticker.toUpperCase();
             if (symbolNameCache[key] !== undefined) return symbolNameCache[key];
@@ -1747,7 +1826,7 @@
                 btn.disabled = false; btn.textContent = orig;
             }
         }
-        $('#universe').onchange = showScreen; loadWatch(); loadUniverses()
+        $('#universe').onchange = showScreen; loadWatch(); loadUniverses(); loadLLMModels()
 
         // --- Simulation view ---
         let simChart = null;

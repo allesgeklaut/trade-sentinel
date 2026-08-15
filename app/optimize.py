@@ -29,7 +29,6 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
 import pandas as pd
 from sqlalchemy import select
 
@@ -41,6 +40,7 @@ from .analysis import (
     strength_for,
 )
 from .config import settings
+from . import llm as llm_mod
 from .db import Candle, Session
 from .screener import tickers as universe_tickers
 
@@ -1172,7 +1172,7 @@ def _build_llm_probe_context(case: TradeCase, snapshot: dict[str, Any],
 
 async def _llm_probe(case: TradeCase, snapshot: dict[str, Any],
                      params: ReplayParams | None = None) -> dict[str, Any]:
-    """Send one decision probe to the configured Ollama model.
+    """Send one decision probe to the configured LLM backend.
 
     Reuses the live hybrid sim's system prompt and JSON-array format so the
     benchmark reflects production behaviour. Returns the raw content, the
@@ -1203,30 +1203,15 @@ async def _llm_probe(case: TradeCase, snapshot: dict[str, Any],
         )
 
     context = _build_llm_probe_context(case, snapshot, params=params)
-    url = settings.ollama_url.rstrip("/") + "/api/chat"
-    timeout = httpx.Timeout(connect=10.0, read=settings.ollama_timeout_seconds,
-                            write=30.0, pool=10.0)
-    payload = {
-        "model": settings.ollama_model,
-        "stream": False,
-        "messages": [
+    try:
+        out = await llm_mod.chat([
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": context},
-        ],
-    }
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(url, json=payload)
-            data = resp.json()
+        ])
     except Exception as e:
         return {"raw": "", "decision": None, "status": f"error: {type(e).__name__}: {e}"}
 
-    status_code = resp.status_code if hasattr(resp, "status_code") else "?"
-    if status_code != 200:
-        body = json.dumps(data)[:300] if data else ""
-        return {"raw": "", "decision": None, "status": f"http {status_code}: {body}"}
-
-    content = (data.get("message", {}) or {}).get("content", "") or data.get("response", "")
+    content = out["text"]
     decisions = _parse_llm_decisions(content)
     picked = None
     if decisions:
@@ -1307,11 +1292,12 @@ async def _run_llm_benchmark(
         print("\n--skip-llm set; not calling the LLM. Re-run without it to probe.")
         return
 
-    if not settings.ollama_model:
-        print("\nOLLAMA_MODEL not configured; cannot probe the LLM.")
+    if not (settings.llm_backends or settings.ollama_model):
+        print("\nNo LLM backend configured (set LLM_BACKENDS or OLLAMA_MODEL); cannot probe the LLM.")
         return
 
-    print(f"\n=== Probing LLM ({settings.ollama_model}) ... ===")
+    active = await llm_mod.current_backend()
+    print(f"\n=== Probing LLM ({active.get('name', '?')} · {active.get('model', '?')}) ... ===")
     rows: list[dict[str, Any]] = []
     for idx, c in enumerate(picked, 1):
         df = series.get(c.ticker)

@@ -10,6 +10,13 @@ class Settings(BaseSettings):
     ollama_model: str = ""  # set via .env, e.g. "qwen3:32b"
     ollama_timeout_seconds: float = 180.0
 
+    # Multi-backend LLM config. JSON list of {"name", "type", "url", "model"}
+    # where type is "ollama" (native /api/chat) or "openai" (OpenAI-compatible
+    # /v1/chat/completions, e.g. llama.cpp llama-server). When unset, the
+    # legacy OLLAMA_URL / OLLAMA_MODEL settings are used as a single backend.
+    llm_backends: str = ""
+    llm_state_file: str = "/data/llm_state.json"
+
     # --- SearXNG news search (optional) -------------------------------
     searxng_url: str = ""  # e.g. "http://192.168.0.46:8081"; empty = disabled
     searxng_timeout: float = 10.0

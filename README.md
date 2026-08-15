@@ -100,6 +100,20 @@ docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize llm-ben
 
 `--end` defaults to `2026-08-11` (leaving a 20-day forward buffer to judge the last trades). Tune `--n-worst`, `--n-control`, and `--forward-days` to control token spend. Raw LLM reasoning for each case is dumped to `/tmp/llm_benchmark_reasoning.json` for inspection. The benchmark is read-only and never touches the live sim account.
 
+## LLM backends (model switching)
+
+The dashboard's AI chat, the sim bot's LLM reasoning, and the LLM sweep/benchmark all talk to whichever backend is active. You can switch models at runtime from the **dropdown in the top-right of the dashboard** — no restart needed, and the choice persists in the `/data` volume.
+
+```dotenv
+# JSON list of backends (single line — dotenv can't parse multi-line values):
+LLM_BACKENDS=[{"name":"llama-server","type":"openai","url":"http://192.168.0.46:8084","model":"Qwen3.8-27B-IQ4_XS.gguf"},{"name":"ollama","type":"ollama","url":"http://host.docker.internal:11434","model":"qwen3:32b"}]
+```
+
+- `type: "openai"` — OpenAI-compatible `/v1/chat/completions`; works with llama.cpp **llama-server**, vLLM, LiteLLM, etc.
+- `type: "ollama"` — Ollama's native `/api/chat`.
+- The dropdown lists every model each backend reports; selecting one switches backend + model on the spot.
+- Without `LLM_BACKENDS`, the legacy `OLLAMA_URL` / `OLLAMA_MODEL` pair is used as a single backend.
+
 ## Timezone convention
 
 All `created_at` / `updated_at` timestamps are stored as tz-aware UTC in SQLite. The autonomous paper-trading scheduler runs at `SIM_RUN_HOUR`:`SIM_RUN_MINUTE` **UTC** (set `22 30` to run at 22:30 UTC). The monthly allowance deposit is the one exception: it is anchored to the operator's local timezone (`Europe/Vienna` by default) so the "monthly" deposit lands on the local calendar month boundary. The frontend renders timestamps as-is (UTC ISO strings); a future enhancement could format them in the browser's local timezone.
