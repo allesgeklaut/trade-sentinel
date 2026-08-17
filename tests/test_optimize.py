@@ -176,6 +176,114 @@ class TestReplayTradeDates:
             assert t["date"] >= "2025-01-01"
 
 
+class TestReplayTopUpAtCap:
+    """The max-positions cap must block NEW positions but still allow topping
+    up tickers already held. Previously the BUY loop used 'break' when at the
+    cap, which stopped all buying — including top-ups — leaving ~50% of equity
+    idle as cash for the entire replay. The fix changed 'break' to 'continue'
+    with a 'ticker not in positions' guard.
+    """
+
+    def _uptrending_series(self, n_tickers: int = 12, n: int = 500) -> dict:
+        """Generate n_tickers uptrending tickers. BUY signals fire from ~day
+        200 onward (once SMA200 is available and trend_up is confirmed)."""
+        return {
+            f"UP{i}": _signal_series(_gen_candles(100.0, 0.01, seed=i, n=n))
+            for i in range(n_tickers)
+        }
+
+    def test_top_ups_happen_when_at_cap(self):
+        # 12 uptrending tickers, max_positions=10: the cap is hit once BUYs
+        # start firing (~day 200), but the monthly allowance keeps depositing
+        # cash. Held tickers with continuing BUY signals should be topped up
+        # despite the cap.
+        series = self._uptrending_series()
+        params = ReplayParams(
+            start_cash=10000.0,
+            monthly_allowance=1000.0,
+            max_positions=10,
+            max_position_pct=10.0,
+            min_cash_pct=5.0,
+            stop_type="none",
+            use_atr_stop=False,
+        )
+        # Start after day 200 so BUY signals are active immediately.
+        res = _replay(series, params, start="2025-07-15", end="2026-05-15")
+
+        # The cap was hit (10 positions) — verify via the position-count curve.
+        assert res.position_count_curve
+        assert max(res.position_count_curve) <= 10, "exceeded max_positions cap"
+        assert any(n >= 10 for n in res.position_count_curve), "never hit the cap"
+
+        # Top-ups: a BUY on a ticker that already had an earlier BUY. Count
+        # distinct tickers bought, then count how many BUYs are repeats.
+        bought_tickers: set[str] = set()
+        top_ups = 0
+        for t in res.trades:
+            if t["side"] == "BUY":
+                if t["ticker"] in bought_tickers:
+                    top_ups += 1
+                else:
+                    bought_tickers.add(t["ticker"])
+        assert top_ups > 0, (
+            f"no top-up BUYs happened ({top_ups}); the cap blocked all buying. "
+            f"distinct tickers bought: {len(bought_tickers)}, total trades: {res.n_trades}"
+        )
+
+    def test_cash_deploys_when_at_cap(self):
+        # Same scenario, but assert that cash actually gets deployed rather
+        # than sitting idle. Before the fix, avg cash was ~50% of equity
+        # because top-ups were blocked. After the fix it should be well below
+        # 30% (the max_position_pct ceiling means cash draws down gradually as
+        # positions grow into their 10% caps and the monthly allowance deploys
+        # via top-ups).
+        series = self._uptrending_series()
+        params = ReplayParams(
+            start_cash=10000.0,
+            monthly_allowance=1000.0,
+            max_positions=10,
+            max_position_pct=10.0,
+            min_cash_pct=5.0,
+            stop_type="none",
+            use_atr_stop=False,
+        )
+        res = _replay(series, params, start="2025-07-15", end="2026-05-15")
+
+        assert res.cash_curve and res.equity_curve
+        cash_pcts = [
+            (c / e["equity"]) * 100 if e["equity"] > 0 else 100.0
+            for c, e in zip(res.cash_curve, res.equity_curve)
+        ]
+        # Skip the first ~20 days while positions are being opened; the test
+        # is about the steady state where the cap is hit and cash should
+        # still deploy via top-ups.
+        steady_state = cash_pcts[20:]
+        avg_cash = sum(steady_state) / len(steady_state) if steady_state else 100.0
+        assert avg_cash < 30.0, (
+            f"avg cash in steady state was {avg_cash:.1f}% of equity — cash is "
+            f"sitting idle because top-ups are blocked by the cap. Before the "
+            f"fix this was ~50%; after it should be well under 30%."
+        )
+
+    def test_no_new_positions_above_cap(self):
+        # The cap must still block NEW tickers — only top-ups of held tickers
+        # should pass through. Verify the position count never exceeds the cap.
+        series = self._uptrending_series(n_tickers=15)
+        params = ReplayParams(
+            start_cash=10000.0,
+            monthly_allowance=1000.0,
+            max_positions=10,
+            max_position_pct=10.0,
+            min_cash_pct=5.0,
+            stop_type="none",
+            use_atr_stop=False,
+        )
+        res = _replay(series, params, start="2025-07-15", end="2026-05-15")
+        assert max(res.position_count_curve) <= 10, (
+            f"position count {max(res.position_count_curve)} exceeded cap 10"
+        )
+
+
 class TestSnapshotForDay:
     """_snapshot_for_day must produce the same snapshot as analysis.compute()
     so the benchmark feeds the LLM identical fields the live sim does."""
