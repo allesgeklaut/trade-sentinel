@@ -206,6 +206,8 @@ class ReplayResult:
     sharpe: float = 0.0
     max_drawdown_pct: float = 0.0
     n_trades: int = 0
+    cash_curve: list[float] = field(default_factory=list)  # cash per day, aligned with equity_curve
+    position_count_curve: list[int] = field(default_factory=list)  # open positions per day
 
 
 def _sharpe(daily_returns: list[float]) -> float:
@@ -385,6 +387,8 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
     pf = PaperPortfolio(cash=params.start_cash)
     equity_curve: list[dict] = []
     invested_curve: list[float] = []  # cumulative capital deposited per day
+    cash_curve: list[float] = []      # cash held per day (aligned with equity_curve)
+    position_count_curve: list[int] = []  # open positions per day
     daily_returns: list[float] = []
     prev_equity: float | None = None
     last_deposit_month: str | None = None
@@ -420,6 +424,8 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
         if total_equity <= 0:
             equity_curve.append({"time": day, "equity": 0.0})
             invested_curve.append(cumulative_invested)
+            cash_curve.append(pf.cash)
+            position_count_curve.append(len(pf.positions))
             continue
 
         # Track portfolio peak for circuit breaker.
@@ -524,9 +530,14 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
         for ticker, row in buy_candidates:
             if pf.cash < min_cash:
                 break
-            # Max open positions: stop buying if we already hold too many.
-            if params.max_positions > 0 and len(pf.positions) >= params.max_positions:
-                break
+            # Max open positions: block NEW positions when at the cap, but
+            # still allow topping up tickers already held (a top-up doesn't
+            # open a new position, and the max_position_pct ceiling below
+            # prevents over-concentration in a single name).
+            if (params.max_positions > 0
+                    and len(pf.positions) >= params.max_positions
+                    and ticker not in pf.positions):
+                continue
             price = row["close"]
             current_value = pf.positions.get(ticker, 0) * price
             if current_value >= max_position_value:
@@ -584,6 +595,8 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
         total_equity = pf.equity(prices)
         equity_curve.append({"time": day, "equity": round(total_equity, 2)})
         invested_curve.append(cumulative_invested)
+        cash_curve.append(pf.cash)
+        position_count_curve.append(len(pf.positions))
         if prev_equity is not None and prev_equity > 0:
             daily_returns.append(total_equity / prev_equity - 1)
         prev_equity = total_equity
@@ -601,6 +614,8 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
         sharpe=_sharpe(daily_returns),
         max_drawdown_pct=_max_drawdown([e["equity"] for e in equity_curve], invested_curve),
         n_trades=len(pf.trades),
+        cash_curve=cash_curve,
+        position_count_curve=position_count_curve,
     )
 
 
@@ -684,25 +699,37 @@ def _valuation_from_portfolio(
     }
 
 
-def _deterministic_phase(
+def _deterministic_propose_replay(
     pf: PaperPortfolio,
     by_time: dict[str, dict[str, dict]],
     prices: dict[str, float],
     day: str,
     params: ReplayParams,
 ) -> list[dict]:
-    """Run the deterministic SELL + BUY phases for one day against ``pf``.
+    """Propose deterministic trades for one day WITHOUT mutating ``pf``.
 
-    Mirrors ``sim._deterministic_decide``: stops/signal SELLs first, then
+    Mirrors ``sim._deterministic_propose``: stops/signal SELLs first, then
     ranked BUYs (strict, else relaxed HOLD fallback), with the max-positions
     cap, run-up block, position/cash floors, and frozen initial stop. Returns
-    the list of executed trades (same shape as ``PaperPortfolio.trades``) so
-    they can be fed to ``_build_llm_context`` as ``deterministic_trades``.
+    a list of proposal dicts (no DB / no portfolio mutation):
+
+      - SELL: {"ticker", "side": "SELL", "price", "shares": None, "reason", "date"}
+      - BUY:  {"ticker", "side": "BUY",  "price", "budget", "reason", "date",
+               "entry_stop"}
+
+    Cash/open-count are tracked locally so successive BUY proposals within
+    the same cycle see reduced cash (mirroring the old execute-as-you-go
+    behaviour) without actually mutating ``pf``.
     """
-    det_trades: list[dict] = []
+    proposals: list[dict] = []
     total_equity = pf.equity(prices)
     if total_equity <= 0:
-        return det_trades
+        return proposals
+
+    min_cash = total_equity * (params.min_cash_pct / 100)
+    max_position_value = total_equity * (params.max_position_pct / 100)
+    open_count = len(pf.positions)
+    sim_cash = pf.cash  # local copy; decremented as BUYs are proposed
 
     # --- SELL phase ---
     for ticker in list(pf.positions.keys()):
@@ -712,35 +739,28 @@ def _deterministic_phase(
         price = row["close"]
         action = _row_action(row, params)
         if action == "SELL":
-            pf.sell(ticker, price, None,
-                    f"SELL signal (strength {_row_strength(row, action)})", date=day)
-            det_trades.append({"ticker": ticker, "side": "SELL",
-                               "price": price, "reason": action, "date": day})
+            proposals.append({"ticker": ticker, "side": "SELL",
+                              "price": price, "shares": None,
+                              "reason": f"SELL signal (strength {_row_strength(row, action)})",
+                              "date": day})
             continue
         # Frozen initial % stop
         if params.stop_type != "none" and ticker in pf.stop_price:
             sp = pf.stop_price[ticker]
             if price <= sp:
-                pf.sell(ticker, price, None,
-                        f"Initial stop: {price:.2f} <= {sp:.2f}", date=day)
-                det_trades.append({"ticker": ticker, "side": "SELL",
-                                   "price": price, "reason": "stop", "date": day})
+                proposals.append({"ticker": ticker, "side": "SELL",
+                                  "price": price, "shares": None,
+                                  "reason": f"Initial stop: {price:.2f} <= {sp:.2f}",
+                                  "date": day})
                 continue
         # ATR trailing stop
         if params.use_atr_stop:
             atr_stop = row["atr_stop"]
             if atr_stop is not None and price < atr_stop:
-                pf.sell(ticker, price, None,
-                        f"ATR stop hit: {price:.2f} < {atr_stop:.2f}", date=day)
-                det_trades.append({"ticker": ticker, "side": "SELL",
-                                   "price": price, "reason": "atr_stop", "date": day})
-
-    # Recompute equity after sells
-    total_equity = pf.equity(prices)
-    if total_equity <= 0:
-        return det_trades
-    min_cash = total_equity * (params.min_cash_pct / 100)
-    max_position_value = total_equity * (params.max_position_pct / 100)
+                proposals.append({"ticker": ticker, "side": "SELL",
+                                  "price": price, "shares": None,
+                                  "reason": f"ATR stop hit: {price:.2f} < {atr_stop:.2f}",
+                                  "date": day})
 
     # --- BUY phase ---
     buy_candidates = [
@@ -766,15 +786,21 @@ def _deterministic_phase(
         buy_candidates = hold_candidates[:params.relaxed_hold_limit]
 
     for ticker, row in buy_candidates:
-        if pf.cash < min_cash:
+        if sim_cash < min_cash:
             break
-        if params.max_positions > 0 and len(pf.positions) >= params.max_positions:
-            break
+        # Max open positions: block NEW positions when at the cap, but still
+        # allow topping up tickers already held (a top-up doesn't open a new
+        # position, and the max_position_pct ceiling below prevents
+        # over-concentration in a single name).
+        if (params.max_positions > 0
+                and open_count >= params.max_positions
+                and ticker not in pf.positions):
+            continue
         price = row["close"]
         current_value = pf.positions.get(ticker, 0) * price
         if current_value >= max_position_value:
             continue
-        budget = min(pf.cash - min_cash, max_position_value - current_value)
+        budget = min(sim_cash - min_cash, max_position_value - current_value)
         if budget < 1:
             continue
         entry_stop = None
@@ -784,13 +810,40 @@ def _deterministic_phase(
             atr = row.get("atr14")
             if atr and atr > 0:
                 entry_stop = price - params.stop_atr_mult * atr
-        pf.buy(ticker, price, budget,
-               f"BUY signal (strength {_row_strength(row, 'BUY')})",
-               stop=entry_stop, date=day)
-        det_trades.append({"ticker": ticker, "side": "BUY", "price": price,
-                           "reason": "BUY", "date": day, "shares": pf.positions[ticker]})
+        proposals.append({"ticker": ticker, "side": "BUY", "price": price,
+                          "budget": budget,
+                          "reason": f"BUY signal (strength {_row_strength(row, 'BUY')})",
+                          "date": day, "entry_stop": entry_stop})
+        # Reserve the budget locally so the next BUY proposal sees reduced
+        # cash. Only bump open_count for NEW positions — a top-up doesn't
+        # change the position count.
+        sim_cash -= budget
+        if ticker not in pf.positions:
+            open_count += 1
 
-    return det_trades
+    return proposals
+
+
+def _execute_proposal(pf: PaperPortfolio, p: dict) -> dict | None:
+    """Execute a single proposal against ``pf``. Returns the trade dict or None."""
+    if p["side"] == "SELL":
+        before = pf.positions.get(p["ticker"], 0)
+        pf.sell(p["ticker"], p["price"], p.get("shares"), p["reason"],
+                date=p.get("date", ""))
+        if pf.positions.get(p["ticker"], 0) < before or p["ticker"] not in pf.positions:
+            return {"ticker": p["ticker"], "side": "SELL", "price": p["price"],
+                    "shares": before - pf.positions.get(p["ticker"], 0),
+                    "reason": p["reason"], "date": p.get("date", "")}
+        return None
+    # BUY
+    before = pf.positions.get(p["ticker"], 0)
+    pf.buy(p["ticker"], p["price"], p["budget"], p["reason"],
+           stop=p.get("entry_stop"), date=p.get("date", ""))
+    if pf.positions.get(p["ticker"], 0) > before:
+        return {"ticker": p["ticker"], "side": "BUY", "price": p["price"],
+                "shares": pf.positions[p["ticker"]] - before,
+                "reason": p["reason"], "date": p.get("date", "")}
+    return None
 
 
 async def _hybrid_replay(
@@ -892,30 +945,24 @@ async def _hybrid_replay(
             invested_curve.append(cumulative_invested)
             continue
 
-        # --- 1. Deterministic phase ---
-        trades_before = len(pf.trades)
-        _deterministic_phase(pf, by_time, prices, day, params)
-        det_today = [t for t in pf.trades[trades_before:] if t.get("date") == day]
-        if det_today:
-            logger.info("  det phase: %d trades — %s",
-                        len(det_today),
-                        ", ".join(f"{t['side']} {t['ticker']}" for t in det_today))
+        # --- 1. Deterministic PROPOSE phase (no mutation) ---
+        proposals = _deterministic_propose_replay(pf, by_time, prices, day, params)
+        if proposals:
+            logger.info("  det proposed: %d — %s",
+                        len(proposals),
+                        ", ".join(f"{p['side']} {p['ticker']}" for p in proposals))
         else:
-            logger.info("  det phase: no trades")
+            logger.info("  det proposed: no trades")
 
-        # --- 2 + 3. LLM review phase ---
-        # Recompute equity after deterministic trades; build the exact context
-        # shape the live sim's _build_llm_context expects.
+        # --- 2 + 3. LLM review → reconcile → execute ---
         total_equity = pf.equity(prices)
         if total_equity > 0 and (settings.llm_backends or settings.ollama_model):
             allowance_total = cumulative_invested
             valuation = _valuation_from_portfolio(pf, prices, allowance_total)
             signals = _signals_for_day(series, by_time, day, params)
-            # Deterministic trades executed this cycle (for context)
-            det_today_ctx = [t for t in pf.trades if t.get("date") == day]
-            context = _build_llm_context(valuation, det_today_ctx, signals, news)
-            logger.info("  llm phase: calling LLM (%d signals, %d det trades)...",
-                        len(signals), len(det_today_ctx))
+            context = _build_llm_context(valuation, proposals, signals, news)
+            logger.info("  llm phase: calling LLM (%d signals, %d proposals)...",
+                        len(signals), len(proposals))
             try:
                 out = await llm_mod.chat([
                     {"role": "system", "content": _LLM_SYSTEM_PROMPT},
@@ -923,63 +970,93 @@ async def _hybrid_replay(
                 ])
                 content = out["text"]
             except Exception as e:
-                logger.warning("LLM call failed on %s: %s — skipping LLM phase", day, e)
+                logger.warning("LLM call failed on %s: %s — executing all proposals", day, e)
                 content = ""
             decisions = _parse_llm_decisions(content) or []
-            trades_before_llm = len(pf.trades)
-            if decisions:
-                # Re-derive budget guards from the post-deterministic state
-                total_equity = pf.equity(prices)
-                min_cash = total_equity * (params.min_cash_pct / 100)
-                max_position_value = total_equity * (params.max_position_pct / 100)
+
+            if not decisions:
+                # LLM unavailable/parse-failed: execute all proposals (fallback)
+                for p in proposals:
+                    _execute_proposal(pf, p)
+                if proposals:
+                    logger.info("  (fallback) executed all %d proposals", len(proposals))
+            else:
+                # Reconcile proposals with LLM decisions (veto vs approve)
+                llm_by_ticker = {d["ticker"].upper(): d for d in decisions}
+                proposal_tickers = set()
+                approved: list[dict] = []
+                vetoed: list[dict] = []
+                for p in proposals:
+                    tu = p["ticker"].upper()
+                    proposal_tickers.add(tu)
+                    ld = llm_by_ticker.get(tu)
+                    if ld is None:
+                        approved.append(p)  # silence = consent
+                    elif ld["action"] == "HOLD":
+                        vetoed.append(p)
+                        logger.info("  llm VETOED %s %s — %s", p["side"], p["ticker"], ld.get("reason", ""))
+                    elif ld["action"] == p["side"]:
+                        approved.append(p)
+                    else:
+                        # Flip: treat as veto of proposal; the flipped action
+                        # is handled as an LLM addition below.
+                        vetoed.append(p)
+                        logger.info("  llm FLIPPED %s %s → %s", p["side"], p["ticker"], ld["action"])
+
+                # Execute approved proposals (SELLs first, already ordered)
+                for p in approved:
+                    _execute_proposal(pf, p)
+
+                # Execute LLM additions (decisions for tickers NOT in proposals)
+                min_cash = pf.equity(prices) * (params.min_cash_pct / 100)
+                max_position_value = pf.equity(prices) * (params.max_position_pct / 100)
                 for d in decisions:
-                    ticker = d["ticker"]
+                    tu = d["ticker"].upper()
+                    if tu in proposal_tickers:
+                        continue
                     action = d["action"]
                     reason = d.get("reason", f"LLM {action}")
-                    price = prices.get(ticker)
-                    if price is None or price <= 0:
+                    price = prices.get(d["ticker"])
+                    if price is None or price <= 0 or action == "HOLD":
                         continue
                     if action == "BUY":
-                        current_value = pf.positions.get(ticker, 0) * price
+                        current_value = pf.positions.get(d["ticker"], 0) * price
                         if current_value >= max_position_value:
                             continue
                         if (params.max_positions > 0
                                 and len(pf.positions) >= params.max_positions
-                                and ticker not in pf.positions):
+                                and d["ticker"] not in pf.positions):
                             continue
-                        budget = min(pf.cash - min_cash,
-                                     max_position_value - current_value)
+                        budget = min(pf.cash - min_cash, max_position_value - current_value)
                         if "shares" in d:
                             budget = min(budget, d["shares"] * price)
                         elif "amount" in d:
                             budget = min(budget, d["amount"])
                         if budget < 1:
                             continue
-                        entry_stop = None
-                        if params.stop_type == "percent":
-                            entry_stop = price * (1 - params.stop_pct / 100)
-                        pf.buy(ticker, price, budget, f"LLM: {reason}",
+                        entry_stop = (price * (1 - params.stop_pct / 100)
+                                      if params.stop_type == "percent" else None)
+                        pf.buy(d["ticker"], price, budget, f"LLM: {reason}",
                                stop=entry_stop, date=day)
                     elif action == "SELL":
-                        target_shares: float | None = None
+                        target_shares = None
                         if "shares" in d:
                             target_shares = d["shares"]
                         elif "amount" in d:
                             target_shares = d["amount"] / price if price > 0 else None
-                        pf.sell(ticker, price, target_shares,
+                        pf.sell(d["ticker"], price, target_shares,
                                 f"LLM: {reason}", date=day)
-                    # HOLD: no-op
-            llm_today = [t for t in pf.trades[trades_before_llm:] if t.get("date") == day]
-            if decisions:
-                summary = ", ".join(
-                    f"{d['ticker']}={d['action']}" for d in decisions)
+
+                summary = ", ".join(f"{d['ticker']}={d['action']}" for d in decisions)
                 logger.info("  llm returned %d decisions: %s", len(decisions), summary)
-                if llm_today:
-                    logger.info("  llm executed %d trades — %s",
-                                len(llm_today),
-                                ", ".join(f"{t['side']} {t['ticker']}" for t in llm_today))
-            else:
-                logger.info("  llm returned no decisions (all HOLD or parse failed)")
+                if vetoed:
+                    logger.info("  vetoes: %d — %s",
+                                len(vetoed),
+                                ", ".join(f"{p['side']} {p['ticker']}" for p in vetoed))
+        else:
+            # No LLM configured: execute all proposals as-is (deterministic)
+            for p in proposals:
+                _execute_proposal(pf, p)
 
         # Record equity
         total_equity = pf.equity(prices)
@@ -1788,6 +1865,55 @@ def _print_result(res: ReplayResult, label: str) -> None:
     print(f"  Trades:            {res.n_trades}")
 
 
+def _print_cash_summary(res: ReplayResult, params: ReplayParams) -> None:
+    """Print cash-utilization stats from the replay's cash/position curves.
+
+    Shows how much equity sat idle as cash, how often the max-positions cap
+    blocked deployment, and a monthly breakdown so the drag is visible.
+    """
+    if not res.cash_curve or not res.equity_curve:
+        print("  (no cash curve data)")
+        return
+    n_days = len(res.equity_curve)
+    cash_pcts = [
+        (c / e["equity"]) * 100 if e["equity"] > 0 else 0.0
+        for c, e in zip(res.cash_curve, res.equity_curve)
+    ]
+    avg_cash_pct = sum(cash_pcts) / n_days
+    at_cap = sum(1 for n in res.position_count_curve
+                 if params.max_positions > 0 and n >= params.max_positions)
+    pct_at_cap = (at_cap / n_days) * 100 if n_days else 0
+    idle_days = sum(1 for p in cash_pcts if p > 30)
+
+    # Longest stretch at cap
+    longest_cap = 0; current_cap = 0
+    for n in res.position_count_curve:
+        if params.max_positions > 0 and n >= params.max_positions:
+            current_cap += 1
+            longest_cap = max(longest_cap, current_cap)
+        else:
+            current_cap = 0
+
+    print(f"\n=== Cash utilization ({n_days} days) ===")
+    print(f"  Avg cash as % of equity:    {avg_cash_pct:.1f}%")
+    print(f"  Days at max-positions cap:  {at_cap}/{n_days} ({pct_at_cap:.0f}%)")
+    print(f"  Longest stretch at cap:     {longest_cap} days")
+    print(f"  Days with >30% cash:        {idle_days} ({idle_days/n_days*100:.0f}%)")
+
+    # Monthly breakdown
+    from collections import defaultdict
+    monthly = defaultdict(list)
+    for e, c, n in zip(res.equity_curve, res.cash_curve, res.position_count_curve):
+        monthly[e["time"][:7]].append((c, n, e["equity"]))
+    print(f"\n  {'month':<8} {'avg_cash_%':>10} {'avg_pos':>8} {'end_cash':>11}")
+    for m in sorted(monthly):
+        vals = monthly[m]
+        avg_c = sum(v[0] / v[2] * 100 for v in vals if v[2] > 0) / max(1, len(vals))
+        avg_p = sum(v[1] for v in vals) / len(vals)
+        end_c = vals[-1][0]
+        print(f"  {m:<8} {avg_c:>9.1f}% {avg_p:>8.1f} {end_c:>11.2f}")
+
+
 async def _main(args: argparse.Namespace) -> None:
     tickers = _candidate_tickers()
     logger.info("Loading series for %d tickers...", len(tickers))
@@ -1829,6 +1955,8 @@ async def _main(args: argparse.Namespace) -> None:
         if args.trades:
             for t in res.trades:
                 print(f"  {t['side']:<4} {t['ticker']:<8} {t['shares']:>10.4f} @ {t['price']:>10.2f} — {t['reason']}")
+        if getattr(args, "cash", False):
+            _print_cash_summary(res, params)
 
     elif args.command == "sweep":
         regime_on = getattr(args, "regime", False)
@@ -1925,6 +2053,7 @@ def _build_parser() -> argparse.ArgumentParser:
     b.add_argument("--start", default=None, help="YYYY-MM-DD inclusive start")
     b.add_argument("--end", default=None, help="YYYY-MM-DD inclusive end")
     b.add_argument("--trades", action="store_true", help="Print every trade")
+    b.add_argument("--cash", action="store_true", help="Print cash-utilization summary (idle cash, max-positions cap)")
     b.add_argument("--regime", action="store_true", help="Enable market regime filter (block BUYs when market < SMA200)")
     b.add_argument("--regime-ticker", default="URTH", help="Benchmark ticker for the regime filter")
 
