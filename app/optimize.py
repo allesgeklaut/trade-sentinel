@@ -43,6 +43,7 @@ from .config import settings
 from . import llm as llm_mod
 from .db import Candle, Session
 from .screener import tickers as universe_tickers
+from .strategy import StrategyParams, propose_trades, reconcile_proposals, valuate_portfolio
 
 logger = logging.getLogger("trade_sentinel.optimize")
 
@@ -699,6 +700,33 @@ def _valuation_from_portfolio(
     }
 
 
+def _pf_to_positions(pf: PaperPortfolio) -> list[dict]:
+    """Convert PaperPortfolio.positions to the plain-data shape strategy.py expects."""
+    return [
+        {"ticker": t, "shares": s, "avg_cost": pf.avg_cost.get(t, 0),
+         "stop_price": pf.stop_price.get(t)}
+        for t, s in pf.positions.items()
+    ]
+
+
+def _replay_params_to_strategy(p: ReplayParams) -> StrategyParams:
+    """Convert ReplayParams to the shared StrategyParams."""
+    return StrategyParams(
+        buy_threshold=p.buy_threshold,
+        sell_threshold=p.sell_threshold,
+        min_cash_pct=p.min_cash_pct,
+        max_position_pct=p.max_position_pct,
+        max_positions=p.max_positions,
+        stop_type=p.stop_type,
+        stop_pct=p.stop_pct,
+        stop_atr_mult=p.stop_atr_mult,
+        use_atr_stop=p.use_atr_stop,
+        max_run_5d=p.max_run_5d,
+        relaxed_hold_strength=p.relaxed_hold_strength,
+        relaxed_hold_limit=p.relaxed_hold_limit,
+    )
+
+
 def _deterministic_propose_replay(
     pf: PaperPortfolio,
     by_time: dict[str, dict[str, dict]],
@@ -708,120 +736,56 @@ def _deterministic_propose_replay(
 ) -> list[dict]:
     """Propose deterministic trades for one day WITHOUT mutating ``pf``.
 
-    Mirrors ``sim._deterministic_propose``: stops/signal SELLs first, then
-    ranked BUYs (strict, else relaxed HOLD fallback), with the max-positions
-    cap, run-up block, position/cash floors, and frozen initial stop. Returns
-    a list of proposal dicts (no DB / no portfolio mutation):
-
-      - SELL: {"ticker", "side": "SELL", "price", "shares": None, "reason", "date"}
-      - BUY:  {"ticker", "side": "BUY",  "price", "budget", "reason", "date",
-               "entry_stop"}
-
-    Cash/open-count are tracked locally so successive BUY proposals within
-    the same cycle see reduced cash (mirroring the old execute-as-you-go
-    behaviour) without actually mutating ``pf``.
+    Thin wrapper over ``strategy.propose_trades`` — converts PaperPortfolio
+    to plain data, builds signals from the precomputed by_time rows, calls
+    the shared propose logic, and stamps each proposal with the day + any
+    entry_stop the shared logic computed.
     """
-    proposals: list[dict] = []
-    total_equity = pf.equity(prices)
-    if total_equity <= 0:
-        return proposals
+    signals = _signals_for_day_from_bytime(by_time, day, params)
+    sp = _replay_params_to_strategy(params)
+    proposals = propose_trades(
+        positions=_pf_to_positions(pf),
+        cash=pf.cash,
+        prices=prices,
+        signals=signals,
+        params=sp,
+    )
+    # Stamp the day on each proposal (strategy.propose_trades is day-agnostic).
+    for p in proposals:
+        p["date"] = day
+    return proposals
 
-    min_cash = total_equity * (params.min_cash_pct / 100)
-    max_position_value = total_equity * (params.max_position_pct / 100)
-    open_count = len(pf.positions)
-    sim_cash = pf.cash  # local copy; decremented as BUYs are proposed
 
-    # --- SELL phase ---
-    for ticker in list(pf.positions.keys()):
-        row = by_time.get(ticker, {}).get(day)
+def _signals_for_day_from_bytime(
+    by_time: dict[str, dict[str, dict]],
+    day: str,
+    params: ReplayParams,
+) -> dict[str, dict]:
+    """Build the ``{ticker: signal}`` dict for one day from precomputed by_time rows.
+
+    Converts the raw scoring components in by_time (net, bullish, bearish,
+    trend_up, etc.) into the same {action, strength, reason, snapshot} shape
+    that ``analysis.compute()`` and ``_signals_for_day`` produce, so the
+    shared ``strategy.propose_trades`` can consume them uniformly.
+    """
+    signals: dict[str, dict] = {}
+    for t, idx in by_time.items():
+        row = idx.get(day)
         if row is None:
             continue
-        price = row["close"]
         action = _row_action(row, params)
-        if action == "SELL":
-            proposals.append({"ticker": ticker, "side": "SELL",
-                              "price": price, "shares": None,
-                              "reason": f"SELL signal (strength {_row_strength(row, action)})",
-                              "date": day})
-            continue
-        # Frozen initial % stop
-        if params.stop_type != "none" and ticker in pf.stop_price:
-            sp = pf.stop_price[ticker]
-            if price <= sp:
-                proposals.append({"ticker": ticker, "side": "SELL",
-                                  "price": price, "shares": None,
-                                  "reason": f"Initial stop: {price:.2f} <= {sp:.2f}",
-                                  "date": day})
-                continue
-        # ATR trailing stop
-        if params.use_atr_stop:
-            atr_stop = row["atr_stop"]
-            if atr_stop is not None and price < atr_stop:
-                proposals.append({"ticker": ticker, "side": "SELL",
-                                  "price": price, "shares": None,
-                                  "reason": f"ATR stop hit: {price:.2f} < {atr_stop:.2f}",
-                                  "date": day})
-
-    # --- BUY phase ---
-    buy_candidates = [
-        (t, by_time[t][day]) for t in by_time
-        if day in by_time[t] and _row_action(by_time[t][day], params) == "BUY"
-        and not (params.max_run_5d > 0
-                 and by_time[t][day].get("run_5d") is not None
-                 and by_time[t][day]["run_5d"] > params.max_run_5d)
-    ]
-    buy_candidates.sort(key=lambda x: _row_strength(x[1], "BUY"), reverse=True)
-
-    if not buy_candidates:
-        hold_candidates = [
-            (t, by_time[t][day]) for t in by_time
-            if day in by_time[t]
-            and _row_action(by_time[t][day], params) == "HOLD"
-            and _row_strength(by_time[t][day], "HOLD") >= params.relaxed_hold_strength
-            and not (params.max_run_5d > 0
-                     and by_time[t][day].get("run_5d") is not None
-                     and by_time[t][day]["run_5d"] > params.max_run_5d)
-        ]
-        hold_candidates.sort(key=lambda x: _row_strength(x[1], "HOLD"), reverse=True)
-        buy_candidates = hold_candidates[:params.relaxed_hold_limit]
-
-    for ticker, row in buy_candidates:
-        if sim_cash < min_cash:
-            break
-        # Max open positions: block NEW positions when at the cap, but still
-        # allow topping up tickers already held (a top-up doesn't open a new
-        # position, and the max_position_pct ceiling below prevents
-        # over-concentration in a single name).
-        if (params.max_positions > 0
-                and open_count >= params.max_positions
-                and ticker not in pf.positions):
-            continue
-        price = row["close"]
-        current_value = pf.positions.get(ticker, 0) * price
-        if current_value >= max_position_value:
-            continue
-        budget = min(sim_cash - min_cash, max_position_value - current_value)
-        if budget < 1:
-            continue
-        entry_stop = None
-        if params.stop_type == "percent":
-            entry_stop = price * (1 - params.stop_pct / 100)
-        elif params.stop_type == "atr":
-            atr = row.get("atr14")
-            if atr and atr > 0:
-                entry_stop = price - params.stop_atr_mult * atr
-        proposals.append({"ticker": ticker, "side": "BUY", "price": price,
-                          "budget": budget,
-                          "reason": f"BUY signal (strength {_row_strength(row, 'BUY')})",
-                          "date": day, "entry_stop": entry_stop})
-        # Reserve the budget locally so the next BUY proposal sees reduced
-        # cash. Only bump open_count for NEW positions — a top-up doesn't
-        # change the position count.
-        sim_cash -= budget
-        if ticker not in pf.positions:
-            open_count += 1
-
-    return proposals
+        strength = _row_strength(row, action)
+        signals[t] = {
+            "action": action,
+            "strength": strength,
+            "reason": f"{action} (strength {strength})",
+            "snapshot": {
+                "atr_stop": row.get("atr_stop"),
+                "run_5d": row.get("run_5d"),
+                "atr14": row.get("atr14"),
+            },
+        }
+    return signals
 
 
 def _execute_proposal(pf: PaperPortfolio, p: dict) -> dict | None:
@@ -958,7 +922,7 @@ async def _hybrid_replay(
         total_equity = pf.equity(prices)
         if total_equity > 0 and (settings.llm_backends or settings.ollama_model):
             allowance_total = cumulative_invested
-            valuation = _valuation_from_portfolio(pf, prices, allowance_total)
+            valuation = valuate_portfolio(_pf_to_positions(pf), pf.cash, prices, allowance_total)
             signals = _signals_for_day(series, by_time, day, params)
             context = _build_llm_context(valuation, proposals, signals, news)
             logger.info("  llm phase: calling LLM (%d signals, %d proposals)...",
@@ -982,26 +946,9 @@ async def _hybrid_replay(
                     logger.info("  (fallback) executed all %d proposals", len(proposals))
             else:
                 # Reconcile proposals with LLM decisions (veto vs approve)
-                llm_by_ticker = {d["ticker"].upper(): d for d in decisions}
-                proposal_tickers = set()
-                approved: list[dict] = []
-                vetoed: list[dict] = []
-                for p in proposals:
-                    tu = p["ticker"].upper()
-                    proposal_tickers.add(tu)
-                    ld = llm_by_ticker.get(tu)
-                    if ld is None:
-                        approved.append(p)  # silence = consent
-                    elif ld["action"] == "HOLD":
-                        vetoed.append(p)
-                        logger.info("  llm VETOED %s %s — %s", p["side"], p["ticker"], ld.get("reason", ""))
-                    elif ld["action"] == p["side"]:
-                        approved.append(p)
-                    else:
-                        # Flip: treat as veto of proposal; the flipped action
-                        # is handled as an LLM addition below.
-                        vetoed.append(p)
-                        logger.info("  llm FLIPPED %s %s → %s", p["side"], p["ticker"], ld["action"])
+                approved, vetoed, proposal_tickers = reconcile_proposals(proposals, decisions)
+                for p in vetoed:
+                    logger.info("  llm VETOED %s %s — %s", p["side"], p["ticker"], p.get("llm_reason", ""))
 
                 # Execute approved proposals (SELLs first, already ordered)
                 for p in approved:
