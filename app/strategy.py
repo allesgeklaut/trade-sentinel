@@ -59,6 +59,14 @@ class StrategyParams:
     max_run_5d: float = 12.0     # block BUYs after a 5-day run-up > this % (0 = disabled)
     relaxed_hold_strength: int = 40
     relaxed_hold_limit: int = 3
+    # Sector diversification cap: max % of equity in any one sector. 0 = disabled.
+    # When enabled, the caller must pass a ``sector_of`` callable to propose_trades.
+    max_sector_pct: float = 0.0
+    # Risk-based position sizing: risk this % of equity per trade, sized by
+    # stop distance. 0 = use flat max_position_pct.
+    risk_pct: float = 0.0
+    relaxed_hold_strength: int = 40
+    relaxed_hold_limit: int = 3
 
 
 def valuate_portfolio(
@@ -102,6 +110,7 @@ def propose_trades(
     prices: dict[str, float],
     signals: dict[str, dict],
     params: StrategyParams,
+    sector_of: callable | None = None,
 ) -> list[dict]:
     """Propose deterministic trades WITHOUT executing them.
 
@@ -135,6 +144,13 @@ def propose_trades(
     held_tickers = {p["ticker"] for p in positions}
     open_count = len(held_tickers)
     sim_cash = cash  # local copy; decremented as BUYs are proposed
+
+    # Track sector exposure progressively (for the sector cap).
+    sector_values: dict[str, float] = {}
+    if params.max_sector_pct > 0 and sector_of:
+        for p in positions:
+            sec = sector_of(p["ticker"])
+            sector_values[sec] = sector_values.get(sec, 0) + p["shares"] * prices.get(p["ticker"], 0)
 
     # --- SELL phase ---
     for pos in positions:
@@ -220,7 +236,33 @@ def propose_trades(
         if current_value >= max_position_value:
             continue
 
+        # Sector diversification cap: limit total exposure per sector.
+        # Tracked progressively so the 2nd same-sector BUY sees the 1st one.
+        if params.max_sector_pct > 0 and sector_of:
+            sec = sector_of(ticker)
+            sector_cap = total_equity * (params.max_sector_pct / 100)
+            if sector_values.get(sec, 0) >= sector_cap:
+                continue
+
         budget = min(sim_cash - min_cash, max_position_value - current_value)
+
+        # Risk-based position sizing: size by stop distance so each
+        # trade risks a fixed % of equity (industry-standard 1% rule).
+        if params.risk_pct > 0 and params.stop_type != "none":
+            atr = sig.get("snapshot", {}).get("atr14")
+            if params.stop_type == "atr" and atr and atr > 0:
+                stop = price - params.stop_atr_mult * atr
+            elif params.stop_type == "percent":
+                stop = price * (1 - params.stop_pct / 100)
+            else:
+                stop = 0
+            if stop > 0 and price > stop:
+                risk_amount = total_equity * (params.risk_pct / 100)
+                risk_per_share = price - stop
+                if risk_per_share > 0:
+                    budget_by_risk = (risk_amount / risk_per_share) * price
+                    budget = min(budget, budget_by_risk)
+
         if budget < 1:
             continue
 
@@ -239,10 +281,13 @@ def propose_trades(
                           "entry_stop": entry_stop})
         # Reserve the budget locally so the next BUY proposal sees reduced
         # cash. Only bump open_count for NEW positions — a top-up doesn't
-        # change the position count.
+        # change the position count. Track sector exposure progressively.
         sim_cash -= budget
         if ticker not in held_tickers:
             open_count += 1
+        if params.max_sector_pct > 0 and sector_of:
+            sec = sector_of(ticker)
+            sector_values[sec] = sector_values.get(sec, 0) + budget
 
     return proposals
 
