@@ -42,9 +42,14 @@ logger = logging.getLogger("trade_sentinel.sim")
 # Stores the raw LLM reasoning text from the most recent _llm_decide() call.
 _last_llm_reasoning: str = ""
 # Stores the deterministic trades from the most recent hybrid cycle (for comparison).
+# In the hybrid strategy these are the PROPOSALS (pre-veto); some may have been
+# vetoed by the LLM and never executed — see _last_llm_vetoes.
 _last_deterministic_trades: list[dict] = []
 # Stores the parsed LLM decisions from the most recent cycle.
 _last_llm_decisions: list[dict] = []
+# Stores the deterministic proposals the LLM vetoed (HOLD) in the most recent
+# hybrid cycle. Empty for non-hybrid strategies and for the pure-LLM strategy.
+_last_llm_vetoes: list[dict] = []
 
 # How many candles to refresh for the sim universe (2y is a good balance
 # for indicator computation without excessive API load).
@@ -282,14 +287,29 @@ async def _exec_sell(ticker: str, price: float, shares: float | None, reason: st
         }
 
 
-async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
-    """Rule-based strategy: use analysis.compute() signals to trade.
+async def _deterministic_propose(
+    valuation: dict[str, Any],
+    signals: dict[str, dict] | None = None,
+) -> list[dict]:
+    """Propose deterministic trades WITHOUT executing them.
+
+    Mirrors the SELL + BUY logic of the old ``_deterministic_decide`` but
+    returns a list of proposed-trade dicts instead of calling _exec_buy /
+    _exec_sell. This lets the hybrid strategy pass the proposals to the LLM
+    for review/veto before any DB write happens.
+
+    Each proposal carries everything ``_execute_proposed`` needs to apply it:
+      - SELL: {"ticker", "side": "SELL", "price", "shares": None, "reason"}
+      - BUY:  {"ticker", "side": "BUY",  "price", "budget", "reason"}
+
+    ``signals`` may be pre-gathered (hybrid path reuses them for the LLM
+    context); when None they are gathered here (deterministic-only path).
 
     SELL logic:
       - Sell any position whose signal is SELL.
       - Sell any position whose price drops below the initial stop
         (entry price × (1 - sim_stop_pct/100), frozen at buy time).
-      - Sell any position whose current price drops below ATR stop (from snapshot).
+      - Sell any position whose current price drops below ATR stop (snapshot).
 
     BUY logic:
       - Among candidates with BUY signal, rank by strength.
@@ -297,22 +317,21 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
         position wouldn't exceed max_position_pct of total equity.
       - Stop opening new positions once sim_max_positions is reached.
     """
-    trades: list[dict] = []
+    proposals: list[dict] = []
     tickers = await _candidate_tickers()
 
-    # Gather signals for all candidates
-    signals: dict[str, dict] = {}
-    for t in tickers:
-        try:
-            rows = await candles(t)
-            r = compute(rows)
-            signals[t] = r
-        except Exception:
-            continue
+    if signals is None:
+        signals = {}
+        for t in tickers:
+            try:
+                rows = await candles(t)
+                signals[t] = compute(rows)
+            except Exception:
+                continue
 
     total_equity = valuation["total_equity"]
     if total_equity <= 0:
-        return trades
+        return proposals
 
     min_cash = total_equity * (settings.sim_min_cash_pct / 100)
     max_position_value = total_equity * (settings.sim_max_position_pct / 100)
@@ -329,42 +348,28 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
             continue
 
         if sig and sig["action"] == "SELL":
-            t = await _exec_sell(pos.ticker, price, None, sig["reason"])
-            if t:
-                trades.append(t)
+            proposals.append({"ticker": pos.ticker, "side": "SELL",
+                              "price": price, "shares": None,
+                              "reason": sig["reason"]})
             continue
 
-        # Initial stop loss (frozen at entry): sell if price has dropped
-        # sim_stop_pct from the average entry cost.
+        # Initial stop loss (frozen at entry)
         stop_price = pos.avg_cost * (1 - stop_pct / 100)
         if price <= stop_price:
-            t = await _exec_sell(
-                pos.ticker, price, None,
-                f"Initial stop: price {price:.2f} <= {stop_price:.2f} "
-                f"(entry {pos.avg_cost:.2f}, -{stop_pct:.0f}%)",
-            )
-            if t:
-                trades.append(t)
+            proposals.append({"ticker": pos.ticker, "side": "SELL",
+                              "price": price, "shares": None,
+                              "reason": f"Initial stop: price {price:.2f} <= {stop_price:.2f} "
+                                        f"(entry {pos.avg_cost:.2f}, -{stop_pct:.0f}%)"})
             continue
 
-        # ATR stop check (from snapshot)
+        # ATR stop check
         if sig:
             snap = sig.get("snapshot", {})
             atr_stop = snap.get("atr_stop")
             if atr_stop and price < atr_stop:
-                t = await _exec_sell(
-                    pos.ticker, price, None,
-                    f"ATR stop hit: price {price:.2f} < stop {atr_stop:.2f}",
-                )
-                if t:
-                    trades.append(t)
-
-    # Recompute equity after sells
-    if trades:
-        valuation = await valuate()
-        total_equity = valuation["total_equity"]
-        min_cash = total_equity * (settings.sim_min_cash_pct / 100)
-        max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+                proposals.append({"ticker": pos.ticker, "side": "SELL",
+                                  "price": price, "shares": None,
+                                  "reason": f"ATR stop hit: price {price:.2f} < stop {atr_stop:.2f}"})
 
     # --- BUY phase ---
     async with Session() as s:
@@ -380,9 +385,8 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
     ]
     buy_candidates.sort(key=lambda x: x[1]["strength"], reverse=True)
 
-    # If no strict BUY signals, use a relaxed fallback: buy the best
-    # near-BUY candidates (HOLD with highest strength) so the bot stays
-    # active and deploys cash instead of sitting idle.
+    # Relaxed fallback: buy the best near-BUY (HOLD with high strength) so
+    # the bot stays active and deploys cash instead of sitting idle.
     if not buy_candidates:
         hold_candidates = [
             (t, sig) for t, sig in signals.items()
@@ -392,7 +396,7 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
                      and sig["snapshot"]["run_5d"] > max_run_5d)
         ]
         hold_candidates.sort(key=lambda x: x[1]["strength"], reverse=True)
-        buy_candidates = hold_candidates[:3]  # limit relaxed buys
+        buy_candidates = hold_candidates[:3]
         if buy_candidates:
             logger.info("No strict BUY signals; using %d relaxed HOLD candidates (strength >= 40)", len(buy_candidates))
 
@@ -401,31 +405,82 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
         if acc.cash < min_cash:
             break  # not enough cash to keep buffer
 
-        # Max open positions: stop buying if we already hold too many.
-        if open_count >= settings.sim_max_positions:
-            break
+        # Max open positions: block NEW positions when at the cap, but still
+        # allow topping up tickers already held (a top-up doesn't open a new
+        # position, and the max_position_pct ceiling below prevents
+        # over-concentration in a single name).
+        async with Session() as s:
+            pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
+        if open_count >= settings.sim_max_positions and pos is None:
+            continue
 
         price = await _latest_close(ticker)
         if price is None or price <= 0:
             continue
 
-        # Check existing position size
-        async with Session() as s:
-            pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
         current_value = (pos.shares * price) if pos else 0
         if current_value >= max_position_value:
-            continue  # position already at max
+            continue
 
         budget = min(acc.cash - min_cash, max_position_value - current_value)
         if budget < 1:
             continue
 
-        t = await _exec_buy(ticker, price, budget, sig["reason"])
-        if t:
-            trades.append(t)
+        proposals.append({"ticker": ticker, "side": "BUY",
+                          "price": price, "budget": budget,
+                          "reason": sig["reason"]})
+        # Reserve the budget locally so subsequent proposals in this same
+        # cycle see reduced cash (mirrors the old execute-as-you-go behaviour
+        # where each _exec_buy decremented acc.cash). Only bump open_count
+        # for NEW positions — a top-up of an existing ticker doesn't change
+        # the position count.
+        acc.cash -= budget
+        if pos is None:
             open_count += 1
 
-    return trades
+    return proposals
+
+
+async def _execute_proposed(proposals: list[dict]) -> list[dict]:
+    """Execute a list of proposed trades via _exec_buy / _exec_sell.
+
+    Returns the list of actually-executed trade dicts (same shape as
+    _exec_buy/_exec_sell return). Skips any that fail the exec guards
+    (e.g. cash shortfall discovered at execution time). Re-checks the
+    max-positions cap on each BUY: a veto that freed a slot mid-list is
+    honoured, and a BUY for an already-held ticker is allowed through as a
+    top-up (the exec guard clamps it to the max-position-% limit).
+    """
+    executed: list[dict] = []
+    for p in proposals:
+        if p["side"] == "SELL":
+            t = await _exec_sell(p["ticker"], p["price"], p.get("shares"), p["reason"])
+            if t:
+                executed.append(t)
+            continue
+        # BUY: re-check the max-positions cap against the live DB state, so
+        # a SELL earlier in this same list frees a slot for the next BUY.
+        async with Session() as s:
+            open_count = await s.scalar(select(func.count()).select_from(SimPosition))
+            held = await s.scalar(select(SimPosition).where(SimPosition.ticker == p["ticker"]))
+        if open_count >= settings.sim_max_positions and held is None:
+            continue  # at cap and this is a new position — skip
+        t = await _exec_buy(p["ticker"], p["price"], p["budget"], p["reason"])
+        if t:
+            executed.append(t)
+    return executed
+
+
+async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
+    """Rule-based strategy: propose + execute deterministic trades.
+
+    Thin wrapper over ``_deterministic_propose`` + ``_execute_proposed`` so
+    the deterministic-only strategy keeps its original behaviour. The hybrid
+    strategy calls the two halves separately so the LLM can review proposals
+    before they execute.
+    """
+    proposals = await _deterministic_propose(valuation)
+    return await _execute_proposed(proposals)
 
 
 # ---------------------------------------------------------------------------
@@ -520,15 +575,19 @@ _LLM_SYSTEM_PROMPT = (
     "You will receive the current portfolio state and a list of candidate "
     "tickers with their technical indicators (signal action, strength, close "
     "price, RSI, MACD).\n"
-    "Your job: review the deterministic trade candidates and the signals, then "
-    "return your own decisions.\n"
+    "Your job: review the deterministic PROPOSED trades (which have NOT yet "
+    "executed) and the signals, then return your own decisions. Your HOLD on "
+    "a proposed trade VETOES it — the trade will not execute. Your BUY/SELL "
+    "on a proposed trade confirms and executes it. You may also add new "
+    "BUY/SELL decisions for tickers not in the proposed list.\n"
     "\n"
     + _SIM_METHODOLOGY +
     "Rules:\n"
     "2. Your primary job is to downgrade overextended BUYs to HOLD. See the "
     "GATING deterministic BUYs section above. This is the highest-impact "
     "decision you make — avoiding catastrophic entries outweighs everything "
-    "else. You may also reject a SELL, but be conservative (see GATING "
+    "else. Your HOLD on a proposed BUY will block it from executing. You may "
+    "also veto a SELL, but be conservative (see GATING "
     "deterministic SELLs).\n"
     "3. Respect risk management: do not buy if cash is too low; do not over-"
     "concentrate in a single ticker. The engine caps the number of open "
@@ -654,12 +713,16 @@ def _build_llm_context(
                 lines.append(format_news_for_context(ticker, hl))
         lines.append("")
 
-    # --- Deterministic candidate trades ---
-    lines.append("## Deterministic Candidate Trades")
+    # --- Deterministic proposed trades (pending — NOT yet executed) ---
+    lines.append("## Deterministic Proposed Trades (pending — your HOLD will veto)")
     if deterministic_trades:
         for t in deterministic_trades:
+            shares = t.get("shares", "?")
+            if t["side"] == "BUY":
+                # Proposals carry a budget; show it so the LLM sees the size
+                shares = f"budget ${t.get('budget', 0):.0f}"
             lines.append(
-                f"  - {t['ticker']} {t['side']} ×{t.get('shares', '?')} @ "
+                f"  - {t['ticker']} {t['side']} ×{shares} @ "
                 f"{t.get('price', '?'):.2f} — {t.get('reason', '')}"
             )
     else:
@@ -670,7 +733,9 @@ def _build_llm_context(
     lines.append(
         "Return ONLY a JSON array of objects: "
         '{"ticker": "...", "action": "BUY|SELL|HOLD", "reason": "..."}. '
-        "No markdown, no prose."
+        "For tickers listed above, HOLD = veto (block the proposed trade); "
+        "BUY/SELL = agree and execute. You may also add new BUY/SELL decisions "
+        "for tickers NOT in the proposed list. No markdown, no prose."
     )
     return "\n".join(lines)
 
@@ -732,6 +797,180 @@ def _parse_llm_decisions(content: str) -> list[dict] | None:
                 entry[field] = float(val)
         valid.append(entry)
     return valid if valid else None
+
+
+async def _llm_review_proposals(
+    valuation: dict[str, Any],
+    proposals: list[dict],
+    signals: dict[str, dict],
+    news: dict[str, list[dict]] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Hybrid flow: let the LLM review deterministic proposals before they execute.
+
+    Mirrors the propose → review → execute flow that makes the LLM's HOLD
+    actually veto a deterministic trade instead of being a silent no-op:
+
+      1. Build the LLM context with the deterministic *proposals* (not yet
+         executed) and the current portfolio state.
+      2. Call the LLM; it returns a JSON array of BUY/SELL/HOLD decisions.
+      3. Reconcile: a deterministic proposal is vetoed when the LLM returns
+         HOLD for its ticker; otherwise it's approved and executes. LLM
+         decisions for tickers NOT in the proposals are treated as
+         LLM-initiated additions and execute on top.
+
+    Returns ``(executed, vetoed)`` where ``executed`` is the full list of
+    trades that ran (deterministic survivors + LLM additions) and ``vetoed``
+    is the list of deterministic proposals the LLM blocked (for logging /
+    frontend display).
+
+    On LLM call failure or unparseable response, falls back to executing all
+    proposals as-is (equivalent to the deterministic-only strategy).
+    """
+    global _last_llm_reasoning
+
+    context = _build_llm_context(valuation, proposals, signals, news)
+    backend = await llm_mod.current_backend()
+
+    try:
+        out = await llm_mod.chat([
+            {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+            {"role": "user", "content": context},
+        ])
+        content = out["text"]
+    except Exception as e:
+        err_detail = f"{type(e).__name__}: {e}"
+        if hasattr(e, 'response'):
+            try:
+                err_detail += f" | status={e.response.status_code} body={e.response.text[:300]}"
+            except Exception:
+                pass
+        logger.warning("LLM review failed [%s] (backend=%s, model=%s); executing all proposals",
+                       err_detail, backend.get("name", "?"), backend.get("model", "?"))
+        _last_llm_reasoning = (
+            f"[LLM UNAVAILABLE — executing all deterministic proposals]\n"
+            f"Error: {err_detail}\n"
+            f"Backend: {backend.get('name', '?')}\n"
+            f"Model: {backend.get('model', '?')}"
+        )
+        executed = await _execute_proposed(proposals)
+        return executed, []
+
+    _last_llm_reasoning = content
+    decisions = _parse_llm_decisions(content)
+    if decisions is None:
+        logger.warning("Could not parse LLM decisions; executing all proposals. Raw: %s", content[:500])
+        executed = await _execute_proposed(proposals)
+        return executed, []
+
+    logger.info("LLM returned %d decisions", len(decisions))
+
+    # --- Reconcile proposals with LLM decisions ---
+    # Build a lookup of the LLM's verdict per ticker (case-insensitive).
+    llm_by_ticker: dict[str, dict] = {}
+    for d in decisions:
+        llm_by_ticker[d["ticker"].upper()] = d
+
+    approved: list[dict] = []
+    vetoed: list[dict] = []
+    proposal_tickers: set[str] = set()
+
+    for p in proposals:
+        ticker_u = p["ticker"].upper()
+        proposal_tickers.add(ticker_u)
+        llm_d = llm_by_ticker.get(ticker_u)
+
+        if llm_d is None:
+            # LLM didn't comment on this proposal — treat as approved (the
+            # LLM's job is to veto bad trades, not rubber-stamp good ones;
+            # silence = consent).
+            approved.append(p)
+            continue
+
+        llm_action = llm_d["action"]
+        if llm_action == "HOLD":
+            # Veto: don't execute this deterministic trade.
+            logger.info("LLM vetoed %s %s — %s", p["side"], p["ticker"], llm_d.get("reason", ""))
+            vetoed.append({**p, "llm_reason": llm_d.get("reason", "")})
+        elif llm_action == p["side"]:
+            # LLM agrees — execute as proposed.
+            approved.append(p)
+        else:
+            # LLM flipped the action (e.g. BUY → SELL). Treat as a veto of
+            # the proposal + an LLM-initiated trade of the flipped side.
+            logger.info("LLM flipped %s %s → %s", p["side"], p["ticker"], llm_action)
+            vetoed.append({**p, "llm_reason": llm_d.get("reason", "")})
+            # The flipped trade is added to the LLM-additions below via the
+            # decisions list (it's not in proposals, so it'll be caught by
+            # the "additions" pass).
+
+    # Execute approved proposals (SELLs first so cash frees up for BUYs;
+    # _execute_proposed preserves order, and _deterministic_propose already
+    # emits SELLs before BUYs).
+    executed = await _execute_proposed(approved)
+
+    # --- LLM-initiated additions: decisions for tickers NOT in proposals ---
+    # These execute on top of the approved proposals, through the same exec
+    # helpers, honouring partial-size fields and risk guards.
+    total_equity = valuation["total_equity"]
+    if total_equity <= 0:
+        return executed, vetoed
+
+    min_cash = total_equity * (settings.sim_min_cash_pct / 100)
+    max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+
+    for d in decisions:
+        ticker_u = d["ticker"].upper()
+        if ticker_u in proposal_tickers:
+            continue  # already handled above
+        action = d["action"]
+        reason = d.get("reason", f"LLM {action}")
+        if action == "HOLD":
+            continue  # HOLD on a non-proposal ticker = no-op
+
+        price = await _latest_close(d["ticker"])
+        if price is None or price <= 0:
+            logger.warning("LLM addition for %s skipped: no price", d["ticker"])
+            continue
+
+        if action == "BUY":
+            acc = await _account()
+            if acc.cash < min_cash:
+                logger.info("LLM BUY %s skipped: cash %.2f < min_cash %.2f", d["ticker"], acc.cash, min_cash)
+                continue
+            async with Session() as s:
+                pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == d["ticker"]))
+            current_value = (pos.shares * price) if pos else 0
+            if current_value >= max_position_value:
+                continue
+            budget = min(acc.cash - min_cash, max_position_value - current_value)
+            if "shares" in d:
+                budget = min(budget, d["shares"] * price)
+            elif "amount" in d:
+                budget = min(budget, d["amount"])
+            if budget < 1:
+                continue
+            t = await _exec_buy(d["ticker"], price, budget, f"LLM: {reason}")
+            if t:
+                executed.append(t)
+                valuation = await valuate()
+                total_equity = valuation["total_equity"]
+                min_cash = total_equity * (settings.sim_min_cash_pct / 100)
+                max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+        elif action == "SELL":
+            target_shares: float | None = None
+            if "shares" in d:
+                target_shares = d["shares"]
+            elif "amount" in d:
+                target_shares = d["amount"] / price if price > 0 else None
+            t = await _exec_sell(d["ticker"], price, target_shares, f"LLM: {reason}")
+            if t:
+                executed.append(t)
+                valuation = await valuate()
+                total_equity = valuation["total_equity"]
+                min_cash = total_equity * (settings.sim_min_cash_pct / 100)
+                max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+
+    return executed, vetoed
 
 
 async def _llm_decide(
@@ -999,14 +1238,16 @@ async def run_cycle() -> dict[str, Any]:
         trades = await _llm_decide(valuation, [], signals, news)
         _last_deterministic_trades = []
     elif strategy == "hybrid":
-        # Hybrid: run deterministic first, then let LLM review/adjust
-        deterministic_trades = await _deterministic_decide(valuation)
-        # Recompute valuation after deterministic trades changed the portfolio
-        valuation = await valuate()
+        # Hybrid: propose deterministic trades → LLM reviews → execute the
+        # survivors. The LLM's HOLD on a proposed ticker VETOES that trade
+        # before it executes (the old flow executed deterministic first and
+        # the LLM could only add on top, making its HOLDs silent no-ops).
         signals = await _gather_signals(tickers)
         news = await _gather_news(signals)
-        trades = await _llm_decide(valuation, deterministic_trades, signals, news)
-        _last_deterministic_trades = deterministic_trades
+        proposals = await _deterministic_propose(valuation, signals)
+        trades, vetoed = await _llm_review_proposals(valuation, proposals, signals, news)
+        _last_deterministic_trades = proposals
+        _last_llm_vetoes = vetoed
     else:
         logger.warning("Unknown strategy '%s', falling back to deterministic", strategy)
         trades = await _deterministic_decide(valuation)
@@ -1057,6 +1298,8 @@ def get_last_llm_summary() -> dict[str, Any]:
     - confirmations: decisions where the LLM agreed with deterministic
     - holds: HOLD decisions (abbreviated)
     - deterministic_trades: what the deterministic engine proposed
+    - vetoes: deterministic proposals the LLM blocked (HOLD) — only populated
+      in the hybrid strategy under the propose→review→execute flow
     """
     global _last_llm_decisions
 
@@ -1073,6 +1316,12 @@ def get_last_llm_summary() -> dict[str, Any]:
     changes: list[dict] = []
     confirmations: list[dict] = []
     holds: list[dict] = []
+    vetoes: list[dict] = []
+
+    # Tickers the LLM explicitly vetoed (HOLD on a proposed trade). These are
+    # surfaced as vetoes, not passive holds, because the deterministic trade
+    # was blocked from executing.
+    vetoed_tickers: set[str] = {v["ticker"] for v in _last_llm_vetoes}
 
     for d in decisions:
         ticker = d["ticker"]
@@ -1081,7 +1330,17 @@ def get_last_llm_summary() -> dict[str, Any]:
         det = det_by_ticker.get(ticker)
 
         if action == "HOLD":
-            holds.append({"ticker": ticker, "reason": reason})
+            if ticker in vetoed_tickers:
+                # HOLD on a proposed trade = veto (blocked execution)
+                det_side = det["side"] if det else None
+                vetoes.append({
+                    "ticker": ticker, "action": "HOLD", "reason": reason,
+                    "det_action": det_side, "det_reason": det.get("reason", "") if det else None,
+                    "change_type": "veto",
+                })
+            else:
+                # HOLD on a non-proposal ticker = passive hold
+                holds.append({"ticker": ticker, "reason": reason})
             continue
 
         if det:
@@ -1122,6 +1381,7 @@ def get_last_llm_summary() -> dict[str, Any]:
         "changes": changes,
         "confirmations": confirmations,
         "holds": holds,
+        "vetoes": vetoes,
         "fallback": is_fallback,
     }
 
