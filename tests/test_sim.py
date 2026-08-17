@@ -894,8 +894,140 @@ class TestYearLongSimulation:
 
 
 # ---------------------------------------------------------------------------
-# Timezone convention (Batch 2)
+# Max-positions cap: top-ups of held tickers must not be blocked
 # ---------------------------------------------------------------------------
+
+class TestTopUpAtCap:
+    """The max-positions cap must block NEW positions but still allow topping
+    up tickers already held. Previously the BUY loop used 'break' when at the
+    cap, which stopped all buying — including top-ups — leaving cash idle.
+    The fix changed 'break' to 'continue' with a 'pos is None' guard.
+    """
+
+    async def test_top_up_proposed_for_held_ticker_at_cap(self, with_cash, monkeypatch):
+        """When the portfolio is at the max-positions cap, a held ticker with
+        a continuing BUY signal should still get a top-up proposal. A new
+        ticker with a BUY signal should NOT get a proposal (cap blocks new)."""
+        from app.analysis import BUY_THRESHOLD, SELL_THRESHOLD
+        from app.db import SimPosition
+
+        # Seed 10 positions (at the cap) at a low cost basis so they're well
+        # below the max_position_pct ceiling and can be topped up.
+        for i in range(10):
+            await sim._exec_buy(f"HELD{i}", 50.0, 200.0, "seed")  # 4 shares @ 50
+
+        # Mock _latest_close: held tickers at 60 (above entry, room to top up),
+        # new ticker at 100.
+        async def mock_close(ticker):
+            if ticker.startswith("HELD"):
+                return 60.0
+            return 100.0  # NEW1
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+
+        # Mock signals: all held tickers + NEW1 have BUY signals; the snapshot
+        # carries run_5d below the block threshold so BUYs aren't filtered.
+        def buy_signal(ticker):
+            return {
+                "action": "BUY",
+                "reason": "BUY (test)",
+                "strength": 70,
+                "snapshot": {"run_5d": 0.0, "atr_stop": None, "close": 60.0 if ticker.startswith("HELD") else 100.0},
+            }
+        signals = {f"HELD{i}": buy_signal(f"HELD{i}") for i in range(10)}
+        signals["NEW1"] = buy_signal("NEW1")
+
+        # Mock _candidate_tickers to return the held + new tickers.
+        async def mock_candidates():
+            return list(signals.keys())
+        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
+
+        # Keep max_positions at the default (10) — the portfolio is at cap.
+        monkeypatch.setattr(settings, "sim_max_positions", 10)
+
+        # Valuation with enough cash for top-ups (monthly allowance just landed).
+        acc = await sim._account()
+        acc.cash = 5000.0
+        async with sim.Session() as s:
+            await s.commit()
+        valuation = await sim.valuate()
+
+        proposals = await sim._deterministic_propose(valuation, signals)
+
+        # Split proposals by whether the ticker is already held.
+        held_tickers = {f"HELD{i}" for i in range(10)}
+        top_ups = [p for p in proposals if p["side"] == "BUY" and p["ticker"] in held_tickers]
+        new_buys = [p for p in proposals if p["side"] == "BUY" and p["ticker"] not in held_tickers]
+
+        # Top-ups should be proposed for held tickers (the fix).
+        assert len(top_ups) > 0, (
+            f"no top-up proposals for held tickers (the cap blocked them); "
+            f"proposals: {[(p['ticker'], p['side']) for p in proposals]}"
+        )
+
+        # NEW1 must NOT be proposed — the cap blocks new positions.
+        assert len(new_buys) == 0, (
+            f"new ticker proposed at cap: {[(p['ticker'], p['side']) for p in new_buys]}"
+        )
+
+    async def test_top_up_executes_and_deploys_cash(self, with_cash, monkeypatch):
+        """End-to-end: propose + execute at the cap should actually buy more of
+        a held ticker and reduce cash. Calls _deterministic_propose (with
+        pre-built signals) + _execute_proposed directly, mirroring the hybrid
+        branch's propose→execute flow."""
+        from app.db import SimPosition
+
+        # Seed 10 positions at low cost basis.
+        for i in range(10):
+            await sim._exec_buy(f"HELD{i}", 50.0, 200.0, "seed")  # 4 shares @ 50
+
+        # Held tickers at 60 (room to top up).
+        async def mock_close(ticker):
+            return 60.0 if ticker.startswith("HELD") else 100.0
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+
+        def buy_signal(ticker):
+            return {
+                "action": "BUY", "reason": "BUY (test)", "strength": 70,
+                "snapshot": {"run_5d": 0.0, "atr_stop": None, "close": 60.0},
+            }
+        signals = {f"HELD{i}": buy_signal(f"HELD{i}") for i in range(10)}
+
+        async def mock_candidates():
+            return list(signals.keys())
+        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
+
+        monkeypatch.setattr(settings, "sim_max_positions", 10)
+
+        # Give excess cash so top-ups can deploy it.
+        acc = await sim._account()
+        acc.cash = 5000.0
+        async with sim.Session() as s:
+            await s.commit()
+        cash_before = acc.cash
+
+        valuation = await sim.valuate()
+        # Propose with pre-built signals (skip the candles() gather path),
+        # then execute — same flow as the hybrid branch.
+        proposals = await sim._deterministic_propose(valuation, signals)
+        trades = await sim._execute_proposed(proposals)
+
+        # BUY trades should exist (top-ups of held tickers).
+        buys = [t for t in trades if t["side"] == "BUY"]
+        assert len(buys) > 0, "no top-up BUYs executed at cap"
+
+        # Cash should have decreased (deployed into top-ups).
+        acc_after = await sim._account()
+        assert acc_after.cash < cash_before, (
+            f"cash didn't decrease: {cash_before} → {acc_after.cash} (top-ups didn't deploy cash)"
+        )
+
+        # Position count should still be 10 (top-ups don't open new positions).
+        async with sim.Session() as s:
+            from sqlalchemy import select as sa_select
+            positions = (await s.scalars(sa_select(SimPosition))).all()
+        assert len(positions) == 10, (
+            f"position count {len(positions)} != 10 (top-ups opened new positions)"
+        )
 
 class TestTimezoneConvention:
     """Verify that sim timestamps are stored as tz-aware UTC, and the monthly
