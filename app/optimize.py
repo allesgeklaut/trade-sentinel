@@ -398,6 +398,7 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
     cumulative_invested = params.start_cash
 
     last_known_prices: dict[str, float] = {}  # carry forward for missing-data days
+    sp = _replay_params_to_strategy(params)
 
     for day in days:
         # Monthly allowance deposit (first trading day of a new month).
@@ -458,139 +459,61 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
         # Update peak prices for trailing stop tracking.
         pf.update_peaks(prices)
 
-        # --- SELL phase ---
-        for ticker in list(pf.positions.keys()):
-            row = by_time.get(ticker, {}).get(day)
-            if row is None:
-                continue
-            price = row["close"]
-            action = _row_action(row, params)
-            if action == "SELL":
-                pf.sell(ticker, price, None, f"SELL signal (strength {_row_strength(row, action)})", date=day)
-                continue
-            # Initial stop loss (frozen at entry): exits before the slow
-            # death-cross SELL signal catches up, limiting catastrophic losses.
-            if params.stop_type != "none" and ticker in pf.stop_price:
-                sp = pf.stop_price[ticker]
-                if price <= sp:
-                    pf.sell(ticker, price, None,
-                            f"Initial stop: {price:.2f} <= {sp:.2f}", date=day)
-                    continue
-            # Trailing stop: sell if price has dropped trailing_stop_pct from
-            # its peak since the position was opened.
-            if params.trailing_stop_pct > 0:
-                peak = pf.peak_price.get(ticker, price)
-                stop_level = peak * (1 - params.trailing_stop_pct / 100)
-                if price <= stop_level:
-                    pf.sell(ticker, price, None,
-                            f"Trailing stop: {price:.2f} <= {stop_level:.2f} (peak {peak:.2f}, -{params.trailing_stop_pct}%)",
-                            date=day)
-                    continue
-            if params.use_atr_stop:
-                atr_stop = row["atr_stop"]
-                if atr_stop is not None and price < atr_stop:
-                    pf.sell(ticker, price, None, f"ATR stop hit: {price:.2f} < {atr_stop:.2f}", date=day)
+        # --- Pre-filter: trailing stop ---
+        # Sell if price has dropped trailing_stop_pct from its peak since entry.
+        # This is a backtest-only SELL that strategy.propose_trades doesn't know
+        # about (it doesn't track per-position peaks), so we apply it before
+        # calling propose_trades and let the core logic handle the rest.
+        if params.trailing_stop_pct > 0:
+            for ticker in list(pf.positions.keys()):
+                peak = pf.peak_price.get(ticker, 0)
+                price = prices.get(ticker, 0)
+                if peak > 0 and price > 0:
+                    stop_level = peak * (1 - params.trailing_stop_pct / 100)
+                    if price <= stop_level:
+                        pf.sell(ticker, price, None,
+                                f"Trailing stop: {price:.2f} <= {stop_level:.2f} "
+                                f"(peak {peak:.2f}, -{params.trailing_stop_pct}%)",
+                                date=day)
 
-        # Recompute equity after sells.
-        total_equity = pf.equity(prices)
-        min_cash = total_equity * (params.min_cash_pct / 100)
-        max_position_value = total_equity * (params.max_position_pct / 100)
+        # --- Core: delegate SELL to strategy.propose_trades, execute, then BUY ---
+        # propose_trades works on a snapshot; SELLs must execute first so the
+        # BUY phase sees freed slots + cash (matching the old inline behaviour
+        # where SELLs mutated pf before BUYs ran).
+        signals = _signals_for_day_from_bytime(by_time, day, params)
 
-        # --- BUY phase ---
+        # SELL phase: get proposals, execute them immediately.
+        proposals = propose_trades(
+            positions=_pf_to_positions(pf),
+            cash=pf.cash,
+            prices=prices,
+            signals=signals,
+            params=sp,
+            sector_of=_sector_of if params.max_sector_pct > 0 else None,
+        )
+        for p in proposals:
+            if p["side"] == "SELL":
+                _execute_proposal(pf, {**p, "date": day})
+
+        # BUY phase: re-derive post-SELL state, re-propose for BUYs only.
         # Regime filter: block new BUYs when the broad market is below its
-        # 200-day SMA. SELLs and ATR stops still execute (we manage risk on
-        # the way down, we just don't add new exposure).
+        # 200-day SMA, or when the circuit breaker is active.
         market_ok = not risk_off
         if params.regime_filter and regime is not None:
             market_ok = market_ok and regime.get(day, True)
 
-        buy_candidates = []
         if market_ok:
-            buy_candidates = [
-                (t, by_time[t][day]) for t in by_time
-                if day in by_time[t] and _row_action(by_time[t][day], params) == "BUY"
-                and not (params.max_run_5d > 0
-                         and by_time[t][day].get("run_5d") is not None
-                         and by_time[t][day]["run_5d"] > params.max_run_5d)
-            ]
-            buy_candidates.sort(key=lambda x: _row_strength(x[1], "BUY"), reverse=True)
-
-        if not buy_candidates and market_ok:
-            hold_candidates = [
-                (t, by_time[t][day]) for t in by_time
-                if day in by_time[t]
-                and _row_action(by_time[t][day], params) == "HOLD"
-                and _row_strength(by_time[t][day], "HOLD") >= params.relaxed_hold_strength
-                and not (params.max_run_5d > 0
-                         and by_time[t][day].get("run_5d") is not None
-                         and by_time[t][day]["run_5d"] > params.max_run_5d)
-            ]
-            hold_candidates.sort(key=lambda x: _row_strength(x[1], "HOLD"), reverse=True)
-            buy_candidates = hold_candidates[:params.relaxed_hold_limit]
-
-        for ticker, row in buy_candidates:
-            if pf.cash < min_cash:
-                break
-            # Max open positions: block NEW positions when at the cap, but
-            # still allow topping up tickers already held (a top-up doesn't
-            # open a new position, and the max_position_pct ceiling below
-            # prevents over-concentration in a single name).
-            if (params.max_positions > 0
-                    and len(pf.positions) >= params.max_positions
-                    and ticker not in pf.positions):
-                continue
-            price = row["close"]
-            current_value = pf.positions.get(ticker, 0) * price
-            if current_value >= max_position_value:
-                continue
-
-            # Sector diversification cap: limit total exposure per sector
-            # to prevent correlated positions from concentrating risk.
-            if params.max_sector_pct > 0:
-                sector = _sector_of(ticker)
-                sector_value = sum(
-                    pf.positions.get(t, 0) * prices.get(t, 0)
-                    for t in pf.positions
-                    if _sector_of(t) == sector
-                )
-                sector_cap = total_equity * (params.max_sector_pct / 100)
-                if sector_value >= sector_cap:
-                    continue
-
-            budget = min(pf.cash - min_cash, max_position_value - current_value)
-
-            # Risk-based position sizing: size by stop distance so each
-            # trade risks a fixed % of equity (industry-standard 1% rule).
-            if params.risk_pct > 0 and params.stop_type != "none":
-                atr = row.get("atr14")
-                if params.stop_type == "atr" and atr and atr > 0:
-                    stop = price - params.stop_atr_mult * atr
-                elif params.stop_type == "percent":
-                    stop = price * (1 - params.stop_pct / 100)
-                else:
-                    stop = 0
-                if stop > 0 and price > stop:
-                    risk_amount = total_equity * (params.risk_pct / 100)
-                    risk_per_share = price - stop
-                    if risk_per_share > 0:
-                        budget_by_risk = (risk_amount / risk_per_share) * price
-                        budget = min(budget, budget_by_risk)
-
-            if budget < 1:
-                continue
-
-            # Compute frozen stop for this entry
-            entry_stop = None
-            if params.stop_type == "percent":
-                entry_stop = price * (1 - params.stop_pct / 100)
-            elif params.stop_type == "atr":
-                atr = row.get("atr14")
-                if atr and atr > 0:
-                    entry_stop = price - params.stop_atr_mult * atr
-
-            pf.buy(ticker, price, budget,
-                   f"BUY signal (strength {_row_strength(row, 'BUY')})",
-                   stop=entry_stop, date=day)
+            proposals2 = propose_trades(
+                positions=_pf_to_positions(pf),
+                cash=pf.cash,
+                prices=prices,
+                signals=signals,
+                params=sp,
+                sector_of=_sector_of if params.max_sector_pct > 0 else None,
+            )
+            for p in proposals2:
+                if p["side"] == "BUY":
+                    _execute_proposal(pf, {**p, "date": day})
 
         # Record equity.
         total_equity = pf.equity(prices)
@@ -724,6 +647,8 @@ def _replay_params_to_strategy(p: ReplayParams) -> StrategyParams:
         max_run_5d=p.max_run_5d,
         relaxed_hold_strength=p.relaxed_hold_strength,
         relaxed_hold_limit=p.relaxed_hold_limit,
+        max_sector_pct=p.max_sector_pct,
+        risk_pct=p.risk_pct,
     )
 
 
