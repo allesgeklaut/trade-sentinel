@@ -605,6 +605,407 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
 
 
 # ---------------------------------------------------------------------------
+# Hybrid replay: deterministic skeleton + LLM per-day review (mirrors live sim)
+# ---------------------------------------------------------------------------
+
+def _signals_for_day(
+    series: dict[str, pd.DataFrame],
+    by_time: dict[str, dict[str, dict]],
+    day: str,
+    params: ReplayParams,
+) -> dict[str, dict]:
+    """Build the ``{ticker: compute()-shaped result}`` dict for one day.
+
+    Mirrors what ``sim._gather_signals`` produces for the live cycle: each
+    ticker maps to ``{"action", "reason", "snapshot", "strength"}``. The
+    snapshot is built via ``snapshot_from_row`` (the single source of truth
+    shared with ``analysis.compute``) so the LLM sees exactly the fields the
+    live engine shows it. Tickers with no row for this day are skipped (the
+    live sim skips them too when ``_latest_close`` returns None).
+    """
+    out: dict[str, dict] = {}
+    for t, idx in by_time.items():
+        row = idx.get(day)
+        if row is None:
+            continue
+        df = series[t]
+        x = df.iloc[df.index[df["time"] == day].tolist()[0]]
+        net = float(x.net)
+        bullish = float(x.bullish)
+        bearish = float(x.bearish)
+        trend_up = bool(x.trend_up)
+        trend_down = bool(x.trend_down)
+        weekly_trend_up = bool(x.weekly_trend_up) if not pd.isna(x.weekly_trend_up) else True
+        vol_surge = bool(x.vol_surge)
+        dist_above = float(x.dist_above)
+        dist_below = float(x.dist_below)
+        atr_stop = None if pd.isna(x.atr_stop) else float(x.atr_stop)
+        action = decide_action(net, trend_up, trend_down, dist_above, dist_below,
+                                params.buy_threshold, params.sell_threshold,
+                                weekly_trend_up)
+        strength = strength_for(action, bullish, bearish)
+        snap = snapshot_from_row(x, net, bullish, bearish, strength,
+                                  weekly_trend_up, vol_surge, atr_stop)
+        reason = f"{action} (strength {strength})"
+        out[t] = {"action": action, "reason": reason, "snapshot": snap,
+                  "strength": strength}
+    return out
+
+
+def _valuation_from_portfolio(
+    pf: PaperPortfolio,
+    prices: dict[str, float],
+    allowance_total: float,
+) -> dict[str, Any]:
+    """Build the ``valuation`` dict the live sim's ``_build_llm_context`` expects.
+
+    Mirrors ``sim.valuate()``: cash, positions_value, total_equity, allowance_total,
+    and a ``positions`` list with per-position current_price / value / pnl_pct.
+    The LLM context builder reads exactly these fields.
+    """
+    positions: list[dict] = []
+    positions_value = 0.0
+    for ticker, shares in pf.positions.items():
+        price = prices.get(ticker, 0.0)
+        value = shares * price
+        positions_value += value
+        avg_cost = pf.avg_cost.get(ticker, 0.0)
+        pnl_pct = ((price / avg_cost - 1) * 100) if avg_cost > 0 else 0.0
+        positions.append({
+            "ticker": ticker, "shares": shares, "avg_cost": avg_cost,
+            "current_price": price, "value": value, "pnl_pct": pnl_pct,
+        })
+    return {
+        "cash": pf.cash,
+        "positions_value": positions_value,
+        "total_equity": pf.cash + positions_value,
+        "allowance_total": allowance_total,
+        "positions": positions,
+    }
+
+
+def _deterministic_phase(
+    pf: PaperPortfolio,
+    by_time: dict[str, dict[str, dict]],
+    prices: dict[str, float],
+    day: str,
+    params: ReplayParams,
+) -> list[dict]:
+    """Run the deterministic SELL + BUY phases for one day against ``pf``.
+
+    Mirrors ``sim._deterministic_decide``: stops/signal SELLs first, then
+    ranked BUYs (strict, else relaxed HOLD fallback), with the max-positions
+    cap, run-up block, position/cash floors, and frozen initial stop. Returns
+    the list of executed trades (same shape as ``PaperPortfolio.trades``) so
+    they can be fed to ``_build_llm_context`` as ``deterministic_trades``.
+    """
+    det_trades: list[dict] = []
+    total_equity = pf.equity(prices)
+    if total_equity <= 0:
+        return det_trades
+
+    # --- SELL phase ---
+    for ticker in list(pf.positions.keys()):
+        row = by_time.get(ticker, {}).get(day)
+        if row is None:
+            continue
+        price = row["close"]
+        action = _row_action(row, params)
+        if action == "SELL":
+            pf.sell(ticker, price, None,
+                    f"SELL signal (strength {_row_strength(row, action)})", date=day)
+            det_trades.append({"ticker": ticker, "side": "SELL",
+                               "price": price, "reason": action, "date": day})
+            continue
+        # Frozen initial % stop
+        if params.stop_type != "none" and ticker in pf.stop_price:
+            sp = pf.stop_price[ticker]
+            if price <= sp:
+                pf.sell(ticker, price, None,
+                        f"Initial stop: {price:.2f} <= {sp:.2f}", date=day)
+                det_trades.append({"ticker": ticker, "side": "SELL",
+                                   "price": price, "reason": "stop", "date": day})
+                continue
+        # ATR trailing stop
+        if params.use_atr_stop:
+            atr_stop = row["atr_stop"]
+            if atr_stop is not None and price < atr_stop:
+                pf.sell(ticker, price, None,
+                        f"ATR stop hit: {price:.2f} < {atr_stop:.2f}", date=day)
+                det_trades.append({"ticker": ticker, "side": "SELL",
+                                   "price": price, "reason": "atr_stop", "date": day})
+
+    # Recompute equity after sells
+    total_equity = pf.equity(prices)
+    if total_equity <= 0:
+        return det_trades
+    min_cash = total_equity * (params.min_cash_pct / 100)
+    max_position_value = total_equity * (params.max_position_pct / 100)
+
+    # --- BUY phase ---
+    buy_candidates = [
+        (t, by_time[t][day]) for t in by_time
+        if day in by_time[t] and _row_action(by_time[t][day], params) == "BUY"
+        and not (params.max_run_5d > 0
+                 and by_time[t][day].get("run_5d") is not None
+                 and by_time[t][day]["run_5d"] > params.max_run_5d)
+    ]
+    buy_candidates.sort(key=lambda x: _row_strength(x[1], "BUY"), reverse=True)
+
+    if not buy_candidates:
+        hold_candidates = [
+            (t, by_time[t][day]) for t in by_time
+            if day in by_time[t]
+            and _row_action(by_time[t][day], params) == "HOLD"
+            and _row_strength(by_time[t][day], "HOLD") >= params.relaxed_hold_strength
+            and not (params.max_run_5d > 0
+                     and by_time[t][day].get("run_5d") is not None
+                     and by_time[t][day]["run_5d"] > params.max_run_5d)
+        ]
+        hold_candidates.sort(key=lambda x: _row_strength(x[1], "HOLD"), reverse=True)
+        buy_candidates = hold_candidates[:params.relaxed_hold_limit]
+
+    for ticker, row in buy_candidates:
+        if pf.cash < min_cash:
+            break
+        if params.max_positions > 0 and len(pf.positions) >= params.max_positions:
+            break
+        price = row["close"]
+        current_value = pf.positions.get(ticker, 0) * price
+        if current_value >= max_position_value:
+            continue
+        budget = min(pf.cash - min_cash, max_position_value - current_value)
+        if budget < 1:
+            continue
+        entry_stop = None
+        if params.stop_type == "percent":
+            entry_stop = price * (1 - params.stop_pct / 100)
+        elif params.stop_type == "atr":
+            atr = row.get("atr14")
+            if atr and atr > 0:
+                entry_stop = price - params.stop_atr_mult * atr
+        pf.buy(ticker, price, budget,
+               f"BUY signal (strength {_row_strength(row, 'BUY')})",
+               stop=entry_stop, date=day)
+        det_trades.append({"ticker": ticker, "side": "BUY", "price": price,
+                           "reason": "BUY", "date": day, "shares": pf.positions[ticker]})
+
+    return det_trades
+
+
+async def _hybrid_replay(
+    series: dict[str, pd.DataFrame],
+    params: ReplayParams,
+    start: str | None = None,
+    end: str | None = None,
+    news: dict[str, list[dict]] | None = None,
+) -> ReplayResult:
+    """Replay the hybrid strategy (deterministic + per-day LLM review).
+
+    For each trading day:
+      1. Run the deterministic SELL + BUY phases against the paper portfolio
+         (mirrors ``sim._deterministic_decide``).
+      2. Build the LLM context with the post-deterministic portfolio state,
+         all candidate signals, and the deterministic trades (mirrors
+         ``sim._build_llm_context``).
+      3. Call the LLM once with ``_LLM_SYSTEM_PROMPT`` and execute its BUY/SELL
+         decisions through ``PaperPortfolio`` (mirrors ``sim._llm_decide``).
+
+    SELLs the LLM adds (not proposed by deterministic) are honoured, as in the
+    live hybrid sim. The result is comparable to a pure-deterministic
+    ``_replay`` over the same window.
+
+    ``news`` is optional and currently unused (the live sim gathers news via
+    SearXNG; a historical replay has no dated news archive). When None the
+    news section is omitted from the context, same as a live cycle with
+    SEARXNG_URL unset.
+    """
+    from .sim import _LLM_SYSTEM_PROMPT, _build_llm_context, _parse_llm_decisions
+
+    # Build the global timeline and per-ticker day index (same as _replay).
+    all_days: set[str] = set()
+    for df in series.values():
+        all_days.update(df["time"].tolist())
+    days = sorted(all_days)
+    if start:
+        days = [d for d in days if d >= start]
+    if end:
+        days = [d for d in days if d <= end]
+    if not days:
+        return ReplayResult(params=params)
+
+    by_time: dict[str, dict[str, dict]] = {}
+    for t, df in series.items():
+        by_time[t] = {
+            row.time: {
+                "close": float(row.close),
+                "net": float(row.net),
+                "bullish": float(row.bullish),
+                "bearish": float(row.bearish),
+                "trend_up": bool(row.trend_up),
+                "trend_down": bool(row.trend_down),
+                "dist_above": float(row.dist_above),
+                "dist_below": float(row.dist_below),
+                "atr_stop": None if pd.isna(row.atr_stop) else float(row.atr_stop),
+                "atr14": float(row.atr14) if not pd.isna(row.atr14) else None,
+                "weekly_trend_up": bool(row.weekly_trend_up) if not pd.isna(row.weekly_trend_up) else True,
+                "run_5d": None if pd.isna(row.run_5d) else float(row.run_5d),
+            }
+            for row in df.itertuples(index=False)
+        }
+
+    pf = PaperPortfolio(cash=params.start_cash)
+    equity_curve: list[dict] = []
+    invested_curve: list[float] = []
+    daily_returns: list[float] = []
+    prev_equity: float | None = None
+    last_deposit_month: str | None = None
+    cumulative_invested = params.start_cash
+    last_known_prices: dict[str, float] = {}
+    llm_trades: list[dict] = list(pf.trades)  # full trade log (det + LLM)
+
+    for day_idx, day in enumerate(days, 1):
+        # Monthly allowance deposit
+        month = day[:7]
+        if month != last_deposit_month:
+            pf.cash += params.monthly_allowance
+            cumulative_invested += params.monthly_allowance
+            last_deposit_month = month
+
+        # Carry-forward prices for missing-data days
+        prices: dict[str, float] = {}
+        for t, idx in by_time.items():
+            row = idx.get(day)
+            if row is not None:
+                p = row["close"]
+                prices[t] = p
+                last_known_prices[t] = p
+            elif t in last_known_prices:
+                prices[t] = last_known_prices[t]
+
+        logger.info("hybrid day %d/%d %s — equity %.2f, cash %.2f, %d positions",
+                    day_idx, len(days), day, pf.equity(prices),
+                    pf.cash, len(pf.positions))
+
+        if pf.equity(prices) <= 0:
+            equity_curve.append({"time": day, "equity": 0.0})
+            invested_curve.append(cumulative_invested)
+            continue
+
+        # --- 1. Deterministic phase ---
+        trades_before = len(pf.trades)
+        _deterministic_phase(pf, by_time, prices, day, params)
+        det_today = [t for t in pf.trades[trades_before:] if t.get("date") == day]
+        if det_today:
+            logger.info("  det phase: %d trades — %s",
+                        len(det_today),
+                        ", ".join(f"{t['side']} {t['ticker']}" for t in det_today))
+        else:
+            logger.info("  det phase: no trades")
+
+        # --- 2 + 3. LLM review phase ---
+        # Recompute equity after deterministic trades; build the exact context
+        # shape the live sim's _build_llm_context expects.
+        total_equity = pf.equity(prices)
+        if total_equity > 0 and (settings.llm_backends or settings.ollama_model):
+            allowance_total = cumulative_invested
+            valuation = _valuation_from_portfolio(pf, prices, allowance_total)
+            signals = _signals_for_day(series, by_time, day, params)
+            # Deterministic trades executed this cycle (for context)
+            det_today_ctx = [t for t in pf.trades if t.get("date") == day]
+            context = _build_llm_context(valuation, det_today_ctx, signals, news)
+            logger.info("  llm phase: calling LLM (%d signals, %d det trades)...",
+                        len(signals), len(det_today_ctx))
+            try:
+                out = await llm_mod.chat([
+                    {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+                    {"role": "user", "content": context},
+                ])
+                content = out["text"]
+            except Exception as e:
+                logger.warning("LLM call failed on %s: %s — skipping LLM phase", day, e)
+                content = ""
+            decisions = _parse_llm_decisions(content) or []
+            trades_before_llm = len(pf.trades)
+            if decisions:
+                # Re-derive budget guards from the post-deterministic state
+                total_equity = pf.equity(prices)
+                min_cash = total_equity * (params.min_cash_pct / 100)
+                max_position_value = total_equity * (params.max_position_pct / 100)
+                for d in decisions:
+                    ticker = d["ticker"]
+                    action = d["action"]
+                    reason = d.get("reason", f"LLM {action}")
+                    price = prices.get(ticker)
+                    if price is None or price <= 0:
+                        continue
+                    if action == "BUY":
+                        current_value = pf.positions.get(ticker, 0) * price
+                        if current_value >= max_position_value:
+                            continue
+                        if (params.max_positions > 0
+                                and len(pf.positions) >= params.max_positions
+                                and ticker not in pf.positions):
+                            continue
+                        budget = min(pf.cash - min_cash,
+                                     max_position_value - current_value)
+                        if "shares" in d:
+                            budget = min(budget, d["shares"] * price)
+                        elif "amount" in d:
+                            budget = min(budget, d["amount"])
+                        if budget < 1:
+                            continue
+                        entry_stop = None
+                        if params.stop_type == "percent":
+                            entry_stop = price * (1 - params.stop_pct / 100)
+                        pf.buy(ticker, price, budget, f"LLM: {reason}",
+                               stop=entry_stop, date=day)
+                    elif action == "SELL":
+                        target_shares: float | None = None
+                        if "shares" in d:
+                            target_shares = d["shares"]
+                        elif "amount" in d:
+                            target_shares = d["amount"] / price if price > 0 else None
+                        pf.sell(ticker, price, target_shares,
+                                f"LLM: {reason}", date=day)
+                    # HOLD: no-op
+            llm_today = [t for t in pf.trades[trades_before_llm:] if t.get("date") == day]
+            if decisions:
+                summary = ", ".join(
+                    f"{d['ticker']}={d['action']}" for d in decisions)
+                logger.info("  llm returned %d decisions: %s", len(decisions), summary)
+                if llm_today:
+                    logger.info("  llm executed %d trades — %s",
+                                len(llm_today),
+                                ", ".join(f"{t['side']} {t['ticker']}" for t in llm_today))
+            else:
+                logger.info("  llm returned no decisions (all HOLD or parse failed)")
+
+        # Record equity
+        total_equity = pf.equity(prices)
+        equity_curve.append({"time": day, "equity": round(total_equity, 2)})
+        invested_curve.append(cumulative_invested)
+        if prev_equity is not None and prev_equity > 0:
+            daily_returns.append(total_equity / prev_equity - 1)
+        prev_equity = total_equity
+
+    final_equity = equity_curve[-1]["equity"] if equity_curve else 0.0
+    total_invested = params.start_cash + params.monthly_allowance * len(set(d[:7] for d in days))
+    total_return_pct = (final_equity / total_invested - 1) * 100 if total_invested > 0 else 0.0
+
+    return ReplayResult(
+        params=params,
+        equity_curve=equity_curve,
+        trades=pf.trades,
+        final_equity=final_equity,
+        total_return_pct=total_return_pct,
+        sharpe=_sharpe(daily_returns),
+        max_drawdown_pct=_max_drawdown([e["equity"] for e in equity_curve], invested_curve),
+        n_trades=len(pf.trades),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Parameter sweep + walk-forward
 # ---------------------------------------------------------------------------
 
@@ -1040,6 +1441,11 @@ def _live_sim_params() -> ReplayParams:
         stop_type="percent",
         stop_pct=settings.sim_stop_pct,
         use_atr_stop=True,
+        # The live sim also blocks BUYs after a 5-day run-up beyond
+        # sim_max_run_5d (prevents chasing short-term spikes). Mirror it so
+        # the replay's buy candidates match what the engine would actually
+        # have considered.
+        max_run_5d=settings.sim_max_run_5d,
     )
 
 
@@ -1403,12 +1809,23 @@ async def _main(args: argparse.Namespace) -> None:
         logger.info("Loaded regime for %d days", len(regime))
 
     if args.command == "backtest":
-        params = ReplayParams(regime_filter=getattr(args, "regime", False))
+        # Replay with the live sim's risk configuration (max-positions cap,
+        # initial + ATR stops, run-up block, position/cash floors) so the
+        # backtest reflects what the engine would actually have held — not a
+        # vanilla unlimited-position replay. ``regime_filter`` is the one knob
+        # the live sim doesn't set, so it stays opt-in via --regime.
+        params = _live_sim_params()
+        params.regime_filter = getattr(args, "regime", False)
         res = _replay(series, params, start=args.start, end=args.end, regime=regime)
-        label = "Backtest (current rules)"
+        label = "Backtest (live sim risk config)"
         if params.regime_filter:
             label += " + regime filter"
         _print_result(res, label)
+        print(f"  Risk config: max_positions={params.max_positions}, "
+              f"stop={params.stop_type} {params.stop_pct:g}%, "
+              f"atr_stop={params.use_atr_stop}, max_run_5d={params.max_run_5d:g}%, "
+              f"max_pos_pct={params.max_position_pct:g}%, "
+              f"min_cash_pct={params.min_cash_pct:g}%")
         if args.trades:
             for t in res.trades:
                 print(f"  {t['side']:<4} {t['ticker']:<8} {t['shares']:>10.4f} @ {t['price']:>10.2f} — {t['reason']}")
@@ -1453,6 +1870,52 @@ async def _main(args: argparse.Namespace) -> None:
             forward_days=args.forward_days, skip_llm=args.skip_llm,
         )
 
+    elif args.command == "hybrid-replay":
+        # Replay the hybrid strategy (deterministic + per-day LLM review) over
+        # the window, then run a pure-deterministic replay over the same
+        # window for a side-by-side comparison. Both use _live_sim_params() so
+        # the only difference is the LLM review phase.
+        if not (settings.llm_backends or settings.ollama_model):
+            print("No LLM backend configured (set LLM_BACKENDS or OLLAMA_MODEL); "
+                  "hybrid-replay needs the LLM. Aborting.")
+            return
+        params = _live_sim_params()
+        start, end = args.start, args.end
+        print(f"\n=== Pure-deterministic replay ({start}..{end}) ===")
+        det = _replay(series, params, start=start, end=end)
+        _print_result(det, "Deterministic baseline")
+        print(f"  Risk config: max_positions={params.max_positions}, "
+              f"stop={params.stop_type} {params.stop_pct:g}%, "
+              f"atr_stop={params.use_atr_stop}, max_run_5d={params.max_run_5d:g}%, "
+              f"max_pos_pct={params.max_position_pct:g}%, "
+              f"min_cash_pct={params.min_cash_pct:g}%")
+
+        active = await llm_mod.current_backend()
+        print(f"\n=== Hybrid replay ({start}..{end}) — probing LLM once per trading day ===")
+        print(f"  Backend: {active.get('name', '?')} · {active.get('model', '?')}")
+        hyb = await _hybrid_replay(series, params, start=start, end=end)
+        _print_result(hyb, "Hybrid (deterministic + LLM review)")
+
+        # Side-by-side comparison
+        print(f"\n=== Comparison ({start}..{end}) ===")
+        print(f"  {'':>20} {'deterministic':>14} {'hybrid':>14} {'delta':>10}")
+        print(f"  {'Return':>20} {det.total_return_pct:>+13.2f}% {hyb.total_return_pct:>+13.2f}% "
+              f"{hyb.total_return_pct - det.total_return_pct:>+9.2f}%")
+        print(f"  {'Max drawdown':>20} {det.max_drawdown_pct:>13.2f}% {hyb.max_drawdown_pct:>13.2f}% "
+              f"{hyb.max_drawdown_pct - det.max_drawdown_pct:>+9.2f}%")
+        print(f"  {'Sharpe':>20} {det.sharpe:>14.2f} {hyb.sharpe:>14.2f} "
+              f"{hyb.sharpe - det.sharpe:>+10.2f}")
+        print(f"  {'Trades':>20} {det.n_trades:>14} {hyb.n_trades:>14} "
+              f"{hyb.n_trades - det.n_trades:>+10}")
+        print(f"  {'Final equity':>20} {det.final_equity:>14.2f} {hyb.final_equity:>14.2f} "
+              f"{hyb.final_equity - det.final_equity:>+10.2f}")
+
+        if args.trades:
+            print(f"\n  Hybrid trades:")
+            for t in hyb.trades:
+                print(f"    {t['date']} {t['side']:<4} {t['ticker']:<8} "
+                      f"{t['shares']:>9.4f} @ {t['price']:>10.2f} — {t['reason']}")
+
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Walk-forward optimization for the deterministic strategy")
@@ -1492,6 +1955,12 @@ def _build_parser() -> argparse.ArgumentParser:
                     help=f"Trading days of forward price action used to judge a trade (default {_BENCH_FORWARD_DAYS})")
     lb.add_argument("--skip-llm", action="store_true",
                     help="Select and print the candidate cases without calling the LLM (token-free preview)")
+
+    hr = sub.add_parser("hybrid-replay",
+                        help="Replay the hybrid strategy (deterministic + per-day LLM review) on history")
+    hr.add_argument("--start", default=None, help="YYYY-MM-DD inclusive start of the replay window")
+    hr.add_argument("--end", default=None, help="YYYY-MM-DD inclusive end of the replay window")
+    hr.add_argument("--trades", action="store_true", help="Print every hybrid trade")
 
     return p
 
