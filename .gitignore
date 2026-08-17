@@ -4,3 +4,4 @@
 static/icon-180.png
 data/*.db
 data/*.db-journal
+data/
