@@ -326,6 +326,15 @@ async def sim_run():
     except Exception as e:
         raise HTTPException(500, f"Sim cycle failed: {e}")
 
+@app.get('/api/sim/run-status')
+async def sim_run_status():
+    """Current/last run-cycle progress for the frontend status poller.
+
+    Returns {running, stage, detail, started_at, updated_at, error}.
+    Polled every ~1s by the Run Bot Now button while a cycle is in flight.
+    """
+    return sim.get_run_progress()
+
 @app.get('/api/sim/reasoning')
 async def sim_reasoning():
     """Return structured LLM reasoning summary from the most recent sim cycle."""

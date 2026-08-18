@@ -488,6 +488,50 @@ class TestParseLLMDecisions:
             assert "amount" not in r
 
 
+class TestExtractSummary:
+    """Tests for sim._extract_summary — pulls the prose the LLM writes before
+    its JSON array. Backward-compatible: returns '' when the LLM only emitted
+    JSON or when the response is an LLM-unavailable fallback string."""
+
+    def test_prose_before_json(self):
+        content = (
+            "Portfolio looks good. No changes needed.\n\n"
+            '[{"ticker":"X","action":"HOLD","reason":"ok"}]'
+        )
+        assert sim._extract_summary(content) == "Portfolio looks good. No changes needed."
+
+    def test_json_only_returns_empty(self):
+        content = '[{"ticker":"X","action":"HOLD","reason":"ok"}]'
+        assert sim._extract_summary(content) == ""
+
+    def test_empty_returns_empty(self):
+        assert sim._extract_summary("") == ""
+        assert sim._extract_summary(None) == ""
+
+    def test_fallback_string_returns_empty(self):
+        # The is_fallback path handles these upstream — no prose to extract.
+        content = "[LLM UNAVAILABLE — fell back to deterministic]\nError: x"
+        assert sim._extract_summary(content) == ""
+
+    def test_markdown_fenced_json(self):
+        # The prose before a fenced JSON block is still extracted.
+        content = (
+            "Two names are extended.\n"
+            "```json\n"
+            '[{"ticker":"X","action":"HOLD","reason":"RSI 72"}]\n'
+            "```"
+        )
+        assert sim._extract_summary(content) == "Two names are extended."
+
+    def test_trailing_colon_stripped(self):
+        content = (
+            "Here is my read.\nDecisions:\n"
+            '[{"ticker":"X","action":"HOLD","reason":"ok"}]'
+        )
+        # The "Decisions:" lead-in is trimmed, the rest preserved.
+        assert sim._extract_summary(content) == "Here is my read.\nDecisions"
+
+
 class TestBuildLLMContext:
     def test_context_includes_portfolio(self):
         val = {
