@@ -11,6 +11,42 @@ _UNIVERSES_DIR = Path(__file__).resolve().parent.parent / "universes"
 logger = logging.getLogger("trade_sentinel.screener")
 
 
+# In-progress screener operation state for the frontend status poller.
+# Shape: {"running": bool, "op": str, "universe": str, "current": str,
+#         "done": int, "total": int, "started_at": iso, "updated_at": iso,
+#         "error": str|None}
+_screener_progress: dict = {
+    "running": False, "op": "", "universe": "", "current": "",
+    "done": 0, "total": 0, "started_at": "", "updated_at": "", "error": None,
+}
+
+
+def _set_screener_progress(op: str, universe: str, *, done: int = 0,
+                           total: int = 0, current: str = "",
+                           running: bool = True, started_at: str | None = None,
+                           error: str | None = None) -> None:
+    """Update the in-progress screener state for /api/screener/status."""
+    now = datetime.now(timezone.utc).isoformat()
+    if started_at is None:
+        started_at = now
+    _screener_progress.update({
+        "running": running,
+        "op": op,
+        "universe": universe,
+        "current": current,
+        "done": done,
+        "total": total,
+        "started_at": started_at,
+        "updated_at": now,
+        "error": error,
+    })
+
+
+def get_screener_progress() -> dict:
+    """Return the current/last screener operation progress for the poller."""
+    return dict(_screener_progress)
+
+
 def universe_names(): return sorted(p.stem for p in _UNIVERSES_DIR.glob("*.txt"))
 def tickers(name):
     p=_UNIVERSES_DIR/f"{name}.txt"
@@ -31,7 +67,12 @@ async def run(name):
     # Preserve order while preventing duplicate symbols from violating the
     # (universe, ticker) database constraint.
     symbols=list(dict.fromkeys(tickers(name))); results=[]
-    for symbol in symbols:
+    started = datetime.now(timezone.utc).isoformat()
+    _set_screener_progress("update", name, done=0, total=len(symbols),
+                           current="", started_at=started)
+    for i, symbol in enumerate(symbols, start=1):
+        _set_screener_progress("update", name, done=i - 1, total=len(symbols),
+                               current=symbol, started_at=started)
         try:
             await refresh(symbol)
             rows = await candles(symbol)
@@ -55,6 +96,8 @@ async def run(name):
         await s.execute(delete(ScreenerResult).where(ScreenerResult.universe==name))
         for symbol,x in results: s.add(ScreenerResult(universe=name,ticker=symbol,updated_at=datetime.now(timezone.utc),**x))
         await s.commit()
+    _set_screener_progress("update", name, done=len(symbols), total=len(symbols),
+                           current="", running=False, started_at=started)
     return {"universe":name,"processed":len(symbols),"ranked":len(results)}
 async def results(name):
     async with Session() as s:
@@ -74,8 +117,13 @@ async def refresh_incremental(name: str, max_age_days: int = 3) -> dict:
     skipped = 0
     errors: list[str] = []
     cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    started = datetime.now(timezone.utc).isoformat()
+    _set_screener_progress("refresh", name, done=0, total=len(symbols),
+                           current="", started_at=started)
 
-    for symbol in symbols:
+    for i, symbol in enumerate(symbols, start=1):
+        _set_screener_progress("refresh", name, done=i - 1, total=len(symbols),
+                               current=symbol, started_at=started)
         try:
             async with Session() as s:
                 latest = await s.scalar(
@@ -92,6 +140,8 @@ async def refresh_incremental(name: str, max_age_days: int = 3) -> dict:
 
     logger.info("Incremental refresh %s: %d refreshed, %d skipped, %d errors",
                 name, refreshed, skipped, len(errors))
+    _set_screener_progress("refresh", name, done=len(symbols), total=len(symbols),
+                           current="", running=False, started_at=started)
     return {"universe": name, "refreshed": refreshed, "skipped": skipped,
             "errors": errors, "total": len(symbols)}
 
@@ -106,8 +156,13 @@ async def load_deep_history(name: str, period: str = "10y") -> dict:
     symbols = list(dict.fromkeys(tickers(name)))
     loaded = 0
     errors: list[str] = []
+    started = datetime.now(timezone.utc).isoformat()
+    _set_screener_progress("deep", name, done=0, total=len(symbols),
+                           current="", started_at=started)
 
-    for symbol in symbols:
+    for i, symbol in enumerate(symbols, start=1):
+        _set_screener_progress("deep", name, done=i - 1, total=len(symbols),
+                               current=symbol, started_at=started)
         try:
             await refresh(symbol, period)
             loaded += 1
@@ -116,5 +171,7 @@ async def load_deep_history(name: str, period: str = "10y") -> dict:
             logger.warning("deep load skip %s: %s", symbol, e)
 
     logger.info("Deep load %s (%s): %d loaded, %d errors", name, period, loaded, len(errors))
+    _set_screener_progress("deep", name, done=len(symbols), total=len(symbols),
+                           current="", running=False, started_at=started)
     return {"universe": name, "period": period, "loaded": loaded,
             "errors": errors, "total": len(symbols)}

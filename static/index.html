@@ -1043,6 +1043,7 @@
                 <button onclick="refreshUniverse(this)" title="Only fetch tickers with missing or stale data">Refresh</button>
                 <button onclick="loadDeepHistory(this)" title="Fetch 10y of history for optimization/backtest">Load 10y</button></p><small>Ranks cached
                     daily candles by trend, 20/60d momentum, RSI and relative volume. <b>Update</b> re-downloads ~2y and re-ranks. <b>Refresh</b> only fills gaps. <b>Load 10y</b> fetches deep history for backtesting.</small>
+                <div id="screener-status" style="margin-top:6px;font-size:12px;color:#7aaa81;min-height:14px"></div>
                 <div id="screen">No screen run yet.</div>
             </details>
         </aside>
@@ -1932,10 +1933,52 @@
       ${ago ? `<div class="screener-updated">Last update: ${escapeHtml(ago)} (${a.length} tickers)</div>` : ''}`;
         }
 
+        // --- Screener progress poller ---
+        // Reuses fmtElapsed() from the sim run-status poller. One poller
+        // instance covers all three screener ops (update / refresh / deep)
+        // because they all write to the same backend _screener_progress dict.
+        const SCREENER_OP_LABELS = {
+            'update': 'Updating',
+            'refresh': 'Refreshing',
+            'deep': 'Loading 10y',
+        };
+        let screenerPollTimer = null;
+
+        function renderScreenerStatus(p) {
+            const el = document.getElementById('screener-status');
+            if (!el) return;
+            if (!p || (!p.running && !p.op)) { el.innerHTML = ''; return; }
+            const label = SCREENER_OP_LABELS[p.op] || p.op;
+            const elapsed = p.running ? fmtElapsed(p.started_at) : '';
+            if (p.op && !p.running) {
+                // Finished — show a green check + counts.
+                el.innerHTML = '<span style="color:#42ff72">✓ ' + label + ' done — ' + p.done + '/' + p.total + ' tickers</span>';
+                return;
+            }
+            const cur = p.current ? ' <span style="color:#b7ffc0">' + escapeHtml(p.current) + '</span>' : '';
+            el.innerHTML = '<span style="color:#42ff72">● </span><span style="color:#b7ffc0">' + label + '</span> ' + p.done + '/' + p.total + cur + '<span style="color:#7aaa81">' + elapsed + '</span>';
+        }
+
+        async function pollScreenerStatus() {
+            try {
+                const p = await api('screener/status');
+                renderScreenerStatus(p);
+                if (!p.running) {
+                    if (screenerPollTimer) { clearInterval(screenerPollTimer); screenerPollTimer = null; }
+                }
+            } catch (e) { /* keep polling; the op will eventually finish */ }
+        }
+
+        function startScreenerPoller() {
+            if (screenerPollTimer) clearInterval(screenerPollTimer);
+            screenerPollTimer = setInterval(pollScreenerStatus, 1000);
+        }
+
         async function runScreen(btn) {
             const orig = btn.textContent;
             btn.disabled = true; btn.textContent = 'Updating...';
             $('#screen').textContent = 'Updating universe sequentially; this downloads ~2y of daily candles per ticker. This may take several minutes.';
+            startScreenerPoller();
             try {
                 let x = await api('screener/run/' + $('#universe').value, { method: 'POST' });
                 setStatus(`SCREENED ${x.ranked}/${x.processed}`, true);
@@ -1945,6 +1988,8 @@
                 setStatus(e.message, false);
             } finally {
                 btn.disabled = false; btn.textContent = orig;
+                await pollScreenerStatus();
+                if (screenerPollTimer) { clearInterval(screenerPollTimer); screenerPollTimer = null; }
             }
         }
 
@@ -1952,6 +1997,7 @@
             const orig = btn.textContent;
             btn.disabled = true; btn.textContent = 'Refreshing...';
             $('#screen').textContent = 'Refreshing — only fetching tickers with missing or stale data...';
+            startScreenerPoller();
             try {
                 let x = await api('screener/refresh/' + $('#universe').value, { method: 'POST' });
                 setStatus(`REFRESHED ${x.refreshed}/${x.total} (${x.skipped} fresh, ${x.errors.length} errors)`, x.errors.length === 0);
@@ -1961,6 +2007,8 @@
                 setStatus(e.message, false);
             } finally {
                 btn.disabled = false; btn.textContent = orig;
+                await pollScreenerStatus();
+                if (screenerPollTimer) { clearInterval(screenerPollTimer); screenerPollTimer = null; }
             }
         }
 
@@ -1969,6 +2017,7 @@
             const orig = btn.textContent;
             btn.disabled = true; btn.textContent = 'Loading 10y...';
             $('#screen').textContent = 'Loading 10y of history per ticker. This may take 10-15 minutes...';
+            startScreenerPoller();
             try {
                 let x = await api('screener/load_deep/' + $('#universe').value, { method: 'POST' });
                 setStatus(`LOADED 10y: ${x.loaded}/${x.total} (${x.errors.length} errors)`, x.errors.length === 0);
@@ -1978,6 +2027,8 @@
                 setStatus(e.message, false);
             } finally {
                 btn.disabled = false; btn.textContent = orig;
+                await pollScreenerStatus();
+                if (screenerPollTimer) { clearInterval(screenerPollTimer); screenerPollTimer = null; }
             }
         }
         $('#universe').onchange = showScreen; loadWatch(); loadUniverses(); loadLLMModels()
