@@ -538,7 +538,13 @@ _LLM_SYSTEM_PROMPT = (
     "9. The max position % is a buy-time sizing limit, not a ceiling to enforce "
     "on exits. Do NOT sell a position just because its price rose above it — "
     "let winners run.\n"
-    "10. When the portfolio holds more positions than the max-positions cap, "
+    "10. The min cash floor is also a buy-time constraint, not a sell trigger. "
+    "Do NOT sell a position solely to restore cash above the floor — the floor "
+    "only blocks new BUYs. If cash is below the floor, hold the positions you "
+    "have and wait for the next allowance deposit or a stop-out to replenish "
+    "cash. (The user can explicitly authorise spending below the floor from "
+    "the chat — that override does not apply to autonomous cycles.)\n"
+    "11. When the portfolio holds more positions than the max-positions cap, "
     "sell the weakest first: lowest strength, SELL signals, low ADX, RSI "
     "overbought, or price below its ATR stop — and keep the highest-strength, "
     "highest-ADX, still-in-uptrend names. But do not sell just to rotate into "
@@ -573,7 +579,7 @@ def _build_llm_context(
     lines.append(f"Positions value: {valuation['positions_value']:.2f}")
     lines.append(f"Total equity: {valuation['total_equity']:.2f}")
     lines.append(f"Cumulative allowance deposited: {valuation['allowance_total']:.2f}")
-    lines.append(f"Min cash to keep ({settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
+    lines.append(f"Min cash floor (buy-time only, {settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
     lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
     lines.append(f"Max open positions: {settings.sim_max_positions}")
     lines.append(f"Stop loss: {settings.sim_stop_pct:.0f}% (frozen at entry; ATR stop also applies)")
@@ -1756,7 +1762,7 @@ async def _build_sim_chat_context() -> str:
     lines.append(f"Min cash %: {settings.sim_min_cash_pct}")
     lines.append(f"Max open positions: {settings.sim_max_positions}")
     lines.append(f"Stop loss: {settings.sim_stop_pct:.0f}% (frozen at entry; ATR stop also applies)")
-    lines.append(f"Min cash to keep ({settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
+    lines.append(f"Min cash floor (buy-time only, {settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
     lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
     lines.append("")
 
