@@ -2,6 +2,7 @@ import json, logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from pydantic import BaseModel
@@ -206,6 +207,48 @@ async def chat(ticker: str, req: ChatRequest):
         logger.warning("Chat LLM call failed for %s: %s", ticker, e)
         return {"text": f"LLM unavailable: {e}", "model": await llm_mod.current_model_label()}
 
+
+async def _sse_event(data: dict) -> str:
+    """Serialize ``data`` as a single Server-Sent Events ``data:`` line."""
+    return "data: " + json.dumps(data) + "\n\n"
+
+
+@app.post('/api/chat/{ticker}/stream')
+async def chat_stream(ticker: str, req: ChatRequest):
+    """SSE stream of a multi-turn chat about a stock.
+
+    Emits ``data: {"type":"delta","text":"..."}`` chunks as the LLM produces
+    tokens, then a final ``data: {"type":"done","text":full,"model":...}``.
+    """
+    ticker = ticker.upper()
+    if not req.messages:
+        raise HTTPException(400, "messages must not be empty")
+    history_msgs = []
+    for m in req.messages[-20:]:
+        if m.role in ('user', 'assistant') and m.content.strip():
+            history_msgs.append({"role": m.role, "content": m.content})
+    if not history_msgs:
+        raise HTTPException(400, "no valid messages")
+    system_prompt = await _stock_context(ticker)
+
+    async def gen():
+        try:
+            async for evt in llm_mod.chat_stream(
+                [{"role": "system", "content": system_prompt}] + history_msgs
+            ):
+                yield await _sse_event(evt)
+        except Exception as e:
+            yield await _sse_event({"type": "error", "text": f"{type(e).__name__}: {e}"})
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable proxy buffering (nginx)
+        },
+    )
+
 # =====================================================================
 # LLM backend / model management
 # =====================================================================
@@ -312,6 +355,46 @@ async def sim_chat_endpoint(req: ChatRequest):
     if not new_msgs:
         raise HTTPException(400, "no valid messages")
     return await sim.sim_chat(new_msgs)
+
+
+@app.post('/api/sim/chat/stream')
+async def sim_chat_stream(req: ChatRequest):
+    """SSE stream of an interactive chat with the sim portfolio manager.
+
+    Same semantics as ``POST /api/sim/chat`` — server persists history, can
+    execute trades from ``[[ACTION]]`` blocks — but streams the LLM text
+    incrementally.
+
+    Events:
+      - ``data: {"type":"delta","text":"..."}`` — raw LLM chunks (action block
+        included; the frontend swaps it for the stripped display_text on done).
+      - ``data: {"type":"done","text":display_text,"trades":[...],
+         "actions_executed":bool,"raw":full_raw}`` — final envelope.
+
+    Persistence happens AFTER the LLM stream completes, so a refresh
+    mid-stream does not leave an orphan user question in the DB.
+    """
+    if not req.messages:
+        raise HTTPException(400, "messages must not be empty")
+    new_msgs = []
+    for m in req.messages[-1:]:
+        if m.role in ('user', 'assistant') and m.content.strip():
+            new_msgs.append({"role": m.role, "content": m.content})
+    if not new_msgs:
+        raise HTTPException(400, "no valid messages")
+
+    async def gen():
+        try:
+            async for evt in sim.sim_chat_stream(new_msgs):
+                yield await _sse_event(evt)
+        except Exception as e:
+            yield await _sse_event({"type": "error", "text": f"{type(e).__name__}: {e}"})
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get('/api/sim/chat/history')

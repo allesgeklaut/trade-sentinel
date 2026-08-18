@@ -1887,3 +1887,207 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
         }
 
     return {"text": display_text, "trades": [], "actions_executed": False, "history": history}
+
+
+async def sim_chat_stream(messages: list[dict]):
+    """Streaming variant of sim_chat — yields progressive LLM text deltas.
+
+    Yields dicts:
+      - {"type": "delta", "text": "..."}: raw LLM content chunks (may include
+        the ``[[ACTION]]`` block as it is generated — the frontend will swap the
+        raw text for the stripped display_text when ``done`` arrives).
+      - {"type": "done", "text": display_text, "trades": [...],
+         "actions_executed": bool, "raw": full_raw_text, "history": [...]}
+
+    Persistence (user message, assistant display_text) happens AFTER the LLM
+    stream completes, so a refresh mid-stream leaves the previous state intact
+    instead of an orphan user question.
+
+    If the LLM stream errors out after yielding some text, a partial ``done``
+    event is emitted with ``error`` set, so the frontend can show what arrived.
+    """
+    history = await _chat_history(limit=40)
+    new_user_contents: list[str] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if not content or role not in ("user", "assistant"):
+            continue
+        history.append({"role": role, "content": content})
+        if role == "user":
+            new_user_contents.append(content)
+
+    if not history:
+        yield {
+            "type": "done",
+            "text": "No messages to send.",
+            "trades": [],
+            "actions_executed": False,
+            "raw": "",
+            "history": [],
+        }
+        return
+
+    context = await _build_sim_chat_context()
+    full_parts: list[str] = []
+    error_msg: str | None = None
+
+    # Stream the LLM response. We collect the full raw text so we can parse the
+    # action block after the stream finishes; the frontend receives raw deltas
+    # so the user sees text as it arrives (action block included, stripped later).
+    try:
+        async for evt in llm_mod.chat_stream([
+            {"role": "system", "content": _SIM_CHAT_SYSTEM_PROMPT},
+            {"role": "user", "content": context},
+        ] + history):
+            etype = evt.get("type")
+            if etype == "delta":
+                chunk = evt.get("text") or ""
+                if chunk:
+                    full_parts.append(chunk)
+                    yield {"type": "delta", "text": chunk}
+            elif etype == "error":
+                error_msg = evt.get("text") or "unknown error"
+                break
+            elif etype == "done":
+                # If the streamer collected text we didn't see as deltas
+                # (e.g. reasoning-only backend), surface it as a delta.
+                seen = "".join(full_parts)
+                if evt.get("text") and not seen:
+                    full_parts.append(evt["text"])
+                    yield {"type": "delta", "text": evt["text"]}
+                break
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+
+    raw_content = "".join(full_parts)
+
+    # If nothing arrived and we hit an error, emit an assistant-style error msg.
+    if not raw_content and error_msg:
+        err_text = f"LLM unavailable: {error_msg}"
+        # Persist user messages even on failure so the question isn't lost.
+        for c in new_user_contents:
+            await _append_chat_message("user", c)
+        await _append_chat_message("assistant", err_text)
+        history.append({"role": "assistant", "content": err_text})
+        yield {
+            "type": "done",
+            "text": err_text,
+            "trades": [],
+            "actions_executed": False,
+            "raw": "",
+            "history": history,
+            "error": error_msg,
+        }
+        return
+
+    # Parse any action block from the complete raw text.
+    actions = _parse_action_block(raw_content)
+    display_text = raw_content
+    if actions:
+        start = raw_content.find("[[ACTION]]")
+        end = raw_content.find("[[/ACTION]]")
+        if start != -1 and end != -1:
+            display_text = (
+                raw_content[:start] + raw_content[end + len("[[/ACTION]]"):]
+            ).strip()
+
+    # Persist NOW that the LLM has finished. User messages first, then the
+    # assistant reply — so a refresh mid-stream never sees an orphan question.
+    for c in new_user_contents:
+        await _append_chat_message("user", c)
+    if display_text:
+        await _append_chat_message("assistant", display_text)
+        history.append({"role": "assistant", "content": display_text})
+
+    executed_trades: list[dict] = []
+    actions_executed = False
+    if actions:
+        # Execute proposed actions (same risk logic as sim_chat).
+        valuation = await valuate()
+        total_equity = valuation["total_equity"]
+        min_cash = total_equity * (settings.sim_min_cash_pct / 100)
+        max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+
+        for action in actions:
+            ticker = action["ticker"]
+            act = action["action"]
+            reason = action["reason"]
+
+            price = await _latest_close(ticker)
+            if price is None or price <= 0:
+                logger.warning("Sim chat action skipped %s: no price", ticker)
+                continue
+
+            if act == "SELL":
+                target_shares: float | None = None
+                if "shares" in action:
+                    target_shares = action["shares"]
+                elif "amount" in action:
+                    target_shares = action["amount"] / price
+                t = await _exec_sell(ticker, price, target_shares, f"User chat: {reason}")
+                if t:
+                    executed_trades.append(t)
+                    valuation = await valuate()
+                    total_equity = valuation["total_equity"]
+                    min_cash = total_equity * (settings.sim_min_cash_pct / 100)
+                    max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+
+            elif act == "BUY":
+                acc = await _account()
+                floor = 0.0 if action.get("use_reserve") else min_cash
+                if acc.cash < floor:
+                    logger.info("Sim chat BUY %s skipped: cash %.2f < floor %.2f",
+                                ticker, acc.cash, floor)
+                    continue
+
+                async with Session() as s:
+                    pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
+                current_value = (pos.shares * price) if pos else 0
+                if current_value >= max_position_value:
+                    logger.info("Sim chat BUY %s skipped: position at max", ticker)
+                    continue
+
+                max_budget = min(acc.cash - floor, max_position_value - current_value)
+                if "shares" in action:
+                    budget = min(max_budget, action["shares"] * price)
+                elif "amount" in action:
+                    budget = min(max_budget, action["amount"])
+                else:
+                    budget = max_budget
+                if budget < 1:
+                    continue
+
+                override_tag = " [reserve spent]" if action.get("use_reserve") else ""
+                t = await _exec_buy(ticker, price, budget, f"User chat:{override_tag} {reason}")
+                if t:
+                    executed_trades.append(t)
+                    valuation = await valuate()
+                    total_equity = valuation["total_equity"]
+                    min_cash = total_equity * (settings.sim_min_cash_pct / 100)
+                    max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+
+        if executed_trades:
+            post_val = await valuate()
+            async with Session() as s:
+                snap = SimSnapshot(
+                    cash=post_val["cash"],
+                    positions_value=post_val["positions_value"],
+                    total_equity=post_val["total_equity"],
+                    allowance_total=post_val["allowance_total"],
+                )
+                s.add(snap)
+                await s.commit()
+        actions_executed = True
+
+    yield {
+        "type": "done",
+        "text": display_text,
+        "trades": executed_trades,
+        "actions_executed": actions_executed,
+        "raw": raw_content,
+        "history": history,
+        **({"error": error_msg} if error_msg else {}),
+    }

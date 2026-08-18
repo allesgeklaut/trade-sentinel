@@ -605,6 +605,42 @@
             cursor: not-allowed
         }
 
+        /* Streaming chat: pending assistant bubble + typing indicator */
+        .ai-msg.assistant.pending::after {
+            content: '';
+            display: inline-block;
+            width: 10px;
+            height: 14px;
+            margin-left: 2px;
+            vertical-align: text-bottom;
+            background: linear-gradient(
+                to bottom,
+                #42ff72 0%, #42ff72 30%,
+                transparent 30%, transparent 100%
+            );
+            animation: ai-caret 1s steps(2, jump-none) infinite;
+        }
+        .ai-msg.assistant.pending:empty::after {
+            /* No text yet — show three pulsing dots instead of a caret. */
+            content: '● ● ●';
+            width: auto;
+            height: auto;
+            background: none;
+            font-size: 10px;
+            letter-spacing: 3px;
+            color: #42ff72;
+            animation: ai-pulse 1.2s ease-in-out infinite;
+            vertical-align: middle;
+        }
+        @keyframes ai-caret {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
+        }
+        @keyframes ai-pulse {
+            0%, 100% { opacity: 0.3; }
+            50% { opacity: 1; }
+        }
+
         table {
             width: 100%;
             border-collapse: collapse;
@@ -1186,7 +1222,8 @@
         function renderMessage(m) {
             if (m.role === 'assistant' && typeof marked !== 'undefined') {
                 const html = marked.parse(m.content, { renderer: markedRenderer });
-                return `<div class="ai-msg ${m.role}">${html}</div>`;
+                const pending = m.pending ? ' pending' : '';
+                return `<div class="ai-msg ${m.role}${pending}">${html}</div>`;
             }
             return `<div class="ai-msg ${m.role}">${escapeHtml(m.content)}</div>`;
         }
@@ -1226,6 +1263,102 @@
             renderChat();
         }
 
+        /**
+         * Stream a chat request over SSE. Posts `body` to `url`, parses the
+         * Server-Sent Events stream, and calls back as text arrives.
+         *
+         * @param {Object} opts
+         *   url:     POST endpoint (e.g. '/api/chat/AAPL/stream')
+         *   body:    JSON-serialisable request body
+         *   signal:  AbortSignal (optional; caller's AbortController)
+         *   onDelta(text):       called for each incremental chunk
+         *   onDone(envelope):    called once with the final {text, trades?, ...}
+         *   onError(text):       called on stream/network error (no done will follow)
+         */
+        async function streamChat(opts) {
+            let resp;
+            try {
+                resp = await fetch(opts.url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(opts.body),
+                    signal: opts.signal,
+                });
+            } catch (e) {
+                if (e.name === 'AbortError') {
+                    opts.onDone && opts.onDone({ aborted: true, text: '' });
+                } else {
+                    opts.onError && opts.onError(e.message);
+                }
+                return;
+            }
+            if (!resp.ok) {
+                let msg = 'HTTP ' + resp.status;
+                try { msg += ': ' + await resp.text(); } catch (_) {}
+                opts.onError && opts.onError(msg);
+                return;
+            }
+            if (!resp.body) {
+                // No streaming support — fall back to single-shot JSON.
+                try {
+                    const data = await resp.json();
+                    opts.onDone && opts.onDone(data);
+                } catch (e) {
+                    opts.onError && opts.onError(e.message);
+                }
+                return;
+            }
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let buf = '';
+            let sawDone = false;
+            try {
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    buf += decoder.decode(value, { stream: true });
+                    // SSE events are separated by a blank line. Process any
+                    // complete events in the buffer; keep the partial tail.
+                    let idx;
+                    while ((idx = buf.indexOf('\n\n')) !== -1) {
+                        const rawEvt = buf.slice(0, idx);
+                        buf = buf.slice(idx + 2);
+                        // Each event may have one or more `data:` lines.
+                        const dataLines = rawEvt
+                            .split('\n')
+                            .filter(l => l.startsWith('data:'))
+                            .map(l => l.slice(l.indexOf(':') + 1).trim());
+                        if (!dataLines.length) continue;
+                        const payload = dataLines.join('\n');
+                        if (!payload) continue;
+                        let evt;
+                        try { evt = JSON.parse(payload); }
+                        catch (_) { continue; }
+                        if (evt.type === 'delta' && evt.text) {
+                            opts.onDelta && opts.onDelta(evt.text);
+                        } else if (evt.type === 'done') {
+                            sawDone = true;
+                            opts.onDone && opts.onDone(evt);
+                        } else if (evt.type === 'error') {
+                            opts.onError && opts.onError(evt.text || 'unknown error');
+                        }
+                    }
+                }
+            } catch (e) {
+                if (e.name === 'AbortError') {
+                    opts.onDone && opts.onDone({ aborted: true, text: '' });
+                    return;
+                }
+                opts.onError && opts.onError(e.message);
+                return;
+            }
+            if (!sawDone) {
+                // Stream closed without an explicit done event — treat as done
+                // with whatever we have (caller has been accumulating deltas).
+                opts.onDone && opts.onDone({ text: '', stream_closed: true });
+            }
+        }
+
         async function pushAndReply(userText) {
             if (chatState.busy || !chatState.ticker) return;
             if (chatAbortController) {
@@ -1235,21 +1368,35 @@
             chatState.busy = true;
             setChatEnabled(true);
             chatState.messages.push({ role: 'user', content: userText });
+            // Push a pending assistant bubble; we'll fill it in as deltas arrive.
+            const pending = { role: 'assistant', content: '', pending: true };
+            chatState.messages.push(pending);
             renderChat();
             try {
-                const x = await api('chat/' + chatState.ticker, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ messages: chatState.messages }),
+                await streamChat({
+                    url: '/api/chat/' + encodeURIComponent(chatState.ticker) + '/stream',
+                    body: { messages: chatState.messages.filter(m => !m.pending) },
                     signal: chatAbortController.signal,
+                    onDelta: (chunk) => {
+                        pending.content += chunk;
+                        renderChat();
+                    },
+                    onDone: (env) => {
+                        // Replace the pending bubble with the final text.
+                        chatState.messages.pop();
+                        if (env.aborted) {
+                            chatState.messages.push({ role: 'assistant', content: pending.content || 'Request stopped.' });
+                        } else {
+                            chatState.messages.push({ role: 'assistant', content: env.text || pending.content });
+                        }
+                        renderChat();
+                    },
+                    onError: (msg) => {
+                        chatState.messages.pop();
+                        chatState.messages.push({ role: 'assistant', content: 'Error: ' + msg });
+                        renderChat();
+                    },
                 });
-                chatState.messages.push({ role: 'assistant', content: x.text });
-            } catch (e) {
-                if (e.name === 'AbortError') {
-                    chatState.messages.push({ role: 'assistant', content: 'Request stopped.' });
-                } else {
-                    chatState.messages.push({ role: 'assistant', content: 'Error: ' + e.message });
-                }
             } finally {
                 chatState.busy = false;
                 chatAbortController = null;
@@ -2064,7 +2211,8 @@
             thread.innerHTML = simChatState.messages.map(m => {
                 if (m.role === 'assistant' && typeof marked !== 'undefined') {
                     const html = marked.parse(m.content, { renderer: markedRenderer });
-                    return '<div class="ai-msg ' + m.role + '">' + html + '</div>';
+                    const pending = m.pending ? ' pending' : '';
+                    return '<div class="ai-msg ' + m.role + pending + '">' + html + '</div>';
                 }
                 return '<div class="ai-msg ' + m.role + '">' + escapeHtml(m.content) + '</div>';
             }).join('');
@@ -2089,29 +2237,44 @@
             simChatState.busy = true;
             setSimChatEnabled(true);
             simChatState.messages.push({ role: 'user', content: text });
+            // Pending assistant bubble — fills with raw LLM text as it streams.
+            // On `done`, the server sends the stripped display_text which we
+            // swap in to replace the raw (action-block-included) text.
+            const pending = { role: 'assistant', content: '', pending: true };
+            simChatState.messages.push(pending);
             renderSimChat();
             try {
-                // Send only the new message — the server persists history and
-                // merges it with prior context on its side.
-                const resp = await fetch('/api/sim/chat', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ messages: [{ role: 'user', content: text }] }),
+                await streamChat({
+                    url: '/api/sim/chat/stream',
+                    body: { messages: [{ role: 'user', content: text }] },
                     signal: simChatAbort.signal,
+                    onDelta: (chunk) => {
+                        pending.content += chunk;
+                        renderSimChat();
+                    },
+                    onDone: (env) => {
+                        // Swap the pending raw bubble for the stripped display_text.
+                        simChatState.messages.pop();
+                        if (env.aborted) {
+                            simChatState.messages.push({ role: 'assistant', content: pending.content || 'Request stopped.' });
+                        } else {
+                            simChatState.messages.push({ role: 'assistant', content: env.text || pending.content });
+                            // Trades are only on done, not on abort/error.
+                            if (env.trades && env.trades.length) {
+                                showSimChatTrades(env.trades);
+                            }
+                            if (env.actions_executed && env.trades && env.trades.length) {
+                                loadSimStatus(); loadSimTrades(); loadSimEquity();
+                            }
+                        }
+                        renderSimChat();
+                    },
+                    onError: (msg) => {
+                        simChatState.messages.pop();
+                        simChatState.messages.push({ role: 'assistant', content: 'Error: ' + msg });
+                        renderSimChat();
+                    },
                 });
-                if (!resp.ok) throw Error(await resp.text());
-                const data = await resp.json();
-                simChatState.messages.push({ role: 'assistant', content: data.text });
-                showSimChatTrades(data.trades);
-                if (data.actions_executed && data.trades && data.trades.length) {
-                    loadSimStatus(); loadSimTrades(); loadSimEquity();
-                }
-            } catch (e) {
-                if (e.name === 'AbortError') {
-                    simChatState.messages.push({ role: 'assistant', content: 'Request stopped.' });
-                } else {
-                    simChatState.messages.push({ role: 'assistant', content: 'Error: ' + e.message });
-                }
             } finally {
                 simChatState.busy = false;
                 simChatAbort = null;

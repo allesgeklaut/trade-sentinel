@@ -188,6 +188,152 @@ class TestChat:
             self._chat(monkeypatch, llm_state_tmp, {}, status_code=500)
 
 
+# ---------------------------------------------------------------------------
+# chat_stream — streaming SSE/NDJSON parser
+# ---------------------------------------------------------------------------
+
+class _FakeStreamResp:
+    """Mimics the relevant subset of httpx.Response for streaming tests."""
+    def __init__(self, lines=None, status_code=200, body=b""):
+        self._lines = lines or []
+        self.status_code = status_code
+        self._body = body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+    async def aread(self):
+        return self._body
+
+
+class _FakeStreamClient:
+    """``httpx.AsyncClient`` substitute that returns a _FakeStreamResp from
+    ``stream()``. Configure the response lines via ``configure()`` before
+    running the test. Each ``AsyncClient(...)`` instantiation returns the same
+    singleton-like instance so httpx's async-context-manager pattern works."""
+    _configured_lines: list = []
+    _configured_status: int = 200
+    _configured_body: bytes = b""
+
+    def __init__(self, *a, **k):
+        # httpx.AsyncClient(timeout=...) calls us with kwargs we ignore.
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def stream(self, method, url, json=None):
+        return _FakeStreamResp(
+            lines=self._configured_lines,
+            status_code=self._configured_status,
+            body=self._configured_body,
+        )
+
+    @classmethod
+    def configure(cls, lines=None, status_code=200, body=b""):
+        cls._configured_lines = lines or []
+        cls._configured_status = status_code
+        cls._configured_body = body
+
+
+def _configure_streaming_backend(monkeypatch, backend_type="openai", model="m1"):
+    """Wire up a single backend and a fake streaming httpx client."""
+    monkeypatch.setattr(llm.settings, "llm_backends", json.dumps([
+        {"name": "a", "type": backend_type, "url": "http://x:1", "model": model},
+    ]))
+    monkeypatch.setattr(llm.httpx, "AsyncClient", _FakeStreamClient)
+
+
+class TestChatStream:
+    def test_openai_sse_streaming(self, monkeypatch, llm_state_tmp):
+        lines = [
+            'data: ' + json.dumps({'choices': [{'delta': {'content': 'Hello'}}], 'model': 'm1'}),
+            'data: ' + json.dumps({'choices': [{'delta': {'content': ' world'}}], 'model': 'm1'}),
+            'data: ' + json.dumps({'choices': [{'delta': {'content': '!'}}], 'model': 'm1'}),
+            'data: [DONE]',
+        ]
+        _FakeStreamClient.configure(lines=lines)
+        _configure_streaming_backend(monkeypatch, "openai", "m1")
+
+        async def run():
+            out = []
+            async for evt in llm.chat_stream([{"role": "user", "content": "hi"}]):
+                out.append(evt)
+            return out
+
+        events = asyncio_run(run())
+        deltas = [e for e in events if e["type"] == "delta"]
+        done = [e for e in events if e["type"] == "done"]
+        assert [d["text"] for d in deltas] == ["Hello", " world", "!"]
+        assert len(done) == 1
+        assert done[0]["text"] == "Hello world!"
+        assert done[0]["model"] == "m1"
+        assert done[0]["backend"] == "a"
+
+    def test_ollama_ndjson_streaming(self, monkeypatch, llm_state_tmp):
+        lines = [
+            json.dumps({'message': {'content': 'Oll'}, 'model': 'm9'}),
+            json.dumps({'message': {'content': 'ama'}, 'model': 'm9'}),
+            json.dumps({'message': {'content': ' rules'}, 'model': 'm9', 'done': True}),
+        ]
+        _FakeStreamClient.configure(lines=lines)
+        _configure_streaming_backend(monkeypatch, "ollama", "m9")
+
+        async def run():
+            out = []
+            async for evt in llm.chat_stream([{"role": "user", "content": "hi"}]):
+                out.append(evt)
+            return out
+
+        events = asyncio_run(run())
+        deltas = [e for e in events if e["type"] == "delta"]
+        done = [e for e in events if e["type"] == "done"]
+        assert [d["text"] for d in deltas] == ["Oll", "ama", " rules"]
+        assert done[0]["text"] == "Ollama rules"
+        assert done[0]["model"] == "m9"
+
+    def test_http_error_emits_error_event(self, monkeypatch, llm_state_tmp):
+        _FakeStreamClient.configure(lines=[], status_code=500, body=b"oops")
+        _configure_streaming_backend(monkeypatch, "openai", "m1")
+
+        async def run():
+            out = []
+            async for evt in llm.chat_stream([{"role": "user", "content": "hi"}]):
+                out.append(evt)
+            return out
+
+        events = asyncio_run(run())
+        assert len(events) == 1
+        assert events[0]["type"] == "error"
+        assert "HTTP 500" in events[0]["text"]
+        assert "oops" in events[0]["text"]
+
+    def test_no_backend_emits_error(self, monkeypatch):
+        monkeypatch.setattr(llm.settings, "llm_backends", "")
+        monkeypatch.setattr(llm.settings, "ollama_model", "")
+
+        async def run():
+            out = []
+            async for evt in llm.chat_stream([{"role": "user", "content": "hi"}]):
+                out.append(evt)
+            return out
+
+        events = asyncio_run(run())
+        assert len(events) == 1
+        assert events[0]["type"] == "error"
+        assert "No LLM backend" in events[0]["text"]
+
+
 def asyncio_run(coro):
     import asyncio
     return asyncio.run(coro)

@@ -209,6 +209,146 @@ async def chat(messages: list[dict[str, str]]) -> dict[str, Any]:
     }
 
 
+async def chat_stream(messages: list[dict[str, str]]):
+    """Stream a chat request to the active backend.
+
+    Yields dicts:
+      - {"type": "delta", "text": "..."} for each content chunk
+      - {"type": "done", "text": full, "reasoning": ..., "backend": ...,
+         "model": ...} at the end
+      - {"type": "error", "text": "..."} if the request fails before any text
+
+    For OpenAI-compatible backends, parses the SSE stream and extracts
+    ``choices[0].delta.content``. For Ollama, parses the NDJSON stream and
+    extracts ``message.content``. ``reasoning_content`` / ``reasoning`` is
+    collected but not streamed (kept out of the visible text).
+    """
+    backend = await current_backend()
+    if not backend:
+        yield {"type": "error", "text": "No LLM backend configured"}
+        return
+    timeout = httpx.Timeout(
+        connect=10.0,
+        read=settings.ollama_timeout_seconds,
+        write=30.0,
+        pool=10.0,
+    )
+    full_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    model_id = ""
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            if backend["type"] == "ollama":
+                req_body = {
+                    "model": backend["model"],
+                    "messages": messages,
+                    "stream": True,
+                }
+                async with client.stream(
+                    "POST", backend["url"] + "/api/chat", json=req_body,
+                ) as resp:
+                    if resp.status_code != 200:
+                        body = await resp.aread()
+                        raise RuntimeError(
+                            f"LLM {backend['name']} HTTP {resp.status_code}: "
+                            f"{body.decode(errors='replace')[:200]}"
+                        )
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(chunk, dict):
+                            continue
+                        msg = chunk.get("message") or {}
+                        delta = msg.get("content") or ""
+                        r = msg.get("reasoning") or msg.get("reasoning_content") or ""
+                        if delta:
+                            full_parts.append(delta)
+                            yield {"type": "delta", "text": delta}
+                        if r:
+                            reasoning_parts.append(r)
+                        if chunk.get("model"):
+                            model_id = chunk["model"]
+                        if chunk.get("done"):
+                            break
+            else:
+                payload: dict[str, Any] = {
+                    "model": backend["model"] or "default",
+                    "messages": messages,
+                    "stream": True,
+                    "chat_template_kwargs": {"enable_thinking": True},
+                }
+                effort = str(settings.llm_reasoning_effort or "").strip().lower()
+                if effort in ("low", "medium", "high", "xhigh"):
+                    payload["chat_template_kwargs"]["thinking_budget"] = {
+                        "low": 512,
+                        "medium": 2048,
+                        "high": 8192,
+                        "xhigh": 32768,
+                    }[effort]
+                async with client.stream(
+                    "POST", backend["url"] + "/v1/chat/completions", json=payload,
+                ) as resp:
+                    if resp.status_code != 200:
+                        body = await resp.aread()
+                        raise RuntimeError(
+                            f"LLM {backend['name']} HTTP {resp.status_code}: "
+                            f"{body.decode(errors='replace')[:200]}"
+                        )
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        if line.startswith("data: "):
+                            line = line[len("data: "):]
+                        if line.strip() == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(chunk, dict):
+                            continue
+                        if chunk.get("model"):
+                            model_id = chunk["model"]
+                        choice = (chunk.get("choices") or [{}])[0]
+                        if not isinstance(choice, dict):
+                            continue
+                        delta_obj = choice.get("delta") or {}
+                        delta = delta_obj.get("content") or ""
+                        r = delta_obj.get("reasoning_content") or delta_obj.get("reasoning") or ""
+                        if delta:
+                            full_parts.append(delta)
+                            yield {"type": "delta", "text": delta}
+                        if r:
+                            reasoning_parts.append(r)
+        yield {
+            "type": "done",
+            "text": "".join(full_parts),
+            "reasoning": "".join(reasoning_parts),
+            "backend": backend["name"],
+            "model": model_id or backend["model"],
+        }
+    except httpx.RequestError as e:
+        yield {"type": "error", "text": f"Network error: {e}"}
+    except Exception as e:
+        # If we already streamed some text, surface the partial plus the error.
+        # Otherwise emit an error message as the assistant reply.
+        if full_parts:
+            yield {
+                "type": "done",
+                "text": "".join(full_parts),
+                "reasoning": "".join(reasoning_parts),
+                "backend": backend["name"],
+                "model": model_id or backend["model"],
+                "error": str(e),
+            }
+        else:
+            yield {"type": "error", "text": f"{type(e).__name__}: {e}"}
+
+
 async def _post_chat(
     backend: dict[str, Any], messages: list[dict[str, str]]
 ) -> tuple[str, str, str]:
