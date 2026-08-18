@@ -1873,3 +1873,125 @@ class TestSimChatMultipleActions:
         assert result["actions_executed"] is False
         assert result["trades"] == []
         assert result["text"] == llm_response_text
+
+
+# ---------------------------------------------------------------------------
+# sim_chat_stream — streaming variant
+# ---------------------------------------------------------------------------
+
+class TestSimChatStream:
+    """Tests for sim.sim_chat_stream: progressive deltas, persist-after-done,
+    action execution after stream completes, orphan-message avoidance."""
+
+    async def _run_stream(self, new_msgs, fake_llm_events):
+        """Drive sim_chat_stream with a mocked llm_mod.chat_stream that yields
+        the given list of events. Returns the list of events yielded to the
+        caller (the frontend), plus the final persisted chat history."""
+        async def fake_chat_stream(messages):
+            for evt in fake_llm_events:
+                yield evt
+        monkeypatch_local = sim.llm_mod.chat_stream
+        sim.llm_mod.chat_stream = fake_chat_stream
+        try:
+            out = []
+            async for evt in sim.sim_chat_stream(new_msgs):
+                out.append(evt)
+        finally:
+            sim.llm_mod.chat_stream = monkeypatch_local
+        history = await sim.get_chat_history()
+        return out, history
+
+    async def test_streams_deltas_then_done(self, with_cash, monkeypatch):
+        """Plain text response — deltas arrive, then a done envelope with the
+        full text. No action block means actions_executed=False, no trades."""
+        async def mock_context():
+            return "mock context"
+        monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
+
+        fake_events = [
+            {"type": "delta", "text": "Hello"},
+            {"type": "delta", "text": " world"},
+            {"type": "done", "text": "Hello world", "reasoning": "",
+             "backend": "a", "model": "m1"},
+        ]
+        out, history = await self._run_stream(
+            [{"role": "user", "content": "hi"}], fake_events,
+        )
+        deltas = [e for e in out if e["type"] == "delta"]
+        dones = [e for e in out if e["type"] == "done"]
+        assert [d["text"] for d in deltas] == ["Hello", " world"]
+        assert len(dones) == 1
+        assert dones[0]["text"] == "Hello world"
+        assert dones[0]["actions_executed"] is False
+        assert dones[0]["trades"] == []
+        # Persistence: user msg + assistant reply both stored AFTER stream done.
+        assert len(history) == 2
+        assert history[0]["role"] == "user"
+        assert history[0]["content"] == "hi"
+        assert history[1]["role"] == "assistant"
+        assert history[1]["content"] == "Hello world"
+
+    async def test_action_block_executed_after_done(self, with_cash, monkeypatch):
+        """LLM streams raw text containing [[ACTION]]; trades execute after the
+        stream completes; done.text is the stripped display_text."""
+        await sim._exec_buy("AAPL", 100.0, 10000.0, "initial")
+
+        async def mock_close(ticker):
+            return 100.0 if ticker == "AAPL" else None
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+
+        async def mock_context():
+            return "mock context"
+        monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
+
+        raw_text = (
+            'Trimming AAPL.\n'
+            '[[ACTION]]\n'
+            '{"actions": [{"ticker": "AAPL", "action": "SELL", "amount": 3000.0, "reason": "trim"}]}\n'
+            '[[/ACTION]]'
+        )
+        fake_events = [
+            {"type": "delta", "text": raw_text[:10]},
+            {"type": "delta", "text": raw_text[10:]},
+            {"type": "done", "text": raw_text, "reasoning": "",
+             "backend": "a", "model": "m1"},
+        ]
+        out, history = await self._run_stream(
+            [{"role": "user", "content": "trim AAPL by $3000"}], fake_events,
+        )
+        dones = [e for e in out if e["type"] == "done"]
+        assert len(dones) == 1
+        assert dones[0]["actions_executed"] is True
+        assert len(dones[0]["trades"]) == 1
+        assert dones[0]["trades"][0]["ticker"] == "AAPL"
+        assert dones[0]["trades"][0]["side"] == "SELL"
+        assert dones[0]["trades"][0]["shares"] == pytest.approx(30.0, abs=0.001)
+        # done.text is the stripped display_text, NOT the raw action block.
+        assert "[[ACTION]]" not in dones[0]["text"]
+        assert "Trimming AAPL." in dones[0]["text"]
+        # raw field carries the original full response.
+        assert "[[ACTION]]" in dones[0]["raw"]
+        # Persisted assistant message is the stripped display_text.
+        assert history[-1]["role"] == "assistant"
+        assert "[[ACTION]]" not in history[-1]["content"]
+
+    async def test_error_no_text_persists_error_message(self, with_cash, monkeypatch):
+        """If the LLM errors before any text, an error-style assistant reply is
+        emitted and persisted (so the user's question isn't lost)."""
+        async def mock_context():
+            return "mock context"
+        monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
+
+        fake_events = [{"type": "error", "text": "connection refused"}]
+        out, history = await self._run_stream(
+            [{"role": "user", "content": "hi"}], fake_events,
+        )
+        dones = [e for e in out if e["type"] == "done"]
+        assert len(dones) == 1
+        assert "LLM unavailable: connection refused" in dones[0]["text"]
+        assert dones[0]["actions_executed"] is False
+        # Both user question and error reply persisted.
+        assert len(history) == 2
+        assert history[0]["role"] == "user"
+        assert history[1]["role"] == "assistant"
+        assert "LLM unavailable" in history[1]["content"]
