@@ -674,6 +674,33 @@
             text-align: right
         }
 
+        /* Progress bar shown while a screener op (update/refresh/deep) runs */
+        .screener-bar {
+            position: relative;
+            height: 14px;
+            background: #050a07;
+            border: 1px solid #12351c;
+            border-radius: 3px;
+            overflow: hidden;
+            margin-top: 4px
+        }
+        .screener-bar-fill {
+            position: absolute;
+            top: 0; left: 0; bottom: 0;
+            background: #1d6030;
+            transition: width 0.3s ease
+        }
+        .screener-bar-label {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            color: #b7ffc0;
+            text-shadow: 0 0 4px #050a07
+        }
+
         .screener-scroll {
             max-height: 480px;
             overflow-y: auto;
@@ -1949,14 +1976,21 @@
             if (!el) return;
             if (!p || (!p.running && !p.op)) { el.innerHTML = ''; return; }
             const label = SCREENER_OP_LABELS[p.op] || p.op;
-            const elapsed = p.running ? fmtElapsed(p.started_at) : '';
+            const total = p.total || 0;
+            const done = p.done || 0;
+            const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
             if (p.op && !p.running) {
                 // Finished — show a green check + counts.
-                el.innerHTML = '<span style="color:#42ff72">✓ ' + label + ' done — ' + p.done + '/' + p.total + ' tickers</span>';
+                el.innerHTML = '<span style="color:#42ff72">✓ ' + label + ' done — ' + done + '/' + total + ' tickers</span>';
                 return;
             }
-            const cur = p.current ? ' <span style="color:#b7ffc0">' + escapeHtml(p.current) + '</span>' : '';
-            el.innerHTML = '<span style="color:#42ff72">● </span><span style="color:#b7ffc0">' + label + '</span> ' + p.done + '/' + p.total + cur + '<span style="color:#7aaa81">' + elapsed + '</span>';
+            const elapsed = p.running ? fmtElapsed(p.started_at) : '';
+            const label2 = label + ' ' + done + '/' + total + (total > 0 ? ' (' + pct + '%)' : '') + (elapsed || '');
+            el.innerHTML =
+                '<div class="screener-bar">' +
+                '<div class="screener-bar-fill" style="width:' + pct + '%"></div>' +
+                '<div class="screener-bar-label">' + escapeHtml(label2) + '</div>' +
+                '</div>';
         }
 
         async function pollScreenerStatus() {
