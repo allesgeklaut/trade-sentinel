@@ -226,13 +226,23 @@ async def _post_chat(
                 json={"model": backend["model"], "messages": messages, "stream": False},
             )
         else:
+            payload: dict[str, Any] = {
+                "model": backend["model"] or "default",
+                "messages": messages,
+                "stream": False,
+                "chat_template_kwargs": {"enable_thinking": True},
+            }
+            effort = str(settings.llm_reasoning_effort or "").strip().lower()
+            if effort in ("low", "medium", "high", "xhigh"):
+                payload["chat_template_kwargs"]["thinking_budget"] = {
+                    "low": 512,
+                    "medium": 2048,
+                    "high": 8192,
+                    "xhigh": 32768,
+                }[effort]
             resp = await client.post(
                 backend["url"] + "/v1/chat/completions",
-                json={
-                    "model": backend["model"] or "default",
-                    "messages": messages,
-                    "stream": False,
-                },
+                json=payload,
             )
         if getattr(resp, "status_code", 200) != 200:
             raise RuntimeError(
