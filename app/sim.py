@@ -42,6 +42,9 @@ logger = logging.getLogger("trade_sentinel.sim")
 
 # Stores the raw LLM reasoning text from the most recent _llm_decide() call.
 _last_llm_reasoning: str = ""
+# Stores the prose summary the LLM emitted before its JSON array (new prompt
+# format). Empty when the LLM only returned JSON or when it was unavailable.
+_last_llm_summary: str = ""
 # Stores the deterministic trades from the most recent hybrid cycle (for comparison).
 # In the hybrid strategy these are the PROPOSALS (pre-veto); some may have been
 # vetoed by the LLM and never executed — see _last_llm_vetoes.
@@ -51,6 +54,12 @@ _last_llm_decisions: list[dict] = []
 # Stores the deterministic proposals the LLM vetoed (HOLD) in the most recent
 # hybrid cycle. Empty for non-hybrid strategies and for the pure-LLM strategy.
 _last_llm_vetoes: list[dict] = []
+
+# In-progress run-cycle state for the frontend status poller. Cleared at the
+# start of each run_cycle() and updated at each stage; read by /api/sim/run-status.
+# Shape: {"running": bool, "stage": str, "started_at": iso, "updated_at": iso,
+#         "detail": str, "error": str|None}
+_run_progress: dict[str, Any] = {"running": False, "stage": "", "started_at": "", "updated_at": "", "detail": "", "error": None}
 
 # How many candles to refresh for the sim universe (2y is a good balance
 # for indicator computation without excessive API load).
@@ -535,11 +544,27 @@ _LLM_SYSTEM_PROMPT = (
     "highest-ADX, still-in-uptrend names. But do not sell just to rotate into "
     "a different ticker with similar indicators.\n"
     "\n"
-    "Return ONLY a JSON array of objects with the fields:\n"
-    '  "ticker": string, "action": "BUY"|"SELL|HOLD", "reason": string, '
+    "OUTPUT FORMAT — follow this exactly:\n"
+    "Your response MUST begin with a brief prose summary (2-4 sentences) that "
+    "a human can read. Start with a capital letter and write in plain English "
+    "about your overall read of the portfolio and what you decided this cycle "
+    "— especially important when you made no changes, so the user understands "
+    "why you held. Do NOT skip this section. Do NOT start with [ or a JSON "
+    "token. After the summary, put the JSON array of decisions on a new "
+    "line.\n"
+    "The JSON array of decisions has objects with the fields:\n"
+    '   "ticker": string, "action": "BUY"|"SELL|HOLD", "reason": string, '
     '"shares"?: number, "amount"?: number\n'
     "\n"
-    "No markdown, no code fences, no prose — just the JSON array.\n"
+    "Example response shape:\n"
+    "The portfolio is in good shape and I made no changes. All ten names still "
+    "have weekly uptrends intact; none are overbought or showing SELL signals, "
+    "and cash is too low to add anything new.\n"
+    '[\n'
+    '  {"ticker":"AAPL","action":"HOLD","reason":"weekly uptrend, no sell signal"}\n'
+    ']\n'
+    "\n"
+    "No code fences. The prose section is required, not optional.\n"
 )
 
 
@@ -709,6 +734,42 @@ def _parse_llm_decisions(content: str) -> list[dict] | None:
     return valid if valid else None
 
 
+def _extract_summary(content: str | None) -> str:
+    """Return the prose summary the LLM wrote before its JSON array.
+
+    The new prompt asks for a brief prose summary followed by the JSON array.
+    This helper returns everything before the array's opening ``[``. If the
+    LLM only returned JSON (no prose), returns an empty string. Fallback
+    ``[LLM UNAVAILABLE...]`` strings are detected and returned as-is (the
+    caller already treats them specially via ``is_fallback``).
+    """
+    if not content:
+        return ""
+    text = content.strip()
+    # The fallback message starts with "[" but is not JSON — leave it for
+    # is_fallback handling upstream; no prose to extract.
+    if text.startswith("[LLM UNAVAILABLE"):
+        return ""
+    # If the prose is followed by a ```json fence, the opening "[" we want is
+    # inside the fence. Strip the fence first so we can locate the array.
+    fence_idx = text.find("```")
+    if fence_idx > 0:
+        # There is prose before a fence. Drop the fence line; the JSON follows.
+        first_nl_after_fence = text.find("\n", fence_idx)
+        if first_nl_after_fence != -1:
+            prose = text[:fence_idx].strip()
+            return prose.rstrip(":").strip()
+    start = text.find("[")
+    if start <= 0:
+        # No JSON array, or it's at the very start — no prose.
+        return ""
+    prose = text[:start].strip()
+    # Trim a trailing colon or "Then:" / "Decisions:" style lead-ins the LLM
+    # might add right before the array.
+    prose = prose.rstrip(":").strip()
+    return prose
+
+
 async def _llm_review_proposals(
     valuation: dict[str, Any],
     proposals: list[dict],
@@ -736,7 +797,7 @@ async def _llm_review_proposals(
     On LLM call failure or unparseable response, falls back to executing all
     proposals as-is (equivalent to the deterministic-only strategy).
     """
-    global _last_llm_reasoning
+    global _last_llm_reasoning, _last_llm_summary
 
     context = _build_llm_context(valuation, proposals, signals, news)
     backend = await llm_mod.current_backend()
@@ -762,10 +823,12 @@ async def _llm_review_proposals(
             f"Backend: {backend.get('name', '?')}\n"
             f"Model: {backend.get('model', '?')}"
         )
+        _last_llm_summary = ""
         executed = await _execute_proposed(proposals)
         return executed, []
 
     _last_llm_reasoning = content
+    _last_llm_summary = _extract_summary(content)
     decisions = _parse_llm_decisions(content)
     if decisions is None:
         logger.warning("Could not parse LLM decisions; executing all proposals. Raw: %s", content[:500])
@@ -869,7 +932,7 @@ async def _llm_decide(
     if signals is None:
         signals = {}
 
-    global _last_llm_reasoning
+    global _last_llm_reasoning, _last_llm_summary
 
     context = _build_llm_context(valuation, deterministic_trades, signals, news)
     backend = await llm_mod.current_backend()
@@ -899,10 +962,12 @@ async def _llm_decide(
             f"  - {t['ticker']} {t['side']} ×{t.get('shares', '?')} @ {t.get('price', '?'):.2f} — {t.get('reason', '')}"
             for t in deterministic_trades
         ) if deterministic_trades else "\n  (no deterministic trades either)")
+        _last_llm_summary = ""
         return list(deterministic_trades)
 
     # Store raw LLM reasoning for display in the frontend
     _last_llm_reasoning = content
+    _last_llm_summary = _extract_summary(content)
 
     decisions = _parse_llm_decisions(content)
     if decisions is None:
@@ -1071,88 +1136,133 @@ async def _gather_news(signals: dict[str, dict]) -> dict[str, list[dict]]:
     return await gather_news_for_candidates(candidates, include_market=True)
 
 
+def _set_progress(stage: str, detail: str = "", *, running: bool = True,
+                  started_at: str | None = None, error: str | None = None) -> None:
+    """Update the in-progress run-cycle state for the /api/sim/run-status poller.
+
+    Called from run_cycle() at each stage. ``started_at`` is preserved across
+    updates so the frontend can show an elapsed timer.
+    """
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    if started_at is None:
+        started_at = now
+    _run_progress.update({
+        "running": running,
+        "stage": stage,
+        "detail": detail,
+        "started_at": started_at,
+        "updated_at": now,
+        "error": error,
+    })
+
+
 async def run_cycle() -> dict[str, Any]:
     """Run one full sim cycle: deposit allowance → refresh → decide → snapshot.
 
     This is called by the scheduler or the manual trigger endpoint.
     """
-    global _last_deterministic_trades
+    global _last_deterministic_trades, _last_llm_summary
 
-    # 1. Deposit allowance (if new month)
-    allowance_result = await deposit_allowance()
+    # Reset the prose summary for this cycle; the LLM path will set it if it
+    # runs. The deterministic path leaves it empty so the frontend can show a
+    # "deterministic mode — no LLM was called" explanation.
+    _last_llm_summary = ""
 
-    # 2. Refresh candles for the universe
-    tickers = await _candidate_tickers()
-    refresh_errors: list[str] = []
-    for t in tickers:
-        try:
-            await refresh(t, _SIM_REFRESH_PERIOD)
-        except Exception as e:
-            refresh_errors.append(f"{t}: {e}")
+    # Progress poller: mark the cycle as running with a start timestamp. Each
+    # stage updates _run_progress so the frontend can show what's happening.
+    _set_progress("starting", "Starting cycle")
+    started_at = _run_progress["started_at"]
 
-    # 2b. Refresh benchmark ticker and run benchmark DCA
-    benchmark_result = {"deposited": False, "skipped": True}
-    if settings.sim_benchmark_enabled:
-        try:
-            await refresh(settings.sim_benchmark_ticker, _SIM_REFRESH_PERIOD)
-        except Exception as e:
-            refresh_errors.append(f"{settings.sim_benchmark_ticker}: {e}")
-        benchmark_result = await _benchmark_deposit_and_buy()
+    try:
+        # 1. Deposit allowance (if new month)
+        _set_progress("allowance", "Depositing monthly allowance", started_at=started_at)
+        allowance_result = await deposit_allowance()
 
-    # 3. Valuate
-    valuation = await valuate()
+        # 2. Refresh candles for the universe
+        _set_progress("refresh", "Refreshing candle data", started_at=started_at)
+        tickers = await _candidate_tickers()
+        refresh_errors: list[str] = []
+        for t in tickers:
+            try:
+                await refresh(t, _SIM_REFRESH_PERIOD)
+            except Exception as e:
+                refresh_errors.append(f"{t}: {e}")
+        _set_progress("refresh", f"Refreshed {len(tickers)} tickers", started_at=started_at)
 
-    # 4. Decide & trade
-    strategy = settings.sim_strategy.lower()
-    if strategy == "deterministic":
-        trades = await _deterministic_decide(valuation)
-        _last_deterministic_trades = trades
-    elif strategy == "llm":
-        # Pure LLM: let the model decide entirely from portfolio context + signals
-        signals = await _gather_signals(tickers)
-        news = await _gather_news(signals)
-        trades = await _llm_decide(valuation, [], signals, news)
-        _last_deterministic_trades = []
-    elif strategy == "hybrid":
-        # Hybrid: propose deterministic trades → LLM reviews → execute the
-        # survivors. The LLM's HOLD on a proposed ticker VETOES that trade
-        # before it executes (the old flow executed deterministic first and
-        # the LLM could only add on top, making its HOLDs silent no-ops).
-        signals = await _gather_signals(tickers)
-        news = await _gather_news(signals)
-        proposals = await _deterministic_propose(valuation, signals)
-        trades, vetoed = await _llm_review_proposals(valuation, proposals, signals, news)
-        _last_deterministic_trades = proposals
-        _last_llm_vetoes = vetoed
-    else:
-        logger.warning("Unknown strategy '%s', falling back to deterministic", strategy)
-        trades = await _deterministic_decide(valuation)
-        _last_deterministic_trades = trades
+        # 2b. Refresh benchmark ticker and run benchmark DCA
+        benchmark_result = {"deposited": False, "skipped": True}
+        if settings.sim_benchmark_enabled:
+            try:
+                await refresh(settings.sim_benchmark_ticker, _SIM_REFRESH_PERIOD)
+            except Exception as e:
+                refresh_errors.append(f"{settings.sim_benchmark_ticker}: {e}")
+            benchmark_result = await _benchmark_deposit_and_buy()
 
-    # 5. Snapshot for equity curve
-    post_valuation = await valuate()
-    allowance_total = post_valuation["allowance_total"]
-    async with Session() as s:
-        snap = SimSnapshot(
-            cash=post_valuation["cash"],
-            positions_value=post_valuation["positions_value"],
-            total_equity=post_valuation["total_equity"],
-            allowance_total=allowance_total,
-        )
-        s.add(snap)
-        await s.commit()
+        # 3. Valuate
+        _set_progress("valuate", "Valuing portfolio", started_at=started_at)
+        valuation = await valuate()
 
-    # 5b. Benchmark snapshot
-    await _benchmark_snapshot()
+        # 4. Decide & trade
+        strategy = settings.sim_strategy.lower()
+        if strategy == "deterministic":
+            _set_progress("decide", "Deterministic engine deciding", started_at=started_at)
+            trades = await _deterministic_decide(valuation)
+            _last_deterministic_trades = trades
+        elif strategy == "llm":
+            _set_progress("signals", "Gathering signals", started_at=started_at)
+            signals = await _gather_signals(tickers)
+            news = await _gather_news(signals)
+            _set_progress("decide", "LLM deciding (pure-LLM strategy)", started_at=started_at)
+            trades = await _llm_decide(valuation, [], signals, news)
+            _last_deterministic_trades = []
+        elif strategy == "hybrid":
+            _set_progress("signals", "Gathering signals", started_at=started_at)
+            signals = await _gather_signals(tickers)
+            news = await _gather_news(signals)
+            _set_progress("propose", "Deterministic engine proposing", started_at=started_at)
+            proposals = await _deterministic_propose(valuation, signals)
+            _set_progress("decide", "LLM reviewing proposals (hybrid)", started_at=started_at)
+            trades, vetoed = await _llm_review_proposals(valuation, proposals, signals, news)
+            _last_deterministic_trades = proposals
+            _last_llm_vetoes = vetoed
+        else:
+            logger.warning("Unknown strategy '%s', falling back to deterministic", strategy)
+            _set_progress("decide", "Deterministic engine deciding (unknown strategy fallback)", started_at=started_at)
+            trades = await _deterministic_decide(valuation)
+            _last_deterministic_trades = trades
 
-    return {
-        "allowance": allowance_result,
-        "benchmark": benchmark_result,
-        "refresh_errors": refresh_errors,
-        "trades": trades,
-        "valuation": post_valuation,
-        "llm_reasoning": _last_llm_reasoning,
-    }
+        # 5. Snapshot for equity curve
+        _set_progress("snapshot", "Snapshotting equity curve", started_at=started_at)
+        post_valuation = await valuate()
+        allowance_total = post_valuation["allowance_total"]
+        async with Session() as s:
+            snap = SimSnapshot(
+                cash=post_valuation["cash"],
+                positions_value=post_valuation["positions_value"],
+                total_equity=post_valuation["total_equity"],
+                allowance_total=allowance_total,
+            )
+            s.add(snap)
+            await s.commit()
+
+        # 5b. Benchmark snapshot
+        await _benchmark_snapshot()
+
+        _set_progress("done", f"Done — {len(trades)} trade(s)", started_at=started_at, running=False)
+        return {
+            "allowance": allowance_result,
+            "benchmark": benchmark_result,
+            "refresh_errors": refresh_errors,
+            "trades": trades,
+            "valuation": post_valuation,
+            "llm_reasoning": _last_llm_reasoning,
+        }
+    except Exception as e:
+        # Mark the cycle as failed so the frontend can show the error instead
+        # of an indeterminate "Running..." state.
+        _set_progress("error", f"{type(e).__name__}: {e}", started_at=started_at, running=False, error=str(e))
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1162,6 +1272,11 @@ async def run_cycle() -> dict[str, Any]:
 def get_last_llm_reasoning() -> str:
     """Return the raw LLM reasoning text from the most recent sim cycle."""
     return _last_llm_reasoning
+
+
+def get_run_progress() -> dict[str, Any]:
+    """Return the current/last run-cycle progress for the frontend poller."""
+    return dict(_run_progress)
 
 
 def get_last_llm_summary() -> dict[str, Any]:
@@ -1251,14 +1366,23 @@ def get_last_llm_summary() -> dict[str, Any]:
                 "change_type": "dropped",
             })
 
+    # Was the LLM called this cycle? In the deterministic strategy it never is,
+    # and both _last_llm_reasoning and _last_llm_summary stay empty (the latter
+    # because run_cycle resets it). The frontend uses this flag to show a
+    # "deterministic mode — no LLM was called" message instead of an empty panel.
+    llm_was_called = bool(_last_llm_reasoning or _last_llm_summary)
+
     return {
         "raw": raw,
+        "summary": _last_llm_summary,
         "deterministic_trades": _last_deterministic_trades,
         "changes": changes,
         "confirmations": confirmations,
         "holds": holds,
         "vetoes": vetoes,
         "fallback": is_fallback,
+        "strategy": settings.sim_strategy,
+        "llm_called": llm_was_called,
     }
 
 

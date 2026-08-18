@@ -1085,6 +1085,7 @@
                         <button id="sim-run-btn" onclick="runSim()">Run Bot Now</button>
                         <button onclick="resetSim()">Reset Sim</button>
                     </div>
+                    <div id="sim-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
                 </div>
             </div>
             <div class="sim-section">
@@ -2086,17 +2087,38 @@
                 const r = await api('sim/reasoning');
                 const el = document.getElementById('sim-reasoning');
                 const rawEl = document.getElementById('sim-raw-reasoning');
-                if (!r.raw && !r.changes && !r.confirmations) {
-                    el.innerHTML = '<div class="sim-empty">No LLM reasoning captured yet — run the bot in LLM or hybrid mode.</div>';
-                    return;
-                }
+                if (rawEl) rawEl.textContent = r.raw || '';
+
+                // Case 1: LLM was unavailable — show a red banner + the raw error.
                 if (r.fallback) {
-                    // LLM was unavailable — show the fallback message
-                    el.innerHTML = '\u003cdiv style="color:#ff5c70;font-size:13px;margin-bottom:8px"\u003e⚠ LLM was unavailable — ran deterministic only\u003c/div\u003e' + escapeHtml(r.raw || '');
-                    if (rawEl) rawEl.textContent = r.raw || '';
+                    el.innerHTML = '<div style="color:#ff5c70;font-size:13px;margin-bottom:8px">⚠ LLM was unavailable — ran deterministic only</div>' + escapeHtml(r.raw || '');
                     return;
                 }
+                // Case 2: deterministic strategy — no LLM was called this cycle.
+                // Show a clear explanation instead of the old "No LLM reasoning
+                // captured yet" placeholder.
+                if (!r.llm_called) {
+                    const n = (r.deterministic_trades || []).length;
+                    const tradesMsg = n
+                        ? `The bot ran <b>${n}</b> trade${n === 1 ? '' : 's'} purely from the rule engine.`
+                        : 'No trades were proposed by the rule engine this cycle.';
+                    el.innerHTML =
+                        '<div class="sim-empty" style="text-align:left;padding:8px 0">' +
+                        '<b>Strategy: ' + escapeHtml(r.strategy || 'deterministic') + '</b> — no LLM was called this cycle. ' +
+                        tradesMsg +
+                        ' Switch <code>SIM_STRATEGY</code> to <code>hybrid</code> or <code>llm</code> in <code>.env</code> to involve the LLM.' +
+                        '</div>';
+                    return;
+                }
+
                 let html = '';
+                // Case 3: LLM was called — show its prose summary at the top.
+                if (r.summary) {
+                    const summaryHtml = (typeof marked !== 'undefined')
+                        ? marked.parse(r.summary, { renderer: markedRenderer })
+                        : escapeHtml(r.summary);
+                    html += '<div style="margin-bottom:12px;padding:8px 10px;border:1px solid #1d6030;background:#0a2412;border-radius:4px;font-size:13px;line-height:1.5">' + summaryHtml + '</div>';
+                }
                 // Changes (LLM diverged from deterministic)
                 if (r.changes && r.changes.length) {
                     html += '<div style="margin-bottom:12px"><span style="color:#ff5c70;font-size:12px;text-transform:uppercase">⚠ LLM changed the plan</span></div>';
@@ -2126,13 +2148,15 @@
                     html += `<div style="margin:12px 0 4px;color:#ffd65c;font-size:12px;text-transform:uppercase">⊙ ${r.holds.length} HOLD</div>`;
                     html += '<div style="font-size:11px;color:#7aaa81;line-height:1.6">' + r.holds.map(h => escapeHtml(h.ticker)).join(' · ') + '</div>';
                 }
-                // If nothing interesting happened
-                if (!r.changes?.length && !r.confirmations?.length && !r.holds?.length) {
-                    html += '<div class="sim-empty">No decisions parsed from LLM output.</div>';
+                // If LLM was called but produced no summary and no decisions at
+                // all — surface a clear message rather than an empty panel.
+                if (!r.summary && !r.changes?.length && !r.confirmations?.length && !r.holds?.length) {
+                    html += '<div class="sim-empty">The LLM responded but did not produce a parseable summary or decisions. See the raw output below.</div>';
+                } else if (!r.summary && !r.changes?.length && !r.confirmations?.length) {
+                    // Only HOLDs, no summary — note that explicitly.
+                    html += '<div class="sim-empty" style="margin-top:8px">No changes from the deterministic plan.</div>';
                 }
                 el.innerHTML = html;
-                // Raw output
-                if (rawEl) rawEl.textContent = r.raw || '';
             } catch (e) { document.getElementById('sim-reasoning').innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
 
@@ -2171,13 +2195,83 @@
             renderSimChat();
         }
 
+        // --- Run Bot Now: progress poller ---
+        // Stage labels shown to the user. Backend stage ids → friendly text.
+        const SIM_STAGE_LABELS = {
+            'starting': 'Starting',
+            'allowance': 'Depositing allowance',
+            'refresh': 'Refreshing market data',
+            'valuate': 'Valuing portfolio',
+            'signals': 'Gathering signals',
+            'propose': 'Deterministic engine proposing',
+            'decide': 'Deciding trades',
+            'snapshot': 'Snapshotting equity',
+            'done': 'Done',
+            'error': 'Error',
+        };
+        let simRunPollTimer = null;
+
+        function fmtElapsed(isoStart) {
+            if (!isoStart) return '';
+            const ms = Date.now() - new Date(isoStart).getTime();
+            if (ms < 1000) return '';
+            const s = Math.floor(ms / 1000);
+            return ' · ' + s + 's';
+        }
+
+        function renderSimRunStatus(p) {
+            const el = document.getElementById('sim-run-status');
+            if (!el) return;
+            if (!p || (!p.running && !p.stage)) {
+                el.innerHTML = '';
+                return;
+            }
+            const label = SIM_STAGE_LABELS[p.stage] || p.stage;
+            const detail = p.detail ? ' — ' + escapeHtml(p.detail) : '';
+            const elapsed = p.running ? fmtElapsed(p.started_at) : '';
+            if (p.stage === 'error') {
+                el.innerHTML = '<span style="color:#ff5c70">⚠ ' + escapeHtml(p.detail || p.error || 'Error') + '</span>';
+                return;
+            }
+            if (p.stage === 'done') {
+                el.innerHTML = '<span style="color:#42ff72">✓ ' + label + detail + '</span>';
+                return;
+            }
+            // Running — show spinner dots + stage + elapsed.
+            el.innerHTML = '<span style="color:#42ff72">● </span><span style="color:#b7ffc0">' + label + '</span><span style="color:#7aaa81">' + detail + elapsed + '</span>';
+        }
+
+        async function pollSimRunStatus() {
+            try {
+                const p = await api('sim/run-status');
+                renderSimRunStatus(p);
+                if (!p.running) {
+                    // Stop polling once the cycle finishes (done or error).
+                    if (simRunPollTimer) { clearInterval(simRunPollTimer); simRunPollTimer = null; }
+                }
+            } catch (e) { /* keep polling; the cycle will eventually set done/error */ }
+        }
+
         async function runSim() {
             const btn = document.getElementById('sim-run-btn');
             const orig = btn.textContent;
             btn.textContent = 'Running...'; btn.classList.add('sim-loading'); btn.disabled = true;
-            try { await api('sim/run', { method: 'POST' }); } catch (e) { /* ignore */ }
-            btn.textContent = orig; btn.classList.remove('sim-loading'); btn.disabled = false;
-            loadSimAll();
+            // Start the poller immediately so the user sees stage changes while
+            // the POST is in flight (the POST only returns when the cycle ends).
+            renderSimRunStatus({ running: true, stage: 'starting', detail: 'Starting cycle', started_at: new Date().toISOString() });
+            if (simRunPollTimer) clearInterval(simRunPollTimer);
+            simRunPollTimer = setInterval(pollSimRunStatus, 1000);
+            try {
+                await api('sim/run', { method: 'POST' });
+            } catch (e) {
+                renderSimRunStatus({ running: false, stage: 'error', detail: e.message, started_at: new Date().toISOString() });
+            } finally {
+                btn.textContent = orig; btn.classList.remove('sim-loading'); btn.disabled = false;
+                // One last poll to pick up the final 'done'/'error' state, then stop.
+                await pollSimRunStatus();
+                if (simRunPollTimer) { clearInterval(simRunPollTimer); simRunPollTimer = null; }
+                loadSimAll();
+            }
         }
 
         async function resetSim() {
