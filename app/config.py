@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     # legacy OLLAMA_URL / OLLAMA_MODEL settings are used as a single backend.
     llm_backends: str = ""
     llm_state_file: str = "/data/llm_state.json"
+    # Qwen3 thinking budget applied to OpenAI-compatible backends (llama-server).
+    # One of: low | medium | high | xhigh. Empty = leave server default untouched.
+    llm_reasoning_effort: str = ""
 
     # --- SearXNG news search (optional) -------------------------------
     searxng_url: str = ""  # e.g. "http://192.168.0.46:8081"; empty = disabled
