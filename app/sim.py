@@ -544,27 +544,11 @@ _LLM_SYSTEM_PROMPT = (
     "highest-ADX, still-in-uptrend names. But do not sell just to rotate into "
     "a different ticker with similar indicators.\n"
     "\n"
-    "OUTPUT FORMAT — follow this exactly:\n"
-    "Your response MUST begin with a brief prose summary (2-4 sentences) that "
-    "a human can read. Start with a capital letter and write in plain English "
-    "about your overall read of the portfolio and what you decided this cycle "
-    "— especially important when you made no changes, so the user understands "
-    "why you held. Do NOT skip this section. Do NOT start with [ or a JSON "
-    "token. After the summary, put the JSON array of decisions on a new "
-    "line.\n"
-    "The JSON array of decisions has objects with the fields:\n"
-    '   "ticker": string, "action": "BUY"|"SELL|HOLD", "reason": string, '
-    '"shares"?: number, "amount"?: number\n'
-    "\n"
-    "Example response shape:\n"
-    "The portfolio is in good shape and I made no changes. All ten names still "
-    "have weekly uptrends intact; none are overbought or showing SELL signals, "
-    "and cash is too low to add anything new.\n"
-    '[\n'
-    '  {"ticker":"AAPL","action":"HOLD","reason":"weekly uptrend, no sell signal"}\n'
-    ']\n'
-    "\n"
-    "No code fences. The prose section is required, not optional.\n"
+    "Response format: begin with a 2-4 sentence prose summary of your overall "
+    "read and the decisions you made (write this even when you made no "
+    "changes), then the JSON array of decisions on a new line. Objects have "
+    'the fields "ticker", "action", "reason", and optional "shares" / '
+    '"amount". No code fences, no markdown — just the prose, then the JSON.\n'
 )
 
 
