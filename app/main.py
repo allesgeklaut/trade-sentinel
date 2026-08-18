@@ -10,7 +10,7 @@ from .config import settings
 from .db import Watchlist, Session, init_db
 from .market import refresh, candles, search, info, provider
 from .analysis import compute, persist, history, MIN_CANDLES
-from .screener import universe_names, run, results, refresh_incremental, load_deep_history
+from .screener import universe_names, run, results, refresh_incremental, load_deep_history, get_screener_progress
 from . import sim
 from . import news as news_mod
 from . import llm as llm_mod
@@ -135,6 +135,16 @@ async def screen_load_deep(universe: str, period: str = '10y'):
     """Fetch deep history (default 10y) for all tickers — for optimization/backtest."""
     try: return await load_deep_history(universe, period)
     except ValueError as e: raise HTTPException(404, str(e))
+@app.get('/api/screener/status')
+async def screener_status():
+    """Current/last screener operation progress for the frontend poller.
+
+    Returns {running, op, universe, current, done, total, started_at,
+    updated_at, error}. Polled by the screener buttons while an update /
+    refresh / deep-load is in flight.
+    """
+    return get_screener_progress()
+
 @app.get('/api/screener/{universe}')
 async def screen_results(universe:str):
     try:
