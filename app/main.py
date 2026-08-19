@@ -330,11 +330,17 @@ async def sim_benchmark():
 
 @app.post('/api/sim/run')
 async def sim_run():
-    """Manually trigger a sim decision cycle."""
-    try:
-        return await sim.run_cycle()
-    except Exception as e:
-        raise HTTPException(500, f"Sim cycle failed: {e}")
+    """Manually trigger a sim decision cycle.
+
+    Fire-and-forget: the cycle runs as a background asyncio task and this
+    endpoint returns immediately with {started: true/false}. The cycle
+    survives browser disconnects because it's not tied to the HTTP request.
+    Track progress via /api/sim/run-status.
+    """
+    result = sim.start_run_cycle_background()
+    if not result.get("started"):
+        raise HTTPException(409, result.get("reason", "already running"))
+    return result
 
 @app.get('/api/sim/run-status')
 async def sim_run_status():
