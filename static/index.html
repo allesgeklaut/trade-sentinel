@@ -924,10 +924,12 @@
         }
 
         /* Scrollable log tables so a long trade history doesn't push the
-           page down; the section header stays fixed, the table scrolls. */
+           page down; the section header stays fixed, the table scrolls.
+           overflow-x:auto keeps wide tables from bleeding out on mobile. */
         #sim-trades, #sim-positions, #sim-allowances {
             max-height: 320px;
-            overflow-y: auto
+            overflow-y: auto;
+            overflow-x: auto
         }
 
         #sim-trades table thead th,
@@ -1002,6 +1004,23 @@
 
             .sim-grid2 .sim-grid2 > .sim-section {
                 margin-bottom: 12px
+            }
+
+            /* Compact tables on mobile: smaller padding + font so the 6-col
+               trade log (Time/Ticker/Side/Shares/Price/Reason) fits without
+               horizontal scroll when possible, and scrolls cleanly when not. */
+            #sim-trades table,
+            #sim-positions table,
+            #sim-allowances table {
+                font-size: 11px
+            }
+            #sim-trades td,
+            #sim-trades th,
+            #sim-positions td,
+            #sim-positions th,
+            #sim-allowances td,
+            #sim-allowances th {
+                padding: 3px 4px
             }
         }
 
@@ -1106,42 +1125,41 @@
                 <div class="bench-label">BENCHMARK: MSCI WORLD DCA</div>
                 <div id="sim-benchmark"></div>
             </div>
-            <div class="sim-grid2">
-                <div class="sim-section">
-                    <div class="bench-label">ACTIONS</div>
-                    <div class="sim-actions">
-                        <button id="sim-run-btn" onclick="runSim()">Run Bot Now</button>
-                        <button onclick="resetSim()">Reset Sim</button>
-                    </div>
-                    <div id="sim-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
-                </div>
+        </div>
+        <div class="sim-section">
+            <div class="bench-label">ACTIONS</div>
+            <div class="sim-actions">
+                <button id="sim-run-btn" onclick="runSim()">Run Bot Now</button>
+                <button onclick="resetSim()">Reset Sim</button>
             </div>
-            <div class="sim-section">
-                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">LLM REASONING</h3>
-                <div id="sim-reasoning"
-                    style="white-space:pre-wrap;word-wrap:break-word;max-height:400px;overflow-y:auto;font-size:13px;line-height:1.5">
-                </div>
-                <details style="margin-top:8px">
-                    <summary style="cursor:pointer;color:#7aaa81;font-size:12px">Show raw LLM output</summary>
-                    <div id="sim-raw-reasoning"
-                        style="white-space:pre-wrap;word-wrap:break-word;max-height:300px;overflow-y:auto;font-size:12px;color:#7aaa81;margin-top:6px">
-                    </div>
-                </details>
+            <div id="sim-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
+        </div>
+        <div class="sim-section">
+            <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">LLM REASONING</h3>
+            <div id="sim-reasoning"
+                style="white-space:pre-wrap;word-wrap:break-word;max-height:400px;overflow-y:auto;font-size:13px;line-height:1.5">
             </div>
-            <div class="sim-section">
-                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">CHAT WITH PORTFOLIO MANAGER</h3>
-                <div class="ai-hint" style="margin-bottom:8px">Ask the LLM to explain decisions, or request actions like "sell AMZN to buy NVDA". If the LLM agrees, trades execute immediately (respecting risk limits).</div>
-                <div id="sim-chat-thread" class="ai-thread" style="max-height:320px">
-                    <div class="ai-empty">Start a conversation with the portfolio manager.</div>
+            <details style="margin-top:8px">
+                <summary style="cursor:pointer;color:#7aaa81;font-size:12px">Show raw LLM output</summary>
+                <div id="sim-raw-reasoning"
+                    style="white-space:pre-wrap;word-wrap:break-word;max-height:300px;overflow-y:auto;font-size:12px;color:#7aaa81;margin-top:6px">
                 </div>
-                <form id="sim-chat-form" class="ai-form" onsubmit="return sendSimChat(event)">
-                    <input id="sim-chat-input" autocomplete="off" placeholder="Ask the portfolio manager…" disabled>
-                    <button id="sim-chat-send" type="submit" disabled>Send</button>
-                    <button id="sim-chat-stop" type="button" onclick="stopSimChat()" disabled>Stop</button>
-                    <button type="button" onclick="clearSimChatHistory()" title="Clear conversation history">Clear</button>
-                </form>
-                <div id="sim-chat-trades" style="margin-top:6px"></div>
+            </details>
+        </div>
+        <div class="sim-section">
+            <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">CHAT WITH PORTFOLIO MANAGER</h3>
+            <div class="ai-hint" style="margin-bottom:8px">Ask the LLM to explain decisions, or request actions like "sell AMZN to buy NVDA". If the LLM agrees, trades execute immediately (respecting risk limits).</div>
+            <div id="sim-chat-thread" class="ai-thread" style="max-height:320px">
+                <div class="ai-empty">Start a conversation with the portfolio manager.</div>
             </div>
+            <form id="sim-chat-form" class="ai-form" onsubmit="return sendSimChat(event)">
+                <input id="sim-chat-input" autocomplete="off" placeholder="Ask the portfolio manager…" disabled>
+                <button id="sim-chat-send" type="submit" disabled>Send</button>
+                <button id="sim-chat-stop" type="button" onclick="stopSimChat()" disabled>Stop</button>
+                <button type="button" onclick="clearSimChatHistory()" title="Clear conversation history">Clear</button>
+            </form>
+            <div id="sim-chat-trades" style="margin-top:6px"></div>
+        </div>
     </section>
     <div id="explain-backdrop-container">
         <div id="explain-modal">
@@ -2295,6 +2313,11 @@
             'error': 'Error',
         };
         let simRunPollTimer = null;
+        // True while the POST /api/sim/run is in flight. The poller must NOT
+        // stop on !p.running while this is true — the server may not have set
+        // running=True yet (race), or the cycle may have finished but the POST
+        // response hasn't returned. Only stop polling once the POST returns.
+        let simRunPOSTInFlight = false;
 
         function fmtElapsed(isoStart) {
             if (!isoStart) return '';
@@ -2330,8 +2353,10 @@
             try {
                 const p = await api('sim/run-status');
                 renderSimRunStatus(p);
-                if (!p.running) {
-                    // Stop polling once the cycle finishes (done or error).
+                // Only stop polling when the cycle is done AND the POST has
+                // returned. If the POST is still in flight, keep polling even
+                // if p.running is false (server may not have set it yet).
+                if (!p.running && !simRunPOSTInFlight) {
                     if (simRunPollTimer) { clearInterval(simRunPollTimer); simRunPollTimer = null; }
                 }
             } catch (e) { /* keep polling; the cycle will eventually set done/error */ }
@@ -2345,12 +2370,14 @@
             // the POST is in flight (the POST only returns when the cycle ends).
             renderSimRunStatus({ running: true, stage: 'starting', detail: 'Starting cycle', started_at: new Date().toISOString() });
             if (simRunPollTimer) clearInterval(simRunPollTimer);
+            simRunPOSTInFlight = true;
             simRunPollTimer = setInterval(pollSimRunStatus, 1000);
             try {
                 await api('sim/run', { method: 'POST' });
             } catch (e) {
                 renderSimRunStatus({ running: false, stage: 'error', detail: e.message, started_at: new Date().toISOString() });
             } finally {
+                simRunPOSTInFlight = false;
                 btn.textContent = orig; btn.classList.remove('sim-loading'); btn.disabled = false;
                 // One last poll to pick up the final 'done'/'error' state, then stop.
                 await pollSimRunStatus();
