@@ -61,6 +61,15 @@ _last_llm_vetoes: list[dict] = []
 #         "detail": str, "error": str|None}
 _run_progress: dict[str, Any] = {"running": False, "stage": "", "started_at": "", "updated_at": "", "detail": "", "error": None}
 
+# Serializes run_cycle() calls so the scheduler and a manual "Run Bot Now"
+# click can't execute simultaneously. If a cycle is already running, a
+# second call returns immediately instead of racing on trades/snapshots.
+_run_cycle_lock: asyncio.Lock = asyncio.Lock()
+# Holds the asyncio.Task for the currently in-flight run_cycle() (whether
+# triggered manually or by the scheduler). Used by the decoupled
+# /api/sim/run endpoint so the cycle survives browser disconnects.
+_run_cycle_task: asyncio.Task | None = None
+
 # How many candles to refresh for the sim universe (2y is a good balance
 # for indicator computation without excessive API load).
 _SIM_REFRESH_PERIOD = "2y"
@@ -1151,108 +1160,146 @@ async def run_cycle() -> dict[str, Any]:
     """Run one full sim cycle: deposit allowance → refresh → decide → snapshot.
 
     This is called by the scheduler or the manual trigger endpoint.
+
+    Concurrency: an asyncio.Lock serialises calls. If a cycle is already
+    running, a second call returns immediately with an "already running"
+    result instead of racing on trades/snapshots/progress state.
     """
     global _last_deterministic_trades, _last_llm_summary
 
-    # Reset the prose summary for this cycle; the LLM path will set it if it
-    # runs. The deterministic path leaves it empty so the frontend can show a
-    # "deterministic mode — no LLM was called" explanation.
-    _last_llm_summary = ""
+    # Non-blocking acquire: if another cycle is in flight, bail out
+    # immediately rather than waiting (which would queue a third cycle
+    # behind the current one and double-execute when the lock frees).
+    if _run_cycle_lock.locked():
+        logger.info("run_cycle() skipped — another cycle is already running")
+        return {"skipped": True, "reason": "already running"}
 
-    # Progress poller: mark the cycle as running with a start timestamp. Each
-    # stage updates _run_progress so the frontend can show what's happening.
-    _set_progress("starting", "Starting cycle")
-    started_at = _run_progress["started_at"]
+    async with _run_cycle_lock:
+        # Reset the prose summary for this cycle; the LLM path will set it if it
+        # runs. The deterministic path leaves it empty so the frontend can show a
+        # "deterministic mode — no LLM was called" explanation.
+        _last_llm_summary = ""
 
-    try:
-        # 1. Deposit allowance (if new month)
-        _set_progress("allowance", "Depositing monthly allowance", started_at=started_at)
-        allowance_result = await deposit_allowance()
+        # Progress poller: mark the cycle as running with a start timestamp. Each
+        # stage updates _run_progress so the frontend can show what's happening.
+        _set_progress("starting", "Starting cycle")
+        started_at = _run_progress["started_at"]
 
-        # 2. Refresh candles for the universe
-        _set_progress("refresh", "Refreshing candle data", started_at=started_at)
-        tickers = await _candidate_tickers()
-        refresh_errors: list[str] = []
-        for t in tickers:
-            try:
-                await refresh(t, _SIM_REFRESH_PERIOD)
-            except Exception as e:
-                refresh_errors.append(f"{t}: {e}")
-        _set_progress("refresh", f"Refreshed {len(tickers)} tickers", started_at=started_at)
+        try:
+            # 1. Deposit allowance (if new month)
+            _set_progress("allowance", "Depositing monthly allowance", started_at=started_at)
+            allowance_result = await deposit_allowance()
 
-        # 2b. Refresh benchmark ticker and run benchmark DCA
-        benchmark_result = {"deposited": False, "skipped": True}
-        if settings.sim_benchmark_enabled:
-            try:
-                await refresh(settings.sim_benchmark_ticker, _SIM_REFRESH_PERIOD)
-            except Exception as e:
-                refresh_errors.append(f"{settings.sim_benchmark_ticker}: {e}")
-            benchmark_result = await _benchmark_deposit_and_buy()
+            # 2. Refresh candles for the universe
+            _set_progress("refresh", "Refreshing candle data", started_at=started_at)
+            tickers = await _candidate_tickers()
+            refresh_errors: list[str] = []
+            for t in tickers:
+                try:
+                    await refresh(t, _SIM_REFRESH_PERIOD)
+                except Exception as e:
+                    refresh_errors.append(f"{t}: {e}")
+            _set_progress("refresh", f"Refreshed {len(tickers)} tickers", started_at=started_at)
 
-        # 3. Valuate
-        _set_progress("valuate", "Valuing portfolio", started_at=started_at)
-        valuation = await valuate()
+            # 2b. Refresh benchmark ticker and run benchmark DCA
+            benchmark_result = {"deposited": False, "skipped": True}
+            if settings.sim_benchmark_enabled:
+                try:
+                    await refresh(settings.sim_benchmark_ticker, _SIM_REFRESH_PERIOD)
+                except Exception as e:
+                    refresh_errors.append(f"{settings.sim_benchmark_ticker}: {e}")
+                benchmark_result = await _benchmark_deposit_and_buy()
 
-        # 4. Decide & trade
-        strategy = settings.sim_strategy.lower()
-        if strategy == "deterministic":
-            _set_progress("decide", "Deterministic engine deciding", started_at=started_at)
-            trades = await _deterministic_decide(valuation)
-            _last_deterministic_trades = trades
-        elif strategy == "llm":
-            _set_progress("signals", "Gathering signals", started_at=started_at)
-            signals = await _gather_signals(tickers)
-            news = await _gather_news(signals)
-            _set_progress("decide", "LLM deciding (pure-LLM strategy)", started_at=started_at)
-            trades = await _llm_decide(valuation, [], signals, news)
-            _last_deterministic_trades = []
-        elif strategy == "hybrid":
-            _set_progress("signals", "Gathering signals", started_at=started_at)
-            signals = await _gather_signals(tickers)
-            news = await _gather_news(signals)
-            _set_progress("propose", "Deterministic engine proposing", started_at=started_at)
-            proposals = await _deterministic_propose(valuation, signals)
-            _set_progress("decide", "LLM reviewing proposals (hybrid)", started_at=started_at)
-            trades, vetoed = await _llm_review_proposals(valuation, proposals, signals, news)
-            _last_deterministic_trades = proposals
-            _last_llm_vetoes = vetoed
-        else:
-            logger.warning("Unknown strategy '%s', falling back to deterministic", strategy)
-            _set_progress("decide", "Deterministic engine deciding (unknown strategy fallback)", started_at=started_at)
-            trades = await _deterministic_decide(valuation)
-            _last_deterministic_trades = trades
+            # 3. Valuate
+            _set_progress("valuate", "Valuing portfolio", started_at=started_at)
+            valuation = await valuate()
 
-        # 5. Snapshot for equity curve
-        _set_progress("snapshot", "Snapshotting equity curve", started_at=started_at)
-        post_valuation = await valuate()
-        allowance_total = post_valuation["allowance_total"]
-        async with Session() as s:
-            snap = SimSnapshot(
-                cash=post_valuation["cash"],
-                positions_value=post_valuation["positions_value"],
-                total_equity=post_valuation["total_equity"],
-                allowance_total=allowance_total,
-            )
-            s.add(snap)
-            await s.commit()
+            # 4. Decide & trade
+            strategy = settings.sim_strategy.lower()
+            if strategy == "deterministic":
+                _set_progress("decide", "Deterministic engine deciding", started_at=started_at)
+                trades = await _deterministic_decide(valuation)
+                _last_deterministic_trades = trades
+            elif strategy == "llm":
+                _set_progress("signals", "Gathering signals", started_at=started_at)
+                signals = await _gather_signals(tickers)
+                news = await _gather_news(signals)
+                _set_progress("decide", "LLM deciding (pure-LLM strategy)", started_at=started_at)
+                trades = await _llm_decide(valuation, [], signals, news)
+                _last_deterministic_trades = []
+            elif strategy == "hybrid":
+                _set_progress("signals", "Gathering signals", started_at=started_at)
+                signals = await _gather_signals(tickers)
+                news = await _gather_news(signals)
+                _set_progress("propose", "Deterministic engine proposing", started_at=started_at)
+                proposals = await _deterministic_propose(valuation, signals)
+                _set_progress("decide", "LLM reviewing proposals (hybrid)", started_at=started_at)
+                trades, vetoed = await _llm_review_proposals(valuation, proposals, signals, news)
+                _last_deterministic_trades = proposals
+                _last_llm_vetoes = vetoed
+            else:
+                logger.warning("Unknown strategy '%s', falling back to deterministic", strategy)
+                _set_progress("decide", "Deterministic engine deciding (unknown strategy fallback)", started_at=started_at)
+                trades = await _deterministic_decide(valuation)
+                _last_deterministic_trades = trades
 
-        # 5b. Benchmark snapshot
-        await _benchmark_snapshot()
+            # 5. Snapshot for equity curve
+            _set_progress("snapshot", "Snapshotting equity curve", started_at=started_at)
+            post_valuation = await valuate()
+            allowance_total = post_valuation["allowance_total"]
+            async with Session() as s:
+                snap = SimSnapshot(
+                    cash=post_valuation["cash"],
+                    positions_value=post_valuation["positions_value"],
+                    total_equity=post_valuation["total_equity"],
+                    allowance_total=allowance_total,
+                )
+                s.add(snap)
+                await s.commit()
 
-        _set_progress("done", f"Done — {len(trades)} trade(s)", started_at=started_at, running=False)
-        return {
-            "allowance": allowance_result,
-            "benchmark": benchmark_result,
-            "refresh_errors": refresh_errors,
-            "trades": trades,
-            "valuation": post_valuation,
-            "llm_reasoning": _last_llm_reasoning,
-        }
-    except Exception as e:
-        # Mark the cycle as failed so the frontend can show the error instead
-        # of an indeterminate "Running..." state.
-        _set_progress("error", f"{type(e).__name__}: {e}", started_at=started_at, running=False, error=str(e))
-        raise
+            # 5b. Benchmark snapshot
+            await _benchmark_snapshot()
+
+            _set_progress("done", f"Done — {len(trades)} trade(s)", started_at=started_at, running=False)
+            return {
+                "allowance": allowance_result,
+                "benchmark": benchmark_result,
+                "refresh_errors": refresh_errors,
+                "trades": trades,
+                "valuation": post_valuation,
+                "llm_reasoning": _last_llm_reasoning,
+            }
+        except Exception as e:
+            # Mark the cycle as failed so the frontend can show the error instead
+            # of an indeterminate "Running..." state.
+            _set_progress("error", f"{type(e).__name__}: {e}", started_at=started_at, running=False, error=str(e))
+            raise
+
+
+def start_run_cycle_background() -> dict[str, Any]:
+    """Launch run_cycle() as a fire-and-forget background task.
+
+    Used by the /api/sim/run endpoint so the cycle survives browser
+    disconnects — the task is not tied to the HTTP request. Returns
+    immediately with {started: true} or {started: false, reason: ...}
+    if a cycle is already running.
+    """
+    global _run_cycle_task
+    if _run_cycle_lock.locked():
+        return {"started": False, "reason": "already running"}
+
+    async def _run_and_clear():
+        global _run_cycle_task
+        try:
+            await run_cycle()
+        except Exception:
+            # run_cycle() already logged + set _run_progress to error.
+            pass
+        finally:
+            _run_cycle_task = None
+
+    _run_cycle_task = asyncio.create_task(_run_and_clear())
+    return {"started": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1610,8 +1657,19 @@ async def _scheduler_loop():
         await asyncio.sleep(wait_seconds)
 
         try:
+            # Skip if a manual run is in flight (e.g. the user clicked "Run
+            # Bot Now" shortly before the scheduled time). The lock check in
+            # run_cycle() also guards against this, but checking here too
+            # avoids logging a confusing "skipped — already running" entry
+            # every scheduled night a manual run overlaps.
+            if _run_cycle_lock.locked():
+                logger.info("Sim scheduler: skipping scheduled run — a cycle is already in progress")
+                continue
             result = await run_cycle()
-            logger.info("Sim cycle complete: %d trades", len(result["trades"]))
+            if result.get("skipped"):
+                logger.info("Sim scheduler: run_cycle skipped — %s", result.get("reason"))
+            else:
+                logger.info("Sim cycle complete: %d trades", len(result["trades"]))
         except Exception as e:
             logger.error("Sim cycle failed: %s", e, exc_info=True)
 

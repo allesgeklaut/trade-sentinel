@@ -2313,11 +2313,9 @@
             'error': 'Error',
         };
         let simRunPollTimer = null;
-        // True while the POST /api/sim/run is in flight. The poller must NOT
-        // stop on !p.running while this is true — the server may not have set
-        // running=True yet (race), or the cycle may have finished but the POST
-        // response hasn't returned. Only stop polling once the POST returns.
-        let simRunPOSTInFlight = false;
+        // True while a sim cycle is in flight. The poller keeps polling until
+        // the server says running=False, then refreshes the whole sim tab.
+        let simRunActive = false;
 
         function fmtElapsed(isoStart) {
             if (!isoStart) return '';
@@ -2353,37 +2351,45 @@
             try {
                 const p = await api('sim/run-status');
                 renderSimRunStatus(p);
-                // Only stop polling when the cycle is done AND the POST has
-                // returned. If the POST is still in flight, keep polling even
-                // if p.running is false (server may not have set it yet).
-                if (!p.running && !simRunPOSTInFlight) {
+                if (!p.running && simRunActive) {
+                    // Cycle finished (done or error) — stop polling, refresh
+                    // the whole sim tab, re-enable the button.
+                    simRunActive = false;
                     if (simRunPollTimer) { clearInterval(simRunPollTimer); simRunPollTimer = null; }
+                    const btn = document.getElementById('sim-run-btn');
+                    if (btn) { btn.textContent = 'Run Bot Now'; btn.classList.remove('sim-loading'); btn.disabled = false; }
+                    loadSimAll();
                 }
             } catch (e) { /* keep polling; the cycle will eventually set done/error */ }
         }
 
         async function runSim() {
             const btn = document.getElementById('sim-run-btn');
-            const orig = btn.textContent;
+            // Fire-and-forget: POST starts a background task and returns
+            // immediately. The cycle survives browser disconnects because
+            // it's not tied to this HTTP request. The poller tracks progress.
+            if (simRunActive) return;  // already running — ignore double-click
             btn.textContent = 'Running...'; btn.classList.add('sim-loading'); btn.disabled = true;
-            // Start the poller immediately so the user sees stage changes while
-            // the POST is in flight (the POST only returns when the cycle ends).
             renderSimRunStatus({ running: true, stage: 'starting', detail: 'Starting cycle', started_at: new Date().toISOString() });
-            if (simRunPollTimer) clearInterval(simRunPollTimer);
-            simRunPOSTInFlight = true;
-            simRunPollTimer = setInterval(pollSimRunStatus, 1000);
             try {
-                await api('sim/run', { method: 'POST' });
+                const r = await api('sim/run', { method: 'POST' });
+                if (!r.started) {
+                    // Server says a cycle is already running — just start polling.
+                }
             } catch (e) {
-                renderSimRunStatus({ running: false, stage: 'error', detail: e.message, started_at: new Date().toISOString() });
-            } finally {
-                simRunPOSTInFlight = false;
-                btn.textContent = orig; btn.classList.remove('sim-loading'); btn.disabled = false;
-                // One last poll to pick up the final 'done'/'error' state, then stop.
-                await pollSimRunStatus();
-                if (simRunPollTimer) { clearInterval(simRunPollTimer); simRunPollTimer = null; }
-                loadSimAll();
+                // 409 "already running" is expected if the user double-clicks
+                // or the scheduler just fired — treat it as "poll the running cycle".
+                if (!e.message || !e.message.includes('already running')) {
+                    renderSimRunStatus({ running: false, stage: 'error', detail: e.message, started_at: new Date().toISOString() });
+                    btn.textContent = 'Run Bot Now'; btn.classList.remove('sim-loading'); btn.disabled = false;
+                    return;
+                }
             }
+            // Start polling. The poller re-enables the button + refreshes
+            // the sim tab when the cycle finishes.
+            simRunActive = true;
+            if (simRunPollTimer) clearInterval(simRunPollTimer);
+            simRunPollTimer = setInterval(pollSimRunStatus, 1000);
         }
 
         async function resetSim() {
