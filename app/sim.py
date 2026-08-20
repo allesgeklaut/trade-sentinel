@@ -2218,6 +2218,10 @@ async def sim_chat_stream(messages: list[dict]):
                 if chunk:
                     full_parts.append(chunk)
                     yield {"type": "delta", "text": chunk}
+            elif etype == "thinking":
+                # Forward so the frontend can keep the typing indicator alive
+                # while a reasoning model (Qwen3) has no visible text yet.
+                yield {"type": "thinking"}
             elif etype == "error":
                 error_msg = evt.get("text") or "unknown error"
                 break
