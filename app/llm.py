@@ -268,6 +268,8 @@ async def chat_stream(messages: list[dict[str, str]]):
                         if delta:
                             full_parts.append(delta)
                             yield {"type": "delta", "text": delta}
+                        elif r and not full_parts:
+                            yield {"type": "thinking"}
                         if r:
                             reasoning_parts.append(r)
                         if chunk.get("model"):
@@ -322,6 +324,12 @@ async def chat_stream(messages: list[dict[str, str]]):
                         if delta:
                             full_parts.append(delta)
                             yield {"type": "delta", "text": delta}
+                        elif r and not full_parts:
+                            # The model is producing reasoning_content (thinking)
+                            # but no visible content yet — emit a thinking event
+                            # so the frontend can keep the typing indicator alive
+                            # instead of looking frozen (Qwen3 does this for minutes).
+                            yield {"type": "thinking"}
                         if r:
                             reasoning_parts.append(r)
         yield {

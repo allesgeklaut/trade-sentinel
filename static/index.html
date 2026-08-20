@@ -1383,6 +1383,12 @@
                         catch (_) { continue; }
                         if (evt.type === 'delta' && evt.text) {
                             opts.onDelta && opts.onDelta(evt.text);
+                        } else if (evt.type === 'thinking') {
+                            // The model is producing reasoning_content but no visible
+                            // content yet (Qwen3 does this for minutes). The pending
+                            // bubble's :empty::after CSS shows pulsing dots already;
+                            // this callback lets the chat optionally label them.
+                            opts.onThinking && opts.onThinking();
                         } else if (evt.type === 'done') {
                             sawDone = true;
                             opts.onDone && opts.onDone(evt);
