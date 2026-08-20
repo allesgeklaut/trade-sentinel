@@ -2161,10 +2161,41 @@
             } catch (e) { document.getElementById('sim-summary').innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
 
+        const VIENNA_TZ = 'Europe/Vienna';
+
+        function fmtVienna(iso, withSeconds) {
+            if (!iso) return '';
+            return new Intl.DateTimeFormat('en-GB', {
+                timeZone: VIENNA_TZ,
+                year: 'numeric', month: 'short', day: 'numeric',
+                hour: '2-digit', minute: '2-digit', ...(withSeconds ? { second: '2-digit' } : {}),
+                timeZoneName: 'short',
+            }).format(new Date(iso));
+        }
+
+        function viennaTimeParts(ts) {
+            const p = {};
+            for (const part of new Intl.DateTimeFormat('en-GB', {
+                timeZone: VIENNA_TZ,
+                year: 'numeric', month: 'short', day: 'numeric',
+                hour: '2-digit', minute: '2-digit',
+            }).formatToParts(new Date(ts * 1000))) {
+                p[part.type] = part.value;
+            }
+            return p;
+        }
+
+        function viennaTickMarkFormatter(time, tickMarkType) {
+            const p = viennaTimeParts(time);
+            if (tickMarkType === 0) return `${p.day} ${p.month} ${p.hour}:${p.minute}`;
+            if (tickMarkType === 1 || tickMarkType === 2) return p.month;
+            return p.year;
+        }
+
         async function loadSimTrades() {
             try {
                 const t = await api('sim/trades?limit=50');
-                document.getElementById('sim-trades').innerHTML = t.length ? `<table><tr><th>Time</th><th>Ticker</th><th>Side</th><th>Shares</th><th>Price</th><th>Reason</th></tr>${t.map(x => `<tr><td>${escapeHtml(x.at || '')}</td><td>${escapeHtml(x.ticker)}</td><td class="${x.side === 'BUY' ? 'buy' : 'sell'}">${escapeHtml(x.side)}</td><td>${escapeHtml(String(x.shares))}</td><td>$${x.price.toFixed(2)}</td><td style="text-align:left">${escapeHtml(x.reason || '')}</td></tr>`).join('')}</table>` : '<div class="sim-empty">No trades yet — run the bot to start.</div>';
+                document.getElementById('sim-trades').innerHTML = t.length ? `<table><tr><th>Time (Europe/Vienna)</th><th>Ticker</th><th>Side</th><th>Shares</th><th>Price</th><th>Reason</th></tr>${t.map(x => `<tr><td>${escapeHtml(fmtVienna(x.at, true))}</td><td>${escapeHtml(x.ticker)}</td><td class="${x.side === 'BUY' ? 'buy' : 'sell'}">${escapeHtml(x.side)}</td><td>${escapeHtml(String(x.shares))}</td><td>$${x.price.toFixed(2)}</td><td style="text-align:left">${escapeHtml(x.reason || '')}</td></tr>`).join('')}</table>` : '<div class="sim-empty">No trades yet — run the bot to start.</div>';
             } catch (e) { document.getElementById('sim-trades').innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
 
@@ -2182,7 +2213,16 @@
             simChart = LightweightCharts.createChart(document.getElementById('sim-chart'), {
                 height: 320, layout: { background: { color: '#071009' }, textColor: '#b7ffc0' },
                 grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } },
-                timeScale: { timeVisible: true, secondsVisible: false }
+                timeScale: {
+                    timeVisible: true, secondsVisible: false,
+                    tickMarkFormatter: viennaTickMarkFormatter,
+                },
+                localization: {
+                    timeFormatter: (time) => {
+                        const p = viennaTimeParts(time);
+                        return `${p.day} ${p.month} '${p.year.slice(2)}  ${p.hour}:${p.minute}`;
+                    },
+                }
             });
             const line = simChart.addLineSeries({ color: '#42ff72', lineWidth: 2 });
             line.setData(snaps.map(s => ({ time: Math.floor(new Date(s.at).getTime() / 1000), value: s.total_equity })));
