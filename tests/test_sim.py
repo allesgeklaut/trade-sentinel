@@ -74,6 +74,22 @@ async def with_cash(mem_db):
     return mem_db
 
 
+@pytest.fixture
+def llm_backend(monkeypatch):
+    """Configure a fake LLM backend so sim.chat/sim_chat reach the mocked
+    HTTP client instead of short-circuiting on "No LLM backend configured".
+
+    Without this, the sim-chat and LLM-decide tests only pass when a real
+    backend exists in the operator's .env, and several of them "pass" by
+    silently hitting the no-backend fallback instead of exercising the mock.
+    """
+    monkeypatch.setattr(sim.llm_mod.settings, "llm_backends", json.dumps([
+        {"name": "test", "type": "ollama", "url": "http://test:11434", "model": "m1"},
+    ]))
+    monkeypatch.setattr(sim.llm_mod.settings, "llm_state_file",
+                        "/tmp/test-llm-state-none.json")
+
+
 # ---------------------------------------------------------------------------
 # Benchmark (DCA control portfolio)
 # ---------------------------------------------------------------------------
@@ -487,6 +503,46 @@ class TestParseLLMDecisions:
             assert "shares" not in r
             assert "amount" not in r
 
+    def test_prose_brackets_before_json(self):
+        """Prose containing '[' must not be mistaken for the decisions array."""
+        content = (
+            "I reviewed [NVDA] and [AMD]. The setup is mixed.\n"
+            '[{"ticker":"NVDA","action":"HOLD","reason":"overbought"}]'
+        )
+        result = sim._parse_llm_decisions(content)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["ticker"] == "NVDA"
+        assert result[0]["action"] == "HOLD"
+
+    def test_brackets_inside_json_strings(self):
+        """Square brackets inside reason strings must not truncate the array."""
+        content = (
+            'Summary [note]. [{"ticker":"X","action":"HOLD",'
+            '"reason":"see [1] and [2] for detail"}]'
+        )
+        result = sim._parse_llm_decisions(content)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["ticker"] == "X"
+        assert result[0]["reason"] == "see [1] and [2] for detail"
+
+    def test_trailing_prose_after_json(self):
+        """Prose after the array should not break parsing."""
+        content = (
+            'Here is my read.\n'
+            '[{"ticker":"SPY","action":"SELL","reason":"trim"}]\n'
+            "That is all, happy to elaborate."
+        )
+        result = sim._parse_llm_decisions(content)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["ticker"] == "SPY"
+
+    def test_prose_brackets_no_array_returns_none(self):
+        """Prose with brackets but no real decisions array → None (fallback)."""
+        assert sim._parse_llm_decisions("I reviewed [NVDA] but decided nothing.") is None
+
 
 class TestExtractSummary:
     """Tests for sim._extract_summary — pulls the prose the LLM writes before
@@ -530,6 +586,22 @@ class TestExtractSummary:
         )
         # The "Decisions:" lead-in is trimmed, the rest preserved.
         assert sim._extract_summary(content) == "Here is my read.\nDecisions"
+
+    def test_prose_brackets_before_json(self):
+        """Prose containing '[' must not corrupt the summary extraction."""
+        content = (
+            "I reviewed [NVDA] and [AMD].\n"
+            '[{"ticker":"NVDA","action":"HOLD","reason":"ok"}]'
+        )
+        assert sim._extract_summary(content) == "I reviewed [NVDA] and [AMD]."
+
+    def test_brackets_inside_json_strings(self):
+        """Brackets inside the JSON itself must not truncate the summary."""
+        content = (
+            "Holding all.\n"
+            '[{"ticker":"X","action":"HOLD","reason":"see [1]"}]'
+        )
+        assert sim._extract_summary(content) == "Holding all."
 
 
 class TestBuildLLMContext:
@@ -598,7 +670,7 @@ class TestLLMDecide:
 
         monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
 
-    async def test_fractional_sell_and_clamped_buy(self, with_cash, monkeypatch):
+    async def test_fractional_sell_and_clamped_buy(self, with_cash, monkeypatch, llm_backend):
         """A SELL with 'amount' sells only that value; a BUY is clamped to budget."""
         # Seed a position: 30 shares of AAPL @ 100 = $3000
         await sim._exec_buy("AAPL", 100.0, 3000.0, "seed")
@@ -646,7 +718,7 @@ class TestLLMDecide:
             assert msft is not None
             assert msft.shares > 0
 
-    async def test_unparseable_decision_falls_back(self, with_cash, monkeypatch):
+    async def test_unparseable_decision_falls_back(self, with_cash, monkeypatch, llm_backend):
         """A genuinely unparseable response (not an empty array) should fall
         back to the deterministic candidate trades."""
         # LLM returns garbage that isn't a JSON array.
@@ -672,7 +744,7 @@ class TestLLMDecide:
         assert executed[0]["side"] == "BUY"
         assert executed[0] is deterministic[0]
 
-    async def test_empty_decisions_do_not_fall_back(self, with_cash, monkeypatch):
+    async def test_empty_decisions_do_not_fall_back(self, with_cash, monkeypatch, llm_backend):
         """An empty [] decision should execute no trades, not fall back to
         deterministic candidates."""
         await sim._exec_buy("AAPL", 100.0, 2000.0, "seed")  # 20 shares
@@ -699,7 +771,7 @@ class TestLLMDecide:
             assert pos is not None  # position untouched
             assert pos.shares == pytest.approx(20.0, abs=0.001)
 
-    async def test_sell_without_size_sells_entire_position(self, with_cash, monkeypatch):
+    async def test_sell_without_size_sells_entire_position(self, with_cash, monkeypatch, llm_backend):
         """A SELL with no size field sells the whole position (default)."""
         await sim._exec_buy("AAPL", 100.0, 2000.0, "seed")  # 20 shares
 
@@ -727,6 +799,40 @@ class TestLLMDecide:
             from sqlalchemy import select as sa_select
             pos = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "AAPL"))
             assert pos is None  # fully sold
+
+
+class TestRunCycleResetsLLMState:
+    """run_cycle() must reset all per-cycle LLM state at the start, so a
+    deterministic cycle never re-reports a previous LLM cycle's reasoning
+    (the frontend's llm_called flag and reasoning panel depend on this)."""
+
+    async def test_llm_state_cleared_before_deterministic_cycle(self, mem_db, monkeypatch, llm_backend):
+        # Stale state from a "previous" hybrid cycle.
+        sim._last_llm_reasoning = "Some previous cycle's reasoning"
+        sim._last_llm_summary = "Previous summary"
+        sim._last_llm_decisions = [{"ticker": "OLD", "action": "BUY", "reason": "stale"}]
+        sim._last_llm_vetoes = [{"ticker": "OLD", "action": "HOLD", "reason": "stale"}]
+
+        monkeypatch.setattr(settings, "sim_strategy", "deterministic")
+        monkeypatch.setattr(settings, "sim_benchmark_enabled", False)
+
+        # Minimal run_cycle setup: no candidates, no benchmark.
+        async def mock_candidates():
+            return []
+        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
+
+        result = await sim.run_cycle()
+
+        assert "skipped" not in result, "cycle should have run"
+        assert sim._last_llm_reasoning == ""
+        assert sim._last_llm_summary == ""
+        assert sim._last_llm_decisions == []
+        assert sim._last_llm_vetoes == []
+
+        # The frontend-facing summary must report the LLM as not called.
+        summary = sim.get_last_llm_summary()
+        assert summary["llm_called"] is False
+        assert summary["raw"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1364,7 +1470,7 @@ class TestSimChatPartialSell:
     (not None, which would liquidate the entire position).
     """
 
-    async def test_sell_with_amount_trims_position(self, with_cash, monkeypatch):
+    async def test_sell_with_amount_trims_position(self, with_cash, monkeypatch, llm_backend):
         """SELL with 'amount' should sell only the equivalent shares, not all."""
         # Setup: buy 100 shares of AAPL at $100 = $10,000
         await sim._exec_buy("AAPL", 100.0, 10000.0, "initial buy")
@@ -1422,7 +1528,7 @@ class TestSimChatPartialSell:
             assert pos is not None, "Position should still exist after partial sell"
             assert pos.shares == pytest.approx(70.0, abs=0.001)
 
-    async def test_sell_with_shares_trims_position(self, with_cash, monkeypatch):
+    async def test_sell_with_shares_trims_position(self, with_cash, monkeypatch, llm_backend):
         """SELL with 'shares' should sell exactly that many shares."""
         await sim._exec_buy("AAPL", 100.0, 10000.0, "initial buy")
 
@@ -1470,7 +1576,7 @@ class TestSimChatPartialSell:
             assert pos is not None
             assert pos.shares == pytest.approx(75.0, abs=0.001)
 
-    async def test_sell_without_size_liquidates_all(self, with_cash, monkeypatch):
+    async def test_sell_without_size_liquidates_all(self, with_cash, monkeypatch, llm_backend):
         """SELL without 'shares' or 'amount' should sell the entire position (backward compat)."""
         await sim._exec_buy("AAPL", 100.0, 5000.0, "initial buy")  # 50 shares
 
@@ -1517,7 +1623,7 @@ class TestSimChatPartialSell:
             pos = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "AAPL"))
             assert pos is None, "Position should be fully liquidated"
 
-    async def test_sell_amount_exceeding_position_sells_all(self, with_cash, monkeypatch):
+    async def test_sell_amount_exceeding_position_sells_all(self, with_cash, monkeypatch, llm_backend):
         """If 'amount' exceeds the position value, sell the entire position."""
         await sim._exec_buy("AAPL", 100.0, 3000.0, "initial buy")  # 30 shares = $3000
 
@@ -1563,7 +1669,7 @@ class TestSimChatPartialSell:
 class TestSimChatPartialBuy:
     """Tests that sim_chat honours partial BUY sizes from the action block."""
 
-    async def test_buy_with_amount(self, with_cash, monkeypatch):
+    async def test_buy_with_amount(self, with_cash, monkeypatch, llm_backend):
         """BUY with 'amount' should invest at most that many dollars."""
         # Raise max position % so the $2000 amount isn't clamped to $1500
         monkeypatch.setattr(settings, "sim_max_position_pct", 30.0)
@@ -1610,7 +1716,7 @@ class TestSimChatPartialBuy:
         # $2000 / $100 = 20 shares
         assert trade["shares"] == pytest.approx(20.0, abs=0.001)
 
-    async def test_buy_with_shares(self, with_cash, monkeypatch):
+    async def test_buy_with_shares(self, with_cash, monkeypatch, llm_backend):
         """BUY with 'shares' should buy at most that many shares (clamped to budget)."""
         # Raise max position % so the requested 15 shares aren't cash/max-clamped.
         monkeypatch.setattr(settings, "sim_max_position_pct", 30.0)
@@ -1653,7 +1759,7 @@ class TestSimChatPartialBuy:
         # 15 shares * $100 = $1500 budget → 15 shares bought
         assert result["trades"][0]["shares"] == pytest.approx(15.0, abs=0.001)
 
-    async def test_buy_amount_clamped_to_max_budget(self, with_cash, monkeypatch):
+    async def test_buy_amount_clamped_to_max_budget(self, with_cash, monkeypatch, llm_backend):
         """BUY 'amount' exceeding the risk-limited budget should be clamped."""
         # Cash = $10,000, min_cash = 5% = $500, so max spend = $9,500
         # max_position = 10% of $10,000 = $1,000
@@ -1696,7 +1802,7 @@ class TestSimChatPartialBuy:
         # max_position = 10% of $10,000 = $1,000 → 10 shares at $100
         assert result["trades"][0]["shares"] == pytest.approx(10.0, abs=0.001)
 
-    async def test_buy_without_amount_uses_max_budget(self, with_cash, monkeypatch):
+    async def test_buy_without_amount_uses_max_budget(self, with_cash, monkeypatch, llm_backend):
         """BUY without 'amount' or 'shares' should use the max allowed budget."""
         async def mock_close(ticker):
             return 100.0 if ticker == "AAPL" else None
@@ -1740,7 +1846,7 @@ class TestSimChatPartialBuy:
 class TestSimChatReserveOverride:
     """Tests that sim_chat can spend the cash reserve only with use_reserve."""
 
-    async def test_buy_without_reserve_is_clamped(self, with_cash, monkeypatch):
+    async def test_buy_without_reserve_is_clamped(self, with_cash, monkeypatch, llm_backend):
         """A normal BUY (no use_reserve) cannot spend below the 5% cash floor."""
         # Raise max position so the cash floor is the only clamp in play.
         monkeypatch.setattr(settings, "sim_max_position_pct", 100.0)
@@ -1783,7 +1889,7 @@ class TestSimChatReserveOverride:
         # min_cash = 5% of $10,000 = $500 → budget = $9,500 → 95 shares @ $100
         assert result["trades"][0]["shares"] == pytest.approx(95.0, abs=0.001)
 
-    async def test_buy_with_reserve_spends_dry_powder(self, with_cash, monkeypatch):
+    async def test_buy_with_reserve_spends_dry_powder(self, with_cash, monkeypatch, llm_backend):
         """A BUY with use_reserve=true can spend below the cash floor (to $0)."""
         monkeypatch.setattr(settings, "sim_max_position_pct", 100.0)
 
@@ -1829,7 +1935,7 @@ class TestSimChatReserveOverride:
 class TestSimChatMultipleActions:
     """Tests that sim_chat correctly processes multiple actions in one response."""
 
-    async def test_sell_then_buy(self, with_cash, monkeypatch):
+    async def test_sell_then_buy(self, with_cash, monkeypatch, llm_backend):
         """Sell one ticker, then buy another — both should execute."""
         # Raise max position % so the $2000 SPY buy isn't clamped to $1500
         monkeypatch.setattr(settings, "sim_max_position_pct", 30.0)
@@ -1887,7 +1993,7 @@ class TestSimChatMultipleActions:
         assert result["trades"][1]["side"] == "BUY"
         assert result["trades"][1]["shares"] == pytest.approx(5.0, abs=0.001)
 
-    async def test_no_action_block_returns_text_only(self, with_cash, monkeypatch):
+    async def test_no_action_block_returns_text_only(self, with_cash, monkeypatch, llm_backend):
         """If the LLM doesn't include an action block, just return the text."""
         async def mock_context():
             return "mock context"

@@ -70,34 +70,46 @@ async def run(name):
     started = datetime.now(timezone.utc).isoformat()
     _set_screener_progress("update", name, done=0, total=len(symbols),
                            current="", started_at=started)
-    for i, symbol in enumerate(symbols, start=1):
-        _set_screener_progress("update", name, done=i - 1, total=len(symbols),
-                               current=symbol, started_at=started)
-        try:
-            await refresh(symbol)
-            rows = await candles(symbol)
-            out = score(rows)
-            if not out: continue
-            # Attach BUY/SELL/HOLD signal from the full analysis engine.
-            # candles() already returned ~2y of data from refresh(); compute()
-            # needs >=206 rows. New IPOs with insufficient history get "N/A".
+    error: str | None = None
+    done = 0
+    try:
+        for i, symbol in enumerate(symbols, start=1):
+            _set_screener_progress("update", name, done=i - 1, total=len(symbols),
+                                   current=symbol, started_at=started)
+            done = i
             try:
-                r = compute(rows)
-                out["action"] = r["action"]
-                out["strength"] = r["strength"]
-            except ValueError:
-                out["action"] = "N/A"
-                out["strength"] = None
-            results.append((symbol, out))
-        except Exception as e:
-            logger.warning("screener skip %s: %s", symbol, e)
-            continue
-    async with Session() as s:
-        await s.execute(delete(ScreenerResult).where(ScreenerResult.universe==name))
-        for symbol,x in results: s.add(ScreenerResult(universe=name,ticker=symbol,updated_at=datetime.now(timezone.utc),**x))
-        await s.commit()
-    _set_screener_progress("update", name, done=len(symbols), total=len(symbols),
-                           current="", running=False, started_at=started)
+                await refresh(symbol)
+                rows = await candles(symbol)
+                out = score(rows)
+                if not out: continue
+                # Attach BUY/SELL/HOLD signal from the full analysis engine.
+                # candles() already returned ~2y of data from refresh(); compute()
+                # needs >=206 rows. New IPOs with insufficient history get "N/A".
+                try:
+                    r = compute(rows)
+                    out["action"] = r["action"]
+                    out["strength"] = r["strength"]
+                except ValueError:
+                    out["action"] = "N/A"
+                    out["strength"] = None
+                results.append((symbol, out))
+            except Exception as e:
+                logger.warning("screener skip %s: %s", symbol, e)
+                continue
+        async with Session() as s:
+            await s.execute(delete(ScreenerResult).where(ScreenerResult.universe==name))
+            for symbol,x in results: s.add(ScreenerResult(universe=name,ticker=symbol,updated_at=datetime.now(timezone.utc),**x))
+            await s.commit()
+    except Exception as e:
+        logger.error("screener run %s failed: %s", name, e)
+        error = str(e)
+        raise
+    finally:
+        # Always clear the running flag (and surface the error, if any) so the
+        # frontend poller never freezes at "Updating N/M" on failure.
+        _set_screener_progress("update", name, done=done, total=len(symbols),
+                               current="", running=False, started_at=started,
+                               error=error)
     return {"universe":name,"processed":len(symbols),"ranked":len(results)}
 async def results(name):
     async with Session() as s:
@@ -121,27 +133,35 @@ async def refresh_incremental(name: str, max_age_days: int = 3) -> dict:
     _set_screener_progress("refresh", name, done=0, total=len(symbols),
                            current="", started_at=started)
 
-    for i, symbol in enumerate(symbols, start=1):
-        _set_screener_progress("refresh", name, done=i - 1, total=len(symbols),
-                               current=symbol, started_at=started)
-        try:
-            async with Session() as s:
-                latest = await s.scalar(
-                    select(func.max(Candle.timestamp)).where(Candle.ticker == symbol)
-                )
-            if latest is not None and latest.replace(tzinfo=timezone.utc) >= cutoff:
-                skipped += 1
-                continue
-            await refresh(symbol, "2y")
-            refreshed += 1
-        except Exception as e:
-            errors.append(f"{symbol}: {e}")
-            logger.warning("incremental refresh skip %s: %s", symbol, e)
+    error: str | None = None
+    try:
+        for i, symbol in enumerate(symbols, start=1):
+            _set_screener_progress("refresh", name, done=i - 1, total=len(symbols),
+                                   current=symbol, started_at=started)
+            try:
+                async with Session() as s:
+                    latest = await s.scalar(
+                        select(func.max(Candle.timestamp)).where(Candle.ticker == symbol)
+                    )
+                if latest is not None and latest.replace(tzinfo=timezone.utc) >= cutoff:
+                    skipped += 1
+                    continue
+                await refresh(symbol, "2y")
+                refreshed += 1
+            except Exception as e:
+                errors.append(f"{symbol}: {e}")
+                logger.warning("incremental refresh skip %s: %s", symbol, e)
 
-    logger.info("Incremental refresh %s: %d refreshed, %d skipped, %d errors",
-                name, refreshed, skipped, len(errors))
-    _set_screener_progress("refresh", name, done=len(symbols), total=len(symbols),
-                           current="", running=False, started_at=started)
+        logger.info("Incremental refresh %s: %d refreshed, %d skipped, %d errors",
+                    name, refreshed, skipped, len(errors))
+    except Exception as e:
+        logger.error("incremental refresh %s failed: %s", name, e)
+        error = str(e)
+        raise
+    finally:
+        _set_screener_progress("refresh", name, done=len(symbols), total=len(symbols),
+                               current="", running=False, started_at=started,
+                               error=error)
     return {"universe": name, "refreshed": refreshed, "skipped": skipped,
             "errors": errors, "total": len(symbols)}
 
@@ -160,18 +180,26 @@ async def load_deep_history(name: str, period: str = "10y") -> dict:
     _set_screener_progress("deep", name, done=0, total=len(symbols),
                            current="", started_at=started)
 
-    for i, symbol in enumerate(symbols, start=1):
-        _set_screener_progress("deep", name, done=i - 1, total=len(symbols),
-                               current=symbol, started_at=started)
-        try:
-            await refresh(symbol, period)
-            loaded += 1
-        except Exception as e:
-            errors.append(f"{symbol}: {e}")
-            logger.warning("deep load skip %s: %s", symbol, e)
+    error: str | None = None
+    try:
+        for i, symbol in enumerate(symbols, start=1):
+            _set_screener_progress("deep", name, done=i - 1, total=len(symbols),
+                                   current=symbol, started_at=started)
+            try:
+                await refresh(symbol, period)
+                loaded += 1
+            except Exception as e:
+                errors.append(f"{symbol}: {e}")
+                logger.warning("deep load skip %s: %s", symbol, e)
 
-    logger.info("Deep load %s (%s): %d loaded, %d errors", name, period, loaded, len(errors))
-    _set_screener_progress("deep", name, done=len(symbols), total=len(symbols),
-                           current="", running=False, started_at=started)
+        logger.info("Deep load %s (%s): %d loaded, %d errors", name, period, loaded, len(errors))
+    except Exception as e:
+        logger.error("deep load %s failed: %s", name, e)
+        error = str(e)
+        raise
+    finally:
+        _set_screener_progress("deep", name, done=len(symbols), total=len(symbols),
+                               current="", running=False, started_at=started,
+                               error=error)
     return {"universe": name, "period": period, "loaded": loaded,
             "errors": errors, "total": len(symbols)}

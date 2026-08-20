@@ -1268,7 +1268,11 @@
 
         function renderMessage(m) {
             if (m.role === 'assistant' && typeof marked !== 'undefined') {
-                const html = marked.parse(m.content, { renderer: markedRenderer });
+                // Reasoning-only models (Qwen3) may emit a thinking event with
+                // no visible text yet — label the pending bubble until deltas
+                // arrive instead of showing a bare empty box.
+                const text = (m.pending && m.thinking && !m.content) ? 'Thinking…' : m.content;
+                const html = marked.parse(text, { renderer: markedRenderer });
                 const pending = m.pending ? ' pending' : '';
                 return `<div class="ai-msg ${m.role}${pending}">${html}</div>`;
             }
@@ -1434,19 +1438,30 @@
                         pending.content += chunk;
                         renderChat();
                     },
+                    onThinking: () => {
+                        // Qwen3-style reasoning: no visible content yet.
+                        pending.thinking = true;
+                        renderChat();
+                    },
                     onDone: (env) => {
                         // Replace the pending bubble with the final text.
                         chatState.messages.pop();
                         if (env.aborted) {
                             chatState.messages.push({ role: 'assistant', content: pending.content || 'Request stopped.' });
                         } else {
-                            chatState.messages.push({ role: 'assistant', content: env.text || pending.content });
+                            // A reasoning-only model may finish with no visible
+                            // text at all — say so instead of an empty bubble.
+                            const finalText = env.text || pending.content || (pending.thinking ? 'Thought about it — no visible reply.' : '');
+                            chatState.messages.push({ role: 'assistant', content: finalText });
                         }
                         renderChat();
                     },
                     onError: (msg) => {
                         chatState.messages.pop();
-                        chatState.messages.push({ role: 'assistant', content: 'Error: ' + msg });
+                        // Keep any partial text that already streamed; only
+                        // fall back to a bare error message if nothing arrived.
+                        const text = pending.content || ('Error: ' + msg);
+                        chatState.messages.push({ role: 'assistant', content: text });
                         renderChat();
                     },
                 });
@@ -1673,7 +1688,11 @@
 
         async function api(p, o) {
             let r = await fetch('/api/' + p, o);
-            if (!r.ok) throw Error(await r.text());
+            if (!r.ok) {
+                const err = new Error(await r.text());
+                err.status = r.status;
+                throw err;
+            }
             return r.json();
         }
 
@@ -2003,6 +2022,11 @@
             const total = p.total || 0;
             const done = p.done || 0;
             const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+            if (p.error) {
+                // The op failed — show the error and stop the bar at its last position.
+                el.innerHTML = '<span style="color:#ff5c70">⚠ ' + escapeHtml(label + ' failed — ' + p.error) + '</span>';
+                return;
+            }
             if (p.op && !p.running) {
                 // Finished — show a green check + counts.
                 el.innerHTML = '<span style="color:#42ff72">✓ ' + label + ' done — ' + done + '/' + total + ' tickers</span>';
@@ -2385,7 +2409,7 @@
             } catch (e) {
                 // 409 "already running" is expected if the user double-clicks
                 // or the scheduler just fired — treat it as "poll the running cycle".
-                if (!e.message || !e.message.includes('already running')) {
+                if (e.status !== 409) {
                     renderSimRunStatus({ running: false, stage: 'error', detail: e.message, started_at: new Date().toISOString() });
                     btn.textContent = 'Run Bot Now'; btn.classList.remove('sim-loading'); btn.disabled = false;
                     return;
@@ -2428,7 +2452,11 @@
             const nearBottom = (thread.scrollHeight - thread.scrollTop - thread.clientHeight) < 50;
             thread.innerHTML = simChatState.messages.map(m => {
                 if (m.role === 'assistant' && typeof marked !== 'undefined') {
-                    const html = marked.parse(m.content, { renderer: markedRenderer });
+                    // Reasoning-only models (Qwen3) may emit a thinking event
+                    // with no visible text — label the pending bubble instead
+                    // of showing a bare empty box.
+                    const text = (m.pending && m.thinking && !m.content) ? 'Thinking…' : m.content;
+                    const html = marked.parse(text, { renderer: markedRenderer });
                     const pending = m.pending ? ' pending' : '';
                     return '<div class="ai-msg ' + m.role + pending + '">' + html + '</div>';
                 }
@@ -2470,13 +2498,21 @@
                         pending.content += chunk;
                         renderSimChat();
                     },
+                    onThinking: () => {
+                        // Qwen3-style reasoning: no visible content yet.
+                        pending.thinking = true;
+                        renderSimChat();
+                    },
                     onDone: (env) => {
                         // Swap the pending raw bubble for the stripped display_text.
                         simChatState.messages.pop();
                         if (env.aborted) {
                             simChatState.messages.push({ role: 'assistant', content: pending.content || 'Request stopped.' });
                         } else {
-                            simChatState.messages.push({ role: 'assistant', content: env.text || pending.content });
+                            // A reasoning-only model may finish with no visible
+                            // text at all — say so instead of leaving an empty bubble.
+                            const finalText = env.text || pending.content || (pending.thinking ? 'Thought about it — no visible reply.' : '');
+                            simChatState.messages.push({ role: 'assistant', content: finalText });
                             // Trades are only on done, not on abort/error.
                             if (env.trades && env.trades.length) {
                                 showSimChatTrades(env.trades);
@@ -2489,7 +2525,10 @@
                     },
                     onError: (msg) => {
                         simChatState.messages.pop();
-                        simChatState.messages.push({ role: 'assistant', content: 'Error: ' + msg });
+                        // Keep any partial text that already streamed; only
+                        // fall back to a bare error message if nothing arrived.
+                        const text = pending.content || ('Error: ' + msg);
+                        simChatState.messages.push({ role: 'assistant', content: text });
                         renderSimChat();
                     },
                 });

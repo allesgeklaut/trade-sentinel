@@ -674,6 +674,42 @@ def _build_llm_context(
     return "\n".join(lines)
 
 
+def _find_json_array(text: str) -> tuple[int, int] | None:
+    """Locate the LLM's JSON array (start, end) inside ``text``.
+
+    The model's response may contain prose before/after the array (the prompt
+    asks for a prose summary first), and that prose — or a JSON string inside
+    the array itself — can contain square brackets (e.g. "I reviewed [NVDA]"
+    or a reason like "see [1]"). A naive ``find("[")/rfind("]")`` pair
+    truncates at such a bracket.
+
+    Instead we try parsing at every ``[`` and keep the candidate that (a)
+    decodes as a JSON list and (b) looks like a decisions array — it holds at
+    least one dict, or is an empty array (a valid "do nothing" decision).
+    Among candidates we pick the one that ends latest: the real array is the
+    last JSON value in the output per the prompt, and bracket fragments inside
+    JSON strings always end before their enclosing array. Prose-only text
+    yields None.
+    """
+    best: tuple[int, int] | None = None
+    for cand in range(len(text)):
+        if text[cand] != "[":
+            continue
+        try:
+            obj, end = json.JSONDecoder().raw_decode(text[cand:])
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, list):
+            continue
+        # "[2]" inside prose or a JSON string parses as a list but is not the
+        # decisions array. Empty arrays are kept (valid "do nothing").
+        if obj and not any(isinstance(d, dict) for d in obj):
+            continue
+        if best is None or cand + end >= best[1]:
+            best = (cand, cand + end)
+    return best
+
+
 def _parse_llm_decisions(content: str) -> list[dict] | None:
     """Parse the LLM JSON array output, tolerating minor formatting issues.
 
@@ -692,12 +728,12 @@ def _parse_llm_decisions(content: str) -> list[dict] | None:
         if text.endswith("```"):
             text = text[:-3].strip()
 
-    # Extract the outermost JSON array
-    start = text.find("[")
-    end = text.rfind("]")
-    if start == -1 or end == -1 or end <= start:
+    # Locate the real JSON array — prose containing "[" must not confuse us.
+    loc = _find_json_array(text)
+    if loc is None:
         return None
-    json_str = text[start:end + 1]
+    start, end = loc
+    json_str = text[start:end]
 
     try:
         decisions = json.loads(json_str)
@@ -758,11 +794,11 @@ def _extract_summary(content: str | None) -> str:
         if first_nl_after_fence != -1:
             prose = text[:fence_idx].strip()
             return prose.rstrip(":").strip()
-    start = text.find("[")
-    if start <= 0:
+    loc = _find_json_array(text)
+    if loc is None or loc[0] <= 0:
         # No JSON array, or it's at the very start — no prose.
         return ""
-    prose = text[:start].strip()
+    prose = text[:loc[0]].strip()
     # Trim a trailing colon or "Then:" / "Decisions:" style lead-ins the LLM
     # might add right before the array.
     prose = prose.rstrip(":").strip()
@@ -1222,7 +1258,8 @@ async def run_cycle() -> dict[str, Any]:
     running, a second call returns immediately with an "already running"
     result instead of racing on trades/snapshots/progress state.
     """
-    global _last_deterministic_trades, _last_llm_summary
+    global _last_deterministic_trades, _last_llm_reasoning, _last_llm_summary
+    global _last_llm_decisions, _last_llm_vetoes
 
     # Non-blocking acquire: if another cycle is in flight, bail out
     # immediately rather than waiting (which would queue a third cycle
@@ -1232,10 +1269,14 @@ async def run_cycle() -> dict[str, Any]:
         return {"skipped": True, "reason": "already running"}
 
     async with _run_cycle_lock:
-        # Reset the prose summary for this cycle; the LLM path will set it if it
-        # runs. The deterministic path leaves it empty so the frontend can show a
-        # "deterministic mode — no LLM was called" explanation.
+        # Reset all per-cycle LLM state; the LLM paths set them if they run.
+        # The deterministic path leaves them empty so the frontend can show a
+        # "deterministic mode — no LLM was called" explanation instead of
+        # re-reporting a previous cycle's reasoning as if it belonged here.
+        _last_llm_reasoning = ""
         _last_llm_summary = ""
+        _last_llm_decisions = []
+        _last_llm_vetoes = []
 
         # Progress poller: mark the cycle as running with a start timestamp. Each
         # stage updates _run_progress so the frontend can show what's happening.

@@ -192,6 +192,56 @@ class TestRunErrorHandling:
             assert len(rows) == 1
             assert rows[0].ticker == "GOOD"
 
+    async def test_run_clears_running_flag_on_failure(self, tmp_path, monkeypatch, mem_db):
+        """If the run aborts (e.g. commit failure), the progress state must be
+        cleared with an error so the frontend poller doesn't freeze at
+        "Updating N/M" forever."""
+        monkeypatch.setattr(screener, "_UNIVERSES_DIR", tmp_path)
+        (tmp_path / "boom.txt").write_text("AAPL\n")
+
+        async def mock_refresh(ticker, period="2y"):
+            pass
+
+        async def mock_candles(ticker, period=None):
+            from datetime import datetime, timedelta
+            base = datetime(2022, 1, 3)
+            return [
+                {
+                    "timestamp": (base + timedelta(days=i)).strftime("%Y-%m-%d"),
+                    "open": 100.0, "high": 100.5, "low": 99.5,
+                    "close": 100.0, "volume": 1_000_000.0,
+                }
+                for i in range(250)
+            ]
+
+        monkeypatch.setattr(screener, "refresh", mock_refresh)
+        monkeypatch.setattr(screener, "candles", mock_candles)
+
+        # Break the DB session so the final commit raises.
+        class BoomSession:
+            def __init__(self, *a, **k):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            async def execute(self, *a, **k):
+                raise RuntimeError("simulated commit failure")
+            async def add(self, *a, **k):
+                pass
+            async def commit(self, *a, **k):
+                raise RuntimeError("simulated commit failure")
+
+        monkeypatch.setattr(screener, "Session", BoomSession)
+
+        with pytest.raises(RuntimeError, match="simulated commit failure"):
+            await screener.run("boom")
+
+        progress = screener.get_screener_progress()
+        assert progress["running"] is False
+        assert progress["error"] == "simulated commit failure"
+        assert progress["op"] == "update"
+
 
 # ---------------------------------------------------------------------------
 # Signal column (action / strength from analysis.compute)
