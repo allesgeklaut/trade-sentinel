@@ -741,6 +741,7 @@ async def _hybrid_replay(
     start: str | None = None,
     end: str | None = None,
     news: dict[str, list[dict]] | None = None,
+    pure_llm: bool = False,
 ) -> ReplayResult:
     """Replay the hybrid strategy (deterministic + per-day LLM review).
 
@@ -835,13 +836,17 @@ async def _hybrid_replay(
             continue
 
         # --- 1. Deterministic PROPOSE phase (no mutation) ---
-        proposals = _deterministic_propose_replay(pf, by_time, prices, day, params)
-        if proposals:
-            logger.info("  det proposed: %d — %s",
-                        len(proposals),
-                        ", ".join(f"{p['side']} {p['ticker']}" for p in proposals))
+        if pure_llm:
+            proposals = []
+            logger.info("  (pure-LLM mode — no deterministic proposals)")
         else:
-            logger.info("  det proposed: no trades")
+            proposals = _deterministic_propose_replay(pf, by_time, prices, day, params)
+            if proposals:
+                logger.info("  det proposed: %d — %s",
+                            len(proposals),
+                            ", ".join(f"{p['side']} {p['ticker']}" for p in proposals))
+            else:
+                logger.info("  det proposed: no trades")
 
         # --- 2 + 3. LLM review → reconcile → execute ---
         total_equity = pf.equity(prices)
@@ -1881,6 +1886,8 @@ async def _main(args: argparse.Namespace) -> None:
             return
         params = _live_sim_params()
         start, end = args.start, args.end
+        pure_llm = getattr(args, "pure_llm", False)
+        mode_label = "pure-LLM" if pure_llm else "hybrid"
         print(f"\n=== Pure-deterministic replay ({start}..{end}) ===")
         det = _replay(series, params, start=start, end=end)
         _print_result(det, "Deterministic baseline")
@@ -1891,14 +1898,14 @@ async def _main(args: argparse.Namespace) -> None:
               f"min_cash_pct={params.min_cash_pct:g}%")
 
         active = await llm_mod.current_backend()
-        print(f"\n=== Hybrid replay ({start}..{end}) — probing LLM once per trading day ===")
+        print(f"\n=== {mode_label} replay ({start}..{end}) — probing LLM once per trading day ===")
         print(f"  Backend: {active.get('name', '?')} · {active.get('model', '?')}")
-        hyb = await _hybrid_replay(series, params, start=start, end=end)
-        _print_result(hyb, "Hybrid (deterministic + LLM review)")
+        hyb = await _hybrid_replay(series, params, start=start, end=end, pure_llm=pure_llm)
+        _print_result(hyb, f"{mode_label} (deterministic + LLM review)" if not pure_llm else "Pure LLM")
 
         # Side-by-side comparison
         print(f"\n=== Comparison ({start}..{end}) ===")
-        print(f"  {'':>20} {'deterministic':>14} {'hybrid':>14} {'delta':>10}")
+        print(f"  {'':>20} {'deterministic':>14} {mode_label:>14} {'delta':>10}")
         print(f"  {'Return':>20} {det.total_return_pct:>+13.2f}% {hyb.total_return_pct:>+13.2f}% "
               f"{hyb.total_return_pct - det.total_return_pct:>+9.2f}%")
         print(f"  {'Max drawdown':>20} {det.max_drawdown_pct:>13.2f}% {hyb.max_drawdown_pct:>13.2f}% "
@@ -1911,7 +1918,7 @@ async def _main(args: argparse.Namespace) -> None:
               f"{hyb.final_equity - det.final_equity:>+10.2f}")
 
         if args.trades:
-            print(f"\n  Hybrid trades:")
+            print(f"\n  {mode_label} trades:")
             for t in hyb.trades:
                 print(f"    {t['date']} {t['side']:<4} {t['ticker']:<8} "
                       f"{t['shares']:>9.4f} @ {t['price']:>10.2f} — {t['reason']}")
@@ -1962,6 +1969,8 @@ def _build_parser() -> argparse.ArgumentParser:
     hr.add_argument("--start", default=None, help="YYYY-MM-DD inclusive start of the replay window")
     hr.add_argument("--end", default=None, help="YYYY-MM-DD inclusive end of the replay window")
     hr.add_argument("--trades", action="store_true", help="Print every hybrid trade")
+    hr.add_argument("--pure-llm", action="store_true",
+                    help="Pure LLM mode: skip deterministic proposals, let the LLM decide from scratch")
 
     return p
 
