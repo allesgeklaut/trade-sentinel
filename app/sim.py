@@ -769,6 +769,51 @@ def _extract_summary(content: str | None) -> str:
     return prose
 
 
+async def _llm_prose_summary(decisions: list[dict]) -> str:
+    """Ask the LLM for a brief prose explanation of its decisions.
+
+    Two-shot pattern: the main LLM call (with the big portfolio context)
+    tends to emit only a bare JSON array because Qwen3 puts its deliberation
+    in the reasoning channel. This second call has a tiny context (just the
+    parsed decisions), so the model reliably produces prose in ``content``.
+
+    Returns an empty string if the LLM is unavailable or the call fails.
+    """
+    if not decisions:
+        # No decisions — ask for a summary of why the LLM held everything.
+        prompt = (
+            "The portfolio was fully reviewed this cycle and no trades were "
+            "made (all positions held). Write 2-3 sentences in plain English "
+            "explaining why no trades were made."
+        )
+    else:
+        # Truncate to avoid re-sending a huge context — the LLM just needs
+        # the ticker/action/reason per decision, not the full portfolio state.
+        short = [
+            {"ticker": d["ticker"], "action": d["action"], "reason": d.get("reason", "")}
+            for d in decisions[:15]
+        ]
+        prompt = (
+            f"Here are my decisions for this cycle:\n"
+            f"{json.dumps(short, indent=2)}\n\n"
+            f"Write 2-3 sentences in plain English explaining why I made "
+            f"these decisions."
+        )
+    try:
+        out = await llm_mod.chat([
+            {"role": "system", "content": (
+                "You are a portfolio manager. Write a brief 2-3 sentence "
+                "summary in plain English. No JSON, no code fences, no "
+                "markdown - just prose."
+            )},
+            {"role": "user", "content": prompt},
+        ])
+        return (out.get("text") or "").strip()
+    except Exception as e:
+        logger.warning("LLM prose summary call failed: %s", e)
+        return ""
+
+
 async def _llm_review_proposals(
     valuation: dict[str, Any],
     proposals: list[dict],
@@ -827,12 +872,20 @@ async def _llm_review_proposals(
         return executed, []
 
     _last_llm_reasoning = content
-    _last_llm_summary = _extract_summary(content)
     decisions = _parse_llm_decisions(content)
     if decisions is None:
         logger.warning("Could not parse LLM decisions; executing all proposals. Raw: %s", content[:500])
+        _last_llm_summary = ""
         executed = await _execute_proposed(proposals)
         return executed, []
+
+    # Two-shot: the main call may have put prose in reasoning_content (Qwen3)
+    # and only emitted JSON in content. Try extracting prose from content
+    # first; if that's empty, make a lightweight second call with just the
+    # parsed decisions — the small context reliably produces prose in content.
+    _last_llm_summary = _extract_summary(content)
+    if not _last_llm_summary:
+        _last_llm_summary = await _llm_prose_summary(decisions)
 
     logger.info("LLM returned %d decisions", len(decisions))
 
@@ -966,14 +1019,18 @@ async def _llm_decide(
 
     # Store raw LLM reasoning for display in the frontend
     _last_llm_reasoning = content
-    _last_llm_summary = _extract_summary(content)
-
     decisions = _parse_llm_decisions(content)
     if decisions is None:
         logger.warning("Could not parse LLM decisions; falling back to deterministic. Raw: %s", content[:500])
+        _last_llm_summary = ""
         return list(deterministic_trades)
 
     logger.info("LLM returned %d decisions", len(decisions))
+
+    # Two-shot prose summary (see _llm_review_proposals for rationale).
+    _last_llm_summary = _extract_summary(content)
+    if not _last_llm_summary:
+        _last_llm_summary = await _llm_prose_summary(decisions)
 
     # Recompute equity / budget guards (same logic as deterministic)
     total_equity = valuation["total_equity"]
