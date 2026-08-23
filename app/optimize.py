@@ -47,12 +47,18 @@ from .strategy import (
     StrategyParams,
     llm_buy_budget,
     llm_sell_shares,
+    plan_llm_buys,
     propose_trades,
     reconcile_proposals,
     valuate_portfolio,
 )
 
 logger = logging.getLogger("trade_sentinel.optimize")
+
+
+async def _aval(value: float | None) -> float | None:
+    """Wrap a sync value as an awaitable for plan_llm_buys' async callbacks."""
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +868,14 @@ async def _hybrid_replay(
                     _execute_proposal(pf, p)
 
                 # Execute LLM additions (decisions for tickers NOT in proposals)
+                plan = await plan_llm_buys(
+                    decisions, pf.cash, pf.equity(prices),
+                    _replay_params_to_strategy(params),
+                    guarded=not pure_llm,
+                    price_of=lambda t: _aval(prices.get(t)),
+                    value_of=lambda t: _aval(pf.positions.get(t, 0) * prices.get(t, 0)),
+                    exclude=proposal_tickers,
+                )
                 for d in decisions:
                     tu = d["ticker"].upper()
                     if tu in proposal_tickers:
@@ -876,12 +890,7 @@ async def _hybrid_replay(
                         # and max-position-%; pure-LLM lets the LLM decide
                         # sizing. Neither enforces a position-count cap on
                         # LLM-initiated additions (matches sim._llm_review_proposals).
-                        current_value = pf.positions.get(d["ticker"], 0) * price
-                        budget = llm_buy_budget(
-                            d, pf.cash, pf.equity(prices), price, current_value,
-                            _replay_params_to_strategy(params),
-                            guarded=not pure_llm,
-                        )
+                        budget = plan.get(tu)
                         if budget is None:
                             continue
                         entry_stop = (price * (1 - params.stop_pct / 100)
@@ -1855,6 +1864,17 @@ async def _main(args: argparse.Namespace) -> None:
             return
         params = _live_sim_params()
         start, end = args.start, args.end
+        if args.days:
+            # Simulate only the last N trading days of the (possibly bounded)
+            # window — a quick, natural way to run short pure-LLM comparisons.
+            window_days = all_days
+            if start:
+                window_days = [d for d in window_days if d >= start]
+            if end:
+                window_days = [d for d in window_days if d <= end]
+            if len(window_days) > args.days:
+                start = window_days[-args.days]
+                end = window_days[-1]
         pure_llm = getattr(args, "pure_llm", False)
         mode_label = "pure-LLM" if pure_llm else "hybrid"
         print(f"\n=== Pure-deterministic replay ({start}..{end}) ===")
@@ -1937,6 +1957,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Replay the hybrid strategy (deterministic + per-day LLM review) on history")
     hr.add_argument("--start", default=None, help="YYYY-MM-DD inclusive start of the replay window")
     hr.add_argument("--end", default=None, help="YYYY-MM-DD inclusive end of the replay window")
+    hr.add_argument("--days", type=int, default=None,
+                    help="Simulate only the last N trading days (overrides --start; default: full history)")
     hr.add_argument("--trades", action="store_true", help="Print every hybrid trade")
     hr.add_argument("--pure-llm", action="store_true",
                     help="Pure LLM mode: skip deterministic proposals, let the LLM decide from scratch")

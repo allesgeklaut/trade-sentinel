@@ -40,6 +40,7 @@ from .strategy import (
     StrategyParams,
     llm_buy_budget,
     llm_sell_shares,
+    plan_llm_buys,
     propose_trades,
     reconcile_proposals,
     valuate_portfolio,
@@ -615,8 +616,11 @@ _PURE_LLM_SYSTEM_PROMPT = (
     "   - \"shares\": exact number of shares to trade (e.g. 3.5).\n"
     "   - \"amount\": dollar amount to trade (e.g. 67.43). For SELL this is the"
     " value of shares to sell; for BUY it is the dollars to invest.\n"
-    "   If neither is given, SELL sells the entire position and BUY invests the"
-    " maximum allowed by risk rules.\n"
+    "   If neither is given, SELL sells the entire position and BUY is executed "
+    "as follows: when you send several BUYs in one cycle, the available cash is "
+    "split evenly between them; when you send a single BUY, it receives the full "
+    "available cash. Always use \"amount\" (or \"shares\") when you want a "
+    "specific size — otherwise your position sizing is left to the even split.\n"
     "9. You decide position sizing. Do NOT sell a position just because its "
     "price rose — let winners run.\n"
     "10. You decide how much cash to hold in reserve. Do NOT sell a position "
@@ -1031,6 +1035,27 @@ async def _llm_review_proposals(
     if total_equity <= 0:
         return executed, vetoed
 
+    async def _price_of(ticker: str) -> float | None:
+        return await _latest_close(ticker)
+
+    async def _value_of(ticker: str) -> float:
+        async with Session() as s:
+            pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
+        price = await _latest_close(ticker) or 0.0
+        return (pos.shares * price) if pos else 0.0
+
+    plan = await plan_llm_buys(
+        decisions, valuation["cash"], total_equity,
+        StrategyParams(
+            min_cash_pct=settings.sim_min_cash_pct,
+            max_position_pct=settings.sim_max_position_pct,
+        ),
+        guarded=True,
+        price_of=_price_of,
+        value_of=_value_of,
+        exclude=proposal_tickers,
+    )
+
     for d in decisions:
         ticker_u = d["ticker"].upper()
         if ticker_u in proposal_tickers:
@@ -1046,19 +1071,7 @@ async def _llm_review_proposals(
             continue
 
         if action == "BUY":
-            acc = await _account()
-            async with Session() as s:
-                pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == d["ticker"]))
-            current_value = (pos.shares * price) if pos else 0
-
-            budget = llm_buy_budget(
-                d, acc.cash, total_equity, price, current_value,
-                StrategyParams(
-                    min_cash_pct=settings.sim_min_cash_pct,
-                    max_position_pct=settings.sim_max_position_pct,
-                ),
-                guarded=True,
-            )
+            budget = plan.get(ticker_u)
             if budget is None:
                 continue
             t = await _exec_buy(d["ticker"], price, budget, f"LLM: {reason}")
@@ -1170,6 +1183,28 @@ async def _llm_decide(
 
     executed: list[dict] = []
 
+    # Plan all BUY budgets up front so unsized BUYs split the cash evenly
+    # instead of the first one taking everything.
+    async def _price_of(ticker: str) -> float | None:
+        return await _latest_close(ticker)
+
+    async def _value_of(ticker: str) -> float:
+        async with Session() as s:
+            pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
+        price = await _latest_close(ticker) or 0.0
+        return (pos.shares * price) if pos else 0.0
+
+    plan = await plan_llm_buys(
+        decisions, valuation["cash"], total_equity,
+        StrategyParams(
+            min_cash_pct=settings.sim_min_cash_pct,
+            max_position_pct=settings.sim_max_position_pct,
+        ),
+        guarded=not pure_llm,
+        price_of=_price_of,
+        value_of=_value_of,
+    )
+
     for decision in decisions:
         ticker = decision["ticker"]
         action = decision["action"]
@@ -1181,19 +1216,7 @@ async def _llm_decide(
             continue
 
         if action == "BUY":
-            acc = await _account()
-            async with Session() as s:
-                pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
-            current_value = (pos.shares * price) if pos else 0
-
-            budget = llm_buy_budget(
-                decision, acc.cash, total_equity, price, current_value,
-                StrategyParams(
-                    min_cash_pct=settings.sim_min_cash_pct,
-                    max_position_pct=settings.sim_max_position_pct,
-                ),
-                guarded=not pure_llm,
-            )
+            budget = plan.get(ticker.upper())
             if budget is None:
                 logger.info("LLM BUY %s skipped (budget guard)", ticker)
                 continue
