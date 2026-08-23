@@ -43,7 +43,14 @@ from .config import settings
 from . import llm as llm_mod
 from .db import Candle, Session
 from .screener import tickers as universe_tickers
-from .strategy import StrategyParams, propose_trades, reconcile_proposals, valuate_portfolio
+from .strategy import (
+    StrategyParams,
+    llm_buy_budget,
+    llm_sell_shares,
+    propose_trades,
+    reconcile_proposals,
+    valuate_portfolio,
+)
 
 logger = logging.getLogger("trade_sentinel.optimize")
 
@@ -591,38 +598,6 @@ def _signals_for_day(
     return out
 
 
-def _valuation_from_portfolio(
-    pf: PaperPortfolio,
-    prices: dict[str, float],
-    allowance_total: float,
-) -> dict[str, Any]:
-    """Build the ``valuation`` dict the live sim's ``_build_llm_context`` expects.
-
-    Mirrors ``sim.valuate()``: cash, positions_value, total_equity, allowance_total,
-    and a ``positions`` list with per-position current_price / value / pnl_pct.
-    The LLM context builder reads exactly these fields.
-    """
-    positions: list[dict] = []
-    positions_value = 0.0
-    for ticker, shares in pf.positions.items():
-        price = prices.get(ticker, 0.0)
-        value = shares * price
-        positions_value += value
-        avg_cost = pf.avg_cost.get(ticker, 0.0)
-        pnl_pct = ((price / avg_cost - 1) * 100) if avg_cost > 0 else 0.0
-        positions.append({
-            "ticker": ticker, "shares": shares, "avg_cost": avg_cost,
-            "current_price": price, "value": value, "pnl_pct": pnl_pct,
-        })
-    return {
-        "cash": pf.cash,
-        "positions_value": positions_value,
-        "total_equity": pf.cash + positions_value,
-        "allowance_total": allowance_total,
-        "positions": positions,
-    }
-
-
 def _pf_to_positions(pf: PaperPortfolio) -> list[dict]:
     """Convert PaperPortfolio.positions to the plain-data shape strategy.py expects."""
     return [
@@ -887,8 +862,6 @@ async def _hybrid_replay(
                     _execute_proposal(pf, p)
 
                 # Execute LLM additions (decisions for tickers NOT in proposals)
-                min_cash = pf.equity(prices) * (params.min_cash_pct / 100)
-                max_position_value = pf.equity(prices) * (params.max_position_pct / 100)
                 for d in decisions:
                     tu = d["ticker"].upper()
                     if tu in proposal_tickers:
@@ -899,35 +872,24 @@ async def _hybrid_replay(
                     if price is None or price <= 0 or action == "HOLD":
                         continue
                     if action == "BUY":
-                        if pure_llm:
-                            # Pure-LLM mode: no hard min-cash / max-position-%
-                            # guards — the LLM decides sizing and cash reserve.
-                            budget = pf.cash
-                        else:
-                            current_value = pf.positions.get(d["ticker"], 0) * price
-                            if current_value >= max_position_value:
-                                continue
-                            if (params.max_positions > 0
-                                    and len(pf.positions) >= params.max_positions
-                                    and d["ticker"] not in pf.positions):
-                                continue
-                            budget = min(pf.cash - min_cash, max_position_value - current_value)
-                        if "shares" in d:
-                            budget = min(budget, d["shares"] * price)
-                        elif "amount" in d:
-                            budget = min(budget, d["amount"])
-                        if budget < 1:
+                        # Guards mirror the live sim: hybrid clamps to min-cash
+                        # and max-position-%; pure-LLM lets the LLM decide
+                        # sizing. Neither enforces a position-count cap on
+                        # LLM-initiated additions (matches sim._llm_review_proposals).
+                        current_value = pf.positions.get(d["ticker"], 0) * price
+                        budget = llm_buy_budget(
+                            d, pf.cash, pf.equity(prices), price, current_value,
+                            _replay_params_to_strategy(params),
+                            guarded=not pure_llm,
+                        )
+                        if budget is None:
                             continue
                         entry_stop = (price * (1 - params.stop_pct / 100)
                                       if params.stop_type == "percent" else None)
                         pf.buy(d["ticker"], price, budget, f"LLM: {reason}",
                                stop=entry_stop, date=day)
                     elif action == "SELL":
-                        target_shares = None
-                        if "shares" in d:
-                            target_shares = d["shares"]
-                        elif "amount" in d:
-                            target_shares = d["amount"] / price if price > 0 else None
+                        target_shares = llm_sell_shares(d, price)
                         pf.sell(d["ticker"], price, target_shares,
                                 f"LLM: {reason}", date=day)
 
