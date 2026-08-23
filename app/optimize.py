@@ -78,7 +78,10 @@ class PaperPortfolio:
             stop: float | None = None, date: str = "") -> None:
         if budget < 1 or price <= 0:
             return
-        shares = round(budget / price, 4)
+        # Floor (not round) the fractional share count so cost never exceeds
+        # the budget — rounding up can push a high-priced ticker cents over
+        # the available cash and silently drop the buy.
+        shares = math.floor(budget / price * 10000) / 10000
         if shares < 0.0001:
             return
         cost = shares * price
