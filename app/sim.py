@@ -575,6 +575,51 @@ _LLM_SYSTEM_PROMPT = (
 )
 
 
+_PURE_LLM_METHODOLOGY = (
+    "## How to read the signals\n"
+    "The snapshot each ticker carries these indicators. Use them to rank "
+    "candidates and to manage open positions:\n"
+    "  - **action / strength**: a deterministic 0-100 score of the indicators "
+    "(strength = the bullish or bearish reading). Use it as a starting point, "
+    "not as a verdict.\n"
+    "  - **close vs sma50 vs sma200**: a genuine uptrend needs close > sma50 > "
+    "sma200 (downtrend is the mirror). Price stuck between the MAs = sideways.\n"
+    "  - **adx** (ADX-14): trend *strength*. ADX > 25 = strong, clean trend; "
+    "ADX < 20 = weak/choppy. High ADX makes a BUY far more trustworthy than "
+    "low ADX.\n"
+    "  - **rsi** (RSI-14): momentum. 40-55 and rising = pullback turning up "
+    "(good entry). 55-65 = moderately strong. > 70 = overbought — don't "
+    "chase. < 30 = oversold (often a bounce risk).\n"
+    "  - **rsi_3d_change**: the 3-day net change in RSI. Positive = momentum "
+    "recovering; negative = momentum deteriorating.\n"
+    "  - **macd / macd_signal / macd_hist**: momentum. macd > macd_signal = "
+    "bullish; macd_hist rising = momentum turning up.\n"
+    "  - **macd_hist_3d_change**: the 3-day net change in the MACD histogram. "
+    "Positive = histogram rising; negative = histogram falling.\n"
+    "  - **weekly_trend_up** (when provided): the slower weekly-chart filter "
+    "(weekly close > weekly SMA-50). A BUY against a down weekly trend is a "
+    "bear-market rally — risky. A position whose weekly trend has turned "
+    "down is structurally weaker.\n"
+    "  - **run_5d**: the 5-day run-up %. A BUY after a >15% spike is chasing "
+    "a short-term move prone to reversion.\n"
+    "  - **atr_stop**: trailing-volatility stop. Price below it = the trend "
+    "broke.\n"
+    "\n"
+    "## Managing exits\n"
+    "You are the ONLY mechanism that sells positions — no engine will do it "
+    "for you. Each cycle, review every open position and sell when the reason "
+    "you bought it is gone: the trend broke (price < sma50 < sma200 or weekly "
+    "trend down), momentum rolled over (RSI falling, MACD histogram "
+    "declining), or price is at/below its stop. Holding a broken position "
+    "traps capital that could earn elsewhere; act on your read.\n"
+    "\n"
+    "## Entry quality\n"
+    "Buying is when care matters most. Avoid entries that are too late: a BUY "
+    "after a >15% 5-day spike, RSI > 70 with momentum turning down, or ADX < "
+    "15 (no trend, just noise). Favor pullbacks that are turning up inside "
+    "an uptrend. Missing a move costs less than catching a falling knife.\n"
+)
+
 _PURE_LLM_SYSTEM_PROMPT = (
     "You are the sole portfolio manager for a paper-trading simulation. "
     "There is no deterministic engine running alongside you — you make all "
@@ -585,28 +630,24 @@ _PURE_LLM_SYSTEM_PROMPT = (
     "scoring of the indicators — use it as a starting point, but you decide "
     "whether to act on it.\n"
     "\n"
-    + _SIM_METHODOLOGY +
+    + _PURE_LLM_METHODOLOGY +
     "Rules:\n"
-    "2. Your primary job is to avoid overextended BUYs. See the GATING "
-    "deterministic BUYs section above — those checks apply to any BUY you "
-    "are considering, not just to proposals from an engine. Avoiding "
-    "catastrophic entries outweighs everything else.\n"
-    "3. You decide how much cash to keep in reserve and how concentrated the "
-    "portfolio should be. There are no hard limits on position size or cash "
-    "reserves — size positions and manage cash based on your judgment of the "
-    "signals. There is no limit on the number of positions you may hold — "
-    "open as many or as few as you judge worthy.\n"
-    "4. You are responsible for stop losses. Each open position shows its "
+    "2. Decide the portfolio yourself: what to buy, what to hold, what to "
+    "sell, how much of the cash to deploy, and how many positions to hold. "
+    "Use the indicators and your exit-management principles; do not simply "
+    "echo the signal actions.\n"
+    "3. You are responsible for stop losses. Each open position shows its "
     "initial stop price (a fixed % below the entry) and the signals include "
-    "an ATR trailing stop. You MUST sell any position whose current price "
-    "has fallen below its initial stop or below the ATR trailing stop. No "
-    "other layer will do this for you.\n"
-    "5. Do NOT sell a position to free up cash for another BUY. Selling one "
-    "ticker to buy another is portfolio churn — backtesting proved this "
-    "reduces returns because the \"stronger opportunity\" has the same "
-    "indicator profile as the position being sold. Only SELL when the "
-    "signals justify it (SELL signal with weekly trend down, or price below "
-    "ATR stop, or stop loss hit).\n"
+    "an ATR trailing stop. Sell any position whose current price is at or "
+    "below either stop unless you have a strong indicator-based reason to "
+    "override.\n"
+    "4. Do NOT sell a position just to buy a different one with a similar "
+    "indicator profile — that is churn and reduces returns. Sell when a "
+    "position's thesis is broken; if the redeployed capital goes into a "
+    "stronger name, so be it, but don't manufacture trades.\n"
+    "5. You decide how much cash to keep in reserve and how concentrated the "
+    "portfolio should be. There are no hard limits on position size or cash "
+    "reserves, and no limit on the number of positions you may hold.\n"
     "6. Decisions must be grounded in the provided signals and indicators.\n"
     "7. You may receive recent news headlines for supplementary context. News "
     "can explain *why* indicators are moving, but do not make trades based on "
@@ -623,9 +664,9 @@ _PURE_LLM_SYSTEM_PROMPT = (
     "specific size — otherwise your position sizing is left to the even split.\n"
     "9. You decide position sizing. Do NOT sell a position just because its "
     "price rose — let winners run.\n"
-    "10. You decide how much cash to hold in reserve. Do NOT sell a position "
-    "solely to restore cash — if you want more dry powder, wait for the next "
-    "allowance deposit or a stop-out to replenish cash.\n"
+    "10. Do NOT sell a position solely to restore cash — if you want more dry "
+    "powder, wait for the next allowance deposit or a stop-out to replenish "
+    "cash.\n"
     "\n"
     "Response format: begin with a 2-4 sentence prose summary of your overall "
     "read and the decisions you made (write this even when you made no "
@@ -693,9 +734,10 @@ def _build_llm_context(
     # --- Signals summary ---
     lines.append("## Signals (all candidate tickers)")
     if signals:
+        atr_col = " {'atrStop':>9}" if pure_llm else ""
         lines.append(
             f"{'ticker':<10} {'action':<6} {'strength':>8} "
-            f"{'close':>10} {'rsi':>6} {'rsiΔ3':>6} {'adx':>5} {'wk':>3} {'macd':>10} {'mhΔ3':>7} {'run5d':>6}"
+            f"{'close':>10} {'rsi':>6} {'rsiΔ3':>6} {'adx':>5} {'wk':>3} {'macd':>10} {'mhΔ3':>7} {'run5d':>6}{atr_col}"
         )
         for ticker, sig in sorted(signals.items()):
             snap = sig.get("snapshot", {})
@@ -703,15 +745,17 @@ def _build_llm_context(
             rsi_d = snap.get("rsi_3d_change")
             mh_d = snap.get("macd_hist_3d_change")
             run5 = snap.get("run_5d")
+            atr_stop = snap.get("atr_stop")
             rsi_d_s = f"{rsi_d:+.1f}" if rsi_d is not None else "  -  "
             mh_d_s = f"{mh_d:+.2f}" if mh_d is not None else "  -  "
             run5_s = f"{run5:+.1f}%" if run5 is not None else "  -  "
+            atr_s = f"{atr_stop:>9.2f}" if pure_llm and atr_stop is not None else ""
             lines.append(
                 f"{ticker:<10} {sig['action']:<6} {sig['strength']:>8} "
                 f"{snap.get('close', 0):>10.2f} {snap.get('rsi', 0):>6.1f} "
                 f"{rsi_d_s:>6} "
                 f"{snap.get('adx', 0):>5.0f} {wk:>3} "
-                f"{snap.get('macd', 0):>10.3f} {mh_d_s:>7} {run5_s:>6}"
+                f"{snap.get('macd', 0):>10.3f} {mh_d_s:>7} {run5_s:>6}{atr_s}"
             )
     else:
         lines.append("(no signals available)")
