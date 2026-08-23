@@ -583,9 +583,11 @@ _PURE_LLM_SYSTEM_PROMPT = (
     "deterministic BUYs section above — those checks apply to any BUY you "
     "are considering, not just to proposals from an engine. Avoiding "
     "catastrophic entries outweighs everything else.\n"
-    "3. Respect risk management: do not buy if cash is too low; do not over-"
-    "concentrate in a single ticker. There is no limit on the number of "
-    "positions you may hold — open as many or as few as you judge worthy.\n"
+    "3. You decide how much cash to keep in reserve and how concentrated the "
+    "portfolio should be. There are no hard limits on position size or cash "
+    "reserves — size positions and manage cash based on your judgment of the "
+    "signals. There is no limit on the number of positions you may hold — "
+    "open as many or as few as you judge worthy.\n"
     "4. You are responsible for stop losses. Each open position shows its "
     "initial stop price (a fixed % below the entry) and the signals include "
     "an ATR trailing stop. You MUST sell any position whose current price "
@@ -608,14 +610,11 @@ _PURE_LLM_SYSTEM_PROMPT = (
     " value of shares to sell; for BUY it is the dollars to invest.\n"
     "   If neither is given, SELL sells the entire position and BUY invests the"
     " maximum allowed by risk rules.\n"
-    "9. The max position % is a buy-time sizing limit, not a ceiling to enforce "
-    "on exits. Do NOT sell a position just because its price rose above it — "
-    "let winners run.\n"
-    "10. The min cash floor is also a buy-time constraint, not a sell trigger. "
-    "Do NOT sell a position solely to restore cash above the floor — the floor "
-    "only blocks new BUYs. If cash is below the floor, hold the positions you "
-    "have and wait for the next allowance deposit or a stop-out to replenish "
-    "cash.\n"
+    "9. You decide position sizing. Do NOT sell a position just because its "
+    "price rose — let winners run.\n"
+    "10. You decide how much cash to hold in reserve. Do NOT sell a position "
+    "solely to restore cash — if you want more dry powder, wait for the next "
+    "allowance deposit or a stop-out to replenish cash.\n"
     "\n"
     "Response format: begin with a 2-4 sentence prose summary of your overall "
     "read and the decisions you made (write this even when you made no "
@@ -652,8 +651,12 @@ def _build_llm_context(
     lines.append(f"Positions value: {valuation['positions_value']:.2f}")
     lines.append(f"Total equity: {valuation['total_equity']:.2f}")
     lines.append(f"Cumulative allowance deposited: {valuation['allowance_total']:.2f}")
-    lines.append(f"Min cash floor (buy-time only, {settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
-    lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
+    if pure_llm:
+        lines.append(f"Reference: min cash floor {settings.sim_min_cash_pct}% = {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f} (guidance only — you decide)")
+        lines.append(f"Reference: max position size {settings.sim_max_position_pct}% = {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f} (guidance only — you decide)")
+    else:
+        lines.append(f"Min cash floor (buy-time only, {settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
+        lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
     if not pure_llm:
         lines.append(f"Max open positions: {settings.sim_max_positions}")
     lines.append(f"Stop loss: {settings.sim_stop_pct:.0f}% (frozen at entry; ATR stop also applies)")
@@ -1187,18 +1190,24 @@ async def _llm_decide(
 
         if action == "BUY":
             acc = await _account()
-            if acc.cash < min_cash:
-                logger.info("LLM BUY %s skipped: cash %.2f < min_cash %.2f", ticker, acc.cash, min_cash)
-                continue
+            if pure_llm:
+                # Pure-LLM mode: no hard min-cash or max-position-% guards —
+                # the LLM decides sizing and cash reserve. Only hard bounds
+                # are the actual cash balance and a $1 minimum.
+                budget = acc.cash
+            else:
+                if acc.cash < min_cash:
+                    logger.info("LLM BUY %s skipped: cash %.2f < min_cash %.2f", ticker, acc.cash, min_cash)
+                    continue
 
-            async with Session() as s:
-                pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
-            current_value = (pos.shares * price) if pos else 0
-            if current_value >= max_position_value:
-                logger.info("LLM BUY %s skipped: position at max (%.2f >= %.2f)", ticker, current_value, max_position_value)
-                continue
+                async with Session() as s:
+                    pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
+                current_value = (pos.shares * price) if pos else 0
+                if current_value >= max_position_value:
+                    logger.info("LLM BUY %s skipped: position at max (%.2f >= %.2f)", ticker, current_value, max_position_value)
+                    continue
 
-            budget = min(acc.cash - min_cash, max_position_value - current_value)
+                budget = min(acc.cash - min_cash, max_position_value - current_value)
 
             # Optional partial size: "shares" or "amount" (dollars). Clamp
             # to the risk-limited budget so we never breach cash/position limits.

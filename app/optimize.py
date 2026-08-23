@@ -899,14 +899,19 @@ async def _hybrid_replay(
                     if price is None or price <= 0 or action == "HOLD":
                         continue
                     if action == "BUY":
-                        current_value = pf.positions.get(d["ticker"], 0) * price
-                        if current_value >= max_position_value:
-                            continue
-                        if (params.max_positions > 0
-                                and len(pf.positions) >= params.max_positions
-                                and d["ticker"] not in pf.positions):
-                            continue
-                        budget = min(pf.cash - min_cash, max_position_value - current_value)
+                        if pure_llm:
+                            # Pure-LLM mode: no hard min-cash / max-position-%
+                            # guards — the LLM decides sizing and cash reserve.
+                            budget = pf.cash
+                        else:
+                            current_value = pf.positions.get(d["ticker"], 0) * price
+                            if current_value >= max_position_value:
+                                continue
+                            if (params.max_positions > 0
+                                    and len(pf.positions) >= params.max_positions
+                                    and d["ticker"] not in pf.positions):
+                                continue
+                            budget = min(pf.cash - min_cash, max_position_value - current_value)
                         if "shares" in d:
                             budget = min(budget, d["shares"] * price)
                         elif "amount" in d:
