@@ -41,12 +41,12 @@ def _fake_async_client(monkeypatch, response_data=None, status_code=200, raise_e
         async def __aexit__(self, *a):
             return False
 
-        async def post(self, url, json=None):
+        async def post(self, url, json=None, headers=None):
             if raise_error:
                 raise raise_error
             return FakeResponse()
 
-        async def get(self, url):
+        async def get(self, url, headers=None):
             if raise_error:
                 raise raise_error
             return FakeResponse()
@@ -232,7 +232,7 @@ class _FakeStreamClient:
     async def __aexit__(self, *a):
         return False
 
-    def stream(self, method, url, json=None):
+    def stream(self, method, url, json=None, headers=None):
         return _FakeStreamResp(
             lines=self._configured_lines,
             status_code=self._configured_status,

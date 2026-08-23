@@ -4,7 +4,9 @@ services:
     container_name: trade-sentinel
     restart: unless-stopped
     ports: ["8002:8000"]
-    env_file: .env
+    env_file:
+      - .env
+      - /opt/secrets/trade-sentinel.env
     volumes: ["trade_sentinel_data:/data"]
     security_opt: ["no-new-privileges:true"]
     cap_drop: [ALL]

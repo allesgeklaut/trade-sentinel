@@ -10,7 +10,7 @@ Supports two wire protocols, both discovered and selectable at runtime:
 Backends are configured through the ``LLM_BACKENDS`` JSON env var, e.g.::
 
     LLM_BACKENDS=[
-      {"name":"local llama","type":"openai","url":"http://192.168.0.46:8084","model":"Qwen3.8-27B-IQ4_XS.gguf"},
+      {"name":"local llama","type":"openai","url":"http://192.168.0.46:4000","model":"qwen3.8-27b","api_key":"sk-..."},
       {"name":"ollama","type":"ollama","url":"http://192.168.0.46:11434","model":"deepseek-v4-flash:0731-cloud"}
     ]
 
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,18 @@ logger = logging.getLogger("trade_sentinel.llm")
 # ---------------------------------------------------------------------------
 
 _DEFAULT_STATE_FILE = Path(settings.llm_state_file)
+
+
+def _auth_headers(backend: dict[str, Any]) -> dict[str, str]:
+    """Authorization headers for an OpenAI-compatible backend.
+
+    Uses the backend's own ``api_key`` if set, otherwise falls back to the
+    shared ``LITELLM_API_KEY`` env var (loaded from /opt/secrets/ by compose).
+    """
+    key = (backend.get("api_key") or os.environ.get("LITELLM_API_KEY") or "").strip()
+    if key:
+        return {"Authorization": f"Bearer {key}"}
+    return {}
 
 
 def _configured_backends() -> list[dict[str, Any]]:
@@ -68,10 +81,12 @@ def _configured_backends() -> list[dict[str, Any]]:
         btype = str(b.get("type") or "openai").strip().lower()
         url = str(b.get("url") or "").strip().rstrip("/")
         model = str(b.get("model") or "").strip()
+        api_key = str(b.get("api_key") or "").strip()
         if btype not in ("ollama", "openai") or not url or not name:
             logger.warning("Skipping invalid LLM backend entry: %r", b)
             continue
-        out.append({"name": name, "type": btype, "url": url, "model": model})
+        out.append({"name": name, "type": btype, "url": url, "model": model,
+                     "api_key": api_key})
     return out
 
 
@@ -125,6 +140,7 @@ async def list_backends() -> list[dict[str, Any]]:
 
 async def _fetch_models(b: dict[str, Any]) -> list[str]:
     timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
+    headers = _auth_headers(b)
     async with httpx.AsyncClient(timeout=timeout) as client:
         if b["type"] == "ollama":
             resp = await client.get(b["url"] + "/api/tags")
@@ -132,7 +148,7 @@ async def _fetch_models(b: dict[str, Any]) -> list[str]:
             data = resp.json()
             names = [m.get("name", "") for m in data.get("models", [])]
         else:
-            resp = await client.get(b["url"] + "/v1/models")
+            resp = await client.get(b["url"] + "/v1/models", headers=headers)
             resp.raise_for_status()
             data = resp.json()
             names = [m.get("id", "") for m in data.get("data", [])]
@@ -292,7 +308,8 @@ async def chat_stream(messages: list[dict[str, str]]):
                         "xhigh": 32768,
                     }[effort]
                 async with client.stream(
-                    "POST", backend["url"] + "/v1/chat/completions", json=payload,
+                    "POST", backend["url"] + "/v1/chat/completions",
+                    json=payload, headers=_auth_headers(backend),
                 ) as resp:
                     if resp.status_code != 200:
                         body = await resp.aread()
@@ -390,7 +407,7 @@ async def _post_chat(
                 }[effort]
             resp = await client.post(
                 backend["url"] + "/v1/chat/completions",
-                json=payload,
+                json=payload, headers=_auth_headers(backend),
             )
         if getattr(resp, "status_code", 200) != 200:
             raise RuntimeError(
