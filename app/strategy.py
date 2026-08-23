@@ -292,6 +292,56 @@ def propose_trades(
     return proposals
 
 
+def llm_buy_budget(
+    decision: dict,
+    cash: float,
+    equity: float,
+    price: float,
+    current_value: float,
+    params: StrategyParams,
+    guarded: bool,
+) -> float | None:
+    """Budget for an LLM BUY decision, or None to skip.
+
+    ``price`` is the execution price, ``current_value`` the value already
+    held in this ticker. ``guarded=True`` applies the hard risk limits (min
+    cash floor and max position %) — used in hybrid mode, matching the
+    deterministic engine. ``guarded=False`` lets the LLM decide sizing and
+    cash reserve; the only hard bounds are the actual cash balance and the
+    $1 minimum. In both modes the optional partial-size fields (``shares`` /
+    ``amount``) clamp the budget.
+    """
+    min_cash = equity * (params.min_cash_pct / 100)
+    max_position_value = equity * (params.max_position_pct / 100)
+
+    if guarded:
+        if cash < min_cash:
+            return None
+        if current_value >= max_position_value:
+            return None
+        budget = min(cash - min_cash, max_position_value - current_value)
+    else:
+        budget = cash
+
+    if "shares" in decision:
+        budget = min(budget, decision["shares"] * price)
+    elif "amount" in decision:
+        budget = min(budget, decision["amount"])
+
+    if budget < 1:
+        return None
+    return budget
+
+
+def llm_sell_shares(decision: dict, price: float) -> float | None:
+    """Shares to sell for an LLM SELL decision (None = entire position)."""
+    if "shares" in decision:
+        return float(decision["shares"])
+    if "amount" in decision:
+        return float(decision["amount"]) / price if price > 0 else None
+    return None
+
+
 def reconcile_proposals(
     proposals: list[dict],
     decisions: list[dict],

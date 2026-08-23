@@ -486,3 +486,55 @@ class TestIsStopOut:
 
     def test_buy_is_not_a_stop(self):
         assert not _is_stop_out("BUY signal (strength 67)")
+
+
+class TestHybridReplayLLMAdditionGuards:
+    """LLM-initiated BUY additions in the hybrid replay must match the live
+    sim: no position-count cap (sim._llm_review_proposals never enforced it),
+    while the deterministic side keeps its own max-positions cap."""
+
+    async def test_hybrid_llm_additions_not_count_capped(self, monkeypatch):
+        import json as _json
+
+        from app import llm as llm_mod
+
+        # 12 uptrending tickers: the deterministic engine proposes at most
+        # max_positions=10 of them; the LLM approves those and adds the rest.
+        series = {
+            f"UP{i}": _signal_series(_gen_candles(100.0, 0.01, seed=i, n=500))
+            for i in range(12)
+        }
+        # max_position_pct=1 keeps positions tiny so cash never binds: the
+        # count-cap removal is what must allow the 11th/12th positions.
+        params = ReplayParams(
+            start_cash=10000.0,
+            monthly_allowance=0.0,
+            max_positions=10,
+            max_position_pct=1.0,
+            min_cash_pct=0.0,
+            stop_type="none",
+            use_atr_stop=False,
+        )
+
+        buy_all = _json.dumps([
+            {"ticker": f"UP{i}", "action": "BUY", "reason": "add"} for i in range(12)
+        ])
+
+        async def fake_chat(messages):
+            return {"text": buy_all}
+
+        monkeypatch.setattr(llm_mod, "chat", fake_chat)
+        monkeypatch.setattr(llm_mod, "current_backend", lambda: {"name": "x", "model": "y"})
+        monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
+
+        res = await optimize._hybrid_replay(series, params, start="2025-07-15", end="2026-05-15")
+
+        # Distinct tickers bought: deterministic side was capped at 10, but the
+        # LLM additions (the remaining 2) must NOT be count-capped — matching
+        # the live sim. Before the fix, additions beyond the cap were skipped.
+        bought = {t["ticker"] for t in res.trades if t["side"] == "BUY"}
+        assert len(bought) > params.max_positions, (
+            f"LLM additions were count-capped: bought {len(bought)} of "
+            f"{len(series)} tickers (cap {params.max_positions}). Expected "
+            f"all {len(series)} — live sim does not cap LLM additions."
+        )
