@@ -374,7 +374,10 @@ async def plan_llm_buys(
     Returns ``{ticker: budget}`` in decision order. Unsized BUYs (no
     ``shares`` / ``amount``) split the available cash evenly so the first
     BUY does not consume everything; sized BUYs get their requested size
-    clamped to what is allowed.
+    clamped to what is allowed. Each planned budget is deducted from a
+    running cash total so the sum never exceeds the available cash — a BUY
+    that no longer fits is skipped rather than silently dropped at
+    execution.
     """
     excluded = {t.upper() for t in (exclude or set())}
     buys = [
@@ -382,6 +385,7 @@ async def plan_llm_buys(
         if d.get("action") == "BUY" and d["ticker"].upper() not in excluded
     ]
     unsized = sum(1 for d in buys if "shares" not in d and "amount" not in d)
+    remaining_cash = cash
     plan: dict[str, float] = {}
     for d in buys:
         ticker = d["ticker"].upper()
@@ -390,14 +394,16 @@ async def plan_llm_buys(
             continue
         is_unsized = "shares" not in d and "amount" not in d
         budget = llm_buy_budget(
-            d, cash, equity, price, await value_of(ticker), params,
+            d, remaining_cash, equity, price, await value_of(ticker), params,
             guarded=guarded,
             unsized_remaining=max(1, unsized) if is_unsized else 1,
         )
         if is_unsized:
             unsized -= 1
-        if budget is not None:
-            plan[ticker] = budget
+        if budget is None:
+            continue
+        plan[ticker] = budget
+        remaining_cash -= budget
     return plan
 
 

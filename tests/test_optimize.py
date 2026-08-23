@@ -176,6 +176,30 @@ class TestReplayTradeDates:
             assert t["date"] >= "2025-01-01"
 
 
+class TestPaperPortfolioFloor:
+    """PaperPortfolio.buy must floor (not round) fractional shares so the
+    cost never exceeds the budget — rounding up can silently drop a buy."""
+
+    def test_high_price_ticker_budget_fits(self):
+        pf = optimize.PaperPortfolio(cash=1000.0)
+        # ASML.AS-like price: round(250/1641.60, 4) = 0.1523 → $250.02,
+        # which exceeded the $250 budget and dropped the buy.
+        pf.buy("ASML.AS", 1641.60, 250.0, "test")
+        assert "ASML.AS" in pf.positions
+        shares = pf.positions["ASML.AS"]
+        assert shares * 1641.60 <= 250.0
+        assert pf.cash >= 1000.0 - 250.0
+
+    def test_multiple_buys_never_exceed_cash(self):
+        pf = optimize.PaperPortfolio(cash=1000.0)
+        pf.buy("A", 334.07, 250.0, "test")
+        pf.buy("B", 1191.74, 250.0, "test")
+        pf.buy("C", 426.54, 250.0, "test")
+        pf.buy("D", 1641.60, 250.0, "test")
+        assert set(pf.positions) == {"A", "B", "C", "D"}
+        assert pf.cash >= 0.0
+
+
 class TestReplayTopUpAtCap:
     """The max-positions cap must block NEW positions but still allow topping
     up tickers already held. Previously the BUY loop used 'break' when at the
@@ -538,3 +562,61 @@ class TestHybridReplayLLMAdditionGuards:
             f"{len(series)} tickers (cap {params.max_positions}). Expected "
             f"all {len(series)} — live sim does not cap LLM additions."
         )
+
+
+class TestPlanLlmBuys:
+    """plan_llm_buys must plan budgets against a running cash total so the
+    sum never exceeds available cash and later BUYs aren't silently dropped
+    at execution."""
+
+    async def test_sized_buys_are_deducted_sequentially(self):
+        from app.strategy import StrategyParams, plan_llm_buys
+
+        decisions = [
+            {"ticker": "AAA", "action": "BUY", "amount": 600.0},
+            {"ticker": "BBB", "action": "BUY", "amount": 600.0},
+            {"ticker": "CCC", "action": "BUY"},
+        ]
+        prices = {"AAA": 50.0, "BBB": 50.0, "CCC": 50.0}
+
+        async def price_of(t):
+            return prices.get(t)
+
+        async def value_of(t):
+            return 0.0
+
+        plan = await plan_llm_buys(
+            decisions, cash=1000.0, equity=1000.0, params=StrategyParams(),
+            guarded=False, price_of=price_of, value_of=value_of,
+        )
+
+        # AAA takes 600, BBB clamps to the remaining 400, CCC gets nothing.
+        assert plan == {"AAA": 600.0, "BBB": 400.0}
+        assert "CCC" not in plan
+        assert sum(plan.values()) <= 1000.0
+
+    async def test_unsized_split_after_sized_deduction(self):
+        from app.strategy import StrategyParams, plan_llm_buys
+
+        decisions = [
+            {"ticker": "AAA", "action": "BUY", "amount": 600.0},
+            {"ticker": "BBB", "action": "BUY"},
+            {"ticker": "CCC", "action": "BUY"},
+        ]
+        prices = {"AAA": 50.0, "BBB": 50.0, "CCC": 50.0}
+
+        async def price_of(t):
+            return prices.get(t)
+
+        async def value_of(t):
+            return 0.0
+
+        plan = await plan_llm_buys(
+            decisions, cash=1000.0, equity=1000.0, params=StrategyParams(),
+            guarded=False, price_of=price_of, value_of=value_of,
+        )
+
+        # AAA takes 600; the two unsized BUYs split the remaining 400.
+        assert plan["AAA"] == 600.0
+        assert plan.get("BBB") == plan.get("CCC") == 200.0
+        assert sum(plan.values()) <= 1000.0

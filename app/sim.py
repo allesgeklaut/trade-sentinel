@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
@@ -242,8 +243,10 @@ async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str) -
     """
     if price <= 0 or max_budget < 1:
         return None
-    # Fractional shares — invest as much of the budget as possible
-    shares = round(max_budget / price, 4)
+    # Fractional shares — floor (not round) so cost never exceeds the
+    # budget; rounding up can push a high-priced ticker cents over the
+    # available cash and silently drop the buy.
+    shares = math.floor(max_budget / price * 10000) / 10000
     if shares < 0.0001:
         return None
     cost = shares * price

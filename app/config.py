@@ -8,7 +8,7 @@ class Settings(BaseSettings):
 
     ollama_url: str = "http://host.docker.internal:11434"
     ollama_model: str = ""  # set via .env, e.g. "qwen3:32b"
-    ollama_timeout_seconds: float = 180.0
+    ollama_timeout_seconds: float = 1200.0
 
     # Multi-backend LLM config. JSON list of {"name", "type", "url", "model"}
     # where type is "ollama" (native /api/chat) or "openai" (OpenAI-compatible
