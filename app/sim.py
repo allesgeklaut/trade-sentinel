@@ -567,16 +567,80 @@ _LLM_SYSTEM_PROMPT = (
 )
 
 
+_PURE_LLM_SYSTEM_PROMPT = (
+    "You are the sole portfolio manager for a paper-trading simulation. "
+    "There is no deterministic engine running alongside you — you make all "
+    "buy and sell decisions yourself.\n"
+    "You will receive the current portfolio state and a list of candidate "
+    "tickers with their technical indicators (signal action, strength, close "
+    "price, RSI, MACD). The signal action/strength is a deterministic "
+    "scoring of the indicators — use it as a starting point, but you decide "
+    "whether to act on it.\n"
+    "\n"
+    + _SIM_METHODOLOGY +
+    "Rules:\n"
+    "2. Your primary job is to avoid overextended BUYs. See the GATING "
+    "deterministic BUYs section above — those checks apply to any BUY you "
+    "are considering, not just to proposals from an engine. Avoiding "
+    "catastrophic entries outweighs everything else.\n"
+    "3. Respect risk management: do not buy if cash is too low; do not over-"
+    "concentrate in a single ticker. There is no limit on the number of "
+    "positions you may hold — open as many or as few as you judge worthy.\n"
+    "4. You are responsible for stop losses. Each open position shows its "
+    "initial stop price (a fixed % below the entry) and the signals include "
+    "an ATR trailing stop. You MUST sell any position whose current price "
+    "has fallen below its initial stop or below the ATR trailing stop. No "
+    "other layer will do this for you.\n"
+    "5. Do NOT sell a position to free up cash for another BUY. Selling one "
+    "ticker to buy another is portfolio churn — backtesting proved this "
+    "reduces returns because the \"stronger opportunity\" has the same "
+    "indicator profile as the position being sold. Only SELL when the "
+    "signals justify it (SELL signal with weekly trend down, or price below "
+    "ATR stop, or stop loss hit).\n"
+    "6. Decisions must be grounded in the provided signals and indicators.\n"
+    "7. You may receive recent news headlines for supplementary context. News "
+    "can explain *why* indicators are moving, but do not make trades based on "
+    "news alone — the technical signals and risk rules take priority. Never "
+    "reference specific URLs in your output.\n"
+    "8. You may specify a partial position size per action using optional fields:\n"
+    "   - \"shares\": exact number of shares to trade (e.g. 3.5).\n"
+    "   - \"amount\": dollar amount to trade (e.g. 67.43). For SELL this is the"
+    " value of shares to sell; for BUY it is the dollars to invest.\n"
+    "   If neither is given, SELL sells the entire position and BUY invests the"
+    " maximum allowed by risk rules.\n"
+    "9. The max position % is a buy-time sizing limit, not a ceiling to enforce "
+    "on exits. Do NOT sell a position just because its price rose above it — "
+    "let winners run.\n"
+    "10. The min cash floor is also a buy-time constraint, not a sell trigger. "
+    "Do NOT sell a position solely to restore cash above the floor — the floor "
+    "only blocks new BUYs. If cash is below the floor, hold the positions you "
+    "have and wait for the next allowance deposit or a stop-out to replenish "
+    "cash.\n"
+    "\n"
+    "Response format: begin with a 2-4 sentence prose summary of your overall "
+    "read and the decisions you made (write this even when you made no "
+    "changes), then the JSON array of decisions on a new line. Objects have "
+    'the fields "ticker", "action", "reason", and optional "shares" / '
+    '"amount". No code fences, no markdown — just the prose, then the JSON.\n'
+)
+
+
 def _build_llm_context(
     valuation: dict[str, Any],
     deterministic_trades: list[dict],
     signals: dict[str, dict],
     news: dict[str, list[dict]] | None = None,
+    pure_llm: bool = False,
 ) -> str:
     """Build the compact context string sent to the LLM.
 
     ``news`` is an optional dict of ``{"market": [...], "TICKER": [...]}``
     headline lists. If empty or None, the news section is omitted.
+
+    ``pure_llm`` omits the deterministic-proposals section (the LLM is the
+    sole decision-maker), drops the max-positions line (no count cap in
+    pure-LLM mode), and shows each position's initial stop price so the LLM
+    can act on stop-loss hits itself.
     """
     from .news import format_news_for_context, format_market_news_for_context
 
@@ -590,17 +654,23 @@ def _build_llm_context(
     lines.append(f"Cumulative allowance deposited: {valuation['allowance_total']:.2f}")
     lines.append(f"Min cash floor (buy-time only, {settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
     lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
-    lines.append(f"Max open positions: {settings.sim_max_positions}")
+    if not pure_llm:
+        lines.append(f"Max open positions: {settings.sim_max_positions}")
     lines.append(f"Stop loss: {settings.sim_stop_pct:.0f}% (frozen at entry; ATR stop also applies)")
     lines.append("")
 
     if valuation["positions"]:
         lines.append("Open positions:")
         for p in valuation["positions"]:
+            stop_price = p["avg_cost"] * (1 - settings.sim_stop_pct / 100)
+            stop_str = (
+                f" | stop {stop_price:.2f}"
+                if pure_llm else ""
+            )
             lines.append(
                 f"  - {p['ticker']}: {p['shares']} shares @ avg {p['avg_cost']:.2f} "
                 f"| current {p['current_price']:.2f} | value {p['value']:.2f} "
-                f"| P&L {p['pnl_pct']:+.2f}%"
+                f"| P&L {p['pnl_pct']:+.2f}%{stop_str}"
             )
     else:
         lines.append("Open positions: none")
@@ -648,29 +718,38 @@ def _build_llm_context(
         lines.append("")
 
     # --- Deterministic proposed trades (pending — NOT yet executed) ---
-    lines.append("## Deterministic Proposed Trades (pending — your HOLD will veto)")
-    if deterministic_trades:
-        for t in deterministic_trades:
-            shares = t.get("shares", "?")
-            if t["side"] == "BUY":
-                # Proposals carry a budget; show it so the LLM sees the size
-                shares = f"budget ${t.get('budget', 0):.0f}"
-            lines.append(
-                f"  - {t['ticker']} {t['side']} ×{shares} @ "
-                f"{t.get('price', '?'):.2f} — {t.get('reason', '')}"
-            )
-    else:
-        lines.append("(no deterministic trades proposed)")
-    lines.append("")
+    if not pure_llm:
+        lines.append("## Deterministic Proposed Trades (pending — your HOLD will veto)")
+        if deterministic_trades:
+            for t in deterministic_trades:
+                shares = t.get("shares", "?")
+                if t["side"] == "BUY":
+                    # Proposals carry a budget; show it so the LLM sees the size
+                    shares = f"budget ${t.get('budget', 0):.0f}"
+                lines.append(
+                    f"  - {t['ticker']} {t['side']} ×{shares} @ "
+                    f"{t.get('price', '?'):.2f} — {t.get('reason', '')}"
+                )
+        else:
+            lines.append("(no deterministic trades proposed)")
+        lines.append("")
 
     lines.append("## Your Decisions")
-    lines.append(
-        "Return ONLY a JSON array of objects: "
-        '{"ticker": "...", "action": "BUY|SELL|HOLD", "reason": "..."}. '
-        "For tickers listed above, HOLD = veto (block the proposed trade); "
-        "BUY/SELL = agree and execute. You may also add new BUY/SELL decisions "
-        "for tickers NOT in the proposed list. No markdown, no prose."
-    )
+    if pure_llm:
+        lines.append(
+            "Return ONLY a JSON array of objects: "
+            '{"ticker": "...", "action": "BUY|SELL|HOLD", "reason": "..."}. '
+            "BUY/SELL will execute; HOLD means do nothing for that ticker. "
+            "No markdown, no prose."
+        )
+    else:
+        lines.append(
+            "Return ONLY a JSON array of objects: "
+            '{"ticker": "...", "action": "BUY|SELL|HOLD", "reason": "..."}. '
+            "For tickers listed above, HOLD = veto (block the proposed trade); "
+            "BUY/SELL = agree and execute. You may also add new BUY/SELL decisions "
+            "for tickers NOT in the proposed list. No markdown, no prose."
+        )
     return "\n".join(lines)
 
 
@@ -1005,16 +1084,23 @@ async def _llm_decide(
     deterministic_trades: list[dict],
     signals: dict[str, dict] | None = None,
     news: dict[str, list[dict]] | None = None,
+    pure_llm: bool = False,
 ) -> list[dict]:
-    """Hybrid strategy: let an LLM review/adjust deterministic candidates.
+    """LLM strategy: let an LLM decide what to buy/sell.
 
-    Builds a structured context with the portfolio state, deterministic
-    candidates, signal summaries, and optional recent news, asks the LLM for
-    a JSON array of decisions, then executes each BUY/SELL through the same
-    exec helpers.
+    In hybrid mode (``pure_llm=False``) the LLM reviews deterministic
+    proposals and can veto/approve/flip them. In pure-LLM mode
+    (``pure_llm=True``) there are no proposals — the LLM is the sole
+    decision-maker and is responsible for enforcing stop losses itself
+    (the prompt tells it to, and the context shows each position's stop
+    price).
+
+    Builds a structured context with the portfolio state, signal summaries,
+    and optional recent news, asks the LLM for a JSON array of decisions,
+    then executes each BUY/SELL through the same exec helpers.
 
     If the LLM call fails or the response can't be parsed, falls back to the
-    deterministic trades.
+    deterministic trades (empty in pure-LLM mode, so effectively no trades).
     """
     # Default fallback
     if signals is None:
@@ -1022,12 +1108,14 @@ async def _llm_decide(
 
     global _last_llm_reasoning, _last_llm_summary
 
-    context = _build_llm_context(valuation, deterministic_trades, signals, news)
+    system_prompt = _PURE_LLM_SYSTEM_PROMPT if pure_llm else _LLM_SYSTEM_PROMPT
+    context = _build_llm_context(valuation, deterministic_trades, signals, news,
+                                pure_llm=pure_llm)
     backend = await llm_mod.current_backend()
 
     try:
         out = await llm_mod.chat([
-            {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": context},
         ])
         content = out["text"]
@@ -1038,18 +1126,27 @@ async def _llm_decide(
                 err_detail += f" | status={e.response.status_code} body={e.response.text[:300]}"
             except Exception:
                 pass
-        logger.warning("LLM decide failed [%s] (backend=%s, model=%s); falling back to deterministic",
-                       err_detail, backend.get("name", "?"), backend.get("model", "?"))
-        _last_llm_reasoning = (
-            f"[LLM UNAVAILABLE — fell back to deterministic]\n"
-            f"Error: {err_detail}\n"
-            f"Backend: {backend.get('name', '?')}\n"
-            f"Model: {backend.get('model', '?')}\n\n"
-            f"Deterministic trades were executed instead:"
-        ) + ("\n" + "\n".join(
-            f"  - {t['ticker']} {t['side']} ×{t.get('shares', '?')} @ {t.get('price', '?'):.2f} — {t.get('reason', '')}"
-            for t in deterministic_trades
-        ) if deterministic_trades else "\n  (no deterministic trades either)")
+        mode = "pure-LLM" if pure_llm else "hybrid"
+        logger.warning("LLM decide failed [%s] (backend=%s, model=%s); falling back (%s)",
+                       err_detail, backend.get("name", "?"), backend.get("model", "?"), mode)
+        if pure_llm:
+            _last_llm_reasoning = (
+                f"[LLM UNAVAILABLE — no trades executed]\n"
+                f"Error: {err_detail}\n"
+                f"Backend: {backend.get('name', '?')}\n"
+                f"Model: {backend.get('model', '?')}"
+            )
+        else:
+            _last_llm_reasoning = (
+                f"[LLM UNAVAILABLE — fell back to deterministic]\n"
+                f"Error: {err_detail}\n"
+                f"Backend: {backend.get('name', '?')}\n"
+                f"Model: {backend.get('model', '?')}\n\n"
+                f"Deterministic trades were executed instead:"
+            ) + ("\n" + "\n".join(
+                f"  - {t['ticker']} {t['side']} ×{t.get('shares', '?')} @ {t.get('price', '?'):.2f} — {t.get('reason', '')}"
+                for t in deterministic_trades
+            ) if deterministic_trades else "\n  (no deterministic trades either)")
         _last_llm_summary = ""
         return list(deterministic_trades)
 
@@ -1057,7 +1154,7 @@ async def _llm_decide(
     _last_llm_reasoning = content
     decisions = _parse_llm_decisions(content)
     if decisions is None:
-        logger.warning("Could not parse LLM decisions; falling back to deterministic. Raw: %s", content[:500])
+        logger.warning("Could not parse LLM decisions; falling back. Raw: %s", content[:500])
         _last_llm_summary = ""
         return list(deterministic_trades)
 
@@ -1323,7 +1420,7 @@ async def run_cycle() -> dict[str, Any]:
                 signals = await _gather_signals(tickers)
                 news = await _gather_news(signals)
                 _set_progress("decide", "LLM deciding (pure-LLM strategy)", started_at=started_at)
-                trades = await _llm_decide(valuation, [], signals, news)
+                trades = await _llm_decide(valuation, [], signals, news, pure_llm=True)
                 _last_deterministic_trades = []
             elif strategy == "hybrid":
                 _set_progress("signals", "Gathering signals", started_at=started_at)

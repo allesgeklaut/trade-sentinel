@@ -763,7 +763,7 @@ async def _hybrid_replay(
     news section is omitted from the context, same as a live cycle with
     SEARXNG_URL unset.
     """
-    from .sim import _LLM_SYSTEM_PROMPT, _build_llm_context, _parse_llm_decisions
+    from .sim import _LLM_SYSTEM_PROMPT, _PURE_LLM_SYSTEM_PROMPT, _build_llm_context, _parse_llm_decisions
 
     # Build the global timeline and per-ticker day index (same as _replay).
     all_days: set[str] = set()
@@ -854,12 +854,14 @@ async def _hybrid_replay(
             allowance_total = cumulative_invested
             valuation = valuate_portfolio(_pf_to_positions(pf), pf.cash, prices, allowance_total)
             signals = _signals_for_day(series, by_time, day, params)
-            context = _build_llm_context(valuation, proposals, signals, news)
+            context = _build_llm_context(valuation, proposals, signals, news,
+                                        pure_llm=pure_llm)
+            system_prompt = _PURE_LLM_SYSTEM_PROMPT if pure_llm else _LLM_SYSTEM_PROMPT
             logger.info("  llm phase: calling LLM (%d signals, %d proposals)...",
                         len(signals), len(proposals))
             try:
                 out = await llm_mod.chat([
-                    {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": context},
                 ])
                 content = out["text"]
