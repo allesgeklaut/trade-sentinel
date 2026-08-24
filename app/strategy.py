@@ -95,6 +95,7 @@ def valuate_portfolio(
             "avg_cost": avg_cost, "current_price": price,
             "value": value, "pnl_pct": pnl_pct,
             "thesis": p.get("thesis", ""), "buy_date": p.get("buy_date", ""),
+            "peak_price": p.get("peak_price"),
         })
     return {
         "cash": cash,

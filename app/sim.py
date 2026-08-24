@@ -795,6 +795,13 @@ def _build_llm_context(
                 # Truncate long theses to keep the line readable.
                 t = thesis if len(thesis) <= 80 else thesis[:77] + "..."
                 thesis_str += f" | thesis: {t}"
+            # Per-position drawdown from its own peak (trailing-stop info).
+            peak = p.get("peak_price")
+            peak_str = ""
+            if pure_llm and peak and peak > p["current_price"]:
+                peak_dd = (peak - p["current_price"]) / peak * 100
+                if peak_dd > 1:
+                    peak_str = f" | offHigh -{peak_dd:.0f}%"
             lines.append(
                 f"  - {p['ticker']}: {p['shares']} shares @ avg {p['avg_cost']:.2f} "
                 f"| current {p['current_price']:.2f} | value {p['value']:.2f} "
