@@ -72,6 +72,8 @@ class PaperPortfolio:
     avg_cost: dict[str, float] = field(default_factory=dict)
     peak_price: dict[str, float] = field(default_factory=dict)  # ticker -> highest close since buy
     stop_price: dict[str, float] = field(default_factory=dict)  # ticker -> frozen initial stop
+    thesis: dict[str, str] = field(default_factory=dict)  # ticker -> BUY reason (entry thesis)
+    buy_date: dict[str, str] = field(default_factory=dict)  # ticker -> date of first BUY
     trades: list[dict] = field(default_factory=list)
 
     def buy(self, ticker: str, price: float, budget: float, reason: str,
@@ -98,6 +100,10 @@ class PaperPortfolio:
             self.peak_price[ticker] = price
             if stop is not None:
                 self.stop_price[ticker] = stop
+            # Record the entry thesis and buy date for the context feedback
+            # loop — the LLM sees why it bought each position and for how long.
+            self.thesis[ticker] = reason
+            self.buy_date[ticker] = date
         self.trades.append({"ticker": ticker, "side": "BUY", "shares": shares,
                             "price": price, "reason": reason, "date": date})
 
@@ -115,6 +121,8 @@ class PaperPortfolio:
             del self.avg_cost[ticker]
             self.peak_price.pop(ticker, None)
             self.stop_price.pop(ticker, None)
+            self.thesis.pop(ticker, None)
+            self.buy_date.pop(ticker, None)
         self.trades.append({"ticker": ticker, "side": "SELL", "shares": sell_shares,
                             "price": price, "reason": reason, "date": date})
 
@@ -608,10 +616,15 @@ def _signals_for_day(
 
 
 def _pf_to_positions(pf: PaperPortfolio) -> list[dict]:
-    """Convert PaperPortfolio.positions to the plain-data shape strategy.py expects."""
+    """Convert PaperPortfolio.positions to the plain-data shape strategy.py expects.
+
+    Includes ``thesis`` and ``buy_date`` (set by PaperPortfolio.buy) so the
+    LLM context builder can show why each position was bought and for how long.
+    """
     return [
         {"ticker": t, "shares": s, "avg_cost": pf.avg_cost.get(t, 0),
-         "stop_price": pf.stop_price.get(t)}
+         "stop_price": pf.stop_price.get(t),
+         "thesis": pf.thesis.get(t, ""), "buy_date": pf.buy_date.get(t, "")}
         for t, s in pf.positions.items()
     ]
 
@@ -726,6 +739,7 @@ async def _hybrid_replay(
     end: str | None = None,
     news: dict[str, list[dict]] | None = None,
     pure_llm: bool = False,
+    seed: int | None = None,
 ) -> ReplayResult:
     """Replay the hybrid strategy (deterministic + per-day LLM review).
 
@@ -746,6 +760,11 @@ async def _hybrid_replay(
     SearXNG; a historical replay has no dated news archive). When None the
     news section is omitted from the context, same as a live cycle with
     SEARXNG_URL unset.
+
+    ``seed`` pins LLM decoding (temperature=0, fixed seed) for reproducible
+    backtests via :func:`llm.set_replay_seed`. None leaves the backend's default
+    sampling. The seed is cleared in a ``finally`` so a replay never leaks
+    deterministic decoding into the live sim.
     """
     from .sim import _LLM_SYSTEM_PROMPT, _PURE_LLM_SYSTEM_PROMPT, _build_llm_context, _parse_llm_decisions
 
@@ -790,154 +809,214 @@ async def _hybrid_replay(
     cumulative_invested = params.start_cash
     last_known_prices: dict[str, float] = {}
     llm_trades: list[dict] = list(pf.trades)  # full trade log (det + LLM)
+    # Precompute day→index map for the holding-period floor (anti-churn).
+    # trading_days_held = day_to_idx[current_day] - day_to_idx[buy_date].
+    day_to_idx: dict[str, int] = {d: i for i, d in enumerate(days)}
 
-    for day_idx, day in enumerate(days, 1):
-        # Monthly allowance deposit
-        month = day[:7]
-        if month != last_deposit_month:
-            pf.cash += params.monthly_allowance
-            cumulative_invested += params.monthly_allowance
-            last_deposit_month = month
+    # Minimum holding period (trading days) before an LLM SELL is allowed.
+    # Blocks same-week buy-then-sell rotations (churn) unless the position
+    # hit a stop, the signal flipped to SELL, or the weekly trend broke.
+    _MIN_HOLD_DAYS = 5
 
-        # Carry-forward prices for missing-data days
-        prices: dict[str, float] = {}
-        for t, idx in by_time.items():
-            row = idx.get(day)
-            if row is not None:
-                p = row["close"]
-                prices[t] = p
-                last_known_prices[t] = p
-            elif t in last_known_prices:
-                prices[t] = last_known_prices[t]
+    # Pin LLM decoding for the replay so repeated runs are comparable. Cleared
+    # in the finally below — a backtest must never leak deterministic decoding
+    # into the live sim.
+    if seed is not None:
+        llm_mod.set_replay_seed(seed)
+    try:
+        for day_idx, day in enumerate(days, 1):
+            # Monthly allowance deposit
+            month = day[:7]
+            if month != last_deposit_month:
+                pf.cash += params.monthly_allowance
+                cumulative_invested += params.monthly_allowance
+                last_deposit_month = month
 
-        logger.info("hybrid day %d/%d %s — equity %.2f, cash %.2f, %d positions",
-                    day_idx, len(days), day, pf.equity(prices),
-                    pf.cash, len(pf.positions))
+            # Carry-forward prices for missing-data days
+            prices: dict[str, float] = {}
+            for t, idx in by_time.items():
+                row = idx.get(day)
+                if row is not None:
+                    p = row["close"]
+                    prices[t] = p
+                    last_known_prices[t] = p
+                elif t in last_known_prices:
+                    prices[t] = last_known_prices[t]
 
-        if pf.equity(prices) <= 0:
-            equity_curve.append({"time": day, "equity": 0.0})
-            invested_curve.append(cumulative_invested)
-            continue
+            logger.info("hybrid day %d/%d %s — equity %.2f, cash %.2f, %d positions",
+                        day_idx, len(days), day, pf.equity(prices),
+                        pf.cash, len(pf.positions))
 
-        # --- 1. Deterministic PROPOSE phase (no mutation) ---
-        if pure_llm:
-            proposals = []
-            logger.info("  (pure-LLM mode — no deterministic proposals)")
-        else:
-            proposals = _deterministic_propose_replay(pf, by_time, prices, day, params)
-            if proposals:
-                logger.info("  det proposed: %d — %s",
-                            len(proposals),
-                            ", ".join(f"{p['side']} {p['ticker']}" for p in proposals))
+            if pf.equity(prices) <= 0:
+                equity_curve.append({"time": day, "equity": 0.0})
+                invested_curve.append(cumulative_invested)
+                continue
+
+            # --- 1. Deterministic PROPOSE phase (no mutation) ---
+            if pure_llm:
+                # Pure-LLM mode: the engine still enforces the risk floor —
+                # auto-sell positions that hit their initial stop or ATR
+                # trailing stop, plus deterministic SELL signals on held
+                # positions. The LLM keeps full BUY discretion and
+                # discretionary-exit discretion on top of the auto-stops.
+                # This prevents the long bleed-stretches of HOLDs visible
+                # in the 60-day replay when the LLM failed to cut losers.
+                auto_proposals = _deterministic_propose_replay(pf, by_time, prices, day, params)
+                stop_sells = [p for p in auto_proposals if p["side"] == "SELL"]
+                for p in stop_sells:
+                    _execute_proposal(pf, p)
+                if stop_sells:
+                    logger.info("  (pure-LLM) auto-stops executed %d SELLs: %s",
+                                len(stop_sells),
+                                ", ".join(f"{p['ticker']} ({p['reason']})" for p in stop_sells))
+                # The LLM sees no deterministic proposals — it decides from scratch
+                # on the post-stop portfolio (broken positions already removed).
+                proposals = []
             else:
-                logger.info("  det proposed: no trades")
+                proposals = _deterministic_propose_replay(pf, by_time, prices, day, params)
+                if proposals:
+                    logger.info("  det proposed: %d — %s",
+                                len(proposals),
+                                ", ".join(f"{p['side']} {p['ticker']}" for p in proposals))
+                else:
+                    logger.info("  det proposed: no trades")
 
-        # --- 2 + 3. LLM review → reconcile → execute ---
-        total_equity = pf.equity(prices)
-        if total_equity > 0 and (settings.llm_backends or settings.ollama_model):
-            allowance_total = cumulative_invested
-            valuation = valuate_portfolio(_pf_to_positions(pf), pf.cash, prices, allowance_total)
-            signals = _signals_for_day(series, by_time, day, params)
-            context = _build_llm_context(valuation, proposals, signals, news,
-                                        pure_llm=pure_llm)
-            system_prompt = _PURE_LLM_SYSTEM_PROMPT if pure_llm else _LLM_SYSTEM_PROMPT
-            logger.info("  llm phase: calling LLM (%d signals, %d proposals)...",
-                        len(signals), len(proposals))
-            try:
-                out = await llm_mod.chat([
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": context},
-                ])
-                content = out["text"]
-            except Exception as e:
-                logger.warning("LLM call failed on %s: %s — executing all proposals", day, e)
-                content = ""
-            decisions = _parse_llm_decisions(content) or []
+            # --- 2 + 3. LLM review → reconcile → execute ---
+            total_equity = pf.equity(prices)
+            if total_equity > 0 and (settings.llm_backends or settings.ollama_model):
+                allowance_total = cumulative_invested
+                valuation = valuate_portfolio(_pf_to_positions(pf), pf.cash, prices, allowance_total)
+                signals = _signals_for_day(series, by_time, day, params)
+                context = _build_llm_context(valuation, proposals, signals, news,
+                                            pure_llm=pure_llm)
+                system_prompt = _PURE_LLM_SYSTEM_PROMPT if pure_llm else _LLM_SYSTEM_PROMPT
+                logger.info("  llm phase: calling LLM (%d signals, %d proposals)...",
+                            len(signals), len(proposals))
+                try:
+                    out = await llm_mod.chat([
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": context},
+                    ])
+                    content = out["text"]
+                except Exception as e:
+                    logger.warning("LLM call failed on %s: %s — executing all proposals", day, e)
+                    content = ""
+                decisions = _parse_llm_decisions(content) or []
 
-            if not decisions:
-                # LLM unavailable/parse-failed: execute all proposals (fallback)
+                if not decisions:
+                    # LLM unavailable/parse-failed: execute all proposals (fallback)
+                    for p in proposals:
+                        _execute_proposal(pf, p)
+                    if proposals:
+                        logger.info("  (fallback) executed all %d proposals", len(proposals))
+                else:
+                    # Reconcile proposals with LLM decisions (veto vs approve)
+                    approved, vetoed, proposal_tickers = reconcile_proposals(proposals, decisions)
+                    for p in vetoed:
+                        logger.info("  llm VETOED %s %s — %s", p["side"], p["ticker"], p.get("llm_reason", ""))
+
+                    # Execute approved proposals (SELLs first, already ordered)
+                    for p in approved:
+                        _execute_proposal(pf, p)
+
+                    # Execute LLM additions (decisions for tickers NOT in proposals)
+                    plan = await plan_llm_buys(
+                        decisions, pf.cash, pf.equity(prices),
+                        _replay_params_to_strategy(params),
+                        guarded=True,
+                        price_of=lambda t: _aval(prices.get(t)),
+                        value_of=lambda t: _aval(pf.positions.get(t, 0) * prices.get(t, 0)),
+                        exclude=proposal_tickers,
+                    )
+                    held_tickers = set(pf.positions.keys())
+                    for d in decisions:
+                        tu = d["ticker"].upper()
+                        if tu in proposal_tickers:
+                            continue
+                        action = d["action"]
+                        reason = d.get("reason", f"LLM {action}")
+                        price = prices.get(d["ticker"])
+                        if price is None or price <= 0 or action == "HOLD":
+                            continue
+                        if action == "BUY":
+                            # Max-positions cap: block NEW positions when at
+                            # the cap, but still allow topping up tickers
+                            # already held (mirrors the deterministic engine).
+                            if (params.max_positions > 0
+                                    and len(held_tickers) >= params.max_positions
+                                    and tu not in held_tickers):
+                                logger.info("  llm BUY %s skipped (max-positions cap %d)",
+                                            tu, params.max_positions)
+                                continue
+                            budget = plan.get(tu)
+                            if budget is None:
+                                continue
+                            entry_stop = (price * (1 - params.stop_pct / 100)
+                                          if params.stop_type == "percent" else None)
+                            pf.buy(d["ticker"], price, budget, f"LLM: {reason}",
+                                   stop=entry_stop, date=day)
+                            held_tickers.add(tu)
+                        elif action == "SELL":
+                            # Anti-churn holding-period floor: block LLM SELLs
+                            # on positions held < _MIN_HOLD_DAYS trading days,
+                            # unless the signal flipped to SELL or the weekly
+                            # trend broke. Auto-stops (executed earlier) are
+                            # not affected — they bypass the LLM entirely.
+                            buy_dt = pf.buy_date.get(d["ticker"], "")
+                            if buy_dt and buy_dt in day_to_idx:
+                                held_days = day_to_idx[day] - day_to_idx[buy_dt]
+                                if held_days < _MIN_HOLD_DAYS:
+                                    sig = signals.get(d["ticker"], {})
+                                    weekly_up = sig.get("snapshot", {}).get("weekly_trend_up", True)
+                                    sig_action = sig.get("action", "HOLD")
+                                    if sig_action != "SELL" and weekly_up:
+                                        logger.info(
+                                            "  llm SELL %s skipped (held %d<%d days, "
+                                            "no SELL signal, weekly trend up)",
+                                            tu, held_days, _MIN_HOLD_DAYS)
+                                        continue
+                            target_shares = llm_sell_shares(d, price)
+                            pf.sell(d["ticker"], price, target_shares,
+                                    f"LLM: {reason}", date=day)
+
+                    summary = ", ".join(f"{d['ticker']}={d['action']}" for d in decisions)
+                    logger.info("  llm returned %d decisions: %s", len(decisions), summary)
+                    if vetoed:
+                        logger.info("  vetoes: %d — %s",
+                                    len(vetoed),
+                                    ", ".join(f"{p['side']} {p['ticker']}" for p in vetoed))
+            else:
+                # No LLM configured: execute all proposals as-is (deterministic)
                 for p in proposals:
                     _execute_proposal(pf, p)
-                if proposals:
-                    logger.info("  (fallback) executed all %d proposals", len(proposals))
-            else:
-                # Reconcile proposals with LLM decisions (veto vs approve)
-                approved, vetoed, proposal_tickers = reconcile_proposals(proposals, decisions)
-                for p in vetoed:
-                    logger.info("  llm VETOED %s %s — %s", p["side"], p["ticker"], p.get("llm_reason", ""))
 
-                # Execute approved proposals (SELLs first, already ordered)
-                for p in approved:
-                    _execute_proposal(pf, p)
+            # Record equity
+            total_equity = pf.equity(prices)
+            equity_curve.append({"time": day, "equity": round(total_equity, 2)})
+            invested_curve.append(cumulative_invested)
+            if prev_equity is not None and prev_equity > 0:
+                daily_returns.append(total_equity / prev_equity - 1)
+            prev_equity = total_equity
 
-                # Execute LLM additions (decisions for tickers NOT in proposals)
-                plan = await plan_llm_buys(
-                    decisions, pf.cash, pf.equity(prices),
-                    _replay_params_to_strategy(params),
-                    guarded=not pure_llm,
-                    price_of=lambda t: _aval(prices.get(t)),
-                    value_of=lambda t: _aval(pf.positions.get(t, 0) * prices.get(t, 0)),
-                    exclude=proposal_tickers,
-                )
-                for d in decisions:
-                    tu = d["ticker"].upper()
-                    if tu in proposal_tickers:
-                        continue
-                    action = d["action"]
-                    reason = d.get("reason", f"LLM {action}")
-                    price = prices.get(d["ticker"])
-                    if price is None or price <= 0 or action == "HOLD":
-                        continue
-                    if action == "BUY":
-                        # Guards mirror the live sim: hybrid clamps to min-cash
-                        # and max-position-%; pure-LLM lets the LLM decide
-                        # sizing. Neither enforces a position-count cap on
-                        # LLM-initiated additions (matches sim._llm_review_proposals).
-                        budget = plan.get(tu)
-                        if budget is None:
-                            continue
-                        entry_stop = (price * (1 - params.stop_pct / 100)
-                                      if params.stop_type == "percent" else None)
-                        pf.buy(d["ticker"], price, budget, f"LLM: {reason}",
-                               stop=entry_stop, date=day)
-                    elif action == "SELL":
-                        target_shares = llm_sell_shares(d, price)
-                        pf.sell(d["ticker"], price, target_shares,
-                                f"LLM: {reason}", date=day)
+        final_equity = equity_curve[-1]["equity"] if equity_curve else 0.0
+        total_invested = params.start_cash + params.monthly_allowance * len(set(d[:7] for d in days))
+        total_return_pct = (final_equity / total_invested - 1) * 100 if total_invested > 0 else 0.0
 
-                summary = ", ".join(f"{d['ticker']}={d['action']}" for d in decisions)
-                logger.info("  llm returned %d decisions: %s", len(decisions), summary)
-                if vetoed:
-                    logger.info("  vetoes: %d — %s",
-                                len(vetoed),
-                                ", ".join(f"{p['side']} {p['ticker']}" for p in vetoed))
-        else:
-            # No LLM configured: execute all proposals as-is (deterministic)
-            for p in proposals:
-                _execute_proposal(pf, p)
-
-        # Record equity
-        total_equity = pf.equity(prices)
-        equity_curve.append({"time": day, "equity": round(total_equity, 2)})
-        invested_curve.append(cumulative_invested)
-        if prev_equity is not None and prev_equity > 0:
-            daily_returns.append(total_equity / prev_equity - 1)
-        prev_equity = total_equity
-
-    final_equity = equity_curve[-1]["equity"] if equity_curve else 0.0
-    total_invested = params.start_cash + params.monthly_allowance * len(set(d[:7] for d in days))
-    total_return_pct = (final_equity / total_invested - 1) * 100 if total_invested > 0 else 0.0
-
-    return ReplayResult(
-        params=params,
-        equity_curve=equity_curve,
-        trades=pf.trades,
-        final_equity=final_equity,
-        total_return_pct=total_return_pct,
-        sharpe=_sharpe(daily_returns),
-        max_drawdown_pct=_max_drawdown([e["equity"] for e in equity_curve], invested_curve),
-        n_trades=len(pf.trades),
-    )
+        return ReplayResult(
+            params=params,
+            equity_curve=equity_curve,
+            trades=pf.trades,
+            final_equity=final_equity,
+            total_return_pct=total_return_pct,
+            sharpe=_sharpe(daily_returns),
+            max_drawdown_pct=_max_drawdown([e["equity"] for e in equity_curve], invested_curve),
+            n_trades=len(pf.trades),
+        )
+    finally:
+        # Always restore default sampling so a replay never leaks pinned
+        # decoding into the live sim, even on exception.
+        if seed is not None:
+            llm_mod.set_replay_seed(None)
 
 
 # ---------------------------------------------------------------------------
@@ -1772,6 +1851,164 @@ def _print_cash_summary(res: ReplayResult, params: ReplayParams) -> None:
         print(f"  {m:<8} {avg_c:>9.1f}% {avg_p:>8.1f} {end_c:>11.2f}")
 
 
+# ---------------------------------------------------------------------------
+# Multi-window LLM vs deterministic benchmark (reliable scoreboard)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _WindowResult:
+    """One window's deterministic vs LLM comparison."""
+    start: str
+    end: str
+    det: ReplayResult
+    llm: ReplayResult
+
+    @property
+    def return_delta(self) -> float:
+        return self.llm.total_return_pct - self.det.total_return_pct
+
+    @property
+    def drawdown_delta(self) -> float:
+        return self.llm.max_drawdown_pct - self.det.max_drawdown_pct
+
+    @property
+    def sharpe_delta(self) -> float:
+        return self.llm.sharpe - self.det.sharpe
+
+    @property
+    def trades_delta(self) -> int:
+        return self.llm.n_trades - self.det.n_trades
+
+
+async def _llm_walkforward(
+    series: dict[str, pd.DataFrame],
+    params: ReplayParams,
+    all_days: list[str],
+    n_windows: int,
+    days_per_window: int,
+    pure_llm: bool,
+    seed: int | None,
+    start: str | None,
+    end: str | None,
+) -> list[_WindowResult]:
+    """Run N non-overlapping windows, each deterministic vs LLM (pinned seed).
+
+    Windows are cut from the tail of the bounded ``all_days`` list so the most
+    recent history is always covered. If the bounded range is shorter than
+    ``n_windows * days_per_window``, windows are allowed to overlap from the
+    front (the tail windows stay non-overlapping) — this keeps the most recent
+    windows intact at the cost of older ones sharing data, which is the
+    conservative direction for a backtest.
+    """
+    days = list(all_days)
+    if start:
+        days = [d for d in days if d >= start]
+    if end:
+        days = [d for d in days if d <= end]
+    if len(days) < days_per_window:
+        raise ValueError(
+            f"need at least {days_per_window} trading days in range, have {len(days)}"
+        )
+
+    # Cut n_windows windows from the tail.
+    windows: list[tuple[str, str]] = []
+    total_needed = n_windows * days_per_window
+    if len(days) >= total_needed:
+        # Non-overlapping: take the last total_needed days, split into n_windows.
+        base = days[-total_needed:]
+        for i in range(n_windows):
+            chunk = base[i * days_per_window:(i + 1) * days_per_window]
+            windows.append((chunk[0], chunk[-1]))
+    else:
+        # Not enough for full non-overlap: every window is still full-size
+        # (days_per_window days), but their start indices are evenly spaced
+        # across the available range so they overlap. This keeps every window
+        # the same length (comparable metrics) at the cost of shared data.
+        last_start = len(days) - days_per_window  # start of the tail window
+        if last_start < 0:
+            raise ValueError(
+                f"need at least {days_per_window} trading days in range, have {len(days)}"
+            )
+        step = last_start / max(1, n_windows - 1) if n_windows > 1 else 0
+        starts = [round(i * step) for i in range(n_windows)]
+        for s in starts:
+            chunk = days[s:s + days_per_window]
+            windows.append((chunk[0], chunk[-1]))
+
+    mode_label = "pure-LLM" if pure_llm else "hybrid"
+    active = await llm_mod.current_backend()
+    print(f"\n=== {mode_label} walk-forward ({len(windows)} windows × {days_per_window} days) ===")
+    print(f"  Backend: {active.get('name', '?')} · {active.get('model', '?')}")
+    if seed is not None:
+        print(f"  Pinned decoding: seed={seed}, temperature=0")
+    print(f"  Risk config: max_positions={params.max_positions}, "
+          f"stop={params.stop_type} {params.stop_pct:g}%, "
+          f"atr_stop={params.use_atr_stop}, max_run_5d={params.max_run_5d:g}%")
+
+    results: list[_WindowResult] = []
+    for i, (w_start, w_end) in enumerate(windows, 1):
+        print(f"\n--- Window {i}/{len(windows)}: {w_start}..{w_end} ---")
+        det = _replay(series, params, start=w_start, end=w_end)
+        logger.info("window %d/%d %s..%s deterministic: return %.2f%%, dd %.2f%%, %d trades",
+                    i, len(windows), w_start, w_end,
+                    det.total_return_pct, det.max_drawdown_pct, det.n_trades)
+        llm = await _hybrid_replay(series, params, start=w_start, end=w_end,
+                                   pure_llm=pure_llm, seed=seed)
+        logger.info("window %d/%d %s..%s %s: return %.2f%%, dd %.2f%%, %d trades",
+                    i, len(windows), w_start, w_end, mode_label,
+                    llm.total_return_pct, llm.max_drawdown_pct, llm.n_trades)
+        wr = _WindowResult(start=w_start, end=w_end, det=det, llm=llm)
+        results.append(wr)
+        _print_window_row(wr)
+
+    return results
+
+
+def _print_window_row(wr: _WindowResult) -> None:
+    """Print one window's compact comparison row."""
+    print(f"  {wr.start}..{wr.end}")
+    print(f"    {'':>14} {'det':>10} {'llm':>10} {'delta':>9}")
+    print(f"    {'Return':>14} {wr.det.total_return_pct:>+9.2f}% {wr.llm.total_return_pct:>+9.2f}% "
+          f"{wr.return_delta:>+8.2f}%")
+    print(f"    {'Max drawdown':>14} {wr.det.max_drawdown_pct:>9.2f}% {wr.llm.max_drawdown_pct:>9.2f}% "
+          f"{wr.drawdown_delta:>+8.2f}%")
+    print(f"    {'Sharpe':>14} {wr.det.sharpe:>10.2f} {wr.llm.sharpe:>10.2f} "
+          f"{wr.sharpe_delta:>+9.2f}")
+    print(f"    {'Trades':>14} {wr.det.n_trades:>10} {wr.llm.n_trades:>10} "
+          f"{wr.trades_delta:>+9}")
+
+
+def _print_walkforward_summary(results: list[_WindowResult]) -> None:
+    """Print the aggregate mean + worst-window delta table."""
+    if not results:
+        return
+    n = len(results)
+    mean_ret = sum(r.return_delta for r in results) / n
+    mean_dd = sum(r.drawdown_delta for r in results) / n
+    mean_sharpe = sum(r.sharpe_delta for r in results) / n
+    mean_trades = sum(r.trades_delta for r in results) / n
+
+    worst_ret = min(r.return_delta for r in results)
+    worst_dd = max(r.drawdown_delta for r in results)  # worst = largest extra drawdown
+    worst_sharpe = min(r.sharpe_delta for r in results)
+    worst_trades = max(r.trades_delta for r in results)  # worst = most extra churn
+
+    best_ret = max(r.return_delta for r in results)
+    pos_windows = sum(1 for r in results if r.return_delta > 0)
+
+    mode = "pure-LLM" if results else "hybrid"
+    print(f"\n=== Aggregate ({n} windows) — {mode} vs deterministic ===")
+    print(f"  {'':>14} {'mean':>10} {'worst':>10} {'best':>10}")
+    print(f"  {'Return delta':>14} {mean_ret:>+9.2f}% {worst_ret:>+9.2f}% {best_ret:>+9.2f}%")
+    print(f"  {'Drawdown delta':>14} {mean_dd:>+9.2f}% {worst_dd:>+9.2f}% "
+          f"{min(r.drawdown_delta for r in results):>+9.2f}%")
+    print(f"  {'Sharpe delta':>14} {mean_sharpe:>+9.2f} {worst_sharpe:>+9.2f} "
+          f"{max(r.sharpe_delta for r in results):>+9.2f}")
+    print(f"  {'Trades delta':>14} {mean_trades:>+10} {worst_trades:>+10} "
+          f"{min(r.trades_delta for r in results):>+10}")
+    print(f"\n  Positive-return windows: {pos_windows}/{n}")
+
+
 async def _main(args: argparse.Namespace) -> None:
     tickers = _candidate_tickers()
     logger.info("Loading series for %d tickers...", len(tickers))
@@ -1879,7 +2116,10 @@ async def _main(args: argparse.Namespace) -> None:
                 start = window_days[-args.days]
                 end = window_days[-1]
         pure_llm = getattr(args, "pure_llm", False)
+        seed = getattr(args, "seed", None)
         mode_label = "pure-LLM" if pure_llm else "hybrid"
+        if seed is not None:
+            print(f"  (pinned decoding: seed={seed}, temperature=0)")
         print(f"\n=== Pure-deterministic replay ({start}..{end}) ===")
         det = _replay(series, params, start=start, end=end)
         _print_result(det, "Deterministic baseline")
@@ -1892,7 +2132,8 @@ async def _main(args: argparse.Namespace) -> None:
         active = await llm_mod.current_backend()
         print(f"\n=== {mode_label} replay ({start}..{end}) — probing LLM once per trading day ===")
         print(f"  Backend: {active.get('name', '?')} · {active.get('model', '?')}")
-        hyb = await _hybrid_replay(series, params, start=start, end=end, pure_llm=pure_llm)
+        hyb = await _hybrid_replay(series, params, start=start, end=end,
+                                   pure_llm=pure_llm, seed=seed)
         _print_result(hyb, f"{mode_label} (deterministic + LLM review)" if not pure_llm else "Pure LLM")
 
         # Side-by-side comparison
@@ -1914,6 +2155,43 @@ async def _main(args: argparse.Namespace) -> None:
             for t in hyb.trades:
                 print(f"    {t['date']} {t['side']:<4} {t['ticker']:<8} "
                       f"{t['shares']:>9.4f} @ {t['price']:>10.2f} — {t['reason']}")
+
+    elif args.command == "llm-walkforward":
+        # Multi-window LLM vs deterministic benchmark. Runs N non-overlapping
+        # windows, each with a deterministic _replay + an LLM _hybrid_replay
+        # (pinned seed for reproducibility), then reports per-window + mean +
+        # worst-window delta. This is the reliable scoreboard for evaluating
+        # pure-LLM / hybrid strategy changes — a single window is noise.
+        if not (settings.llm_backends or settings.ollama_model):
+            print("No LLM backend configured (set LLM_BACKENDS or OLLAMA_MODEL); "
+                  "llm-walkforward needs the LLM. Aborting.")
+            return
+        params = _live_sim_params()
+        pure_llm = getattr(args, "pure_llm", False)
+        seed = getattr(args, "seed", None)
+        if seed is not None and seed < 0:
+            seed = None  # -1 sentinel disables pinning
+        n_windows = args.windows
+        days_per_window = args.days_per_window
+        try:
+            results = await _llm_walkforward(
+                series, params, all_days,
+                n_windows=n_windows, days_per_window=days_per_window,
+                pure_llm=pure_llm, seed=seed,
+                start=args.start, end=args.end,
+            )
+        except ValueError as e:
+            print(f"Cannot run walk-forward: {e}")
+            return
+        _print_walkforward_summary(results)
+
+        if getattr(args, "trades", False):
+            mode_label = "pure-LLM" if pure_llm else "hybrid"
+            for wr in results:
+                print(f"\n  {mode_label} trades ({wr.start}..{wr.end}):")
+                for t in wr.llm.trades:
+                    print(f"    {t['date']} {t['side']:<4} {t['ticker']:<8} "
+                          f"{t['shares']:>9.4f} @ {t['price']:>10.2f} — {t['reason']}")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1965,6 +2243,24 @@ def _build_parser() -> argparse.ArgumentParser:
     hr.add_argument("--trades", action="store_true", help="Print every hybrid trade")
     hr.add_argument("--pure-llm", action="store_true",
                     help="Pure LLM mode: skip deterministic proposals, let the LLM decide from scratch")
+    hr.add_argument("--seed", type=int, default=None,
+                    help="Pin LLM decoding (temperature=0, fixed seed) for reproducible replays")
+
+    lwf = sub.add_parser("llm-walkforward",
+                         help="Multi-window LLM vs deterministic benchmark (reliable scoreboard)")
+    lwf.add_argument("--start", default=None,
+                     help="YYYY-MM-DD inclusive start of the full walk-forward range")
+    lwf.add_argument("--end", default=None,
+                     help="YYYY-MM-DD inclusive end of the full walk-forward range")
+    lwf.add_argument("--windows", type=int, default=4,
+                     help="Number of non-overlapping windows to score (default 4)")
+    lwf.add_argument("--days-per-window", type=int, default=30,
+                     help="Trading days per window (default 30)")
+    lwf.add_argument("--pure-llm", action=argparse.BooleanOptionalAction, default=True,
+                     help="Pure LLM mode (default); use --no-pure-llm for hybrid (deterministic + LLM review)")
+    lwf.add_argument("--seed", type=int, default=42,
+                     help="Pin LLM decoding for reproducibility (default 42; use -1 to disable)")
+    lwf.add_argument("--trades", action="store_true", help="Print every LLM trade per window")
 
     return p
 
