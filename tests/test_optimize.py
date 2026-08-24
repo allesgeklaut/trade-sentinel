@@ -242,6 +242,31 @@ class TestPaperPortfolioThesis:
         assert positions[0]["thesis"] == "AI infrastructure leader"
         assert positions[0]["buy_date"] == "2025-06-01"
 
+    def test_last_sell_date_recorded_on_full_sell(self):
+        pf = optimize.PaperPortfolio(cash=1000.0)
+        pf.buy("AMD", 100.0, 500.0, "momentum play", date="2025-06-01")
+        pf.sell("AMD", 110.0, None, "take profit", date="2025-06-15")
+        # Full sell records the date so the re-buy cooldown can block a
+        # round-trip re-buy within 10 trading days.
+        assert pf.last_sell_date["AMD"] == "2025-06-15"
+
+    def test_last_sell_date_not_set_on_partial_sell(self):
+        pf = optimize.PaperPortfolio(cash=1000.0)
+        pf.buy("AMD", 100.0, 500.0, "momentum play", date="2025-06-01")
+        pf.sell("AMD", 110.0, 2.0, "partial take profit", date="2025-06-15")
+        # Partial sell keeps the position — no re-buy cooldown needed.
+        assert "AMD" not in pf.last_sell_date
+
+    def test_rebuy_after_cooldown_clears_last_sell(self):
+        pf = optimize.PaperPortfolio(cash=1000.0)
+        pf.buy("AMD", 100.0, 500.0, "momentum play", date="2025-06-01")
+        pf.sell("AMD", 110.0, None, "take profit", date="2025-06-15")
+        # Re-buying opens a fresh position — the old sell date is superseded.
+        pf.buy("AMD", 105.0, 500.0, "new thesis", date="2025-07-01")
+        assert pf.thesis["AMD"] == "new thesis"
+        assert pf.buy_date["AMD"] == "2025-07-01"
+        # The last_sell_date is stale but harmless; the position exists now.
+
 
 class TestReplayTopUpAtCap:
     """The max-positions cap must block NEW positions but still allow topping
@@ -614,8 +639,10 @@ class TestHybridReplayLLMAdditionGuards:
 
         # 12 tickers, but only buy 3 of them via the LLM. max_positions=3 so
         # the cap is hit immediately; the LLM's 2nd+3rd BUYs are top-ups.
+        # drift 0.02 keeps the signals consistently BUY so the candidate
+        # filter (BUY or strong HOLD >= 40) lets the top-ups through.
         series = {
-            f"UP{i}": _signal_series(_gen_candles(100.0, 0.01, seed=i, n=300))
+            f"UP{i}": _signal_series(_gen_candles(100.0, 0.02, seed=i, n=300))
             for i in range(12)
         }
         params = ReplayParams(
@@ -641,7 +668,7 @@ class TestHybridReplayLLMAdditionGuards:
         monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
 
         res = await optimize._hybrid_replay(series, params,
-                                            start="2025-07-01", end="2025-10-31",
+                                            start="2025-08-01", end="2025-10-31",
                                             pure_llm=True, seed=42)
 
         # Distinct tickers bought = 3 (the cap). But there should be more than
@@ -726,8 +753,10 @@ class TestPureLLMAutoStops:
         monkeypatch.setattr(llm_mod, "current_backend", lambda: {"name": "x", "model": "y"})
         monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
 
+        # Start on 2025-08-01: the first LLM call lands on a BUY-signal day
+        # so the entry goes through cleanly.
         res = await optimize._hybrid_replay(series, params,
-                                            start="2025-07-01", end="2025-12-31",
+                                            start="2025-08-01", end="2025-12-31",
                                             pure_llm=True, seed=42)
 
         sells = [t for t in res.trades if t["side"] == "SELL"]
@@ -774,20 +803,18 @@ class TestPureLLMAutoStops:
 
 
 class TestPureLLMAntiChurn:
-    """The 5-trading-day holding-period floor blocks LLM SELLs on positions
-    held < 5 days, unless the signal flipped to SELL or the weekly trend
-    broke. This prevents the same-week buy-then-sell rotations (churn) that
-    drove +42 extra trades in the 60-day replay."""
+    """The re-buy cooldown (10 trading days) blocks round-trip re-buys of a
+    fully-sold ticker. The LLM keeps full SELL discretion — the engine only
+    enforces the true risk floor (stop-price hits), never flushes positions
+    on SELL signals."""
 
-    async def test_early_sell_blocked(self, monkeypatch):
-        """LLM SELL on a position held < 5 trading days is blocked when
-        the signal is not SELL and weekly trend is up."""
+    async def test_llm_sell_discretion_preserved(self, monkeypatch):
+        """The LLM may sell a position any time — there is no holding-period
+        floor (it was removed: it fought the LLM and caused churn)."""
         import json as _json
 
         from app import llm as llm_mod
 
-        # A gentle uptrend so the signal stays BUY (not SELL), and weekly
-        # trend stays up — the anti-churn floor should block the early SELL.
         series = {"UP": _signal_series(_gen_candles(100.0, 0.005, seed=1, n=300))}
         params = ReplayParams(
             start_cash=10000.0,
@@ -808,7 +835,7 @@ class TestPureLLMAntiChurn:
                 return {"text": _json.dumps([
                     {"ticker": "UP", "action": "BUY", "reason": "uptrend"}
                 ])}
-            # Day 2-4: try to sell immediately (churn).
+            # Day 2: sell immediately — the LLM owns discretionary exits.
             return {"text": _json.dumps([
                 {"ticker": "UP", "action": "SELL", "reason": "rotate"}
             ])}
@@ -817,23 +844,16 @@ class TestPureLLMAntiChurn:
         monkeypatch.setattr(llm_mod, "current_backend", lambda: {"name": "x", "model": "y"})
         monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
 
-        # Run just 5 days so the LLM buys on day 1 and tries to sell on days 2-5.
-        # Day 5: held_days = 4 (still < 5) → blocked. We stop before day 6 where
-        # held_days = 5 would allow the SELL.
         res = await optimize._hybrid_replay(series, params,
-                                            start="2025-01-01", end="2025-01-05",
+                                            start="2025-08-01", end="2025-08-05",
                                             pure_llm=True, seed=42)
 
-        # The BUY should happen on day 1.
         buys = [t for t in res.trades if t["side"] == "BUY"]
-        assert buys, "expected the LLM BUY to execute on day 1"
-
-        # SELLs from days 2-5 (held < 5 trading days, signal=BUY, weekly up)
-        # must be blocked by the anti-churn floor.
         sells = [t for t in res.trades if t["side"] == "SELL"]
-        assert not sells, (
-            f"anti-churn floor failed to block early SELLs: {len(sells)} SELLs "
-            f"executed on a position held < 5 trading days"
+        assert buys, "expected the LLM BUY to execute on day 1"
+        assert sells, (
+            "the LLM's early SELL was blocked — the LLM must own discretionary "
+            "exits; only stop-price hits are engine-enforced"
         )
 
     async def test_sell_after_5_days_allowed(self, monkeypatch):
@@ -869,15 +889,128 @@ class TestPureLLMAntiChurn:
         monkeypatch.setattr(llm_mod, "current_backend", lambda: {"name": "x", "model": "y"})
         monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
 
-        # Run 15 days — by day 6+ the position is held >= 5 trading days.
+        # Run 15 days so the LLM buys on day 1 and sells on day 2 (LLM owns
+        # exits — no holding floor).
         res = await optimize._hybrid_replay(series, params,
-                                            start="2025-01-01", end="2025-01-21",
+                                            start="2025-08-01", end="2025-08-21",
                                             pure_llm=True, seed=42)
 
         sells = [t for t in res.trades if t["side"] == "SELL"]
-        # By day 6+ the SELL should go through.
+        # The LLM's SELL (day 2) goes through — no holding floor.
         assert sells, (
-            "expected a SELL after the 5-day holding period, but none executed"
+            "expected the LLM SELL to execute — the LLM owns discretionary exits"
+        )
+
+
+class TestPureLLMBuyGuards:
+    """Pure-LLM BUY guards: the re-buy cooldown blocks re-buying a fully-sold
+    ticker within 10 trading days (round-trip churn prevention). The LLM keeps
+    full buy discretion on any ticker — there is no candidate filter (it was
+    removed: it fought the LLM and caused churn)."""
+
+    async def test_buy_discretion_preserved_on_weak_signal(self, monkeypatch):
+        """The LLM may buy any ticker it chooses — the engine does not filter
+        candidates by signal strength. (The candidate filter was removed.)"""
+        import json as _json
+
+        from app import llm as llm_mod
+
+        # A downtrending ticker with weak signals. The LLM decides to buy it —
+        # that is its call to make (and the risk floor will stop it out if it
+        # is wrong). No engine filter blocks the entry.
+        series = {"DOWN": _signal_series(_gen_candles(100.0, -0.008, seed=2, n=300))}
+        params = ReplayParams(
+            start_cash=10000.0,
+            monthly_allowance=0.0,
+            max_positions=0,
+            max_position_pct=100.0,
+            min_cash_pct=0.0,
+            stop_type="none",
+            use_atr_stop=False,
+        )
+
+        async def fake_chat(messages):
+            return {"text": _json.dumps([
+                {"ticker": "DOWN", "action": "BUY", "reason": "contrarian"}
+            ])}
+
+        monkeypatch.setattr(llm_mod, "chat", fake_chat)
+        monkeypatch.setattr(llm_mod, "current_backend", lambda: {"name": "x", "model": "y"})
+        monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
+
+        res = await optimize._hybrid_replay(series, params,
+                                            start="2025-09-01", end="2025-10-31",
+                                            pure_llm=True, seed=42)
+
+        buys = [t for t in res.trades if t["side"] == "BUY"]
+        assert buys, (
+            "the LLM's BUY on a weak-signal ticker was blocked — the candidate "
+            "filter must not constrain the LLM's buy discretion"
+        )
+
+    async def test_rebuy_blocked_within_cooldown(self, monkeypatch):
+        """A ticker fully sold < 10 trading days ago cannot be re-bought."""
+        import json as _json
+
+        from app import llm as llm_mod
+
+        series = {"UP": _signal_series(_gen_candles(100.0, 0.005, seed=1, n=300))}
+        params = ReplayParams(
+            start_cash=10000.0,
+            monthly_allowance=0.0,
+            max_positions=0,
+            max_position_pct=100.0,
+            min_cash_pct=0.0,
+            stop_type="none",
+            use_atr_stop=False,
+        )
+
+        call_count = [0]
+
+        async def fake_chat(messages):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return {"text": _json.dumps([
+                    {"ticker": "UP", "action": "BUY", "reason": "entry"}
+                ])}
+            if call_count[0] == 2:
+                # Day 2: sell (LLM owns exits — allowed immediately).
+                return {"text": _json.dumps([
+                    {"ticker": "UP", "action": "SELL", "reason": "exit"}
+                ])}
+            # After the sell (day 3+), try to re-buy immediately — must be
+            # blocked by the re-buy cooldown.
+            return {"text": _json.dumps([
+                {"ticker": "UP", "action": "BUY", "reason": "looks strong again"}
+            ])}
+
+        monkeypatch.setattr(llm_mod, "chat", fake_chat)
+        monkeypatch.setattr(llm_mod, "current_backend", lambda: {"name": "x", "model": "y"})
+        monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
+
+        res = await optimize._hybrid_replay(series, params,
+                                            start="2025-08-01", end="2025-08-31",
+                                            pure_llm=True, seed=42)
+
+        # A SELL happened (LLM discretion — no holding floor anymore).
+        sells = [t for t in res.trades if t["side"] == "SELL"]
+        assert sells, "expected the LLM SELL to execute (LLM owns exits)"
+        sell_date = sells[-1]["date"]
+
+        # The re-buy must NOT happen within 10 trading days of the sell —
+        # but it may happen once the cooldown expires (day 10+). Assert the
+        # second BUY is >= 10 trading days after the SELL date.
+        buys = [t for t in res.trades if t["side"] == "BUY"]
+        assert len(buys) == 2, (
+            f"expected exactly 2 BUYs (entry + cooldown-expired re-buy), got {len(buys)}"
+        )
+        rebuy_date = buys[-1]["date"]
+        days = sorted(set().union(*(set(df["time"]) for df in series.values())))
+        day_to_idx = {d: i for i, d in enumerate(days)}
+        gap = day_to_idx[rebuy_date] - day_to_idx[sell_date]
+        assert gap >= 10, (
+            f"re-buy happened only {gap} trading days after the sell — the "
+            f"re-buy cooldown (10 days) must block round-trips"
         )
 
 

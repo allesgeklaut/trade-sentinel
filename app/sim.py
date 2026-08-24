@@ -320,6 +320,39 @@ async def _exec_sell(ticker: str, price: float, shares: float | None, reason: st
         }
 
 
+async def _risk_floor_sells(signals: dict[str, dict]) -> list[dict]:
+    """Pure-LLM risk floor: SELL any held position whose price has actually
+    fallen to the frozen initial stop or below the ATR trailing stop.
+
+    This is the ONLY engine-enforced exit in pure-LLM mode. It deliberately
+    does NOT react to SELL *signals* — the LLM owns discretionary exits, and
+    flushing positions on signals (as the earlier auto-stop layer did) made
+    the LLM churn and lose. Returns executed trade dicts.
+    """
+    async with Session() as s:
+        positions = (await s.scalars(select(SimPosition))).all()
+    executed: list[dict] = []
+    for pos in positions:
+        price = await _latest_close(pos.ticker)
+        if price is None or price <= 0:
+            continue
+        init_stop = pos.avg_cost * (1 - settings.sim_stop_pct / 100)
+        if price <= init_stop:
+            t = await _exec_sell(pos.ticker, price, None,
+                                 f"Initial stop: {price:.2f} <= {init_stop:.2f}")
+            if t:
+                executed.append(t)
+            continue
+        sig = signals.get(pos.ticker, {})
+        atr_stop = sig.get("snapshot", {}).get("atr_stop")
+        if atr_stop and price < atr_stop:
+            t = await _exec_sell(pos.ticker, price, None,
+                                 f"ATR stop hit: {price:.2f} < {atr_stop:.2f}")
+            if t:
+                executed.append(t)
+    return executed
+
+
 async def _deterministic_propose(
     valuation: dict[str, Any],
     signals: dict[str, dict] | None = None,
@@ -601,72 +634,33 @@ _PURE_LLM_METHODOLOGY = (
     "(good entry). 55-65 = moderately strong. > 70 = overbought — don't "
     "chase. < 30 = oversold (often a bounce risk).\n"
     "  - **rsi_3d_change**: the 3-day net change in RSI. Positive = momentum "
-    "recovering; negative = momentum deteriorating. This is critical for "
-    "exit-gating: a position with RSI 35 and rsi_3d_change positive is a "
-    "pullback *ending*, not deepening — hold through it. RSI 35 and "
-    "rsi_3d_change negative is still falling — sell.\n"
+    "recovering; negative = momentum deteriorating.\n"
     "  - **macd / macd_signal / macd_hist**: momentum. macd > macd_signal = "
     "bullish; macd_hist rising = momentum turning up.\n"
     "  - **macd_hist_3d_change**: the 3-day net change in the MACD histogram. "
-    "Positive = histogram rising; negative = histogram falling. Use this the "
-    "same way as rsi_3d_change: a position with macd_hist_3d_change positive "
-    "is a turn-up signal — hold unless the trend is genuinely broken "
-    "(ADX > 25 + price < sma50 < sma200).\n"
+    "Positive = histogram rising; negative = histogram falling.\n"
     "  - **weekly_trend_up** (when provided): the slower weekly-chart filter "
     "(weekly close > weekly SMA-50). A BUY against a down weekly trend is a "
     "bear-market rally — risky. A position whose weekly trend has turned "
-    "down is structurally weaker. For exit-gating, weekly_trend_up is the "
-    "most important factor: a SELL signal is wrong ~86% of the time when "
-    "the weekly trend is still up — it fires on normal pullbacks within an "
-    "uptrend, not just on real trend breaks.\n"
+    "down is structurally weaker.\n"
     "  - **run_5d**: the 5-day run-up %. A BUY after a >15% spike is chasing "
     "a short-term move prone to reversion.\n"
     "  - **atr_stop**: trailing-volatility stop. Price below it = the trend "
     "broke.\n"
     "\n"
     "## Managing exits\n"
-    "The engine auto-sells any position that hits its initial stop (a fixed % "
-    "below entry) or its ATR trailing stop — you do not need to replicate those "
-    "stops, and a position that hit a stop will simply be gone next cycle. Your "
-    "job is the DISCRETIONARY exits the stops don't cover: a position whose "
-    "trend broke (price < sma50 < sma200 or weekly trend down) but hasn't hit "
-    "its stop yet, momentum rolled over (RSI falling, MACD histogram "
-    "declining), or the reason you bought it is clearly gone. Acting early on "
-    "a weakening position frees capital before the stop forces the exit; "
-    "holding a broken position traps capital that could earn elsewhere.\n"
+    "You are the ONLY mechanism that sells positions — no engine will do it "
+    "for you. Each cycle, review every open position and sell when the reason "
+    "you bought it is gone: the trend broke (price < sma50 < sma200 or weekly "
+    "trend down), momentum rolled over (RSI falling, MACD histogram "
+    "declining), or price is at/below its stop. Holding a broken position "
+    "traps capital that could earn elsewhere; act on your read.\n"
     "\n"
-    "## GATING your own entries\n"
-    "Do NOT buy when ANY of these signal the entry is too late:\n"
-    "  - **run_5d > 15%**: price already spiked more than 15% in the last 5 "
-    "days — you are chasing a short-term spike that is prone to reversion.\n"
-    "  - **RSI > 70 AND rsi_3d_change < 0**: overbought and turning down — "
-    "momentum is fading at the top.\n"
-    "  - **ADX < 15 AND macd_hist_3d_change <= 0 AND rsi_3d_change <= 0**: no "
-    "real trend AND no momentum turning up — the signal is noise. NOTE: ADX "
-    "is a lagging indicator that stays low at the START of trends; a low ADX "
-    "with rising MACD histogram or rising RSI is an early-trend entry, not "
-    "noise — do NOT veto those.\n"
-    "Avoiding a bad entry is the highest-impact decision you can make: "
-    "backtesting showed avoiding 4 catastrophic entries (each losing 15-38% "
-    "within 20 days) outweighs missing 8 good entries, for a net +5% return "
-    "improvement. Missing a move costs less than catching a falling knife. "
-    "But do not over-gate: a low-ADX entry inside a confirmed uptrend with "
-    "momentum turning up is a valid pullback-buying opportunity.\n"
-    "\n"
-    "## GATING your own exits\n"
-    "When you see a SELL signal on a held position, do not sell blindly — "
-    "the SELL signal fires on any pullback that briefly crosses below SMA50, "
-    "not just on real trend breaks. You may hold through it, but be "
-    "conservative: holding traps capital that could be redeployed. Only hold "
-    "when ALL of these hold:\n"
-    "  1. weekly_trend_up is True, AND\n"
-    "  2. rsi_3d_change is positive OR macd_hist_3d_change is positive.\n"
-    "When in doubt, sell — the capital will be redeployed into the next BUY.\n"
-    "\n"
-    "When the portfolio holds more positions than the max-positions cap, "
-    "sell the weakest first: lowest strength, SELL signals, low ADX, RSI "
-    "overbought, or price below its ATR stop — and keep the highest-strength, "
-    "highest-ADX, still-in-uptrend names.\n"
+    "## Entry quality\n"
+    "Buying is when care matters most. Avoid entries that are too late: a BUY "
+    "after a >15% 5-day spike, RSI > 70 with momentum turning down, or ADX < "
+    "15 (no trend, just noise). Favor pullbacks that are turning up inside "
+    "an uptrend. Missing a move costs less than catching a falling knife.\n"
 )
 
 _PURE_LLM_SYSTEM_PROMPT = (
@@ -686,27 +680,31 @@ _PURE_LLM_SYSTEM_PROMPT = (
     "sell, how much of the cash to deploy, and how many positions to hold. "
     "Use the indicators and your exit-management principles; do not simply "
     "echo the signal actions.\n"
-    "3. The engine enforces stop losses for you: any position that hits its "
-    "initial stop (a fixed % below the entry price) or its ATR trailing stop "
-    "is auto-sold before you see the portfolio. You will NOT see broken "
-    "positions in the portfolio state — they are already gone. Focus your "
-    "exit decisions on positions that are weakening but haven't hit a stop "
-    "yet (trend breaking, momentum rolling over). Do not try to replicate "
-    "the engine's stop logic.\n"
-    "4. Do NOT sell a position just to buy a different one with a similar "
-    "indicator profile — that is churn and reduces returns. Sell when a "
-    "position's thesis is broken; if the redeployed capital goes into a "
-    "stronger name, so be it, but don't manufacture trades. The engine "
-    "blocks SELLs on positions held fewer than 5 trading days unless the "
-    "signal has flipped to SELL or the weekly trend has turned down — do "
-    "not waste your output proposing early SELLs that will be filtered.\n"
-    "5. The engine enforces hard risk limits on your BUYs: a max-position-% "
-    "ceiling prevents over-concentration in a single ticker, a min-cash floor "
-    "preserves a cash buffer, and a max-positions cap limits the total number "
-    "of open positions. New BUYs beyond the position cap are blocked, but "
-    "topping up tickers you already hold is always allowed. You choose WHICH "
-    "tickers to buy and sell within these limits; the engine enforces the "
-    "sizing guardrails.\n"
+    "3. You are responsible for stop losses. Each open position shows its "
+    "initial stop price (a fixed % below the entry) and the signals include "
+    "an ATR trailing stop. Sell any position whose current price is at or "
+    "below either stop unless you have a strong indicator-based reason to "
+    "override. (The engine also auto-sells stop hits as a safety net, but "
+    "do not rely on it — act on your read.)\n"
+    "4. STABILITY RULES — do NOT rotate the portfolio. These are the most "
+    "important rules you have:\n"
+    "   - Never SELL and BUY in the same cycle (no 'sell X to buy Y' rotation). "
+    "Decide holds first; only propose new BUYs from cash that is already free.\n"
+    "   - Never re-buy a ticker you sold within the last 10 trading days — the "
+    "Recent Trades section shows your own activity. A round-trip (sell Monday, "
+    "re-buy Thursday) is churn and loses money on the spread. If you sold it, "
+    "you had a reason; that reason has not changed in 3 days.\n"
+    "   - Hold through short-term noise. A position that is down 3-5% on a "
+    "normal pullback inside an uptrend is NOT a sell — the engine's stop is "
+    "your safety net. Do not exit a position just because it is red today.\n"
+    "   - Sell when a position's thesis is broken; if the redeployed capital "
+    "goes into a stronger name, so be it, but don't manufacture trades.\n"
+    "   - The engine blocks re-buying a ticker sold within the last 10 "
+    "trading days — don't waste your output proposing those.\n"
+    "5. You decide how much cash to keep in reserve and how concentrated the "
+    "portfolio should be. The reference min-cash floor and max-position-% in "
+    "the portfolio state are guidance, not hard limits — you decide. There is "
+    "no limit on the number of positions you may hold.\n"
     "6. Decisions must be grounded in the provided signals and indicators.\n"
     "7. You may receive recent news headlines for supplementary context. News "
     "can explain *why* indicators are moving, but do not make trades based on "
@@ -741,11 +739,18 @@ def _build_llm_context(
     signals: dict[str, dict],
     news: dict[str, list[dict]] | None = None,
     pure_llm: bool = False,
+    trade_history: list[dict] | None = None,
 ) -> str:
     """Build the compact context string sent to the LLM.
 
     ``news`` is an optional dict of ``{"market": [...], "TICKER": [...]}``
     headline lists. If empty or None, the news section is omitted.
+
+    ``trade_history`` is an optional list of recent trade dicts
+    (``{"date", "side", "ticker", "shares", "price", "reason"}``), newest
+    first. When provided, a "Recent Trades" section is included so the LLM
+    can see what it did recently and avoid round-trips / repeated mistakes.
+    The list is truncated to the last 12 trades to keep the context compact.
 
     ``pure_llm`` omits the deterministic-proposals section (the LLM is the
     sole decision-maker), drops the max-positions line (no count cap in
@@ -763,12 +768,12 @@ def _build_llm_context(
     lines.append(f"Total equity: {valuation['total_equity']:.2f}")
     lines.append(f"Cumulative allowance deposited: {valuation['allowance_total']:.2f}")
     if pure_llm:
-        lines.append(f"Min cash floor (buy-time only, {settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
-        lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
-        lines.append(f"Max open positions: {settings.sim_max_positions}")
+        lines.append(f"Reference: min cash floor {settings.sim_min_cash_pct}% = {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f} (guidance only — you decide)")
+        lines.append(f"Reference: max position size {settings.sim_max_position_pct}% = {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f} (guidance only — you decide)")
     else:
         lines.append(f"Min cash floor (buy-time only, {settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
         lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
+    if not pure_llm:
         lines.append(f"Max open positions: {settings.sim_max_positions}")
     lines.append(f"Stop loss: {settings.sim_stop_pct:.0f}% (frozen at entry; ATR stop also applies)")
     lines.append("")
@@ -800,41 +805,11 @@ def _build_llm_context(
     lines.append("")
 
     # --- Signals summary ---
-    # When the universe is large (97 tickers), dumping every signal row
-    # overloads the LLM with a wall of numbers it must re-rank. The
-    # deterministic engine already scored them; truncate to the top 20
-    # non-held by strength + all held + all SELL signals, so the LLM sees
-    # the best entry candidates, every position it needs to manage, and
-    # every exit signal without parsing 97 rows.
-    _MAX_SHOWN_NON_HELD = 20
-    _TRUNCATION_THRESHOLD = 30
-    held_set = {p["ticker"].upper() for p in valuation["positions"]}
-
-    if signals and len(signals) > _TRUNCATION_THRESHOLD:
-        def _sig_sort_key(item):
-            ticker, sig = item
-            # Held tickers and SELL signals always shown — sort those first.
-            is_held = ticker.upper() in held_set
-            is_sell = sig.get("action") == "SELL"
-            return (not is_held and not is_sell, -sig.get("strength", 0))
-
-        sorted_signals = sorted(signals.items(), key=_sig_sort_key)
-        shown = []
-        non_held_count = 0
-        for ticker, sig in sorted_signals:
-            is_held = ticker.upper() in held_set
-            is_sell = sig.get("action") == "SELL"
-            if not is_held and not is_sell:
-                if non_held_count >= _MAX_SHOWN_NON_HELD:
-                    continue
-                non_held_count += 1
-            shown.append((ticker, sig))
-        truncated_count = len(signals) - len(shown)
-        lines.append(f"## Signals (top {_MAX_SHOWN_NON_HELD} non-held by strength + all held + SELLs"
-                     f" — {len(signals)} total, {truncated_count} lower-ranked hidden)")
-    else:
-        shown = sorted(signals.items()) if signals else []
-        lines.append("## Signals (all candidate tickers)")
+    # The full signal table is shown — the LLM is the decision-maker in
+    # pure-LLM mode and needs to see every candidate, exactly as the good-era
+    # runs did. Truncating to "top N" starved it of context.
+    shown = sorted(signals.items()) if signals else []
+    lines.append("## Signals (all candidate tickers)")
 
     if shown:
         atr_col = " {'atrStop':>9}" if pure_llm else ""
@@ -876,6 +851,17 @@ def _build_llm_context(
             hl = news.get(ticker, [])
             if hl:
                 lines.append(format_news_for_context(ticker, hl))
+        lines.append("")
+
+    # --- Recent Trades (your own recent activity, for continuity) ---
+    if trade_history:
+        lines.append("## Recent Trades (your last 12 actions — use this to avoid round-trips)")
+        for t in trade_history[:12]:
+            shares = t.get("shares", "?")
+            lines.append(
+                f"  - {t.get('date', '?')} {t['side']:<4} {t['ticker']:<10} "
+                f"×{shares} @ {t.get('price', '?'):.2f} — {t.get('reason', '')[:60]}"
+            )
         lines.append("")
 
     # --- Deterministic proposed trades (pending — NOT yet executed) ---
@@ -1267,8 +1253,21 @@ async def _llm_decide(
     global _last_llm_reasoning, _last_llm_summary
 
     system_prompt = _PURE_LLM_SYSTEM_PROMPT if pure_llm else _LLM_SYSTEM_PROMPT
+    # Recent trade history from the DB (newest first) so the LLM sees what it
+    # did recently and can avoid round-trips / repeated mistakes.
+    recent_trades: list[dict] = []
+    async with Session() as s:
+        recent_rows = (await s.scalars(
+            select(SimTrade).order_by(SimTrade.created_at.desc()).limit(12)
+        )).all()
+    recent_trades = [
+        {"date": tr.created_at.strftime("%Y-%m-%d") if tr.created_at else "",
+         "side": tr.side, "ticker": tr.ticker, "shares": tr.shares,
+         "price": tr.price, "reason": tr.reason}
+        for tr in recent_rows
+    ]
     context = _build_llm_context(valuation, deterministic_trades, signals, news,
-                                pure_llm=pure_llm)
+                                pure_llm=pure_llm, trade_history=recent_trades)
     backend = await llm_mod.current_backend()
 
     try:
@@ -1348,7 +1347,7 @@ async def _llm_decide(
             max_position_pct=settings.sim_max_position_pct,
             max_positions=settings.sim_max_positions,
         ),
-        guarded=True,
+        guarded=not pure_llm,
         price_of=_price_of,
         value_of=_value_of,
     )
@@ -1356,17 +1355,25 @@ async def _llm_decide(
     # Track held tickers for the max-positions cap on LLM-initiated BUYs.
     # Updated progressively as BUYs execute so the 2nd new BUY sees the 1st.
     held_tickers: set[str] = set()
-    # Preload position opened_at for the holding-period floor (anti-churn).
-    pos_opened: dict[str, datetime] = {}
     async with Session() as s:
         existing = (await s.scalars(select(SimPosition))).all()
     held_tickers = {p.ticker.upper() for p in existing}
-    pos_opened = {p.ticker.upper(): p.opened_at for p in existing if p.opened_at}
 
-    # Minimum holding period (calendar days, ~5 trading days) before an LLM
-    # SELL is allowed. Blocks same-week buy-then-sell rotations (churn)
-    # unless the signal flipped to SELL or the weekly trend broke.
-    _MIN_HOLD_CALENDAR_DAYS = 7
+    # Minimum calendar days before a fully-sold ticker may be re-bought.
+    # Blocks round-trips (sell Monday, re-buy Thursday at a higher price).
+    _REBUY_COOLDOWN_CALENDAR_DAYS = 14
+
+    # Last-sell date per ticker (from the trade log) for the re-buy cooldown.
+    last_sell: dict[str, datetime] = {}
+    async with Session() as s:
+        sells = (await s.scalars(
+            select(SimTrade).where(SimTrade.side == "SELL")
+        )).all()
+    for tr in sells:
+        if tr.created_at:
+            key = tr.ticker.upper()
+            if key not in last_sell or tr.created_at > last_sell[key]:
+                last_sell[key] = tr.created_at
 
     for decision in decisions:
         ticker = decision["ticker"]
@@ -1379,10 +1386,21 @@ async def _llm_decide(
             continue
 
         if action == "BUY":
-            # Max-positions cap: block NEW positions when at the cap, but
-            # still allow topping up tickers already held (mirrors the
-            # deterministic engine's behaviour).
-            if (settings.sim_max_positions > 0
+            # Round-trip guard: block re-buying a ticker fully sold within
+            # the cooldown window.
+            last_sold = last_sell.get(ticker.upper())
+            if last_sold is not None:
+                days_since = (_utcnow() - last_sold).days
+                if days_since < _REBUY_COOLDOWN_CALENDAR_DAYS:
+                    logger.info(
+                        "LLM BUY %s skipped (sold %d calendar days ago, "
+                        "re-buy cooldown %d)",
+                        ticker, days_since, _REBUY_COOLDOWN_CALENDAR_DAYS)
+                    continue
+            # Hybrid mode keeps the max-positions cap on LLM additions;
+            # pure-LLM mode lets the LLM decide the portfolio size (matches
+            # the good-era behaviour).
+            if (not pure_llm and settings.sim_max_positions > 0
                     and len(held_tickers) >= settings.sim_max_positions
                     and ticker.upper() not in held_tickers):
                 logger.info("LLM BUY %s skipped (max-positions cap %d)",
@@ -1402,25 +1420,6 @@ async def _llm_decide(
                 total_equity = valuation["total_equity"]
 
         elif action == "SELL":
-            # Anti-churn holding-period floor: block LLM SELLs on positions
-            # held < _MIN_HOLD_CALENDAR_DAYS, unless the signal flipped to
-            # SELL or the weekly trend broke. Auto-stops (executed earlier
-            # by the engine) are not affected — they bypass the LLM entirely.
-            tu = ticker.upper()
-            opened = pos_opened.get(tu)
-            if opened is not None:
-                held_calendar_days = (_utcnow() - opened).days
-                if held_calendar_days < _MIN_HOLD_CALENDAR_DAYS:
-                    # Check if the signal is SELL or weekly trend is down.
-                    sig = signals.get(ticker, {}) if signals else {}
-                    weekly_up = sig.get("snapshot", {}).get("weekly_trend_up", True)
-                    sig_action = sig.get("action", "HOLD")
-                    if sig_action != "SELL" and weekly_up:
-                        logger.info(
-                            "LLM SELL %s skipped (held %d<%d calendar days, "
-                            "no SELL signal, weekly trend up)",
-                            ticker, held_calendar_days, _MIN_HOLD_CALENDAR_DAYS)
-                        continue
             # Optional partial size: "shares" (exact) or "amount" (dollars).
             target_shares = llm_sell_shares(decision, price)
             t = await _exec_sell(ticker, price, target_shares, f"LLM: {reason}")
@@ -1613,19 +1612,15 @@ async def run_cycle() -> dict[str, Any]:
                 _set_progress("signals", "Gathering signals", started_at=started_at)
                 signals = await _gather_signals(tickers)
                 news = await _gather_news(signals)
-                # Pure-LLM mode: the engine still enforces the risk floor —
-                # auto-sell positions that hit their initial stop, ATR trailing
-                # stop, or fired a deterministic SELL signal. The LLM keeps
-                # full BUY discretion and discretionary-exit discretion on top
-                # of the auto-stops. This prevents the long bleed-stretches of
-                # HOLDs visible in the 60-day replay when the LLM failed to cut
-                # losers on its own.
+                # Pure-LLM mode: the engine enforces ONLY the true risk floor
+                # — auto-sell positions whose price has actually fallen to the
+                # frozen initial stop or the ATR trailing stop. It does NOT
+                # flush positions on SELL *signals* (the LLM owns discretionary
+                # exits) and makes no BUY proposals (the LLM picks entries).
                 _set_progress("stops", "Engine enforcing stop losses", started_at=started_at)
-                auto_proposals = await _deterministic_propose(valuation, signals)
-                stop_sells = [p for p in auto_proposals if p["side"] == "SELL"]
-                if stop_sells:
-                    stop_trades = await _execute_proposed(stop_sells)
-                    logger.info("  (pure-LLM) auto-stops executed %d SELLs: %s",
+                stop_trades = await _risk_floor_sells(signals)
+                if stop_trades:
+                    logger.info("  (pure-LLM) risk floor executed %d stop-outs: %s",
                                 len(stop_trades),
                                 ", ".join(t["ticker"] for t in stop_trades))
                     # Re-valuate after stop-outs so the LLM sees the post-stop

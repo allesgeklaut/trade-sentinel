@@ -74,6 +74,7 @@ class PaperPortfolio:
     stop_price: dict[str, float] = field(default_factory=dict)  # ticker -> frozen initial stop
     thesis: dict[str, str] = field(default_factory=dict)  # ticker -> BUY reason (entry thesis)
     buy_date: dict[str, str] = field(default_factory=dict)  # ticker -> date of first BUY
+    last_sell_date: dict[str, str] = field(default_factory=dict)  # ticker -> date last fully sold
     trades: list[dict] = field(default_factory=list)
 
     def buy(self, ticker: str, price: float, budget: float, reason: str,
@@ -123,6 +124,9 @@ class PaperPortfolio:
             self.stop_price.pop(ticker, None)
             self.thesis.pop(ticker, None)
             self.buy_date.pop(ticker, None)
+            # Remember when this ticker was fully sold so the LLM can't
+            # immediately re-buy it (round-trip churn prevention).
+            self.last_sell_date[ticker] = date
         self.trades.append({"ticker": ticker, "side": "SELL", "shares": sell_shares,
                             "price": price, "reason": reason, "date": date})
 
@@ -809,14 +813,13 @@ async def _hybrid_replay(
     cumulative_invested = params.start_cash
     last_known_prices: dict[str, float] = {}
     llm_trades: list[dict] = list(pf.trades)  # full trade log (det + LLM)
-    # Precompute day→index map for the holding-period floor (anti-churn).
-    # trading_days_held = day_to_idx[current_day] - day_to_idx[buy_date].
+    # Precompute day→index map for the re-buy cooldown (anti-churn).
+    # days_since_sell = day_to_idx[current_day] - day_to_idx[last_sell_date].
     day_to_idx: dict[str, int] = {d: i for i, d in enumerate(days)}
 
-    # Minimum holding period (trading days) before an LLM SELL is allowed.
-    # Blocks same-week buy-then-sell rotations (churn) unless the position
-    # hit a stop, the signal flipped to SELL, or the weekly trend broke.
-    _MIN_HOLD_DAYS = 5
+    # Minimum days (trading days) before a fully-sold ticker may be re-bought.
+    # Blocks round-trips (sell Monday, re-buy Thursday at a higher price).
+    _REBUY_COOLDOWN_DAYS = 10
 
     # Pin LLM decoding for the replay so repeated runs are comparable. Cleared
     # in the finally below — a backtest must never leak deterministic decoding
@@ -853,20 +856,39 @@ async def _hybrid_replay(
                 continue
 
             # --- 1. Deterministic PROPOSE phase (no mutation) ---
+            # Signals are computed first — the pure-LLM risk floor needs the
+            # day's ATR stop levels, and the LLM context needs the full table.
+            signals = _signals_for_day(series, by_time, day, params)
             if pure_llm:
-                # Pure-LLM mode: the engine still enforces the risk floor —
-                # auto-sell positions that hit their initial stop or ATR
-                # trailing stop, plus deterministic SELL signals on held
-                # positions. The LLM keeps full BUY discretion and
-                # discretionary-exit discretion on top of the auto-stops.
-                # This prevents the long bleed-stretches of HOLDs visible
-                # in the 60-day replay when the LLM failed to cut losers.
-                auto_proposals = _deterministic_propose_replay(pf, by_time, prices, day, params)
-                stop_sells = [p for p in auto_proposals if p["side"] == "SELL"]
+                # Pure-LLM mode: the engine enforces ONLY the true risk floor
+                # — auto-sell positions whose price has actually fallen to the
+                # frozen initial stop or the ATR trailing stop. It does NOT
+                # flush positions on SELL *signals* (the LLM owns discretionary
+                # exits) and makes no BUY proposals (the LLM picks entries).
+                # The LLM decides everything else from the full signal table.
+                stop_sells = []
+                for ticker in list(pf.positions.keys()):
+                    price = prices.get(ticker)
+                    if price is None or price <= 0:
+                        continue
+                    # Frozen initial stop (set at entry by PaperPortfolio.buy).
+                    init_stop = pf.stop_price.get(ticker)
+                    if init_stop is not None and price <= init_stop:
+                        stop_sells.append({"ticker": ticker, "side": "SELL",
+                                           "price": price, "shares": None,
+                                           "reason": f"Initial stop: {price:.2f} <= {init_stop:.2f}"})
+                        continue
+                    # ATR trailing stop from the day's signal snapshot.
+                    sig = signals.get(ticker, {})
+                    atr_stop = sig.get("snapshot", {}).get("atr_stop")
+                    if atr_stop and price < atr_stop:
+                        stop_sells.append({"ticker": ticker, "side": "SELL",
+                                           "price": price, "shares": None,
+                                           "reason": f"ATR stop hit: {price:.2f} < {atr_stop:.2f}"})
                 for p in stop_sells:
                     _execute_proposal(pf, p)
                 if stop_sells:
-                    logger.info("  (pure-LLM) auto-stops executed %d SELLs: %s",
+                    logger.info("  (pure-LLM) risk floor executed %d stop-outs: %s",
                                 len(stop_sells),
                                 ", ".join(f"{p['ticker']} ({p['reason']})" for p in stop_sells))
                 # The LLM sees no deterministic proposals — it decides from scratch
@@ -888,7 +910,8 @@ async def _hybrid_replay(
                 valuation = valuate_portfolio(_pf_to_positions(pf), pf.cash, prices, allowance_total)
                 signals = _signals_for_day(series, by_time, day, params)
                 context = _build_llm_context(valuation, proposals, signals, news,
-                                            pure_llm=pure_llm)
+                                            pure_llm=pure_llm,
+                                            trade_history=list(reversed(pf.trades[-15:]))[:12])
                 system_prompt = _PURE_LLM_SYSTEM_PROMPT if pure_llm else _LLM_SYSTEM_PROMPT
                 logger.info("  llm phase: calling LLM (%d signals, %d proposals)...",
                             len(signals), len(proposals))
@@ -923,7 +946,7 @@ async def _hybrid_replay(
                     plan = await plan_llm_buys(
                         decisions, pf.cash, pf.equity(prices),
                         _replay_params_to_strategy(params),
-                        guarded=True,
+                        guarded=not pure_llm,
                         price_of=lambda t: _aval(prices.get(t)),
                         value_of=lambda t: _aval(pf.positions.get(t, 0) * prices.get(t, 0)),
                         exclude=proposal_tickers,
@@ -939,10 +962,21 @@ async def _hybrid_replay(
                         if price is None or price <= 0 or action == "HOLD":
                             continue
                         if action == "BUY":
-                            # Max-positions cap: block NEW positions when at
-                            # the cap, but still allow topping up tickers
-                            # already held (mirrors the deterministic engine).
-                            if (params.max_positions > 0
+                            # Round-trip guard: block re-buying a ticker that
+                            # was fully sold less than 10 trading days ago.
+                            last_sell = pf.last_sell_date.get(d["ticker"], "")
+                            if last_sell and last_sell in day_to_idx:
+                                days_since_sell = day_to_idx[day] - day_to_idx[last_sell]
+                                if days_since_sell < _REBUY_COOLDOWN_DAYS:
+                                    logger.info(
+                                        "  llm BUY %s skipped (sold %d days ago, "
+                                        "re-buy cooldown %d)",
+                                        tu, days_since_sell, _REBUY_COOLDOWN_DAYS)
+                                    continue
+                            # Hybrid mode keeps the max-positions cap on LLM
+                            # additions; pure-LLM mode lets the LLM decide the
+                            # portfolio size (matches the good-era behaviour).
+                            if (not pure_llm and params.max_positions > 0
                                     and len(held_tickers) >= params.max_positions
                                     and tu not in held_tickers):
                                 logger.info("  llm BUY %s skipped (max-positions cap %d)",
@@ -957,24 +991,6 @@ async def _hybrid_replay(
                                    stop=entry_stop, date=day)
                             held_tickers.add(tu)
                         elif action == "SELL":
-                            # Anti-churn holding-period floor: block LLM SELLs
-                            # on positions held < _MIN_HOLD_DAYS trading days,
-                            # unless the signal flipped to SELL or the weekly
-                            # trend broke. Auto-stops (executed earlier) are
-                            # not affected — they bypass the LLM entirely.
-                            buy_dt = pf.buy_date.get(d["ticker"], "")
-                            if buy_dt and buy_dt in day_to_idx:
-                                held_days = day_to_idx[day] - day_to_idx[buy_dt]
-                                if held_days < _MIN_HOLD_DAYS:
-                                    sig = signals.get(d["ticker"], {})
-                                    weekly_up = sig.get("snapshot", {}).get("weekly_trend_up", True)
-                                    sig_action = sig.get("action", "HOLD")
-                                    if sig_action != "SELL" and weekly_up:
-                                        logger.info(
-                                            "  llm SELL %s skipped (held %d<%d days, "
-                                            "no SELL signal, weekly trend up)",
-                                            tu, held_days, _MIN_HOLD_DAYS)
-                                        continue
                             target_shares = llm_sell_shares(d, price)
                             pf.sell(d["ticker"], price, target_shares,
                                     f"LLM: {reason}", date=day)

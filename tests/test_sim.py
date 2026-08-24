@@ -644,82 +644,29 @@ class TestBuildLLMContext:
         assert "AMD" in ctx
         assert "strong momentum" in ctx
 
-    def test_signal_truncation_shows_top_non_held(self):
-        """When there are >30 signals, only the top 20 non-held by strength
-        + all held + all SELLs are shown. Lower-ranked non-held names are
-        hidden to keep the LLM's context focused."""
+    def test_all_signals_shown_regardless_of_strength(self):
+        """The full signal table is always shown — the LLM is the
+        decision-maker and needs to see every candidate. (Truncation was
+        removed: it starved the LLM of context and caused churn.)"""
         val = {"cash": 0, "positions_value": 0, "total_equity": 0,
                "allowance_total": 0, "positions": []}
-        # 40 BUY signals with different strengths.
+        # 40 BUY signals with different strengths, plus weak SELLs.
         signals = {
             f"T{i:02d}": {"action": "BUY", "strength": i,
                            "snapshot": {"close": 100.0, "rsi": 50.0, "macd": 0.0}}
             for i in range(40)
         }
-        ctx = sim._build_llm_context(val, [], signals)
-        # Top 20 by strength = T20..T39 (strength 20..39).
-        assert "T39" in ctx
-        assert "T20" in ctx
-        # T00..T19 (strength 0..19) are below the top-20 cutoff — hidden.
-        assert "T00" not in ctx
-        assert "T19" not in ctx
-        # Truncation notice must appear.
-        assert "hidden" in ctx
-
-    def test_signal_truncation_keeps_all_held(self):
-        """Held positions must always appear in the signals table even if
-        their strength is low — the LLM needs to manage exits on them."""
-        val = {
-            "cash": 0, "positions_value": 0, "total_equity": 0,
-            "allowance_total": 0,
-            "positions": [{"ticker": "LOW", "shares": 5, "avg_cost": 100.0,
-                            "current_price": 90.0, "value": 450.0, "pnl_pct": -10.0}],
-        }
-        # 40 signals: LOW has strength 0 (lowest), rest have strength 50+.
-        signals = {
-            "LOW": {"action": "HOLD", "strength": 0,
-                    "snapshot": {"close": 90.0, "rsi": 40.0, "macd": -0.1}},
-        }
-        for i in range(40):
-            signals[f"T{i:02d}"] = {"action": "BUY", "strength": 50 + i,
-                                    "snapshot": {"close": 100.0, "rsi": 50.0, "macd": 0.0}}
-        ctx = sim._build_llm_context(val, [], signals)
-        # LOW is held — must appear despite strength 0.
-        assert "LOW" in ctx
-
-    def test_signal_truncation_keeps_all_sells(self):
-        """SELL signals must always appear so the LLM sees exit opportunities
-        on weak names, even if the signal's strength is low."""
-        val = {"cash": 0, "positions_value": 0, "total_equity": 0,
-               "allowance_total": 0, "positions": []}
-        signals = {}
-        # 25 strong BUYs (strength 80+).
-        for i in range(25):
-            signals[f"BUY{i:02d}"] = {"action": "BUY", "strength": 80 + i,
-                                     "snapshot": {"close": 100.0, "rsi": 50.0, "macd": 0.0}}
-        # 10 weak SELLs (strength 10).
-        for i in range(10):
+        for i in range(5):
             signals[f"SELL{i:02d}"] = {"action": "SELL", "strength": 10,
-                                     "snapshot": {"close": 50.0, "rsi": 30.0, "macd": -0.5}}
+                                       "snapshot": {"close": 50.0, "rsi": 30.0, "macd": -0.5}}
         ctx = sim._build_llm_context(val, [], signals)
-        # SELLs must appear — they're exit signals the LLM needs to see.
-        assert "SELL00" in ctx
-        assert "SELL09" in ctx
-
-    def test_no_truncation_below_threshold(self):
-        """When there are <=30 signals, all are shown without truncation."""
-        val = {"cash": 0, "positions_value": 0, "total_equity": 0,
-               "allowance_total": 0, "positions": []}
-        signals = {
-            f"T{i:02d}": {"action": "BUY", "strength": i,
-                          "snapshot": {"close": 100.0, "rsi": 50.0, "macd": 0.0}}
-            for i in range(30)
-        }
-        ctx = sim._build_llm_context(val, [], signals)
-        # All 30 should appear — no truncation.
+        # Every ticker appears — no truncation, no "hidden" notice.
         assert "T00" in ctx
-        assert "T29" in ctx
+        assert "T39" in ctx
+        assert "SELL00" in ctx
+        assert "SELL04" in ctx
         assert "hidden" not in ctx
+        assert "all candidate tickers" in ctx
 
     def test_context_shows_position_thesis(self):
         """The context must show each position's entry thesis and holding
@@ -770,6 +717,49 @@ class TestBuildLLMContext:
         ctx = sim._build_llm_context(val, [], {}, pure_llm=True)
         assert "thesis:" not in ctx
         assert "since" not in ctx
+
+    def test_context_includes_recent_trades(self):
+        """The Recent Trades section lets the LLM see its own recent activity
+        so it can avoid round-trips and repeated mistakes."""
+        val = {"cash": 0, "positions_value": 0, "total_equity": 0,
+               "allowance_total": 0, "positions": []}
+        history = [
+            {"date": "2025-06-10", "side": "SELL", "ticker": "ASML.AS",
+             "shares": 5.0, "price": 100.0, "reason": "momentum rolled over"},
+            {"date": "2025-06-08", "side": "BUY", "ticker": "NVDA",
+             "shares": 3.0, "price": 120.0, "reason": "pullback in uptrend"},
+        ]
+        ctx = sim._build_llm_context(val, [], {}, pure_llm=True,
+                                     trade_history=history)
+        assert "Recent Trades" in ctx
+        assert "ASML.AS" in ctx
+        assert "2025-06-10" in ctx
+        assert "momentum rolled over" in ctx
+
+    def test_context_truncates_trade_history_to_12(self):
+        """Only the last 12 trades are shown — the context stays compact."""
+        val = {
+            "cash": 0, "positions_value": 0, "total_equity": 0,
+            "allowance_total": 0, "positions": [],
+        }
+        history = [
+            {"date": f"2025-06-{i:02d}", "side": "BUY", "ticker": f"T{i:02d}",
+             "shares": 1.0, "price": 100.0, "reason": "test"}
+            for i in range(20)
+        ]
+        ctx = sim._build_llm_context(val, [], {}, pure_llm=True, trade_history=history)
+        assert "Recent Trades" in ctx
+        # Only the first 12 (by provided order) are shown.
+        assert "T00" in ctx  # first trade shown
+        assert "T19" not in ctx  # 20th trade truncated
+
+    def test_context_no_recent_trades_omits_section(self):
+        val = {
+            "cash": 0, "positions_value": 0, "total_equity": 0,
+            "allowance_total": 0, "positions": [],
+        }
+        ctx = sim._build_llm_context(val, [], {}, pure_llm=True)
+        assert "Recent Trades" not in ctx
 
 
 class TestLLMDecide:
@@ -832,7 +822,12 @@ class TestLLMDecide:
             "cash": 10000.0, "positions_value": 3000.0, "total_equity": 13000.0,
             "allowance_total": 10000.0, "positions": [],
         }
-        executed = await sim._llm_decide(valuation, [], {})
+        # Provide a BUY signal for MSFT so its BUY decision has signal context.
+        signals = {
+            "MSFT": {"action": "BUY", "strength": 60,
+                     "snapshot": {"close": 50.0, "rsi": 55.0, "macd": 0.5}},
+        }
+        executed = await sim._llm_decide(valuation, [], signals)
 
         # Two trades executed
         assert len(executed) == 2
