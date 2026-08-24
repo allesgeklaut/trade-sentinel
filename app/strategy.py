@@ -94,6 +94,7 @@ def valuate_portfolio(
             "ticker": p["ticker"], "shares": p["shares"],
             "avg_cost": avg_cost, "current_price": price,
             "value": value, "pnl_pct": pnl_pct,
+            "thesis": p.get("thesis", ""), "buy_date": p.get("buy_date", ""),
         })
     return {
         "cash": cash,

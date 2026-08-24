@@ -644,12 +644,152 @@ class TestBuildLLMContext:
         assert "AMD" in ctx
         assert "strong momentum" in ctx
 
+    def test_signal_truncation_shows_top_non_held(self):
+        """When there are >30 signals, only the top 20 non-held by strength
+        + all held + all SELLs are shown. Lower-ranked non-held names are
+        hidden to keep the LLM's context focused."""
+        val = {"cash": 0, "positions_value": 0, "total_equity": 0,
+               "allowance_total": 0, "positions": []}
+        # 40 BUY signals with different strengths.
+        signals = {
+            f"T{i:02d}": {"action": "BUY", "strength": i,
+                           "snapshot": {"close": 100.0, "rsi": 50.0, "macd": 0.0}}
+            for i in range(40)
+        }
+        ctx = sim._build_llm_context(val, [], signals)
+        # Top 20 by strength = T20..T39 (strength 20..39).
+        assert "T39" in ctx
+        assert "T20" in ctx
+        # T00..T19 (strength 0..19) are below the top-20 cutoff — hidden.
+        assert "T00" not in ctx
+        assert "T19" not in ctx
+        # Truncation notice must appear.
+        assert "hidden" in ctx
+
+    def test_signal_truncation_keeps_all_held(self):
+        """Held positions must always appear in the signals table even if
+        their strength is low — the LLM needs to manage exits on them."""
+        val = {
+            "cash": 0, "positions_value": 0, "total_equity": 0,
+            "allowance_total": 0,
+            "positions": [{"ticker": "LOW", "shares": 5, "avg_cost": 100.0,
+                            "current_price": 90.0, "value": 450.0, "pnl_pct": -10.0}],
+        }
+        # 40 signals: LOW has strength 0 (lowest), rest have strength 50+.
+        signals = {
+            "LOW": {"action": "HOLD", "strength": 0,
+                    "snapshot": {"close": 90.0, "rsi": 40.0, "macd": -0.1}},
+        }
+        for i in range(40):
+            signals[f"T{i:02d}"] = {"action": "BUY", "strength": 50 + i,
+                                    "snapshot": {"close": 100.0, "rsi": 50.0, "macd": 0.0}}
+        ctx = sim._build_llm_context(val, [], signals)
+        # LOW is held — must appear despite strength 0.
+        assert "LOW" in ctx
+
+    def test_signal_truncation_keeps_all_sells(self):
+        """SELL signals must always appear so the LLM sees exit opportunities
+        on weak names, even if the signal's strength is low."""
+        val = {"cash": 0, "positions_value": 0, "total_equity": 0,
+               "allowance_total": 0, "positions": []}
+        signals = {}
+        # 25 strong BUYs (strength 80+).
+        for i in range(25):
+            signals[f"BUY{i:02d}"] = {"action": "BUY", "strength": 80 + i,
+                                     "snapshot": {"close": 100.0, "rsi": 50.0, "macd": 0.0}}
+        # 10 weak SELLs (strength 10).
+        for i in range(10):
+            signals[f"SELL{i:02d}"] = {"action": "SELL", "strength": 10,
+                                     "snapshot": {"close": 50.0, "rsi": 30.0, "macd": -0.5}}
+        ctx = sim._build_llm_context(val, [], signals)
+        # SELLs must appear — they're exit signals the LLM needs to see.
+        assert "SELL00" in ctx
+        assert "SELL09" in ctx
+
+    def test_no_truncation_below_threshold(self):
+        """When there are <=30 signals, all are shown without truncation."""
+        val = {"cash": 0, "positions_value": 0, "total_equity": 0,
+               "allowance_total": 0, "positions": []}
+        signals = {
+            f"T{i:02d}": {"action": "BUY", "strength": i,
+                          "snapshot": {"close": 100.0, "rsi": 50.0, "macd": 0.0}}
+            for i in range(30)
+        }
+        ctx = sim._build_llm_context(val, [], signals)
+        # All 30 should appear — no truncation.
+        assert "T00" in ctx
+        assert "T29" in ctx
+        assert "hidden" not in ctx
+
+    def test_context_shows_position_thesis(self):
+        """The context must show each position's entry thesis and holding
+        date so the LLM can judge 'is the thesis still valid?'"""
+        val = {
+            "cash": 0, "positions_value": 0, "total_equity": 0,
+            "allowance_total": 0,
+            "positions": [
+                {"ticker": "NVDA", "shares": 5, "avg_cost": 100.0,
+                 "current_price": 120.0, "value": 600.0, "pnl_pct": 20.0,
+                 "thesis": "AI infrastructure leader, strong uptrend",
+                 "buy_date": "2025-06-01"},
+            ],
+        }
+        ctx = sim._build_llm_context(val, [], {}, pure_llm=True)
+        assert "AI infrastructure leader" in ctx
+        assert "2025-06-01" in ctx
+        assert "thesis:" in ctx
+
+    def test_context_truncates_long_thesis(self):
+        """Long theses are truncated to 77 chars + ... to keep lines readable."""
+        long_thesis = "x" * 100
+        val = {
+            "cash": 0, "positions_value": 0, "total_equity": 0,
+            "allowance_total": 0,
+            "positions": [
+                {"ticker": "A", "shares": 1, "avg_cost": 10.0,
+                 "current_price": 10.0, "value": 10.0, "pnl_pct": 0.0,
+                 "thesis": long_thesis, "buy_date": "2025-01-01"},
+            ],
+        }
+        ctx = sim._build_llm_context(val, [], {}, pure_llm=True)
+        # The full 100-char thesis should not appear; the truncated version should.
+        assert long_thesis not in ctx
+        assert "xxx..." in ctx  # truncated to 77 chars + "..."
+
+    def test_context_no_thesis_shows_nothing(self):
+        """Positions without a thesis don't show a 'thesis:' line."""
+        val = {
+            "cash": 0, "positions_value": 0, "total_equity": 0,
+            "allowance_total": 0,
+            "positions": [
+                {"ticker": "A", "shares": 1, "avg_cost": 10.0,
+                 "current_price": 10.0, "value": 10.0, "pnl_pct": 0.0,
+                 "thesis": "", "buy_date": ""},
+            ],
+        }
+        ctx = sim._build_llm_context(val, [], {}, pure_llm=True)
+        assert "thesis:" not in ctx
+        assert "since" not in ctx
+
 
 class TestLLMDecide:
     """Integration tests for _llm_decide: LLM decisions → executed trades.
 
     Mocks the Ollama HTTP call and _latest_close so no network is needed.
     """
+
+    @staticmethod
+    async def _backdate(tickers: list[str], days: int = 10) -> None:
+        """Backdate positions so the 5-day holding-period floor (anti-churn)
+        does not block test SELLs. Tests that seed-then-sell need this."""
+        from datetime import timedelta
+        from sqlalchemy import select as sa_select
+        async with sim.Session() as s:
+            for t in tickers:
+                pos = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == t))
+                if pos:
+                    pos.opened_at = sim._utcnow() - timedelta(days=days)
+            await s.commit()
 
     def _fake_http(self, monkeypatch, content: str):
         """Replace httpx.AsyncClient with a fake returning ``content``."""
@@ -674,6 +814,7 @@ class TestLLMDecide:
         """A SELL with 'amount' sells only that value; a BUY is clamped to budget."""
         # Seed a position: 30 shares of AAPL @ 100 = $3000
         await sim._exec_buy("AAPL", 100.0, 3000.0, "seed")
+        await self._backdate(["AAPL"])
 
         # LLM returns: sell $500 of AAPL, buy $99999 of MSFT (clamped by cash).
         decisions = json.dumps([
@@ -774,6 +915,7 @@ class TestLLMDecide:
     async def test_sell_without_size_sells_entire_position(self, with_cash, monkeypatch, llm_backend):
         """A SELL with no size field sells the whole position (default)."""
         await sim._exec_buy("AAPL", 100.0, 2000.0, "seed")  # 20 shares
+        await self._backdate(["AAPL"])
 
         decisions = json.dumps([
             {"ticker": "AAPL", "action": "SELL", "reason": "exit"},

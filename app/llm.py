@@ -201,6 +201,45 @@ async def select_backend(name: str, model: str | None = None) -> dict[str, Any]:
     return await current_backend()
 
 
+# ---------------------------------------------------------------------------
+# Reproducible decoding for backtests / replays
+# ---------------------------------------------------------------------------
+
+# When set to a non-None value, every chat request includes deterministic
+# decoding options (temperature=0 and the given seed) so repeated backtests of
+# the pure-LLM / hybrid strategy produce identical LLM decisions. The live
+# dashboard chat leaves this None and keeps the backend's default sampling.
+# Ollama honours `seed` via the request `options` block; OpenAI-compatible
+# servers accept `temperature` and `seed` at the top level (seed support is
+# server-dependent and silently ignored when unsupported — acceptable since
+# the replay harness uses the Ollama backend by default).
+_replay_seed: int | None = None
+
+
+def set_replay_seed(seed: int | None) -> None:
+    """Pin decoding for repeatable backtests, or clear it with ``None``.
+
+    When set, subsequent :func:`chat` / :func:`chat_stream` calls send
+    ``temperature=0`` and the given ``seed`` to the active backend. Call with
+    ``None`` to restore the backend's default sampling (used by the live sim).
+    """
+    global _replay_seed
+    _replay_seed = seed
+
+
+def _deterministic_options(backend: dict[str, Any]) -> dict[str, Any] | None:
+    """Extra request fields for deterministic decoding, or None when disabled.
+
+    Ollama receives an ``options`` block (its native shape); OpenAI-compatible
+    backends get top-level ``temperature`` / ``seed`` keys.
+    """
+    if _replay_seed is None:
+        return None
+    if backend["type"] == "ollama":
+        return {"options": {"temperature": 0, "seed": _replay_seed}}
+    return {"temperature": 0, "seed": _replay_seed}
+
+
 async def chat(messages: list[dict[str, str]]) -> dict[str, Any]:
     """Send a chat request to the active backend.
 
@@ -260,6 +299,7 @@ async def chat_stream(messages: list[dict[str, str]]):
                     "messages": messages,
                     "stream": True,
                 }
+                req_body.update(_deterministic_options(backend) or {})
                 async with client.stream(
                     "POST", backend["url"] + "/api/chat", json=req_body,
                 ) as resp:
@@ -307,6 +347,7 @@ async def chat_stream(messages: list[dict[str, str]]):
                         "high": 8192,
                         "xhigh": 32768,
                     }[effort]
+                payload.update(_deterministic_options(backend) or {})
                 async with client.stream(
                     "POST", backend["url"] + "/v1/chat/completions",
                     json=payload, headers=_auth_headers(backend),
@@ -386,10 +427,11 @@ async def _post_chat(
     )
     async with httpx.AsyncClient(timeout=timeout) as client:
         if backend["type"] == "ollama":
-            resp = await client.post(
-                backend["url"] + "/api/chat",
-                json={"model": backend["model"], "messages": messages, "stream": False},
-            )
+            req_body: dict[str, Any] = {
+                "model": backend["model"], "messages": messages, "stream": False,
+            }
+            req_body.update(_deterministic_options(backend) or {})
+            resp = await client.post(backend["url"] + "/api/chat", json=req_body)
         else:
             payload: dict[str, Any] = {
                 "model": backend["model"] or "default",
@@ -405,6 +447,7 @@ async def _post_chat(
                     "high": 8192,
                     "xhigh": 32768,
                 }[effort]
+            payload.update(_deterministic_options(backend) or {})
             resp = await client.post(
                 backend["url"] + "/v1/chat/completions",
                 json=payload, headers=_auth_headers(backend),

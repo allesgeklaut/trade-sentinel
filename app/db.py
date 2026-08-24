@@ -118,6 +118,7 @@ class SimPosition(Base):
     shares: Mapped[float] = mapped_column(Float)
     avg_cost: Mapped[float] = mapped_column(Float)
     opened_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    thesis: Mapped[str] = mapped_column(Text, default="")  # BUY reason for context feedback
 
 
 class SimTrade(Base):
@@ -220,3 +221,10 @@ async def init_db():
                 )
             except Exception:
                 pass  # column already exists — expected on subsequent starts
+        # Migration for sim_positions: add thesis column for LLM context feedback.
+        try:
+            await conn.execute(
+                text("ALTER TABLE sim_positions ADD COLUMN thesis TEXT DEFAULT ''")
+            )
+        except Exception:
+            pass  # column already exists

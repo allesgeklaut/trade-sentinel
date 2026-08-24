@@ -200,6 +200,49 @@ class TestPaperPortfolioFloor:
         assert pf.cash >= 0.0
 
 
+class TestPaperPortfolioThesis:
+    """PaperPortfolio must track the entry thesis (BUY reason) and buy date
+    for each position, clear them on full sell, and pass them through to the
+    LLM context so the LLM can judge 'is the thesis still valid?'."""
+
+    def test_thesis_set_on_new_buy(self):
+        pf = optimize.PaperPortfolio(cash=1000.0)
+        pf.buy("NVDA", 100.0, 500.0, "strong uptrend + high ADX", date="2025-06-01")
+        assert pf.thesis["NVDA"] == "strong uptrend + high ADX"
+        assert pf.buy_date["NVDA"] == "2025-06-01"
+
+    def test_thesis_not_overwritten_on_top_up(self):
+        pf = optimize.PaperPortfolio(cash=1000.0)
+        pf.buy("NVDA", 100.0, 300.0, "original thesis", date="2025-06-01")
+        pf.buy("NVDA", 110.0, 300.0, "top-up reason", date="2025-06-15")
+        # The thesis from the first BUY is preserved — the LLM sees why it
+        # originally opened the position, not the top-up reason.
+        assert pf.thesis["NVDA"] == "original thesis"
+        assert pf.buy_date["NVDA"] == "2025-06-01"
+
+    def test_thesis_cleared_on_full_sell(self):
+        pf = optimize.PaperPortfolio(cash=1000.0)
+        pf.buy("AMD", 100.0, 500.0, "momentum play", date="2025-06-01")
+        pf.sell("AMD", 110.0, None, "take profit", date="2025-06-15")
+        assert "AMD" not in pf.thesis
+        assert "AMD" not in pf.buy_date
+
+    def test_thesis_preserved_on_partial_sell(self):
+        pf = optimize.PaperPortfolio(cash=1000.0)
+        pf.buy("AMD", 100.0, 500.0, "momentum play", date="2025-06-01")
+        pf.sell("AMD", 110.0, 2.0, "partial take profit", date="2025-06-15")
+        # Partial sell keeps the position — thesis must survive.
+        assert pf.thesis["AMD"] == "momentum play"
+        assert pf.buy_date["AMD"] == "2025-06-01"
+
+    def test_pf_to_positions_includes_thesis(self):
+        pf = optimize.PaperPortfolio(cash=1000.0)
+        pf.buy("NVDA", 100.0, 500.0, "AI infrastructure leader", date="2025-06-01")
+        positions = optimize._pf_to_positions(pf)
+        assert positions[0]["thesis"] == "AI infrastructure leader"
+        assert positions[0]["buy_date"] == "2025-06-01"
+
+
 class TestReplayTopUpAtCap:
     """The max-positions cap must block NEW positions but still allow topping
     up tickers already held. Previously the BUY loop used 'break' when at the
@@ -513,23 +556,24 @@ class TestIsStopOut:
 
 
 class TestHybridReplayLLMAdditionGuards:
-    """LLM-initiated BUY additions in the hybrid replay must match the live
-    sim: no position-count cap (sim._llm_review_proposals never enforced it),
-    while the deterministic side keeps its own max-positions cap."""
+    """LLM-initiated BUY additions must respect the max-positions cap: block
+    NEW positions when at the cap, but allow topping up tickers already held.
+    Previously (before Step 1b) LLM additions were uncapped — the 60-day
+    replay sprawled to 19 positions. Now both hybrid and pure-LLM modes enforce
+    the cap on LLM BUYs the same way the deterministic engine does."""
 
-    async def test_hybrid_llm_additions_not_count_capped(self, monkeypatch):
+    async def test_llm_additions_respect_position_cap(self, monkeypatch):
         import json as _json
 
         from app import llm as llm_mod
 
         # 12 uptrending tickers: the deterministic engine proposes at most
-        # max_positions=10 of them; the LLM approves those and adds the rest.
+        # max_positions=10 of them; the LLM approves those and tries to add
+        # the remaining 2 — which must now be blocked by the cap.
         series = {
             f"UP{i}": _signal_series(_gen_candles(100.0, 0.01, seed=i, n=500))
             for i in range(12)
         }
-        # max_position_pct=1 keeps positions tiny so cash never binds: the
-        # count-cap removal is what must allow the 11th/12th positions.
         params = ReplayParams(
             start_cash=10000.0,
             monthly_allowance=0.0,
@@ -553,14 +597,287 @@ class TestHybridReplayLLMAdditionGuards:
 
         res = await optimize._hybrid_replay(series, params, start="2025-07-15", end="2026-05-15")
 
-        # Distinct tickers bought: deterministic side was capped at 10, but the
-        # LLM additions (the remaining 2) must NOT be count-capped — matching
-        # the live sim. Before the fix, additions beyond the cap were skipped.
+        # The cap must hold: at most max_positions distinct tickers bought.
         bought = {t["ticker"] for t in res.trades if t["side"] == "BUY"}
-        assert len(bought) > params.max_positions, (
-            f"LLM additions were count-capped: bought {len(bought)} of "
-            f"{len(series)} tickers (cap {params.max_positions}). Expected "
-            f"all {len(series)} — live sim does not cap LLM additions."
+        assert len(bought) <= params.max_positions, (
+            f"LLM additions exceeded the cap: bought {len(bought)} distinct "
+            f"tickers (cap {params.max_positions}). The max-positions cap must "
+            f"block new LLM BUYs beyond the limit."
+        )
+
+    async def test_llm_top_ups_allowed_at_cap(self, monkeypatch):
+        """At the position cap, the LLM must still be able to top up a ticker
+        it already holds — the cap blocks NEW positions only."""
+        import json as _json
+
+        from app import llm as llm_mod
+
+        # 12 tickers, but only buy 3 of them via the LLM. max_positions=3 so
+        # the cap is hit immediately; the LLM's 2nd+3rd BUYs are top-ups.
+        series = {
+            f"UP{i}": _signal_series(_gen_candles(100.0, 0.01, seed=i, n=300))
+            for i in range(12)
+        }
+        params = ReplayParams(
+            start_cash=10000.0,
+            monthly_allowance=0.0,
+            max_positions=3,
+            max_position_pct=10.0,
+            min_cash_pct=0.0,
+            stop_type="none",
+            use_atr_stop=False,
+        )
+
+        # LLM always tries to buy UP0, UP1, UP2 (the same 3 every cycle).
+        buy_3 = _json.dumps([
+            {"ticker": f"UP{i}", "action": "BUY", "reason": "add"} for i in range(3)
+        ])
+
+        async def fake_chat(messages):
+            return {"text": buy_3}
+
+        monkeypatch.setattr(llm_mod, "chat", fake_chat)
+        monkeypatch.setattr(llm_mod, "current_backend", lambda: {"name": "x", "model": "y"})
+        monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
+
+        res = await optimize._hybrid_replay(series, params,
+                                            start="2025-07-01", end="2025-10-31",
+                                            pure_llm=True, seed=42)
+
+        # Distinct tickers bought = 3 (the cap). But there should be more than
+        # 3 BUY trades — the top-ups go through because the tickers are held.
+        bought_tickers = {t["ticker"] for t in res.trades if t["side"] == "BUY"}
+        assert len(bought_tickers) <= 3, "cap exceeded"
+        # Top-ups: more BUY trades than distinct tickers means some were repeats.
+        n_buys = sum(1 for t in res.trades if t["side"] == "BUY")
+        assert n_buys > len(bought_tickers), (
+            f"no top-up BUYs happened ({n_buys} buys, {len(bought_tickers)} distinct) — "
+            f"the cap blocked top-ups of held tickers"
+        )
+
+
+class TestPureLLMAutoStops:
+    """In pure-LLM mode the engine must auto-sell positions that hit their
+    initial stop or ATR trailing stop — the LLM is told to focus on
+    discretionary exits, not replicate the stop logic. Before the fix the
+    pure-LLM mode set proposals=[] and skipped the entire SELL phase, so
+    broken positions bled indefinitely while the LLM held."""
+
+    def _spike_then_crash_candles(self) -> list[dict]:
+        """A series that uptrends for ~220 days (enough to confirm SMA200 +
+        trigger BUY signals), then drops 25%+ to blow through the 15% stop."""
+        # Uptrend phase: price rises from 100 to ~130 over 220 days.
+        up = _gen_candles(100.0, 0.0012, seed=1, n=220)
+        # Crash phase: price drops from ~130 to ~90 over 60 days (-0.6%/day).
+        # The 15% stop from the ~130 entry is ~110.5; the price crosses below
+        # it within ~20 days of the crash start.
+        crash_start = up[-1]["close"]
+        crash = _gen_candles(crash_start, -0.006, seed=99, n=60)
+        # Shift crash dates to continue after the uptrend.
+        up_last_date = datetime.strptime(up[-1]["time"], "%Y-%m-%d")
+        for i, row in enumerate(crash, 1):
+            row["time"] = (up_last_date + timedelta(days=i)).strftime("%Y-%m-%d")
+            # Keep the close continuous: chain from the previous close.
+            if i == 1:
+                row["open"] = crash_start
+        # Re-chain closes so the crash starts from the uptrend's last close.
+        price = crash_start
+        for row in crash:
+            row["close"] = round(price * (1 + (-0.006 + random.Random(99).gauss(0, 0.01))), 2)
+            row["open"] = round(price, 2)
+            row["high"] = round(max(row["open"], row["close"]) * 1.002, 2)
+            row["low"] = round(min(row["open"], row["close"]) * 0.998, 2)
+            price = row["close"]
+        return up + crash
+
+    async def test_pure_llm_auto_sells_on_stop_hit(self, monkeypatch):
+        import json as _json
+
+        from app import llm as llm_mod
+
+        series = {"CRASH": _signal_series(self._spike_then_crash_candles())}
+        params = ReplayParams(
+            start_cash=10000.0,
+            monthly_allowance=0.0,
+            max_positions=0,       # no cap (pure-LLM mode doesn't use it yet)
+            max_position_pct=100.0,
+            min_cash_pct=0.0,
+            stop_type="percent",
+            stop_pct=15.0,         # 15% initial stop
+            use_atr_stop=True,
+        )
+
+        # LLM: BUY on first day, HOLD everything afterward. The engine must
+        # sell the position when it hits the 15% stop — the LLM never sells.
+        call_count = [0]
+
+        async def fake_chat(messages):
+            call_count[0] += 1
+            # First call: buy the only ticker. After that: hold everything.
+            if call_count[0] == 1:
+                return {"text": _json.dumps([
+                    {"ticker": "CRASH", "action": "BUY", "reason": "uptrend"}
+                ])}
+            return {"text": _json.dumps([
+                {"ticker": "CRASH", "action": "HOLD", "reason": "hold"}
+            ])}
+
+        monkeypatch.setattr(llm_mod, "chat", fake_chat)
+        monkeypatch.setattr(llm_mod, "current_backend", lambda: {"name": "x", "model": "y"})
+        monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
+
+        res = await optimize._hybrid_replay(series, params,
+                                            start="2025-07-01", end="2025-12-31",
+                                            pure_llm=True, seed=42)
+
+        sells = [t for t in res.trades if t["side"] == "SELL"]
+        assert sells, (
+            "pure-LLM mode never auto-sold the stop-hit position — the engine "
+            "must enforce stops even when the LLM only returns HOLDs"
+        )
+        # The SELL reason must mention the stop (initial or ATR).
+        assert any("stop" in t["reason"].lower() for t in sells), (
+            f"expected a stop-related SELL reason, got: {[t['reason'] for t in sells]}"
+        )
+
+    async def test_pure_llm_llm_still_decides_buys(self, monkeypatch):
+        """The auto-stop layer must not take over BUY decisions — the LLM
+        keeps full buy discretion."""
+        import json as _json
+
+        from app import llm as llm_mod
+
+        series = {"UP": _signal_series(_gen_candles(100.0, 0.01, seed=1, n=400))}
+        params = ReplayParams(
+            start_cash=10000.0,
+            monthly_allowance=0.0,
+            stop_type="none",
+            use_atr_stop=False,
+        )
+
+        # LLM returns HOLD for everything — no BUYs should happen.
+        async def fake_chat(messages):
+            return {"text": "[]"}
+
+        monkeypatch.setattr(llm_mod, "chat", fake_chat)
+        monkeypatch.setattr(llm_mod, "current_backend", lambda: {"name": "x", "model": "y"})
+        monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
+
+        res = await optimize._hybrid_replay(series, params,
+                                            start="2025-07-01", end="2025-12-31",
+                                            pure_llm=True, seed=42)
+        buys = [t for t in res.trades if t["side"] == "BUY"]
+        assert not buys, (
+            "pure-LLM mode bought tickers without the LLM issuing a BUY — "
+            "the auto-stop layer must not take over BUY decisions"
+        )
+
+
+class TestPureLLMAntiChurn:
+    """The 5-trading-day holding-period floor blocks LLM SELLs on positions
+    held < 5 days, unless the signal flipped to SELL or the weekly trend
+    broke. This prevents the same-week buy-then-sell rotations (churn) that
+    drove +42 extra trades in the 60-day replay."""
+
+    async def test_early_sell_blocked(self, monkeypatch):
+        """LLM SELL on a position held < 5 trading days is blocked when
+        the signal is not SELL and weekly trend is up."""
+        import json as _json
+
+        from app import llm as llm_mod
+
+        # A gentle uptrend so the signal stays BUY (not SELL), and weekly
+        # trend stays up — the anti-churn floor should block the early SELL.
+        series = {"UP": _signal_series(_gen_candles(100.0, 0.005, seed=1, n=300))}
+        params = ReplayParams(
+            start_cash=10000.0,
+            monthly_allowance=0.0,
+            max_positions=0,
+            max_position_pct=100.0,
+            min_cash_pct=0.0,
+            stop_type="none",
+            use_atr_stop=False,
+        )
+
+        call_count = [0]
+
+        async def fake_chat(messages):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # Day 1: buy UP.
+                return {"text": _json.dumps([
+                    {"ticker": "UP", "action": "BUY", "reason": "uptrend"}
+                ])}
+            # Day 2-4: try to sell immediately (churn).
+            return {"text": _json.dumps([
+                {"ticker": "UP", "action": "SELL", "reason": "rotate"}
+            ])}
+
+        monkeypatch.setattr(llm_mod, "chat", fake_chat)
+        monkeypatch.setattr(llm_mod, "current_backend", lambda: {"name": "x", "model": "y"})
+        monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
+
+        # Run just 5 days so the LLM buys on day 1 and tries to sell on days 2-5.
+        # Day 5: held_days = 4 (still < 5) → blocked. We stop before day 6 where
+        # held_days = 5 would allow the SELL.
+        res = await optimize._hybrid_replay(series, params,
+                                            start="2025-01-01", end="2025-01-05",
+                                            pure_llm=True, seed=42)
+
+        # The BUY should happen on day 1.
+        buys = [t for t in res.trades if t["side"] == "BUY"]
+        assert buys, "expected the LLM BUY to execute on day 1"
+
+        # SELLs from days 2-5 (held < 5 trading days, signal=BUY, weekly up)
+        # must be blocked by the anti-churn floor.
+        sells = [t for t in res.trades if t["side"] == "SELL"]
+        assert not sells, (
+            f"anti-churn floor failed to block early SELLs: {len(sells)} SELLs "
+            f"executed on a position held < 5 trading days"
+        )
+
+    async def test_sell_after_5_days_allowed(self, monkeypatch):
+        """After the holding period has passed, LLM SELLs are allowed."""
+        import json as _json
+
+        from app import llm as llm_mod
+
+        series = {"UP": _signal_series(_gen_candles(100.0, 0.005, seed=1, n=300))}
+        params = ReplayParams(
+            start_cash=10000.0,
+            monthly_allowance=0.0,
+            max_positions=0,
+            max_position_pct=100.0,
+            min_cash_pct=0.0,
+            stop_type="none",
+            use_atr_stop=False,
+        )
+
+        call_count = [0]
+
+        async def fake_chat(messages):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return {"text": _json.dumps([
+                    {"ticker": "UP", "action": "BUY", "reason": "uptrend"}
+                ])}
+            return {"text": _json.dumps([
+                {"ticker": "UP", "action": "SELL", "reason": "take profit"}
+            ])}
+
+        monkeypatch.setattr(llm_mod, "chat", fake_chat)
+        monkeypatch.setattr(llm_mod, "current_backend", lambda: {"name": "x", "model": "y"})
+        monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
+
+        # Run 15 days — by day 6+ the position is held >= 5 trading days.
+        res = await optimize._hybrid_replay(series, params,
+                                            start="2025-01-01", end="2025-01-21",
+                                            pure_llm=True, seed=42)
+
+        sells = [t for t in res.trades if t["side"] == "SELL"]
+        # By day 6+ the SELL should go through.
+        assert sells, (
+            "expected a SELL after the 5-day holding period, but none executed"
         )
 
 
@@ -620,3 +937,246 @@ class TestPlanLlmBuys:
         assert plan["AAA"] == 600.0
         assert plan.get("BBB") == plan.get("CCC") == 200.0
         assert sum(plan.values()) <= 1000.0
+
+
+class TestWindowResult:
+    """_WindowResult computes per-window deltas (LLM minus deterministic)."""
+
+    def _wr(self, det_ret=1.0, llm_ret=-2.0, det_dd=12.0, llm_dd=15.0,
+            det_sharpe=2.8, llm_sharpe=2.6, det_trades=52, llm_trades=94):
+        from app.optimize import ReplayResult, _WindowResult
+        det = ReplayResult(params=ReplayParams(),
+                           total_return_pct=det_ret, max_drawdown_pct=det_dd,
+                           sharpe=det_sharpe, n_trades=det_trades)
+        llm = ReplayResult(params=ReplayParams(),
+                           total_return_pct=llm_ret, max_drawdown_pct=llm_dd,
+                           sharpe=llm_sharpe, n_trades=llm_trades)
+        return _WindowResult(start="2026-06-01", end="2026-08-21", det=det, llm=llm)
+
+    def test_return_delta(self):
+        wr = self._wr(det_ret=1.6, llm_ret=-2.1)
+        assert wr.return_delta == pytest.approx(-3.7)
+
+    def test_drawdown_delta(self):
+        wr = self._wr(det_dd=12.18, llm_dd=15.04)
+        assert wr.drawdown_delta == pytest.approx(2.86)
+
+    def test_sharpe_delta(self):
+        wr = self._wr(det_sharpe=2.84, llm_sharpe=2.66)
+        assert wr.sharpe_delta == pytest.approx(-0.18)
+
+    def test_trades_delta(self):
+        wr = self._wr(det_trades=52, llm_trades=94)
+        assert wr.trades_delta == 42
+
+
+class TestWalkforwardSummary:
+    """_print_walkforward_summary must report mean + worst + best deltas."""
+
+    def test_summary_prints_mean_worst_best(self, capsys):
+        from app.optimize import ReplayResult, _WindowResult, _print_walkforward_summary
+        wr1 = _WindowResult(
+            start="d1", end="d2",
+            det=ReplayResult(params=ReplayParams(), total_return_pct=1.0,
+                             max_drawdown_pct=5.0, sharpe=2.0, n_trades=10),
+            llm=ReplayResult(params=ReplayParams(), total_return_pct=2.0,
+                             max_drawdown_pct=6.0, sharpe=1.8, n_trades=15),
+        )
+        wr2 = _WindowResult(
+            start="d3", end="d4",
+            det=ReplayResult(params=ReplayParams(), total_return_pct=1.0,
+                             max_drawdown_pct=5.0, sharpe=2.0, n_trades=10),
+            llm=ReplayResult(params=ReplayParams(), total_return_pct=-1.0,
+                             max_drawdown_pct=8.0, sharpe=1.5, n_trades=20),
+        )
+        _print_walkforward_summary([wr1, wr2])
+        out = capsys.readouterr().out
+        # Mean return delta = (1.0 + -2.0) / 2 = -0.5
+        assert "-0.50%" in out
+        # Worst return delta = -2.0
+        assert "-2.00%" in out
+        # Best return delta = +1.0
+        assert "1.00%" in out
+        # Positive windows count
+        assert "Positive-return windows: 1/2" in out
+
+
+class TestLlmWalkforwardWindows:
+    """_llm_walkforward must cut non-overlapping windows from the tail when
+    there is enough history, and overlap from the front when there isn't."""
+
+    def test_non_overlapping_when_enough_days(self, monkeypatch):
+        from app.optimize import _llm_walkforward, ReplayResult, ReplayParams
+        # 120 days, 4 windows of 30 → non-overlapping.
+        all_days = [f"2025-01-{i:02d}" for i in range(1, 121)]
+
+        calls = []
+
+        def fake_det(series, params, start=None, end=None):
+            calls.append(("det", start, end))
+            return ReplayResult(params=params)
+
+        async def fake_llm(series, params, start=None, end=None, pure_llm=False, seed=None, news=None):
+            calls.append(("llm", start, end))
+            return ReplayResult(params=params)
+
+        monkeypatch.setattr(optimize, "_replay", fake_det)
+        monkeypatch.setattr(optimize, "_hybrid_replay", fake_llm)
+        monkeypatch.setattr(optimize, "_print_window_row", lambda wr: None)
+        async def fake_backend():
+            return {"name": "x", "model": "y"}
+        monkeypatch.setattr(optimize.llm_mod, "current_backend", fake_backend)
+
+        import asyncio
+        results = asyncio.run(_llm_walkforward(
+            {}, ReplayParams(), all_days,
+            n_windows=4, days_per_window=30,
+            pure_llm=True, seed=42, start=None, end=None,
+        ))
+        assert len(results) == 4
+        # The 4 windows should be non-overlapping and cover the tail 120 days.
+        llm_calls = [(s, e) for tag, s, e in calls if tag == "llm"]
+        # Each window is 30 days; windows are ordered chronologically.
+        for i in range(3):
+            assert llm_calls[i][1] < llm_calls[i + 1][0], "windows overlap"
+
+    def test_overlapping_when_not_enough_days(self, monkeypatch):
+        from app.optimize import _llm_walkforward, ReplayParams
+        # 90 days, 4 windows of 30 → need 120, only 90. The 4th window
+        # overlaps the 3rd at the front. We get 4 windows total.
+        all_days = [f"2025-01-{i:02d}" for i in range(1, 91)]
+
+        def fake_det(series, params, start=None, end=None):
+            from app.optimize import ReplayResult
+            return ReplayResult(params=params)
+
+        async def fake_llm(series, params, start=None, end=None, pure_llm=False, seed=None, news=None):
+            from app.optimize import ReplayResult
+            return ReplayResult(params=params)
+
+        monkeypatch.setattr(optimize, "_replay", fake_det)
+        monkeypatch.setattr(optimize, "_hybrid_replay", fake_llm)
+        monkeypatch.setattr(optimize, "_print_window_row", lambda wr: None)
+        async def fake_backend():
+            return {"name": "x", "model": "y"}
+        monkeypatch.setattr(optimize.llm_mod, "current_backend", fake_backend)
+
+        import asyncio
+        results = asyncio.run(_llm_walkforward(
+            {}, ReplayParams(), all_days,
+            n_windows=4, days_per_window=30,
+            pure_llm=True, seed=42, start=None, end=None,
+        ))
+        # Still get 4 windows even though the 4th overlaps the 3rd at front.
+        assert len(results) == 4
+
+    def test_too_few_days_raises(self, monkeypatch):
+        from app.optimize import _llm_walkforward, ReplayParams
+        all_days = [f"2025-01-{i:02d}" for i in range(1, 11)]  # 10 days
+
+        async def fake_backend():
+            return {"name": "x", "model": "y"}
+        monkeypatch.setattr(optimize.llm_mod, "current_backend", fake_backend)
+
+        import asyncio
+        with pytest.raises(ValueError, match="at least 30"):
+            asyncio.run(_llm_walkforward(
+                {}, ReplayParams(), all_days,
+                n_windows=4, days_per_window=30,
+                pure_llm=True, seed=42, start=None, end=None,
+            ))
+
+
+class TestReplaySeedPinning:
+    """llm.set_replay_seed() must pin decoding for _hybrid_replay and clear
+    it afterwards, even on exception — a backtest must never leak pinned
+    decoding into the live sim."""
+
+    def test_seed_set_during_replay_and_cleared_after(self, monkeypatch):
+        from app import llm as llm_mod
+        from app.optimize import _hybrid_replay, ReplayParams, ReplayResult
+
+        seed_during = []
+
+        async def fake_chat(messages):
+            seed_during.append(llm_mod._replay_seed)
+            return {"text": "[]", "reasoning": "", "backend": "x", "model": "y"}
+
+        async def fake_backend():
+            return {"name": "x", "model": "y"}
+
+        monkeypatch.setattr(llm_mod, "chat", fake_chat)
+        monkeypatch.setattr(llm_mod, "current_backend", fake_backend)
+        monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
+
+        series = {"UP": _signal_series(_gen_candles(100.0, 0.01, seed=1, n=300))}
+        import asyncio
+        asyncio.run(_hybrid_replay(series, ReplayParams(start_cash=1000.0,
+                                                          monthly_allowance=0.0,
+                                                          stop_type="none",
+                                                          use_atr_stop=False),
+                                    start="2025-07-01", end="2025-12-01",
+                                    pure_llm=True, seed=42))
+        # During the replay the seed was set.
+        assert seed_during, "LLM was never called"
+        assert all(s == 42 for s in seed_during), f"seed not pinned during replay: {seed_during}"
+        # After the replay the seed is cleared.
+        assert llm_mod._replay_seed is None, "seed leaked after replay"
+
+    def test_seed_cleared_even_on_exception(self, monkeypatch):
+        from app import llm as llm_mod
+        from app.optimize import _hybrid_replay, ReplayParams
+
+        async def failing_chat(messages):
+            raise RuntimeError("boom")
+
+        async def fake_backend():
+            return {"name": "x", "model": "y"}
+
+        monkeypatch.setattr(llm_mod, "chat", failing_chat)
+        monkeypatch.setattr(llm_mod, "current_backend", fake_backend)
+        monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
+
+        series = {"UP": _signal_series(_gen_candles(100.0, 0.01, seed=1, n=300))}
+        import asyncio
+        # The replay catches LLM errors internally (logs + fallback), so it
+        # won't raise. But force an early exit by making the series empty to
+        # trigger the ValueError path — actually that returns early. Instead,
+        # test the finally directly: simulate by calling with a bad window.
+        # The simplest assertion: after a normal run that hit LLM errors, the
+        # seed is still cleared.
+        asyncio.run(_hybrid_replay(series, ReplayParams(start_cash=1000.0,
+                                                         monthly_allowance=0.0,
+                                                         stop_type="none",
+                                                         use_atr_stop=False),
+                                    start="2025-07-01", end="2025-12-01",
+                                    pure_llm=True, seed=42))
+        assert llm_mod._replay_seed is None, "seed leaked after LLM-error replay"
+
+    def test_no_seed_leaves_default_sampling(self, monkeypatch):
+        from app import llm as llm_mod
+        from app.optimize import _hybrid_replay, ReplayParams
+
+        seed_during = []
+
+        async def fake_chat(messages):
+            seed_during.append(llm_mod._replay_seed)
+            return {"text": "[]", "reasoning": "", "backend": "x", "model": "y"}
+
+        async def fake_backend():
+            return {"name": "x", "model": "y"}
+
+        monkeypatch.setattr(llm_mod, "chat", fake_chat)
+        monkeypatch.setattr(llm_mod, "current_backend", fake_backend)
+        monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
+
+        series = {"UP": _signal_series(_gen_candles(100.0, 0.01, seed=1, n=300))}
+        import asyncio
+        asyncio.run(_hybrid_replay(series, ReplayParams(start_cash=1000.0,
+                                                          monthly_allowance=0.0,
+                                                          stop_type="none",
+                                                          use_atr_stop=False),
+                                    start="2025-07-01", end="2025-12-01",
+                                    pure_llm=True, seed=None))
+        assert seed_during, "LLM was never called"
+        assert all(s is None for s in seed_during), f"seed was set without pinning: {seed_during}"
