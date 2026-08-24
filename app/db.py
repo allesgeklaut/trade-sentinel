@@ -119,6 +119,7 @@ class SimPosition(Base):
     avg_cost: Mapped[float] = mapped_column(Float)
     opened_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     thesis: Mapped[str] = mapped_column(Text, default="")  # BUY reason for context feedback
+    peak_price: Mapped[float] = mapped_column(Float, default=0.0)  # highest close since entry
 
 
 class SimTrade(Base):
@@ -225,6 +226,13 @@ async def init_db():
         try:
             await conn.execute(
                 text("ALTER TABLE sim_positions ADD COLUMN thesis TEXT DEFAULT ''")
+            )
+        except Exception:
+            pass  # column already exists
+        # Migration for sim_positions: add peak_price for the trailing stop.
+        try:
+            await conn.execute(
+                text("ALTER TABLE sim_positions ADD COLUMN peak_price REAL DEFAULT 0")
             )
         except Exception:
             pass  # column already exists
