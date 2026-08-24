@@ -867,10 +867,13 @@ async def _hybrid_replay(
             if pure_llm:
                 # Pure-LLM mode: the engine enforces ONLY the true risk floor
                 # — auto-sell positions whose price has actually fallen to the
-                # frozen initial stop or the ATR trailing stop. It does NOT
-                # flush positions on SELL *signals* (the LLM owns discretionary
-                # exits) and makes no BUY proposals (the LLM picks entries).
+                # frozen initial stop, the ATR trailing stop, or 12% from their
+                # own peak (a trailing stop that catches crashes the LLM might
+                # freeze through). It does NOT flush positions on SELL
+                # *signals* (the LLM owns discretionary exits) and makes no
+                # BUY proposals (the LLM picks entries).
                 # The LLM decides everything else from the full signal table.
+                _TRAILING_STOP_PCT = 12.0
                 stop_sells = []
                 for ticker in list(pf.positions.keys()):
                     price = prices.get(ticker)
@@ -890,6 +893,19 @@ async def _hybrid_replay(
                         stop_sells.append({"ticker": ticker, "side": "SELL",
                                            "price": price, "shares": None,
                                            "reason": f"ATR stop hit: {price:.2f} < {atr_stop:.2f}"})
+                        continue
+                    # Trailing stop from peak: sell if price dropped 12% from
+                    # its high since entry. Catches crashes the LLM freezes
+                    # through (the 60-day replay lost -13% holding into a
+                    # crash with no exits).
+                    peak = pf.peak_price.get(ticker, 0)
+                    if peak > 0:
+                        stop_level = peak * (1 - _TRAILING_STOP_PCT / 100)
+                        if price <= stop_level:
+                            stop_sells.append({"ticker": ticker, "side": "SELL",
+                                               "price": price, "shares": None,
+                                               "reason": f"Trailing stop: {price:.2f} <= {stop_level:.2f} "
+                                                         f"(peak {peak:.2f}, -{_TRAILING_STOP_PCT:.0f}%)"})
                 for p in stop_sells:
                     _execute_proposal(pf, p)
                 if stop_sells:
@@ -987,8 +1003,30 @@ async def _hybrid_replay(
                                 logger.info("  llm BUY %s skipped (max-positions cap %d)",
                                             tu, params.max_positions)
                                 continue
+                            # Concentration cap: no single position may exceed
+                            # 15% of equity (incl. top-ups). Pure-LLM unsized
+                            # BUYs absorb ALL available cash — the first buy
+                            # of a cycle could take 90%+ and a single crash
+                            # would destroy the portfolio (the 60-day replay
+                            # lost -13% holding 3-4 ~33% positions). This caps
+                            # SIZE, not the LLM's choice of tickers.
+                            _MAX_POS_PCT = 15.0
+                            cur_equity = pf.equity(prices)
+                            cur_value = pf.positions.get(d["ticker"], 0) * price
+                            if cur_value >= cur_equity * _MAX_POS_PCT / 100:
+                                logger.info(
+                                    "  llm BUY %s skipped (concentration cap %.0f%% "
+                                    "of equity)",
+                                    tu, _MAX_POS_PCT)
+                                continue
                             budget = plan.get(tu)
                             if budget is None:
+                                continue
+                            # Clamp the budget to the concentration cap too, so
+                            # an unsized BUY can't blow past it in one shot.
+                            max_by_pos = cur_equity * _MAX_POS_PCT / 100 - cur_value
+                            budget = min(budget, max_by_pos)
+                            if budget < 1:
                                 continue
                             entry_stop = (price * (1 - params.stop_pct / 100)
                                           if params.stop_type == "percent" else None)

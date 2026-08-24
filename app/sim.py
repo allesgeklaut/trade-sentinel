@@ -207,6 +207,7 @@ async def valuate() -> dict[str, Any]:
             "pnl_pct": round(pnl_pct, 2),
             "thesis": p.thesis or "",
             "buy_date": p.opened_at.strftime("%Y-%m-%d") if p.opened_at else "",
+            "peak_price": p.peak_price or None,
         })
 
     return {
@@ -265,9 +266,11 @@ async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str) -
             total_shares = pos.shares + shares
             pos.avg_cost = (pos.shares * pos.avg_cost + cost) / total_shares
             pos.shares = total_shares
+            if price > pos.peak_price:
+                pos.peak_price = price
         else:
             s.add(SimPosition(ticker=ticker, shares=shares, avg_cost=price,
-                              thesis=reason))
+                              thesis=reason, peak_price=price))
 
         trade = SimTrade(
             ticker=ticker, side="BUY", shares=shares, price=price,
@@ -329,6 +332,7 @@ async def _risk_floor_sells(signals: dict[str, dict]) -> list[dict]:
     flushing positions on signals (as the earlier auto-stop layer did) made
     the LLM churn and lose. Returns executed trade dicts.
     """
+    _TRAILING_STOP_PCT = 12.0
     async with Session() as s:
         positions = (await s.scalars(select(SimPosition))).all()
     executed: list[dict] = []
@@ -336,6 +340,9 @@ async def _risk_floor_sells(signals: dict[str, dict]) -> list[dict]:
         price = await _latest_close(pos.ticker)
         if price is None or price <= 0:
             continue
+        # Update the peak tracker before checking stops.
+        if price > pos.peak_price:
+            pos.peak_price = price
         init_stop = pos.avg_cost * (1 - settings.sim_stop_pct / 100)
         if price <= init_stop:
             t = await _exec_sell(pos.ticker, price, None,
@@ -350,6 +357,20 @@ async def _risk_floor_sells(signals: dict[str, dict]) -> list[dict]:
                                  f"ATR stop hit: {price:.2f} < {atr_stop:.2f}")
             if t:
                 executed.append(t)
+            continue
+        # Trailing stop from peak: sell if price dropped 12% from its high
+        # since entry. Catches crashes the LLM freezes through.
+        if pos.peak_price > 0:
+            stop_level = pos.peak_price * (1 - _TRAILING_STOP_PCT / 100)
+            if price <= stop_level:
+                t = await _exec_sell(
+                    pos.ticker, price, None,
+                    f"Trailing stop: {price:.2f} <= {stop_level:.2f} "
+                    f"(peak {pos.peak_price:.2f}, -{_TRAILING_STOP_PCT:.0f}%)")
+                if t:
+                    executed.append(t)
+    async with Session() as s:
+        await s.commit()
     return executed
 
 
@@ -805,7 +826,7 @@ def _build_llm_context(
             lines.append(
                 f"  - {p['ticker']}: {p['shares']} shares @ avg {p['avg_cost']:.2f} "
                 f"| current {p['current_price']:.2f} | value {p['value']:.2f} "
-                f"| P&L {p['pnl_pct']:+.2f}%{stop_str}{thesis_str}"
+                f"| P&L {p['pnl_pct']:+.2f}%{stop_str}{peak_str}{thesis_str}"
             )
     else:
         lines.append("Open positions: none")
