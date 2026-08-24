@@ -628,7 +628,8 @@ def _pf_to_positions(pf: PaperPortfolio) -> list[dict]:
     return [
         {"ticker": t, "shares": s, "avg_cost": pf.avg_cost.get(t, 0),
          "stop_price": pf.stop_price.get(t),
-         "thesis": pf.thesis.get(t, ""), "buy_date": pf.buy_date.get(t, "")}
+         "thesis": pf.thesis.get(t, ""), "buy_date": pf.buy_date.get(t, ""),
+         "peak_price": pf.peak_price.get(t)}
         for t, s in pf.positions.items()
     ]
 
@@ -854,6 +855,10 @@ async def _hybrid_replay(
                 equity_curve.append({"time": day, "equity": 0.0})
                 invested_curve.append(cumulative_invested)
                 continue
+
+            # Track per-position peak prices so the LLM context can show how
+            # far each position has fallen from its high (trailing stop info).
+            pf.update_peaks(prices)
 
             # --- 1. Deterministic PROPOSE phase (no mutation) ---
             # Signals are computed first — the pure-LLM risk floor needs the
