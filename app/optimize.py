@@ -740,8 +740,9 @@ async def _hybrid_replay(
     news: dict[str, list[dict]] | None = None,
     pure_llm: bool = False,
     seed: int | None = None,
+    review_interval: int = 1,
 ) -> ReplayResult:
-    """Replay the hybrid strategy (deterministic + per-day LLM review).
+    """Replay the hybrid strategy (deterministic + LLM review).
 
     For each trading day:
       1. Run the deterministic SELL + BUY phases against the paper portfolio
@@ -755,6 +756,12 @@ async def _hybrid_replay(
     SELLs the LLM adds (not proposed by deterministic) are honoured, as in the
     live hybrid sim. The result is comparable to a pure-deterministic
     ``_replay`` over the same window.
+
+    ``review_interval`` controls how often the LLM is consulted: 1 (default)
+    reviews every day; 5 reviews once a week. On non-review days the
+    deterministic proposals execute as-is with no LLM call — the engine runs
+    daily, the LLM reviews periodically (the "weekly portfolio review"
+    strategy: deterministic risk management + LLM judgment on selection).
 
     ``news`` is optional and currently unused (the live sim gathers news via
     SearXNG; a historical replay has no dated news archive). When None the
@@ -866,7 +873,8 @@ async def _hybrid_replay(
 
             # --- 2 + 3. LLM review → reconcile → execute ---
             total_equity = pf.equity(prices)
-            if total_equity > 0 and (settings.llm_backends or settings.ollama_model):
+            is_review_day = (day_idx % review_interval == 0) or (day_idx == 1)
+            if total_equity > 0 and (settings.llm_backends or settings.ollama_model) and is_review_day:
                 allowance_total = cumulative_invested
                 valuation = valuate_portfolio(_pf_to_positions(pf), pf.cash, prices, allowance_total)
                 signals = _signals_for_day(series, by_time, day, params)
@@ -956,7 +964,10 @@ async def _hybrid_replay(
                                     len(vetoed),
                                     ", ".join(f"{p['side']} {p['ticker']}" for p in vetoed))
             else:
-                # No LLM configured: execute all proposals as-is (deterministic)
+                # No LLM configured, or not a review day: execute all
+                # proposals as-is (deterministic). On non-review days the
+                # engine runs alone — the LLM only reviews every
+                # review_interval days.
                 for p in proposals:
                     _execute_proposal(pf, p)
 
@@ -1860,6 +1871,7 @@ async def _llm_walkforward(
     seed: int | None,
     start: str | None,
     end: str | None,
+    review_interval: int = 1,
 ) -> list[_WindowResult]:
     """Run N non-overlapping windows, each deterministic vs LLM (pinned seed).
 
@@ -1923,7 +1935,8 @@ async def _llm_walkforward(
                     i, len(windows), w_start, w_end,
                     det.total_return_pct, det.max_drawdown_pct, det.n_trades)
         llm = await _hybrid_replay(series, params, start=w_start, end=w_end,
-                                   pure_llm=pure_llm, seed=seed)
+                                   pure_llm=pure_llm, seed=seed,
+                                   review_interval=review_interval)
         logger.info("window %d/%d %s..%s %s: return %.2f%%, dd %.2f%%, %d trades",
                     i, len(windows), w_start, w_end, mode_label,
                     llm.total_return_pct, llm.max_drawdown_pct, llm.n_trades)
@@ -2100,10 +2113,13 @@ async def _main(args: argparse.Namespace) -> None:
               f"min_cash_pct={params.min_cash_pct:g}%")
 
         active = await llm_mod.current_backend()
-        print(f"\n=== {mode_label} replay ({start}..{end}) — probing LLM once per trading day ===")
+        review_interval = getattr(args, "review_interval", 1)
+        print(f"\n=== {mode_label} replay ({start}..{end}) — probing LLM "
+              f"every {review_interval} trading day(s) ===")
         print(f"  Backend: {active.get('name', '?')} · {active.get('model', '?')}")
         hyb = await _hybrid_replay(series, params, start=start, end=end,
-                                   pure_llm=pure_llm, seed=seed)
+                                   pure_llm=pure_llm, seed=seed,
+                                   review_interval=review_interval)
         _print_result(hyb, f"{mode_label} (deterministic + LLM review)" if not pure_llm else "Pure LLM")
 
         # Side-by-side comparison
@@ -2143,12 +2159,14 @@ async def _main(args: argparse.Namespace) -> None:
             seed = None  # -1 sentinel disables pinning
         n_windows = args.windows
         days_per_window = args.days_per_window
+        review_interval = getattr(args, "review_interval", 1)
         try:
             results = await _llm_walkforward(
                 series, params, all_days,
                 n_windows=n_windows, days_per_window=days_per_window,
                 pure_llm=pure_llm, seed=seed,
                 start=args.start, end=args.end,
+                review_interval=review_interval,
             )
         except ValueError as e:
             print(f"Cannot run walk-forward: {e}")
@@ -2215,6 +2233,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Pure LLM mode: skip deterministic proposals, let the LLM decide from scratch")
     hr.add_argument("--seed", type=int, default=None,
                     help="Pin LLM decoding (temperature=0, fixed seed) for reproducible replays")
+    hr.add_argument("--review-interval", type=int, default=1,
+                    help="Consult the LLM every N trading days (1=daily, 5=weekly); "
+                         "deterministic proposals execute as-is on other days")
 
     lwf = sub.add_parser("llm-walkforward",
                          help="Multi-window LLM vs deterministic benchmark (reliable scoreboard)")
@@ -2230,6 +2251,9 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="Pure LLM mode (default); use --no-pure-llm for hybrid (deterministic + LLM review)")
     lwf.add_argument("--seed", type=int, default=42,
                      help="Pin LLM decoding for reproducibility (default 42; use -1 to disable)")
+    lwf.add_argument("--review-interval", type=int, default=1,
+                     help="Consult the LLM every N trading days (1=daily, 5=weekly); "
+                          "deterministic proposals execute as-is on other days")
     lwf.add_argument("--trades", action="store_true", help="Print every LLM trade per window")
 
     return p
