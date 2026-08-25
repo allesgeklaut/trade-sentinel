@@ -630,13 +630,14 @@ class TestHybridReplayLLMAdditionGuards:
         from app import llm as llm_mod
 
         # 12 tickers, but only buy 3 of them via the LLM. max_positions=3 so
-        # the cap is hit immediately; the LLM's 2nd+3rd BUYs are top-ups.
-        # drift 0.02 keeps the signals consistently BUY so the candidate
-        # filter (BUY or strong HOLD >= 40) lets the top-ups through.
+        # the cap is hit immediately; the LLM's later BUYs are top-ups.
+        # UP0 drifts DOWN so its position value falls below the 10% position
+        # cap between weekly reviews, giving the top-up room to execute.
         series = {
             f"UP{i}": _signal_series(_gen_candles(100.0, 0.02, seed=i, n=300))
-            for i in range(12)
+            for i in range(1, 12)
         }
+        series["UP0"] = _signal_series(_gen_candles(100.0, -0.01, seed=0, n=300))
         params = ReplayParams(
             start_cash=10000.0,
             monthly_allowance=0.0,
@@ -1200,7 +1201,11 @@ class TestLlmWalkforwardWindows:
 
 class TestReviewInterval:
     """review_interval controls how often the LLM is consulted: on non-review
-    days the deterministic proposals execute as-is with no LLM call."""
+    weeks the deterministic proposals execute as-is with no LLM call.
+
+    The review is anchored to the calendar week (mirrors the live sim): the
+    LLM fires on the first trading day of each ISO week, at most once per
+    week, and review_interval>1 skips that many weeks between reviews."""
 
     async def test_llm_called_only_on_review_days(self, monkeypatch):
         import json as _json
@@ -1234,19 +1239,20 @@ class TestReviewInterval:
         monkeypatch.setattr(llm_mod, "current_backend", lambda: {"name": "x", "model": "y"})
         monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
 
-        # 10 trading days, review every 5 → LLM called on days 1, 5, 10 (3 calls).
+        # 10 trading days (Aug 1-14) spanning ISO weeks 30, 31, 32; review
+        # every 5 weeks → LLM called only on the first day (week 30, 1 call).
         res = await optimize._hybrid_replay(series, params,
                                             start="2025-08-01", end="2025-08-14",
                                             pure_llm=False,
                                             review_interval=5)
-        assert call_count[0] == 3, (
-            f"expected 3 LLM calls (days 1, 5, 10) with review_interval=5, "
-            f"got {call_count[0]}"
+        assert call_count[0] == 1, (
+            f"expected 1 LLM call (first day of week 30) with review_interval=5 "
+            f"over 3 calendar weeks, got {call_count[0]}"
         )
         # Trades still happened on non-review days (deterministic executed).
         assert res.n_trades > 0
 
-    async def test_review_interval_1_calls_every_day(self, monkeypatch):
+    async def test_review_interval_1_calls_once_per_week(self, monkeypatch):
         import json as _json
 
         from app import llm as llm_mod
@@ -1275,12 +1281,13 @@ class TestReviewInterval:
         monkeypatch.setattr(llm_mod, "current_backend", lambda: {"name": "x", "model": "y"})
         monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
 
-        # 14 days in the synthetic series (no weekends), review every 1 →
-        # LLM called every day (14 calls).
+        # 14 days in the synthetic series (no weekends, Aug 1-14 = weeks
+        # 30, 31, 32), review every 1 → LLM called once per week (3 calls).
         res = await optimize._hybrid_replay(series, params,
                                             start="2025-08-01", end="2025-08-14",
                                             pure_llm=False,
                                             review_interval=1)
-        assert call_count[0] == 14, (
-            f"expected 14 LLM calls with review_interval=1, got {call_count[0]}"
+        assert call_count[0] == 3, (
+            f"expected 3 LLM calls (once per calendar week) with "
+            f"review_interval=1, got {call_count[0]}"
         )
