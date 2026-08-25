@@ -101,6 +101,24 @@ def _current_month() -> str:
     return datetime.now(_TZ).strftime("%Y-%m")
 
 
+def _current_week() -> str:
+    """ISO calendar week key (YYYY-Www), anchored to the operator's local
+    timezone. Used for the weekly LLM portfolio review: the review fires on
+    the FIRST cycle of each new week, regardless of manual runs."""
+    return datetime.now(_TZ).strftime("%Y-W%W")
+
+
+def _week_diff(current: str, last: str) -> int:
+    """Calendar-week distance between two 'YYYY-Www' keys (>= 0).
+
+    Uses 53 as the per-year week cap (the ISO maximum) so year boundaries
+    don't undercount. ``last`` is assumed to be <= ``current``.
+    """
+    cy, cw = (int(x) for x in current.split("-W"))
+    ly, lw = (int(x) for x in last.split("-W"))
+    return (cy - ly) * 53 + (cw - lw)
+
+
 async def _latest_close(ticker: str) -> float | None:
     """Return the most recent cached close price for *ticker*, or None."""
     rows = await candles(ticker)
@@ -1551,17 +1569,30 @@ async def run_cycle() -> dict[str, Any]:
                 trades = await _llm_decide(valuation, [], signals, news, pure_llm=True)
                 _last_deterministic_trades = []
             elif strategy == "hybrid":
-                # Hybrid with a review interval: the deterministic engine runs
-                # every cycle; the LLM reviews the proposals only every
-                # sim_llm_review_interval cycles (e.g. 5 = weekly review).
+                # Hybrid with a weekly review: the deterministic engine runs
+                # every cycle; the LLM reviews the proposals on the FIRST
+                # cycle of each calendar week (Europe/Vienna). Manual runs
+                # later in the same week do NOT trigger the LLM again — the
+                # review is anchored to the week, not to a run counter.
                 # On non-review cycles the deterministic proposals execute
                 # as-is — the engine manages daily risk, the LLM adds
-                # judgment periodically.
+                # judgment once per week.
                 review_interval = max(1, settings.sim_llm_review_interval)
+                week = _current_week()
                 async with Session() as s:
-                    cycle_count = await s.scalar(select(func.count()).select_from(SimSnapshot))
-                cycle_count = cycle_count or 0
-                is_review_cycle = (cycle_count % review_interval == 0)
+                    acc = await s.get(SimAccount, 1)
+                    if acc is None:
+                        acc = SimAccount(id=1, cash=settings.sim_start_cash,
+                                         last_allowance_month=None)
+                        s.add(acc)
+                        await s.commit()
+                    last_review_week = acc.last_review_week
+                # Fire the review when the last review is more than
+                # (review_interval - 1) weeks ago (or never happened).
+                is_review_cycle = (
+                    last_review_week is None
+                    or _week_diff(week, last_review_week) >= review_interval
+                )
                 if not is_review_cycle:
                     _set_progress("decide", "Deterministic engine deciding (LLM review off-cycle)", started_at=started_at)
                     trades = await _deterministic_decide(valuation)
@@ -1577,6 +1608,13 @@ async def run_cycle() -> dict[str, Any]:
                     trades, vetoed = await _llm_review_proposals(valuation, proposals, signals, news)
                     _last_deterministic_trades = proposals
                     _last_llm_vetoes = vetoed
+                    # Mark the week as reviewed — no more LLM calls until the
+                    # calendar week changes.
+                    async with Session() as s:
+                        acc = await s.get(SimAccount, 1)
+                        if acc is not None:
+                            acc.last_review_week = week
+                            await s.commit()
             else:
                 logger.warning("Unknown strategy '%s', falling back to deterministic", strategy)
                 _set_progress("decide", "Deterministic engine deciding (unknown strategy fallback)", started_at=started_at)

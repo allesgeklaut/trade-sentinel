@@ -104,6 +104,7 @@ class SimAccount(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     cash: Mapped[float] = mapped_column(Float, default=0)
     last_allowance_month: Mapped[str | None] = mapped_column(String(7), nullable=True)  # YYYY-MM
+    last_review_week: Mapped[str | None] = mapped_column(String(7), nullable=True)  # YYYY-Www (ISO week)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
@@ -225,6 +226,14 @@ async def init_db():
         try:
             await conn.execute(
                 text("ALTER TABLE sim_positions ADD COLUMN thesis TEXT DEFAULT ''")
+            )
+        except Exception:
+            pass  # column already exists
+        # Migration for sim_account: add last_review_week for calendar-based
+        # weekly LLM portfolio reviews.
+        try:
+            await conn.execute(
+                text("ALTER TABLE sim_account ADD COLUMN last_review_week VARCHAR(7)")
             )
         except Exception:
             pass  # column already exists
