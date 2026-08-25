@@ -1189,12 +1189,16 @@ async def _llm_review_proposals(
     """
     global _last_llm_reasoning, _last_llm_summary
 
-    context = _build_llm_context(valuation, proposals, signals, news)
+    context = _build_llm_context(valuation, proposals, signals, news,
+                                minimal=settings.sim_llm_minimal_prompt)
     backend = await llm_mod.current_backend()
+
+    system_prompt = (_LLM_MINIMAL_SYSTEM_PROMPT if settings.sim_llm_minimal_prompt
+                     else _LLM_SYSTEM_PROMPT)
 
     try:
         out = await llm_mod.chat([
-            {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": context},
         ])
         content = out["text"]
@@ -1336,7 +1340,8 @@ async def _llm_decide(
 
     global _last_llm_reasoning, _last_llm_summary
 
-    system_prompt = _LLM_SYSTEM_PROMPT  # shared prompt: main-branch parity
+    system_prompt = (_LLM_MINIMAL_SYSTEM_PROMPT if settings.sim_llm_minimal_prompt
+                     else _LLM_SYSTEM_PROMPT)  # shared prompt: main-branch parity
     # Recent trade history from the DB (newest first) so the LLM sees what it
     # did recently and can avoid round-trips / repeated mistakes.
     recent_trades: list[dict] = []
@@ -1351,7 +1356,8 @@ async def _llm_decide(
         for tr in recent_rows
     ]
     context = _build_llm_context(valuation, deterministic_trades, signals, news,
-                                pure_llm=pure_llm, trade_history=recent_trades)
+                                pure_llm=pure_llm, trade_history=recent_trades,
+                                minimal=settings.sim_llm_minimal_prompt)
     backend = await llm_mod.current_backend()
 
     try:
