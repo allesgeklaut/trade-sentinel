@@ -1127,7 +1127,7 @@ class TestLlmWalkforwardWindows:
             calls.append(("det", start, end))
             return ReplayResult(params=params)
 
-        async def fake_llm(series, params, start=None, end=None, pure_llm=False, seed=None, news=None):
+        async def fake_llm(series, params, start=None, end=None, pure_llm=False, seed=None, news=None, review_interval=1):
             calls.append(("llm", start, end))
             return ReplayResult(params=params)
 
@@ -1161,7 +1161,7 @@ class TestLlmWalkforwardWindows:
             from app.optimize import ReplayResult
             return ReplayResult(params=params)
 
-        async def fake_llm(series, params, start=None, end=None, pure_llm=False, seed=None, news=None):
+        async def fake_llm(series, params, start=None, end=None, pure_llm=False, seed=None, news=None, review_interval=1):
             from app.optimize import ReplayResult
             return ReplayResult(params=params)
 
@@ -1196,6 +1196,94 @@ class TestLlmWalkforwardWindows:
                 n_windows=4, days_per_window=30,
                 pure_llm=True, seed=42, start=None, end=None,
             ))
+
+
+class TestReviewInterval:
+    """review_interval controls how often the LLM is consulted: on non-review
+    days the deterministic proposals execute as-is with no LLM call."""
+
+    async def test_llm_called_only_on_review_days(self, monkeypatch):
+        import json as _json
+
+        from app import llm as llm_mod
+
+        # 12 uptrending tickers so the deterministic engine proposes trades
+        # most days.
+        series = {
+            f"UP{i}": _signal_series(_gen_candles(100.0, 0.02, seed=i, n=300))
+            for i in range(12)
+        }
+        params = ReplayParams(
+            start_cash=10000.0,
+            monthly_allowance=0.0,
+            max_positions=10,
+            max_position_pct=10.0,
+            min_cash_pct=0.0,
+            stop_type="none",
+            use_atr_stop=False,
+        )
+
+        call_count = [0]
+
+        async def fake_chat(messages):
+            call_count[0] += 1
+            # Approve everything the engine proposed.
+            return {"text": "[]"}
+
+        monkeypatch.setattr(llm_mod, "chat", fake_chat)
+        monkeypatch.setattr(llm_mod, "current_backend", lambda: {"name": "x", "model": "y"})
+        monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
+
+        # 10 trading days, review every 5 → LLM called on days 1, 5, 10 (3 calls).
+        res = await optimize._hybrid_replay(series, params,
+                                            start="2025-08-01", end="2025-08-14",
+                                            pure_llm=False, seed=42,
+                                            review_interval=5)
+        assert call_count[0] == 3, (
+            f"expected 3 LLM calls (days 1, 5, 10) with review_interval=5, "
+            f"got {call_count[0]}"
+        )
+        # Trades still happened on non-review days (deterministic executed).
+        assert res.n_trades > 0
+
+    async def test_review_interval_1_calls_every_day(self, monkeypatch):
+        import json as _json
+
+        from app import llm as llm_mod
+
+        series = {
+            f"UP{i}": _signal_series(_gen_candles(100.0, 0.02, seed=i, n=300))
+            for i in range(12)
+        }
+        params = ReplayParams(
+            start_cash=10000.0,
+            monthly_allowance=0.0,
+            max_positions=10,
+            max_position_pct=10.0,
+            min_cash_pct=0.0,
+            stop_type="none",
+            use_atr_stop=False,
+        )
+
+        call_count = [0]
+
+        async def fake_chat(messages):
+            call_count[0] += 1
+            return {"text": "[]"}
+
+        monkeypatch.setattr(llm_mod, "chat", fake_chat)
+        monkeypatch.setattr(llm_mod, "current_backend", lambda: {"name": "x", "model": "y"})
+        monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
+
+        # 14 days in the synthetic series (no weekends), review every 1 →
+        # LLM called every day (14 calls).
+        res = await optimize._hybrid_replay(series, params,
+                                            start="2025-08-01", end="2025-08-14",
+                                            pure_llm=False, seed=42,
+                                            review_interval=1)
+        assert call_count[0] == 14, (
+            f"expected 14 LLM calls with review_interval=1, got {call_count[0]}"
+        )
 
 
 class TestReplaySeedPinning:

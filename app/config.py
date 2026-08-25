@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     sim_max_positions: int = 10
     sim_stop_pct: float = 15.0
     sim_max_run_5d: float = 12.0  # block BUYs after a 5-day run-up > this % (0 = disabled)
+    sim_llm_review_interval: int = 1  # consult the LLM every N cycles (1=daily, 5=weekly)
     sim_run_hour: int = 22
     sim_run_minute: int = 30
 
