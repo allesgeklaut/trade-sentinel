@@ -405,6 +405,9 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
                 "atr14": float(row.atr14) if not pd.isna(row.atr14) else None,
                 "weekly_trend_up": bool(row.weekly_trend_up) if not pd.isna(row.weekly_trend_up) else True,
                 "run_5d": None if pd.isna(row.run_5d) else float(row.run_5d),
+                "run_20d": None if pd.isna(row.run_20d) else float(row.run_20d),
+                "run_60d": None if pd.isna(row.run_60d) else float(row.run_60d),
+                "dist_52w_high": None if pd.isna(row.dist_52w_high) else float(row.dist_52w_high),
             }
             for row in df.itertuples(index=False)
         }
@@ -813,6 +816,9 @@ async def _hybrid_replay(
                 "atr14": float(row.atr14) if not pd.isna(row.atr14) else None,
                 "weekly_trend_up": bool(row.weekly_trend_up) if not pd.isna(row.weekly_trend_up) else True,
                 "run_5d": None if pd.isna(row.run_5d) else float(row.run_5d),
+                "run_20d": None if pd.isna(row.run_20d) else float(row.run_20d),
+                "run_60d": None if pd.isna(row.run_60d) else float(row.run_60d),
+                "dist_52w_high": None if pd.isna(row.dist_52w_high) else float(row.dist_52w_high),
             }
             for row in df.itertuples(index=False)
         }

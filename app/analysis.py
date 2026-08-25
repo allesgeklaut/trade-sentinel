@@ -210,6 +210,21 @@ def signal_series(rows: list[dict]) -> pd.DataFrame:
     # 5 days is chasing — the entry is late and prone to a short-term reversion.
     run_5d = (c / c.shift(5) - 1) * 100
 
+    # --- medium/long-term run (trend-perspective momentum) ----------------
+    # 20d and 60d runs put the 5d move in context: a +10% 5d run inside a
+    # +30% 60d trend is continuation; the same 5d run after a flat 60d is a
+    # spike. Exposed so the LLM can judge position within the longer trend.
+    run_20d = (c / c.shift(20) - 1) * 100
+    run_60d = (c / c.shift(60) - 1) * 100
+
+    # --- distance from 52-week high ---------------------------------------
+    # Standard position-in-trend context: how far the price is from its
+    # 52-week high. Near the high = strong trend (but extended); far below =
+    # broken trend / value trap. The engine has no direct use for it; the
+    # LLM benefits from seeing the long-term position.
+    win_high_252 = c.rolling(252, min_periods=60).max()
+    dist_52w_high = (c / win_high_252 - 1) * 100
+
     # --- weekly trend (multi-timeframe confirmation) ----------------------
     # Resample daily close to weekly (Friday) for a slower trend filter.
     # BUYs are gated on weekly close > weekly SMA-50 so we don't buy into
@@ -250,6 +265,9 @@ def signal_series(rows: list[dict]) -> pd.DataFrame:
         "rsi_3d_change": rsi_3d_change,
         "macd_hist_3d_change": macd_hist_3d_change,
         "run_5d": run_5d,
+        "run_20d": run_20d,
+        "run_60d": run_60d,
+        "dist_52w_high": dist_52w_high,
     })
 
 
@@ -310,6 +328,9 @@ def snapshot_from_row(x, net: float, bullish: float, bearish: float,
     snap["rsi_3d_change"] = norm(x.rsi_3d_change)
     snap["macd_hist_3d_change"] = norm(x.macd_hist_3d_change)
     snap["run_5d"] = norm(x.run_5d)
+    snap["run_20d"] = norm(x.run_20d)
+    snap["run_60d"] = norm(x.run_60d)
+    snap["dist_52w_high"] = norm(x.dist_52w_high)
     return snap
 
 
