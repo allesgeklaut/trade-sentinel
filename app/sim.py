@@ -553,7 +553,14 @@ _LLM_SYSTEM_PROMPT = (
     "else. Your HOLD on a proposed BUY will block it from executing. You may "
     "also veto a SELL, but be conservative (see GATING "
     "deterministic SELLs).\n"
-    "3. Respect risk management: do not buy if cash is too low; do not over-"
+    "3. ADAPT TO THE MARKET REGIME shown in the context: in a BULL regime "
+    "momentum persists, so do NOT veto strong entries merely for being "
+    "slightly overbought (RSI 70-78 or a hot 5-day run is normal in a "
+    "bull); reserve vetoes for confirmed reversals. In a BEAR regime be "
+    "aggressive — skip weak-trend and overbought entries entirely. In a "
+    "MIXED regime judge each entry on its own merits. A one-size-fits-all "
+    "RSI>70 veto rule loses money in bull markets.\n"
+    "3b. Respect risk management: do not buy if cash is too low; do not over-"
     "concentrate in a single ticker. The engine caps the number of open "
     "positions (it stops buying once the max position count is reached), so "
     "prioritize the strongest candidates.\n"
@@ -787,6 +794,49 @@ def _build_llm_context(
     # runs did. Truncating to "top N" starved it of context.
     shown = sorted(signals.items()) if signals else []
     lines.append("## Signals (all candidate tickers)")
+
+    # --- Market regime (breadth-derived) ---
+    # Count candidates above their SMA200 / weekly-up so the LLM can tell a
+    # strong bull market (momentum persists — be slow to veto RSI-hot
+    # entries) from a fragile one (veto aggressively).
+    ups, total = 0, 0
+    for ticker, sig in signals.items():
+        snap = sig.get("snapshot", {})
+        c = snap.get("close")
+        s2 = snap.get("sma200")
+        if c is not None and s2 is not None and s2 > 0:
+            total += 1
+            if c > s2:
+                ups += 1
+    if total > 0:
+        pct = ups / total * 100
+        if pct >= 60:
+            regime = "BULL"
+            regime_advice = (
+                "Broad-market uptrend. In this regime momentum often persists: "
+                "do NOT veto a strong BUY purely on RSI > 70 or a 5-day run — "
+                "only veto on clear reversals (ADX < 15 AND rsi_3d_change < 0 "
+                "AND macd_hist_3d_change <= 0), broken trends, or overbought "
+                "WITH momentum already turning down."
+            )
+        elif pct >= 40:
+            regime = "MIXED"
+            regime_advice = (
+                "Mixed market. Veto overextended entries on their merits "
+                "(run_5d > 15% or RSI > 70 with momentum turning down), but "
+                "allow entries with confirmed trend (ADX > 20, weekly up)."
+            )
+        else:
+            regime = "BEAR"
+            regime_advice = (
+                "Broad-market downtrend / fragile tape. Veto aggressively: "
+                "skip weak-trend entries (low ADX), RSI > 65, and any BUY "
+                "against the weekly trend. Capital preservation comes first."
+            )
+        lines.append("")
+        lines.append(f"## Market Regime: {regime} — {ups}/{total} candidates above SMA200 ({pct:.0f}%)")
+        lines.append(regime_advice)
+        lines.append("")
 
     if shown:
         atr_col = " {'atrStop':>9}" if pure_llm else ""
