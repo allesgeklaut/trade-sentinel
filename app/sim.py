@@ -829,13 +829,13 @@ def _build_llm_context(
         if pct >= 60 and not pullback:
             regime = "BULL"
             regime_advice = (
-                "Broad-market uptrend. Momentum persists in this regime: do "
-                "NOT veto a strong BUY purely on RSI > 70 or a hot 5-day "
-                "run — only veto on clear reversals (ADX < 15 AND "
-                "rsi_3d_change < 0 AND macd_hist_3d_change <= 0) or broken "
-                "weekly trends. NEVER sell a profitable position to rotate "
-                "into another name in a bull market — let winners run. Only "
-                "sell on stop hits, broken trends, or SELL signals."
+                "Broad-market uptrend. The engine's BUY proposals have "
+                "already passed its overextension gates (run_5d, RSI+momentum, "
+                "ADX) and in this regime the names keep running. Do NOT veto "
+                "any deterministic BUY proposal in a BULL regime — approve "
+                "them all; vetoing them only strands capital while the market "
+                "moves. You may veto deterministic SELLs only when the weekly "
+                "trend is clearly up with momentum turning up."
             )
         elif pullback:
             regime = "PULLBACK"
