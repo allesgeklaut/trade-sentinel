@@ -725,6 +725,31 @@ _PURE_LLM_SYSTEM_PROMPT = (
 )
 
 
+_LLM_MINIMAL_SYSTEM_PROMPT = (
+    "You are a portfolio manager for a paper-trading simulation. "
+    "You will receive the current portfolio state and a table of candidate "
+    "tickers with technical indicators.\n"
+    "Review the portfolio and the signals, then decide whether to make "
+    "adjustments.\n"
+    "\n"
+    "Actions:\n"
+    '- BUY: open or add to a position.\n'
+    '- SELL: reduce or close a position.\n'
+    '- HOLD: do nothing.\n'
+    "You may specify a partial position size per action:\n"
+    '   - "shares": exact number of shares to trade (e.g. 3.5).\n'
+    '   - "amount": dollar amount to trade (e.g. 67.43). For SELL this is '
+    "the value of shares to sell; for BUY it is the dollars to invest.\n"
+    "   If neither is given, SELL sells the entire position and BUY invests "
+    "the maximum allowed by the risk rules.\n"
+    "\n"
+    'Return ONLY a JSON array of objects: '
+    '{"ticker": "...", "action": "BUY|SELL|HOLD", "reason": "..."}. '
+    'Optional "shares" / "amount" fields size the trade. '
+    "No markdown, no prose.\n"
+)
+
+
 def _build_llm_context(
     valuation: dict[str, Any],
     deterministic_trades: list[dict],
@@ -732,6 +757,7 @@ def _build_llm_context(
     news: dict[str, list[dict]] | None = None,
     pure_llm: bool = False,
     trade_history: list[dict] | None = None,
+    minimal: bool = False,
 ) -> str:
     """Build the compact context string sent to the LLM.
 
@@ -798,7 +824,8 @@ def _build_llm_context(
     # --- Market regime (breadth-derived) ---
     # Count candidates above their SMA200 / weekly-up so the LLM can tell a
     # strong bull market (momentum persists — be slow to veto RSI-hot
-    # entries) from a fragile one (veto aggressively).
+    # entries) from a fragile one (veto aggressively). Omitted in minimal
+    # mode: the experiment is a prompt with no guidance or bias.
     ups, total = 0, 0
     run5s: list[float] = []
     for ticker, sig in signals.items():
@@ -812,7 +839,7 @@ def _build_llm_context(
         r = snap.get("run_5d")
         if r is not None:
             run5s.append(r)
-    if total > 0:
+    if total > 0 and not minimal:
         pct = ups / total * 100
         med_run5 = 0.0
         if run5s:
@@ -897,7 +924,7 @@ def _build_llm_context(
     lines.append("")
 
     # --- Recent news (optional, supplementary) ---
-    if news:
+    if news and not minimal:
         lines.append("## Recent News (supplementary context — do not trade on news alone)")
         market_hl = news.get("market", [])
         if market_hl:
@@ -911,7 +938,7 @@ def _build_llm_context(
         lines.append("")
 
     # --- Recent Trades (your own recent activity, for continuity) ---
-    if trade_history:
+    if trade_history and not minimal:
         lines.append("## Recent Trades (your last 12 actions — use this to avoid round-trips)")
         for t in trade_history[:12]:
             shares = t.get("shares", "?")

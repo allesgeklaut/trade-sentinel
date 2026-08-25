@@ -1128,7 +1128,7 @@ class TestLlmWalkforwardWindows:
             calls.append(("det", start, end))
             return ReplayResult(params=params)
 
-        async def fake_llm(series, params, start=None, end=None, pure_llm=False, news=None, review_interval=1, veto_only=False, no_llm_sells=False):
+        async def fake_llm(series, params, start=None, end=None, pure_llm=False, news=None, review_interval=1, veto_only=False, no_llm_sells=False, minimal_prompt=False):
             calls.append(("llm", start, end))
             return ReplayResult(params=params)
 
@@ -1162,7 +1162,7 @@ class TestLlmWalkforwardWindows:
             from app.optimize import ReplayResult
             return ReplayResult(params=params)
 
-        async def fake_llm(series, params, start=None, end=None, pure_llm=False, news=None, review_interval=1, veto_only=False, no_llm_sells=False):
+        async def fake_llm(series, params, start=None, end=None, pure_llm=False, news=None, review_interval=1, veto_only=False, no_llm_sells=False, minimal_prompt=False):
             from app.optimize import ReplayResult
             return ReplayResult(params=params)
 
