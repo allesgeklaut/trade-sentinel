@@ -739,7 +739,6 @@ async def _hybrid_replay(
     end: str | None = None,
     news: dict[str, list[dict]] | None = None,
     pure_llm: bool = False,
-    seed: int | None = None,
     review_interval: int = 1,
 ) -> ReplayResult:
     """Replay the hybrid strategy (deterministic + LLM review).
@@ -767,11 +766,6 @@ async def _hybrid_replay(
     SearXNG; a historical replay has no dated news archive). When None the
     news section is omitted from the context, same as a live cycle with
     SEARXNG_URL unset.
-
-    ``seed`` pins LLM decoding (temperature=0, fixed seed) for reproducible
-    backtests via :func:`llm.set_replay_seed`. None leaves the backend's default
-    sampling. The seed is cleared in a ``finally`` so a replay never leaks
-    deterministic decoding into the live sim.
     """
     from .sim import _LLM_SYSTEM_PROMPT, _PURE_LLM_SYSTEM_PROMPT, _build_llm_context, _parse_llm_decisions
 
@@ -817,13 +811,7 @@ async def _hybrid_replay(
     last_known_prices: dict[str, float] = {}
     llm_trades: list[dict] = list(pf.trades)  # full trade log (det + LLM)
 
-    # Pin LLM decoding for the replay so repeated runs are comparable. Cleared
-    # in the finally below — a backtest must never leak deterministic decoding
-    # into the live sim.
-    if seed is not None:
-        llm_mod.set_replay_seed(seed)
-    try:
-        for day_idx, day in enumerate(days, 1):
+    for day_idx, day in enumerate(days, 1):
             # Monthly allowance deposit
             month = day[:7]
             if month != last_deposit_month:
@@ -979,11 +967,11 @@ async def _hybrid_replay(
                 daily_returns.append(total_equity / prev_equity - 1)
             prev_equity = total_equity
 
-        final_equity = equity_curve[-1]["equity"] if equity_curve else 0.0
-        total_invested = params.start_cash + params.monthly_allowance * len(set(d[:7] for d in days))
-        total_return_pct = (final_equity / total_invested - 1) * 100 if total_invested > 0 else 0.0
+    final_equity = equity_curve[-1]["equity"] if equity_curve else 0.0
+    total_invested = params.start_cash + params.monthly_allowance * len(set(d[:7] for d in days))
+    total_return_pct = (final_equity / total_invested - 1) * 100 if total_invested > 0 else 0.0
 
-        return ReplayResult(
+    return ReplayResult(
             params=params,
             equity_curve=equity_curve,
             trades=pf.trades,
@@ -993,11 +981,6 @@ async def _hybrid_replay(
             max_drawdown_pct=_max_drawdown([e["equity"] for e in equity_curve], invested_curve),
             n_trades=len(pf.trades),
         )
-    finally:
-        # Always restore default sampling so a replay never leaks pinned
-        # decoding into the live sim, even on exception.
-        if seed is not None:
-            llm_mod.set_replay_seed(None)
 
 
 # ---------------------------------------------------------------------------
@@ -1868,12 +1851,11 @@ async def _llm_walkforward(
     n_windows: int,
     days_per_window: int,
     pure_llm: bool,
-    seed: int | None,
     start: str | None,
     end: str | None,
     review_interval: int = 1,
 ) -> list[_WindowResult]:
-    """Run N non-overlapping windows, each deterministic vs LLM (pinned seed).
+    """Run N non-overlapping windows, each deterministic vs LLM.
 
     Windows are cut from the tail of the bounded ``all_days`` list so the most
     recent history is always covered. If the bounded range is shorter than
@@ -1921,8 +1903,6 @@ async def _llm_walkforward(
     active = await llm_mod.current_backend()
     print(f"\n=== {mode_label} walk-forward ({len(windows)} windows × {days_per_window} days) ===")
     print(f"  Backend: {active.get('name', '?')} · {active.get('model', '?')}")
-    if seed is not None:
-        print(f"  Pinned decoding: seed={seed}, temperature=0")
     print(f"  Risk config: max_positions={params.max_positions}, "
           f"stop={params.stop_type} {params.stop_pct:g}%, "
           f"atr_stop={params.use_atr_stop}, max_run_5d={params.max_run_5d:g}%")
@@ -1935,7 +1915,7 @@ async def _llm_walkforward(
                     i, len(windows), w_start, w_end,
                     det.total_return_pct, det.max_drawdown_pct, det.n_trades)
         llm = await _hybrid_replay(series, params, start=w_start, end=w_end,
-                                   pure_llm=pure_llm, seed=seed,
+                                   pure_llm=pure_llm,
                                    review_interval=review_interval)
         logger.info("window %d/%d %s..%s %s: return %.2f%%, dd %.2f%%, %d trades",
                     i, len(windows), w_start, w_end, mode_label,
@@ -2099,10 +2079,7 @@ async def _main(args: argparse.Namespace) -> None:
                 start = window_days[-args.days]
                 end = window_days[-1]
         pure_llm = getattr(args, "pure_llm", False)
-        seed = getattr(args, "seed", None)
         mode_label = "pure-LLM" if pure_llm else "hybrid"
-        if seed is not None:
-            print(f"  (pinned decoding: seed={seed}, temperature=0)")
         print(f"\n=== Pure-deterministic replay ({start}..{end}) ===")
         det = _replay(series, params, start=start, end=end)
         _print_result(det, "Deterministic baseline")
@@ -2118,7 +2095,7 @@ async def _main(args: argparse.Namespace) -> None:
               f"every {review_interval} trading day(s) ===")
         print(f"  Backend: {active.get('name', '?')} · {active.get('model', '?')}")
         hyb = await _hybrid_replay(series, params, start=start, end=end,
-                                   pure_llm=pure_llm, seed=seed,
+                                   pure_llm=pure_llm,
                                    review_interval=review_interval)
         _print_result(hyb, f"{mode_label} (deterministic + LLM review)" if not pure_llm else "Pure LLM")
 
@@ -2144,19 +2121,16 @@ async def _main(args: argparse.Namespace) -> None:
 
     elif args.command == "llm-walkforward":
         # Multi-window LLM vs deterministic benchmark. Runs N non-overlapping
-        # windows, each with a deterministic _replay + an LLM _hybrid_replay
-        # (pinned seed for reproducibility), then reports per-window + mean +
-        # worst-window delta. This is the reliable scoreboard for evaluating
-        # pure-LLM / hybrid strategy changes — a single window is noise.
+        # windows, each with a deterministic _replay + an LLM _hybrid_replay,
+        # then reports per-window + mean + worst-window delta. This is the
+        # reliable scoreboard for evaluating pure-LLM / hybrid strategy
+        # changes — a single window is noise.
         if not (settings.llm_backends or settings.ollama_model):
             print("No LLM backend configured (set LLM_BACKENDS or OLLAMA_MODEL); "
                   "llm-walkforward needs the LLM. Aborting.")
             return
         params = _live_sim_params()
         pure_llm = getattr(args, "pure_llm", False)
-        seed = getattr(args, "seed", None)
-        if seed is not None and seed < 0:
-            seed = None  # -1 sentinel disables pinning
         n_windows = args.windows
         days_per_window = args.days_per_window
         review_interval = getattr(args, "review_interval", 1)
@@ -2164,7 +2138,7 @@ async def _main(args: argparse.Namespace) -> None:
             results = await _llm_walkforward(
                 series, params, all_days,
                 n_windows=n_windows, days_per_window=days_per_window,
-                pure_llm=pure_llm, seed=seed,
+                pure_llm=pure_llm,
                 start=args.start, end=args.end,
                 review_interval=review_interval,
             )
@@ -2231,8 +2205,6 @@ def _build_parser() -> argparse.ArgumentParser:
     hr.add_argument("--trades", action="store_true", help="Print every hybrid trade")
     hr.add_argument("--pure-llm", action="store_true",
                     help="Pure LLM mode: skip deterministic proposals, let the LLM decide from scratch")
-    hr.add_argument("--seed", type=int, default=None,
-                    help="Pin LLM decoding (temperature=0, fixed seed) for reproducible replays")
     hr.add_argument("--review-interval", type=int, default=1,
                     help="Consult the LLM every N trading days (1=daily, 5=weekly); "
                          "deterministic proposals execute as-is on other days")
@@ -2249,8 +2221,6 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="Trading days per window (default 30)")
     lwf.add_argument("--pure-llm", action=argparse.BooleanOptionalAction, default=True,
                      help="Pure LLM mode (default); use --no-pure-llm for hybrid (deterministic + LLM review)")
-    lwf.add_argument("--seed", type=int, default=42,
-                     help="Pin LLM decoding for reproducibility (default 42; use -1 to disable)")
     lwf.add_argument("--review-interval", type=int, default=1,
                      help="Consult the LLM every N trading days (1=daily, 5=weekly); "
                           "deterministic proposals execute as-is on other days")
