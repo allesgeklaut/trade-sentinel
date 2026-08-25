@@ -710,6 +710,17 @@ def _signals_for_day_from_bytime(
     return signals
 
 
+def _current_week_from(day: str) -> str:
+    """ISO calendar week key (YYYY-Www) for a replay day.
+
+    Mirror of the live sim's :func:`sim._current_week`, but anchored to the
+    replayed date instead of ``datetime.now`` so historical backtests get the
+    same weekly-review cadence as production.
+    """
+    from datetime import datetime
+    return datetime.strptime(day, "%Y-%m-%d").strftime("%Y-W%W")
+
+
 def _execute_proposal(pf: PaperPortfolio, p: dict) -> dict | None:
     """Execute a single proposal against ``pf``. Returns the trade dict or None."""
     if p["side"] == "SELL":
@@ -757,17 +768,19 @@ async def _hybrid_replay(
     ``_replay`` over the same window.
 
     ``review_interval`` controls how often the LLM is consulted: 1 (default)
-    reviews every day; 5 reviews once a week. On non-review days the
-    deterministic proposals execute as-is with no LLM call — the engine runs
-    daily, the LLM reviews periodically (the "weekly portfolio review"
-    strategy: deterministic risk management + LLM judgment on selection).
+    reviews the first trading day of every calendar week; larger values skip
+    that many weeks. Between reviews the deterministic proposals execute
+    as-is with no LLM call — the engine runs daily, the LLM reviews weekly
+    (the "weekly portfolio review" strategy: deterministic risk management +
+    LLM judgment on selection). This mirrors the live sim's calendar-week
+    anchoring exactly.
 
     ``news`` is optional and currently unused (the live sim gathers news via
     SearXNG; a historical replay has no dated news archive). When None the
     news section is omitted from the context, same as a live cycle with
     SEARXNG_URL unset.
     """
-    from .sim import _LLM_SYSTEM_PROMPT, _PURE_LLM_SYSTEM_PROMPT, _build_llm_context, _parse_llm_decisions
+    from .sim import _LLM_SYSTEM_PROMPT, _PURE_LLM_SYSTEM_PROMPT, _build_llm_context, _parse_llm_decisions, _week_diff
 
     # Build the global timeline and per-ticker day index (same as _replay).
     all_days: set[str] = set()
@@ -810,6 +823,7 @@ async def _hybrid_replay(
     cumulative_invested = params.start_cash
     last_known_prices: dict[str, float] = {}
     llm_trades: list[dict] = list(pf.trades)  # full trade log (det + LLM)
+    last_review_week: str | None = None
 
     for day_idx, day in enumerate(days, 1):
             # Monthly allowance deposit
@@ -861,7 +875,16 @@ async def _hybrid_replay(
 
             # --- 2 + 3. LLM review → reconcile → execute ---
             total_equity = pf.equity(prices)
-            is_review_day = (day_idx % review_interval == 0) or (day_idx == 1)
+            # Fire the review on the first trading day of each calendar week
+            # (mirrors the live sim's weekly review): the LLM is consulted at
+            # most once per ISO week, anchored to the week, not a day counter.
+            # review_interval=1 still reviews every week; larger values skip
+            # intermediate weeks.
+            week = _current_week_from(day)
+            is_review_day = (
+                last_review_week is None
+                or _week_diff(week, last_review_week) >= review_interval
+            )
             if total_equity > 0 and (settings.llm_backends or settings.ollama_model) and is_review_day:
                 allowance_total = cumulative_invested
                 valuation = valuate_portfolio(_pf_to_positions(pf), pf.cash, prices, allowance_total)
@@ -951,11 +974,13 @@ async def _hybrid_replay(
                         logger.info("  vetoes: %d — %s",
                                     len(vetoed),
                                     ", ".join(f"{p['side']} {p['ticker']}" for p in vetoed))
+                # Mark the week as reviewed — no more LLM calls until the
+                # calendar week changes (same anchoring as the live sim).
+                last_review_week = week
             else:
-                # No LLM configured, or not a review day: execute all
-                # proposals as-is (deterministic). On non-review days the
-                # engine runs alone — the LLM only reviews every
-                # review_interval days.
+                # No LLM configured, or not a review week: execute all
+                # proposals as-is (deterministic). On non-review weeks the
+                # engine runs alone — the LLM only reviews once per week.
                 for p in proposals:
                     _execute_proposal(pf, p)
 
@@ -2092,7 +2117,7 @@ async def _main(args: argparse.Namespace) -> None:
         active = await llm_mod.current_backend()
         review_interval = getattr(args, "review_interval", 1)
         print(f"\n=== {mode_label} replay ({start}..{end}) — probing LLM "
-              f"every {review_interval} trading day(s) ===")
+              f"once per {review_interval} calendar week(s) ===")
         print(f"  Backend: {active.get('name', '?')} · {active.get('model', '?')}")
         hyb = await _hybrid_replay(series, params, start=start, end=end,
                                    pure_llm=pure_llm,
@@ -2206,8 +2231,8 @@ def _build_parser() -> argparse.ArgumentParser:
     hr.add_argument("--pure-llm", action="store_true",
                     help="Pure LLM mode: skip deterministic proposals, let the LLM decide from scratch")
     hr.add_argument("--review-interval", type=int, default=1,
-                    help="Consult the LLM every N trading days (1=daily, 5=weekly); "
-                         "deterministic proposals execute as-is on other days")
+                    help="Consult the LLM once per N calendar weeks (1=weekly); "
+                         "deterministic proposals execute as-is in between")
 
     lwf = sub.add_parser("llm-walkforward",
                          help="Multi-window LLM vs deterministic benchmark (reliable scoreboard)")
@@ -2222,8 +2247,8 @@ def _build_parser() -> argparse.ArgumentParser:
     lwf.add_argument("--pure-llm", action=argparse.BooleanOptionalAction, default=True,
                      help="Pure LLM mode (default); use --no-pure-llm for hybrid (deterministic + LLM review)")
     lwf.add_argument("--review-interval", type=int, default=1,
-                     help="Consult the LLM every N trading days (1=daily, 5=weekly); "
-                          "deterministic proposals execute as-is on other days")
+                     help="Consult the LLM once per N calendar weeks (1=weekly); "
+                          "deterministic proposals execute as-is in between")
     lwf.add_argument("--trades", action="store_true", help="Print every LLM trade per window")
 
     return p
