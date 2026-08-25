@@ -661,7 +661,7 @@ class TestHybridReplayLLMAdditionGuards:
 
         res = await optimize._hybrid_replay(series, params,
                                             start="2025-08-01", end="2025-10-31",
-                                            pure_llm=True, seed=42)
+                                            pure_llm=True)
 
         # Distinct tickers bought = 3 (the cap). But there should be more than
         # 3 BUY trades — the top-ups go through because the tickers are held.
@@ -749,7 +749,7 @@ class TestPureLLMAutoStops:
 
         res = await optimize._hybrid_replay(series, params,
                                             start="2025-08-01", end="2025-12-31",
-                                            pure_llm=True, seed=42)
+                                            pure_llm=True)
 
         buys = [t for t in res.trades if t["side"] == "BUY"]
         sells = [t for t in res.trades if t["side"] == "SELL"]
@@ -785,7 +785,7 @@ class TestPureLLMAutoStops:
 
         res = await optimize._hybrid_replay(series, params,
                                             start="2025-07-01", end="2025-12-31",
-                                            pure_llm=True, seed=42)
+                                            pure_llm=True)
         buys = [t for t in res.trades if t["side"] == "BUY"]
         assert not buys, (
             "pure-LLM mode bought tickers without the LLM issuing a BUY — "
@@ -837,7 +837,7 @@ class TestPureLLMAntiChurn:
 
         res = await optimize._hybrid_replay(series, params,
                                             start="2025-08-01", end="2025-08-05",
-                                            pure_llm=True, seed=42)
+                                            pure_llm=True)
 
         buys = [t for t in res.trades if t["side"] == "BUY"]
         sells = [t for t in res.trades if t["side"] == "SELL"]
@@ -884,7 +884,7 @@ class TestPureLLMAntiChurn:
         # exits — no holding floor).
         res = await optimize._hybrid_replay(series, params,
                                             start="2025-08-01", end="2025-08-21",
-                                            pure_llm=True, seed=42)
+                                            pure_llm=True)
 
         sells = [t for t in res.trades if t["side"] == "SELL"]
         # The LLM's SELL (day 2) goes through — no holding floor.
@@ -930,7 +930,7 @@ class TestPureLLMBuyGuards:
 
         res = await optimize._hybrid_replay(series, params,
                                             start="2025-09-01", end="2025-10-31",
-                                            pure_llm=True, seed=42)
+                                            pure_llm=True)
 
         buys = [t for t in res.trades if t["side"] == "BUY"]
         assert buys, (
@@ -981,7 +981,7 @@ class TestPureLLMBuyGuards:
 
         res = await optimize._hybrid_replay(series, params,
                                             start="2025-08-01", end="2025-08-31",
-                                            pure_llm=True, seed=42)
+                                            pure_llm=True)
 
         sells = [t for t in res.trades if t["side"] == "SELL"]
         assert sells, "expected the LLM SELL to execute (LLM owns exits)"
@@ -1127,7 +1127,7 @@ class TestLlmWalkforwardWindows:
             calls.append(("det", start, end))
             return ReplayResult(params=params)
 
-        async def fake_llm(series, params, start=None, end=None, pure_llm=False, seed=None, news=None, review_interval=1):
+        async def fake_llm(series, params, start=None, end=None, pure_llm=False, news=None, review_interval=1):
             calls.append(("llm", start, end))
             return ReplayResult(params=params)
 
@@ -1142,7 +1142,7 @@ class TestLlmWalkforwardWindows:
         results = asyncio.run(_llm_walkforward(
             {}, ReplayParams(), all_days,
             n_windows=4, days_per_window=30,
-            pure_llm=True, seed=42, start=None, end=None,
+            pure_llm=True, start=None, end=None,
         ))
         assert len(results) == 4
         # The 4 windows should be non-overlapping and cover the tail 120 days.
@@ -1161,7 +1161,7 @@ class TestLlmWalkforwardWindows:
             from app.optimize import ReplayResult
             return ReplayResult(params=params)
 
-        async def fake_llm(series, params, start=None, end=None, pure_llm=False, seed=None, news=None, review_interval=1):
+        async def fake_llm(series, params, start=None, end=None, pure_llm=False, news=None, review_interval=1):
             from app.optimize import ReplayResult
             return ReplayResult(params=params)
 
@@ -1176,7 +1176,7 @@ class TestLlmWalkforwardWindows:
         results = asyncio.run(_llm_walkforward(
             {}, ReplayParams(), all_days,
             n_windows=4, days_per_window=30,
-            pure_llm=True, seed=42, start=None, end=None,
+            pure_llm=True, start=None, end=None,
         ))
         # Still get 4 windows even though the 4th overlaps the 3rd at front.
         assert len(results) == 4
@@ -1194,7 +1194,7 @@ class TestLlmWalkforwardWindows:
             asyncio.run(_llm_walkforward(
                 {}, ReplayParams(), all_days,
                 n_windows=4, days_per_window=30,
-                pure_llm=True, seed=42, start=None, end=None,
+                pure_llm=True, start=None, end=None,
             ))
 
 
@@ -1237,7 +1237,7 @@ class TestReviewInterval:
         # 10 trading days, review every 5 → LLM called on days 1, 5, 10 (3 calls).
         res = await optimize._hybrid_replay(series, params,
                                             start="2025-08-01", end="2025-08-14",
-                                            pure_llm=False, seed=42,
+                                            pure_llm=False,
                                             review_interval=5)
         assert call_count[0] == 3, (
             f"expected 3 LLM calls (days 1, 5, 10) with review_interval=5, "
@@ -1279,103 +1279,8 @@ class TestReviewInterval:
         # LLM called every day (14 calls).
         res = await optimize._hybrid_replay(series, params,
                                             start="2025-08-01", end="2025-08-14",
-                                            pure_llm=False, seed=42,
+                                            pure_llm=False,
                                             review_interval=1)
         assert call_count[0] == 14, (
             f"expected 14 LLM calls with review_interval=1, got {call_count[0]}"
         )
-
-
-class TestReplaySeedPinning:
-    """llm.set_replay_seed() must pin decoding for _hybrid_replay and clear
-    it afterwards, even on exception — a backtest must never leak pinned
-    decoding into the live sim."""
-
-    def test_seed_set_during_replay_and_cleared_after(self, monkeypatch):
-        from app import llm as llm_mod
-        from app.optimize import _hybrid_replay, ReplayParams, ReplayResult
-
-        seed_during = []
-
-        async def fake_chat(messages):
-            seed_during.append(llm_mod._replay_seed)
-            return {"text": "[]", "reasoning": "", "backend": "x", "model": "y"}
-
-        async def fake_backend():
-            return {"name": "x", "model": "y"}
-
-        monkeypatch.setattr(llm_mod, "chat", fake_chat)
-        monkeypatch.setattr(llm_mod, "current_backend", fake_backend)
-        monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
-
-        series = {"UP": _signal_series(_gen_candles(100.0, 0.01, seed=1, n=300))}
-        import asyncio
-        asyncio.run(_hybrid_replay(series, ReplayParams(start_cash=1000.0,
-                                                          monthly_allowance=0.0,
-                                                          stop_type="none",
-                                                          use_atr_stop=False),
-                                    start="2025-07-01", end="2025-12-01",
-                                    pure_llm=True, seed=42))
-        # During the replay the seed was set.
-        assert seed_during, "LLM was never called"
-        assert all(s == 42 for s in seed_during), f"seed not pinned during replay: {seed_during}"
-        # After the replay the seed is cleared.
-        assert llm_mod._replay_seed is None, "seed leaked after replay"
-
-    def test_seed_cleared_even_on_exception(self, monkeypatch):
-        from app import llm as llm_mod
-        from app.optimize import _hybrid_replay, ReplayParams
-
-        async def failing_chat(messages):
-            raise RuntimeError("boom")
-
-        async def fake_backend():
-            return {"name": "x", "model": "y"}
-
-        monkeypatch.setattr(llm_mod, "chat", failing_chat)
-        monkeypatch.setattr(llm_mod, "current_backend", fake_backend)
-        monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
-
-        series = {"UP": _signal_series(_gen_candles(100.0, 0.01, seed=1, n=300))}
-        import asyncio
-        # The replay catches LLM errors internally (logs + fallback), so it
-        # won't raise. But force an early exit by making the series empty to
-        # trigger the ValueError path — actually that returns early. Instead,
-        # test the finally directly: simulate by calling with a bad window.
-        # The simplest assertion: after a normal run that hit LLM errors, the
-        # seed is still cleared.
-        asyncio.run(_hybrid_replay(series, ReplayParams(start_cash=1000.0,
-                                                         monthly_allowance=0.0,
-                                                         stop_type="none",
-                                                         use_atr_stop=False),
-                                    start="2025-07-01", end="2025-12-01",
-                                    pure_llm=True, seed=42))
-        assert llm_mod._replay_seed is None, "seed leaked after LLM-error replay"
-
-    def test_no_seed_leaves_default_sampling(self, monkeypatch):
-        from app import llm as llm_mod
-        from app.optimize import _hybrid_replay, ReplayParams
-
-        seed_during = []
-
-        async def fake_chat(messages):
-            seed_during.append(llm_mod._replay_seed)
-            return {"text": "[]", "reasoning": "", "backend": "x", "model": "y"}
-
-        async def fake_backend():
-            return {"name": "x", "model": "y"}
-
-        monkeypatch.setattr(llm_mod, "chat", fake_chat)
-        monkeypatch.setattr(llm_mod, "current_backend", fake_backend)
-        monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
-
-        series = {"UP": _signal_series(_gen_candles(100.0, 0.01, seed=1, n=300))}
-        import asyncio
-        asyncio.run(_hybrid_replay(series, ReplayParams(start_cash=1000.0,
-                                                          monthly_allowance=0.0,
-                                                          stop_type="none",
-                                                          use_atr_stop=False),
-                                    start="2025-07-01", end="2025-12-01",
-                                    pure_llm=True, seed=None))
-        assert seed_during, "LLM was never called"
-        assert all(s is None for s in seed_during), f"seed was set without pinning: {seed_during}"
