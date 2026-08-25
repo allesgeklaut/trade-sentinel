@@ -242,30 +242,22 @@ class TestPaperPortfolioThesis:
         assert positions[0]["thesis"] == "AI infrastructure leader"
         assert positions[0]["buy_date"] == "2025-06-01"
 
-    def test_last_sell_date_recorded_on_full_sell(self):
+    def test_full_sell_clears_position_metadata(self):
         pf = optimize.PaperPortfolio(cash=1000.0)
         pf.buy("AMD", 100.0, 500.0, "momentum play", date="2025-06-01")
         pf.sell("AMD", 110.0, None, "take profit", date="2025-06-15")
-        # Full sell records the date so the re-buy cooldown can block a
-        # round-trip re-buy within 10 trading days.
-        assert pf.last_sell_date["AMD"] == "2025-06-15"
+        # Full sell clears the thesis/buy-date bookkeeping.
+        assert "AMD" not in pf.thesis
+        assert "AMD" not in pf.buy_date
 
-    def test_last_sell_date_not_set_on_partial_sell(self):
-        pf = optimize.PaperPortfolio(cash=1000.0)
-        pf.buy("AMD", 100.0, 500.0, "momentum play", date="2025-06-01")
-        pf.sell("AMD", 110.0, 2.0, "partial take profit", date="2025-06-15")
-        # Partial sell keeps the position — no re-buy cooldown needed.
-        assert "AMD" not in pf.last_sell_date
-
-    def test_rebuy_after_cooldown_clears_last_sell(self):
+    def test_rebuy_opens_fresh_position(self):
         pf = optimize.PaperPortfolio(cash=1000.0)
         pf.buy("AMD", 100.0, 500.0, "momentum play", date="2025-06-01")
         pf.sell("AMD", 110.0, None, "take profit", date="2025-06-15")
-        # Re-buying opens a fresh position — the old sell date is superseded.
+        # Re-buying opens a fresh position with a new thesis.
         pf.buy("AMD", 105.0, 500.0, "new thesis", date="2025-07-01")
         assert pf.thesis["AMD"] == "new thesis"
         assert pf.buy_date["AMD"] == "2025-07-01"
-        # The last_sell_date is stale but harmless; the position exists now.
 
 
 class TestReplayTopUpAtCap:
@@ -717,7 +709,10 @@ class TestPureLLMAutoStops:
             price = row["close"]
         return up + crash
 
-    async def test_pure_llm_auto_sells_on_stop_hit(self, monkeypatch):
+    async def test_pure_llm_no_engine_stops(self, monkeypatch):
+        """Parity with main: the engine makes NO risk-floor sells in pure-LLM
+        mode — if the LLM only returns HOLDs, positions are held (no stop
+        flushing, no trailing stops)."""
         import json as _json
 
         from app import llm as llm_mod
@@ -726,21 +721,20 @@ class TestPureLLMAutoStops:
         params = ReplayParams(
             start_cash=10000.0,
             monthly_allowance=0.0,
-            max_positions=0,       # no cap (pure-LLM mode doesn't use it yet)
+            max_positions=0,
             max_position_pct=100.0,
             min_cash_pct=0.0,
             stop_type="percent",
-            stop_pct=15.0,         # 15% initial stop
+            stop_pct=15.0,
             use_atr_stop=True,
         )
 
         # LLM: BUY on first day, HOLD everything afterward. The engine must
-        # sell the position when it hits the 15% stop — the LLM never sells.
+        # NOT sell — no risk floor in pure-LLM mode.
         call_count = [0]
 
         async def fake_chat(messages):
             call_count[0] += 1
-            # First call: buy the only ticker. After that: hold everything.
             if call_count[0] == 1:
                 return {"text": _json.dumps([
                     {"ticker": "CRASH", "action": "BUY", "reason": "uptrend"}
@@ -753,20 +747,17 @@ class TestPureLLMAutoStops:
         monkeypatch.setattr(llm_mod, "current_backend", lambda: {"name": "x", "model": "y"})
         monkeypatch.setattr(optimize.settings, "llm_backends", '[{"name":"x"}]')
 
-        # Start on 2025-08-01: the first LLM call lands on a BUY-signal day
-        # so the entry goes through cleanly.
         res = await optimize._hybrid_replay(series, params,
                                             start="2025-08-01", end="2025-12-31",
                                             pure_llm=True, seed=42)
 
+        buys = [t for t in res.trades if t["side"] == "BUY"]
         sells = [t for t in res.trades if t["side"] == "SELL"]
-        assert sells, (
-            "pure-LLM mode never auto-sold the stop-hit position — the engine "
-            "must enforce stops even when the LLM only returns HOLDs"
-        )
-        # The SELL reason must mention the stop (initial or ATR).
-        assert any("stop" in t["reason"].lower() for t in sells), (
-            f"expected a stop-related SELL reason, got: {[t['reason'] for t in sells]}"
+        assert buys, "expected the LLM BUY to execute"
+        assert not sells, (
+            f"engine risk floor sold positions in pure-LLM mode: {len(sells)} "
+            f"SELLs. Parity with main: the engine makes no risk-floor sells; "
+            f"the LLM owns all exits."
         )
 
     async def test_pure_llm_llm_still_decides_buys(self, monkeypatch):
@@ -803,10 +794,10 @@ class TestPureLLMAutoStops:
 
 
 class TestPureLLMAntiChurn:
-    """The re-buy cooldown (10 trading days) blocks round-trip re-buys of a
-    fully-sold ticker. The LLM keeps full SELL discretion — the engine only
-    enforces the true risk floor (stop-price hits), never flushes positions
-    on SELL signals."""
+    """Parity with main: the engine makes NO exits in pure-LLM mode — the LLM
+    owns all sell decisions (no risk floor, no holding floor, no cooldown).
+    The engine's hard sizing limits (min-cash, max-pos-%, max-positions cap)
+    are the only constraints."""
 
     async def test_llm_sell_discretion_preserved(self, monkeypatch):
         """The LLM may sell a position any time — there is no holding-period
@@ -853,7 +844,7 @@ class TestPureLLMAntiChurn:
         assert buys, "expected the LLM BUY to execute on day 1"
         assert sells, (
             "the LLM's early SELL was blocked — the LLM must own discretionary "
-            "exits; only stop-price hits are engine-enforced"
+            "exits; the engine makes no exits in pure-LLM mode"
         )
 
     async def test_sell_after_5_days_allowed(self, monkeypatch):
@@ -903,10 +894,10 @@ class TestPureLLMAntiChurn:
 
 
 class TestPureLLMBuyGuards:
-    """Pure-LLM BUY guards: the re-buy cooldown blocks re-buying a fully-sold
-    ticker within 10 trading days (round-trip churn prevention). The LLM keeps
-    full buy discretion on any ticker — there is no candidate filter (it was
-    removed: it fought the LLM and caused churn)."""
+    """Pure-LLM BUY behavior (parity with main): the LLM keeps full buy
+    discretion on any ticker — no candidate filter, no cooldown. The engine
+    only enforces hard sizing limits (min-cash, max-pos-%, max-positions cap)
+    on each BUY."""
 
     async def test_buy_discretion_preserved_on_weak_signal(self, monkeypatch):
         """The LLM may buy any ticker it chooses — the engine does not filter
@@ -916,8 +907,7 @@ class TestPureLLMBuyGuards:
         from app import llm as llm_mod
 
         # A downtrending ticker with weak signals. The LLM decides to buy it —
-        # that is its call to make (and the risk floor will stop it out if it
-        # is wrong). No engine filter blocks the entry.
+        # that is its call to make. No engine filter blocks the entry.
         series = {"DOWN": _signal_series(_gen_candles(100.0, -0.008, seed=2, n=300))}
         params = ReplayParams(
             start_cash=10000.0,
@@ -948,8 +938,10 @@ class TestPureLLMBuyGuards:
             "filter must not constrain the LLM's buy discretion"
         )
 
-    async def test_rebuy_blocked_within_cooldown(self, monkeypatch):
-        """A ticker fully sold < 10 trading days ago cannot be re-bought."""
+    async def test_rebuy_allowed_after_sell(self, monkeypatch):
+        """Parity with main: there is no re-buy cooldown — the LLM may re-buy
+        a ticker it sold, even the next day. The engine does not restrict
+        LLM BUY choices."""
         import json as _json
 
         from app import llm as llm_mod
@@ -978,8 +970,7 @@ class TestPureLLMBuyGuards:
                 return {"text": _json.dumps([
                     {"ticker": "UP", "action": "SELL", "reason": "exit"}
                 ])}
-            # After the sell (day 3+), try to re-buy immediately — must be
-            # blocked by the re-buy cooldown.
+            # After the sell (day 3+), re-buy — no cooldown blocks it.
             return {"text": _json.dumps([
                 {"ticker": "UP", "action": "BUY", "reason": "looks strong again"}
             ])}
@@ -992,27 +983,12 @@ class TestPureLLMBuyGuards:
                                             start="2025-08-01", end="2025-08-31",
                                             pure_llm=True, seed=42)
 
-        # A SELL happened (LLM discretion — no holding floor anymore).
         sells = [t for t in res.trades if t["side"] == "SELL"]
         assert sells, "expected the LLM SELL to execute (LLM owns exits)"
-        sell_date = sells[-1]["date"]
-
-        # The re-buy must NOT happen within 10 trading days of the sell —
-        # but it may happen once the cooldown expires (day 10+). Assert that
-        # no BUY occurs between the sell date and 10 trading days later.
-        # (The concentration cap may split re-buys into several small ones,
-        # so assert on the earliest re-buy date, not the count.)
-        buys = [t for t in res.trades if t["side"] == "BUY"]
-        assert len(buys) >= 2, (
-            f"expected the entry BUY + at least one re-buy, got {len(buys)}"
-        )
-        rebuy_date = buys[-1]["date"]
-        days = sorted(set().union(*(set(df["time"]) for df in series.values())))
-        day_to_idx = {d: i for i, d in enumerate(days)}
-        gap = day_to_idx[rebuy_date] - day_to_idx[sell_date]
-        assert gap >= 10, (
-            f"re-buy happened only {gap} trading days after the sell — the "
-            f"re-buy cooldown (10 days) must block round-trips"
+        # The re-buy goes through — no cooldown in parity mode.
+        rebuys = [t for t in res.trades if t["side"] == "BUY"]
+        assert len(rebuys) >= 2, (
+            f"expected the entry BUY + re-buy (no cooldown), got {len(rebuys)}"
         )
 
 
