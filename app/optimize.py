@@ -743,30 +743,6 @@ def _execute_proposal(pf: PaperPortfolio, p: dict) -> dict | None:
     return None
 
 
-def _build_by_time(series: dict[str, pd.DataFrame]) -> dict[str, dict[str, dict]]:
-    """Build the per-ticker {day: snapshot-row} index shared by replays."""
-    by_time: dict[str, dict[str, dict]] = {}
-    for t, df in series.items():
-        by_time[t] = {
-            row.time: {
-                "close": float(row.close),
-                "net": float(row.net),
-                "bullish": float(row.bullish),
-                "bearish": float(row.bearish),
-                "trend_up": bool(row.trend_up),
-                "trend_down": bool(row.trend_down),
-                "dist_above": float(row.dist_above),
-                "dist_below": float(row.dist_below),
-                "atr_stop": None if pd.isna(row.atr_stop) else float(row.atr_stop),
-                "atr14": float(row.atr14) if not pd.isna(row.atr14) else None,
-                "weekly_trend_up": bool(row.weekly_trend_up) if not pd.isna(row.weekly_trend_up) else True,
-                "run_5d": None if pd.isna(row.run_5d) else float(row.run_5d),
-            }
-            for row in df.itertuples(index=False)
-        }
-    return by_time
-
-
 async def _hybrid_replay(
     series: dict[str, pd.DataFrame],
     params: ReplayParams,
@@ -801,10 +777,10 @@ async def _hybrid_replay(
     LLM judgment on selection). This mirrors the live sim's calendar-week
     anchoring exactly.
 
-    ``news`` is optional: a dict of ``{"market": [...], "TICKER": [...]}``
-    headline lists fetched up-front (e.g. via ``--live-news``) and passed to
-    the LLM context each review, exactly like the live sim's news section.
-    When None the news section is omitted from the context.
+    ``news`` is optional and currently unused (the live sim gathers news via
+    SearXNG; a historical replay has no dated news archive). When None the
+    news section is omitted from the context, same as a live cycle with
+    SEARXNG_URL unset.
     """
     from .sim import _LLM_SYSTEM_PROMPT, _PURE_LLM_SYSTEM_PROMPT, _build_llm_context, _parse_llm_decisions, _week_diff
 
@@ -820,7 +796,25 @@ async def _hybrid_replay(
     if not days:
         return ReplayResult(params=params)
 
-    by_time = _build_by_time(series)
+    by_time: dict[str, dict[str, dict]] = {}
+    for t, df in series.items():
+        by_time[t] = {
+            row.time: {
+                "close": float(row.close),
+                "net": float(row.net),
+                "bullish": float(row.bullish),
+                "bearish": float(row.bearish),
+                "trend_up": bool(row.trend_up),
+                "trend_down": bool(row.trend_down),
+                "dist_above": float(row.dist_above),
+                "dist_below": float(row.dist_below),
+                "atr_stop": None if pd.isna(row.atr_stop) else float(row.atr_stop),
+                "atr14": float(row.atr14) if not pd.isna(row.atr14) else None,
+                "weekly_trend_up": bool(row.weekly_trend_up) if not pd.isna(row.weekly_trend_up) else True,
+                "run_5d": None if pd.isna(row.run_5d) else float(row.run_5d),
+            }
+            for row in df.itertuples(index=False)
+        }
 
     pf = PaperPortfolio(cash=params.start_cash)
     equity_curve: list[dict] = []
@@ -1892,7 +1886,6 @@ async def _llm_walkforward(
     review_interval: int = 1,
     veto_only: bool = False,
     no_llm_sells: bool = False,
-    news: dict[str, list[dict]] | None = None,
 ) -> list[_WindowResult]:
     """Run N non-overlapping windows, each deterministic vs LLM.
 
@@ -1957,8 +1950,7 @@ async def _llm_walkforward(
                                    pure_llm=pure_llm,
                                    review_interval=review_interval,
                                    veto_only=veto_only,
-                                   no_llm_sells=no_llm_sells,
-                                   news=news)
+                                   no_llm_sells=no_llm_sells)
         logger.info("window %d/%d %s..%s %s: return %.2f%%, dd %.2f%%, %d trades",
                     i, len(windows), w_start, w_end, mode_label,
                     llm.total_return_pct, llm.max_drawdown_pct, llm.n_trades)
@@ -2180,22 +2172,6 @@ async def _main(args: argparse.Namespace) -> None:
         review_interval = getattr(args, "review_interval", 1)
         veto_only = getattr(args, "veto_only", False)
         no_llm_sells = getattr(args, "no_llm_sells", False)
-        live_news = getattr(args, "live_news", False)
-        market_news_only = getattr(args, "market_news_only", False)
-        news: dict[str, list[dict]] | None = None
-        if live_news or market_news_only:
-            from .news import gather_news_for_candidates
-            from .sim import _top_news_candidates
-            if market_news_only:
-                print("  Fetching market news only...")
-                news = await gather_news_for_candidates([], include_market=True)
-            else:
-                by_time = _build_by_time(series)
-                sigs = _signals_for_day(series, by_time, all_days[-1], params)
-                candidates = _top_news_candidates(sigs)
-                print(f"  Fetching live news for {len(candidates)} candidates + market...")
-                news = await gather_news_for_candidates(candidates, include_market=True)
-            print(f"  News keys: {sorted(news.keys()) if news else 'none'}")
         try:
             results = await _llm_walkforward(
                 series, params, all_days,
@@ -2205,7 +2181,6 @@ async def _main(args: argparse.Namespace) -> None:
                 review_interval=review_interval,
                 veto_only=veto_only,
                 no_llm_sells=no_llm_sells,
-                news=news,
             )
         except ValueError as e:
             print(f"Cannot run walk-forward: {e}")
@@ -2298,13 +2273,6 @@ def _build_parser() -> argparse.ArgumentParser:
     lwf.add_argument("--no-llm-sells", action="store_true",
                      help="Hybrid: block LLM-initiated SELLs (engine owns exits via "
                           "stops and SELL signals; LLM owns entries)")
-    lwf.add_argument("--live-news", action="store_true",
-                     help="Fetch current news (SearXNG) for the top candidates + "
-                          "market and inject it into every LLM review — same news "
-                          "section the live sim shows (note: not date-filtered)")
-    lwf.add_argument("--market-news-only", action="store_true",
-                     help="Fetch only market-wide news (no per-ticker headlines) "
-                          "into every LLM review")
     lwf.add_argument("--trades", action="store_true", help="Print every LLM trade per window")
 
     return p
