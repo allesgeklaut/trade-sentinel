@@ -899,7 +899,7 @@ def _build_llm_context(
         atr_col = " {'atrStop':>9}" if pure_llm else ""
         lines.append(
             f"{'ticker':<10} {'action':<6} {'strength':>8} "
-            f"{'close':>10} {'rsi':>6} {'rsiΔ3':>6} {'adx':>5} {'wk':>3} {'macd':>10} {'mhΔ3':>7} {'run5d':>6}{atr_col}"
+            f"{'close':>10} {'rsi':>6} {'rsiΔ3':>6} {'adx':>5} {'wk':>3} {'macd':>10} {'mhΔ3':>7} {'run5d':>6} {'run20d':>7} {'run60d':>7} {'hi52d':>6}{atr_col}"
         )
         for ticker, sig in shown:
             snap = sig.get("snapshot", {})
@@ -907,17 +907,23 @@ def _build_llm_context(
             rsi_d = snap.get("rsi_3d_change")
             mh_d = snap.get("macd_hist_3d_change")
             run5 = snap.get("run_5d")
+            run20 = snap.get("run_20d")
+            run60 = snap.get("run_60d")
+            dist52 = snap.get("dist_52w_high")
             atr_stop = snap.get("atr_stop")
             rsi_d_s = f"{rsi_d:+.1f}" if rsi_d is not None else "  -  "
             mh_d_s = f"{mh_d:+.2f}" if mh_d is not None else "  -  "
             run5_s = f"{run5:+.1f}%" if run5 is not None else "  -  "
+            run20_s = f"{run20:+.1f}%" if run20 is not None else "  -  "
+            run60_s = f"{run60:+.1f}%" if run60 is not None else "  -  "
+            dist52_s = f"{dist52:+.1f}%" if dist52 is not None else "  -  "
             atr_s = f"{atr_stop:>9.2f}" if pure_llm and atr_stop is not None else ""
             lines.append(
                 f"{ticker:<10} {sig['action']:<6} {sig['strength']:>8} "
                 f"{(snap.get('close') or 0):>10.2f} {(snap.get('rsi') or 0):>6.1f} "
                 f"{rsi_d_s:>6} "
                 f"{(snap.get('adx') or 0):>5.0f} {wk:>3} "
-                f"{(snap.get('macd') or 0):>10.3f} {mh_d_s:>7} {run5_s:>6}{atr_s}"
+                f"{(snap.get('macd') or 0):>10.3f} {mh_d_s:>7} {run5_s:>6} {run20_s:>7} {run60_s:>7} {dist52_s:>6}{atr_s}"
             )
     else:
         lines.append("(no signals available)")
@@ -2342,13 +2348,19 @@ async def _build_sim_chat_context() -> str:
             rsi_d = snap.get("rsi_3d_change")
             mh_d = snap.get("macd_hist_3d_change")
             run5 = snap.get("run_5d")
+            run20 = snap.get("run_20d")
+            run60 = snap.get("run_60d")
+            dist52 = snap.get("dist_52w_high")
             rsi_d_s = f" | rsiΔ3 {rsi_d:+.1f}" if rsi_d is not None else ""
             mh_d_s = f" | mhΔ3 {mh_d:+.2f}" if mh_d is not None else ""
             run5_s = f" | run5d {run5:+.1f}%" if run5 is not None else ""
+            run20_s = f" | run20d {run20:+.1f}%" if run20 is not None else ""
+            run60_s = f" | run60d {run60:+.1f}%" if run60 is not None else ""
+            dist52_s = f" | hi52 {dist52:+.1f}%" if dist52 is not None else ""
             lines.append(
                 f"  {ticker}: {sig['action']} (strength {sig['strength']}) "
                 f"| RSI {snap.get('rsi', 0):.1f}{rsi_d_s} | ADX {snap.get('adx', 0):.0f} "
-                f"| wk {wk} | MACD {snap.get('macd', 0):.3f}{mh_d_s}{run5_s} "
+                f"| wk {wk} | MACD {snap.get('macd', 0):.3f}{mh_d_s}{run5_s}{run20_s}{run60_s}{dist52_s} "
                 f"| close {snap.get('close', 0):.2f}"
             )
     lines.append("")
