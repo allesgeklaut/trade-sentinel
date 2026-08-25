@@ -751,6 +751,8 @@ async def _hybrid_replay(
     news: dict[str, list[dict]] | None = None,
     pure_llm: bool = False,
     review_interval: int = 1,
+    veto_only: bool = False,
+    no_llm_sells: bool = False,
 ) -> ReplayResult:
     """Replay the hybrid strategy (deterministic + LLM review).
 
@@ -927,46 +929,49 @@ async def _hybrid_replay(
                     # floor, max-position-% ceiling, max-positions cap. This is
                     # the design that measured stable (stddev 0.79% over 3 runs);
                     # free sizing (guarded=False) made results ~3x more volatile.
-                    plan = await plan_llm_buys(
-                        decisions, pf.cash, pf.equity(prices),
-                        _replay_params_to_strategy(params),
-                        guarded=True,
-                        price_of=lambda t: _aval(prices.get(t)),
-                        value_of=lambda t: _aval(pf.positions.get(t, 0) * prices.get(t, 0)),
-                        exclude=proposal_tickers,
-                    )
-                    held_tickers = set(pf.positions.keys())
-                    for d in decisions:
-                        tu = d["ticker"].upper()
-                        if tu in proposal_tickers:
-                            continue
-                        action = d["action"]
-                        reason = d.get("reason", f"LLM {action}")
-                        price = prices.get(d["ticker"])
-                        if price is None or price <= 0 or action == "HOLD":
-                            continue
-                        if action == "BUY":
-                            # Max-positions cap: block NEW positions when at
-                            # the cap, but still allow topping up tickers
-                            # already held.
-                            if (params.max_positions > 0
-                                    and len(held_tickers) >= params.max_positions
-                                    and tu not in held_tickers):
-                                logger.info("  llm BUY %s skipped (max-positions cap %d)",
-                                            tu, params.max_positions)
+                    # In veto-only mode the LLM's job is confined to blocking
+                    # bad deterministic proposals; it never sizes new entries.
+                    if not veto_only:
+                        plan = await plan_llm_buys(
+                            decisions, pf.cash, pf.equity(prices),
+                            _replay_params_to_strategy(params),
+                            guarded=True,
+                            price_of=lambda t: _aval(prices.get(t)),
+                            value_of=lambda t: _aval(pf.positions.get(t, 0) * prices.get(t, 0)),
+                            exclude=proposal_tickers,
+                        )
+                        held_tickers = set(pf.positions.keys())
+                        for d in decisions:
+                            tu = d["ticker"].upper()
+                            if tu in proposal_tickers:
                                 continue
-                            budget = plan.get(tu)
-                            if budget is None:
+                            action = d["action"]
+                            reason = d.get("reason", f"LLM {action}")
+                            price = prices.get(d["ticker"])
+                            if price is None or price <= 0 or action == "HOLD":
                                 continue
-                            entry_stop = (price * (1 - params.stop_pct / 100)
-                                          if params.stop_type == "percent" else None)
-                            pf.buy(d["ticker"], price, budget, f"LLM: {reason}",
-                                   stop=entry_stop, date=day)
-                            held_tickers.add(tu)
-                        elif action == "SELL":
-                            target_shares = llm_sell_shares(d, price)
-                            pf.sell(d["ticker"], price, target_shares,
-                                    f"LLM: {reason}", date=day)
+                            if action == "BUY":
+                                # Max-positions cap: block NEW positions when at
+                                # the cap, but still allow topping up tickers
+                                # already held.
+                                if (params.max_positions > 0
+                                        and len(held_tickers) >= params.max_positions
+                                        and tu not in held_tickers):
+                                    logger.info("  llm BUY %s skipped (max-positions cap %d)",
+                                                tu, params.max_positions)
+                                    continue
+                                budget = plan.get(tu)
+                                if budget is None:
+                                    continue
+                                entry_stop = (price * (1 - params.stop_pct / 100)
+                                              if params.stop_type == "percent" else None)
+                                pf.buy(d["ticker"], price, budget, f"LLM: {reason}",
+                                       stop=entry_stop, date=day)
+                                held_tickers.add(tu)
+                            elif action == "SELL" and not no_llm_sells:
+                                target_shares = llm_sell_shares(d, price)
+                                pf.sell(d["ticker"], price, target_shares,
+                                        f"LLM: {reason}", date=day)
 
                     summary = ", ".join(f"{d['ticker']}={d['action']}" for d in decisions)
                     logger.info("  llm returned %d decisions: %s", len(decisions), summary)
@@ -1879,6 +1884,8 @@ async def _llm_walkforward(
     start: str | None,
     end: str | None,
     review_interval: int = 1,
+    veto_only: bool = False,
+    no_llm_sells: bool = False,
 ) -> list[_WindowResult]:
     """Run N non-overlapping windows, each deterministic vs LLM.
 
@@ -1941,7 +1948,9 @@ async def _llm_walkforward(
                     det.total_return_pct, det.max_drawdown_pct, det.n_trades)
         llm = await _hybrid_replay(series, params, start=w_start, end=w_end,
                                    pure_llm=pure_llm,
-                                   review_interval=review_interval)
+                                   review_interval=review_interval,
+                                   veto_only=veto_only,
+                                   no_llm_sells=no_llm_sells)
         logger.info("window %d/%d %s..%s %s: return %.2f%%, dd %.2f%%, %d trades",
                     i, len(windows), w_start, w_end, mode_label,
                     llm.total_return_pct, llm.max_drawdown_pct, llm.n_trades)
@@ -2116,12 +2125,14 @@ async def _main(args: argparse.Namespace) -> None:
 
         active = await llm_mod.current_backend()
         review_interval = getattr(args, "review_interval", 1)
+        veto_only = getattr(args, "veto_only", False)
         print(f"\n=== {mode_label} replay ({start}..{end}) — probing LLM "
               f"once per {review_interval} calendar week(s) ===")
         print(f"  Backend: {active.get('name', '?')} · {active.get('model', '?')}")
         hyb = await _hybrid_replay(series, params, start=start, end=end,
                                    pure_llm=pure_llm,
-                                   review_interval=review_interval)
+                                   review_interval=review_interval,
+                                   veto_only=veto_only)
         _print_result(hyb, f"{mode_label} (deterministic + LLM review)" if not pure_llm else "Pure LLM")
 
         # Side-by-side comparison
@@ -2159,6 +2170,8 @@ async def _main(args: argparse.Namespace) -> None:
         n_windows = args.windows
         days_per_window = args.days_per_window
         review_interval = getattr(args, "review_interval", 1)
+        veto_only = getattr(args, "veto_only", False)
+        no_llm_sells = getattr(args, "no_llm_sells", False)
         try:
             results = await _llm_walkforward(
                 series, params, all_days,
@@ -2166,6 +2179,8 @@ async def _main(args: argparse.Namespace) -> None:
                 pure_llm=pure_llm,
                 start=args.start, end=args.end,
                 review_interval=review_interval,
+                veto_only=veto_only,
+                no_llm_sells=no_llm_sells,
             )
         except ValueError as e:
             print(f"Cannot run walk-forward: {e}")
@@ -2233,6 +2248,9 @@ def _build_parser() -> argparse.ArgumentParser:
     hr.add_argument("--review-interval", type=int, default=1,
                     help="Consult the LLM once per N calendar weeks (1=weekly); "
                          "deterministic proposals execute as-is in between")
+    hr.add_argument("--veto-only", action="store_true",
+                    help="Hybrid: LLM may only veto/approve deterministic proposals "
+                         "(no LLM-initiated BUY/SELL additions)")
 
     lwf = sub.add_parser("llm-walkforward",
                          help="Multi-window LLM vs deterministic benchmark (reliable scoreboard)")
@@ -2249,6 +2267,12 @@ def _build_parser() -> argparse.ArgumentParser:
     lwf.add_argument("--review-interval", type=int, default=1,
                      help="Consult the LLM once per N calendar weeks (1=weekly); "
                           "deterministic proposals execute as-is in between")
+    lwf.add_argument("--veto-only", action="store_true",
+                     help="Hybrid: LLM may only veto/approve deterministic proposals "
+                          "(no LLM-initiated BUY/SELL additions)")
+    lwf.add_argument("--no-llm-sells", action="store_true",
+                     help="Hybrid: block LLM-initiated SELLs (engine owns exits via "
+                          "stops and SELL signals; LLM owns entries)")
     lwf.add_argument("--trades", action="store_true", help="Print every LLM trade per window")
 
     return p
