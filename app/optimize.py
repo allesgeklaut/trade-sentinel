@@ -752,7 +752,7 @@ async def _hybrid_replay(
     pure_llm: bool = False,
     review_interval: int = 1,
     veto_only: bool = False,
-    no_llm_sells: bool = False,
+    no_llm_sells: bool = True,
 ) -> ReplayResult:
     """Replay the hybrid strategy (deterministic + LLM review).
 
@@ -968,7 +968,7 @@ async def _hybrid_replay(
                                 pf.buy(d["ticker"], price, budget, f"LLM: {reason}",
                                        stop=entry_stop, date=day)
                                 held_tickers.add(tu)
-                            elif action == "SELL" and not no_llm_sells:
+                            elif action == "SELL" and not (no_llm_sells and not pure_llm):
                                 target_shares = llm_sell_shares(d, price)
                                 pf.sell(d["ticker"], price, target_shares,
                                         f"LLM: {reason}", date=day)
