@@ -753,6 +753,7 @@ async def _hybrid_replay(
     review_interval: int = 1,
     veto_only: bool = False,
     no_llm_sells: bool = True,
+    minimal_prompt: bool = False,
 ) -> ReplayResult:
     """Replay the hybrid strategy (deterministic + LLM review).
 
@@ -782,7 +783,7 @@ async def _hybrid_replay(
     news section is omitted from the context, same as a live cycle with
     SEARXNG_URL unset.
     """
-    from .sim import _LLM_SYSTEM_PROMPT, _PURE_LLM_SYSTEM_PROMPT, _build_llm_context, _parse_llm_decisions, _week_diff
+    from .sim import _LLM_SYSTEM_PROMPT, _LLM_MINIMAL_SYSTEM_PROMPT, _PURE_LLM_SYSTEM_PROMPT, _build_llm_context, _parse_llm_decisions, _week_diff
 
     # Build the global timeline and per-ticker day index (same as _replay).
     all_days: set[str] = set()
@@ -893,8 +894,10 @@ async def _hybrid_replay(
                 signals = _signals_for_day(series, by_time, day, params)
                 context = _build_llm_context(valuation, proposals, signals, news,
                                             pure_llm=pure_llm,
-                                            trade_history=list(reversed(pf.trades[-15:]))[:12])
-                system_prompt = _LLM_SYSTEM_PROMPT  # shared prompt: main-branch parity
+                                            trade_history=list(reversed(pf.trades[-15:]))[:12],
+                                            minimal=minimal_prompt)
+                system_prompt = (_LLM_MINIMAL_SYSTEM_PROMPT if minimal_prompt
+                                 else _LLM_SYSTEM_PROMPT)  # shared prompt: main-branch parity
                 logger.info("  llm phase: calling LLM (%d signals, %d proposals)...",
                             len(signals), len(proposals))
                 try:
@@ -1886,6 +1889,8 @@ async def _llm_walkforward(
     review_interval: int = 1,
     veto_only: bool = False,
     no_llm_sells: bool = False,
+    news: dict[str, list[dict]] | None = None,
+    minimal_prompt: bool = False,
 ) -> list[_WindowResult]:
     """Run N non-overlapping windows, each deterministic vs LLM.
 
@@ -1950,7 +1955,8 @@ async def _llm_walkforward(
                                    pure_llm=pure_llm,
                                    review_interval=review_interval,
                                    veto_only=veto_only,
-                                   no_llm_sells=no_llm_sells)
+                                   no_llm_sells=no_llm_sells,
+                                   minimal_prompt=minimal_prompt)
         logger.info("window %d/%d %s..%s %s: return %.2f%%, dd %.2f%%, %d trades",
                     i, len(windows), w_start, w_end, mode_label,
                     llm.total_return_pct, llm.max_drawdown_pct, llm.n_trades)
@@ -2126,13 +2132,15 @@ async def _main(args: argparse.Namespace) -> None:
         active = await llm_mod.current_backend()
         review_interval = getattr(args, "review_interval", 1)
         veto_only = getattr(args, "veto_only", False)
+        minimal_prompt = getattr(args, "minimal_prompt", False)
         print(f"\n=== {mode_label} replay ({start}..{end}) — probing LLM "
               f"once per {review_interval} calendar week(s) ===")
         print(f"  Backend: {active.get('name', '?')} · {active.get('model', '?')}")
         hyb = await _hybrid_replay(series, params, start=start, end=end,
                                    pure_llm=pure_llm,
                                    review_interval=review_interval,
-                                   veto_only=veto_only)
+                                   veto_only=veto_only,
+                                   minimal_prompt=minimal_prompt)
         _print_result(hyb, f"{mode_label} (deterministic + LLM review)" if not pure_llm else "Pure LLM")
 
         # Side-by-side comparison
@@ -2172,6 +2180,7 @@ async def _main(args: argparse.Namespace) -> None:
         review_interval = getattr(args, "review_interval", 1)
         veto_only = getattr(args, "veto_only", False)
         no_llm_sells = getattr(args, "no_llm_sells", False)
+        minimal_prompt = getattr(args, "minimal_prompt", False)
         try:
             results = await _llm_walkforward(
                 series, params, all_days,
@@ -2181,6 +2190,7 @@ async def _main(args: argparse.Namespace) -> None:
                 review_interval=review_interval,
                 veto_only=veto_only,
                 no_llm_sells=no_llm_sells,
+                minimal_prompt=minimal_prompt,
             )
         except ValueError as e:
             print(f"Cannot run walk-forward: {e}")
@@ -2251,6 +2261,8 @@ def _build_parser() -> argparse.ArgumentParser:
     hr.add_argument("--veto-only", action="store_true",
                     help="Hybrid: LLM may only veto/approve deterministic proposals "
                          "(no LLM-initiated BUY/SELL additions)")
+    hr.add_argument("--minimal-prompt", action="store_true",
+                    help="Use the minimal system prompt (no methodology / regime / veto rules)")
 
     lwf = sub.add_parser("llm-walkforward",
                          help="Multi-window LLM vs deterministic benchmark (reliable scoreboard)")
@@ -2273,6 +2285,10 @@ def _build_parser() -> argparse.ArgumentParser:
     lwf.add_argument("--no-llm-sells", action="store_true",
                      help="Hybrid: block LLM-initiated SELLs (engine owns exits via "
                           "stops and SELL signals; LLM owns entries)")
+    lwf.add_argument("--minimal-prompt", action="store_true",
+                     help="Use the minimal system prompt: no methodology, no regime "
+                          "guidance, no veto rules — just portfolio + signals and "
+                          "BUY/SELL/HOLD instructions")
     lwf.add_argument("--trades", action="store_true", help="Print every LLM trade per window")
 
     return p
