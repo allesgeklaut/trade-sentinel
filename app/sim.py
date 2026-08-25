@@ -1270,12 +1270,13 @@ async def _llm_review_proposals(
                 valuation = await valuate()
                 total_equity = valuation["total_equity"]
         elif action == "SELL":
-            target_shares = llm_sell_shares(d, price)
-            t = await _exec_sell(d["ticker"], price, target_shares, f"LLM: {reason}")
-            if t:
-                executed.append(t)
-                valuation = await valuate()
-                total_equity = valuation["total_equity"]
+            # Replay evidence (90-day bull window: -8.7% → +4.7%): the LLM's
+            # self-initiated SELLs (not proposed by the engine) are churn —
+            # it sells winners in bull markets. The engine owns exits via
+            # stop-losses and deterministic SELL signals. Skip LLM-initiated
+            # SELLs in hybrid mode; only SELLs tied to engine proposals
+            # (handled in the reconcile step above) execute.
+            logger.info("LLM-initiated SELL %s skipped (engine owns exits)", d["ticker"])
 
     return executed, vetoed
 
