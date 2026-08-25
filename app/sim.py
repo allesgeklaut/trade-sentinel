@@ -800,6 +800,7 @@ def _build_llm_context(
     # strong bull market (momentum persists — be slow to veto RSI-hot
     # entries) from a fragile one (veto aggressively).
     ups, total = 0, 0
+    run5s: list[float] = []
     for ticker, sig in signals.items():
         snap = sig.get("snapshot", {})
         c = snap.get("close")
@@ -808,23 +809,52 @@ def _build_llm_context(
             total += 1
             if c > s2:
                 ups += 1
+        r = snap.get("run_5d")
+        if r is not None:
+            run5s.append(r)
     if total > 0:
         pct = ups / total * 100
-        if pct >= 60:
+        med_run5 = 0.0
+        if run5s:
+            run5s.sort()
+            med_run5 = run5s[len(run5s) // 2]
+            p25_run5 = run5s[len(run5s) // 4]
+            momentum_line = (f" | median 5d run {med_run5:+.1f}% "
+                             f"(p25 {p25_run5:+.1f}%)")
+        else:
+            momentum_line = ""
+        # A tape mid-pullback (median 5d run deeply negative) is a fragile
+        # regime even when breadth is high — entries made there stop out.
+        pullback = bool(run5s) and med_run5 < -2.5
+        if pct >= 60 and not pullback:
             regime = "BULL"
             regime_advice = (
-                "Broad-market uptrend. In this regime momentum often persists: "
-                "do NOT veto a strong BUY purely on RSI > 70 or a 5-day run — "
-                "only veto on clear reversals (ADX < 15 AND rsi_3d_change < 0 "
-                "AND macd_hist_3d_change <= 0), broken trends, or overbought "
-                "WITH momentum already turning down."
+                "Broad-market uptrend. Momentum persists in this regime: do "
+                "NOT veto a strong BUY purely on RSI > 70 or a hot 5-day "
+                "run — only veto on clear reversals (ADX < 15 AND "
+                "rsi_3d_change < 0 AND macd_hist_3d_change <= 0) or broken "
+                "weekly trends. NEVER sell a profitable position to rotate "
+                "into another name in a bull market — let winners run. Only "
+                "sell on stop hits, broken trends, or SELL signals."
+            )
+        elif pullback:
+            regime = "PULLBACK"
+            regime_advice = (
+                "Market is mid-pullback (median 5d run is negative across "
+                "the tape). Entries made during pullbacks frequently stop "
+                "out within days. Be selective: only approve BUYs with "
+                "confirmed strength (ADX > 25, strong weekly trend, RSI "
+                "recovering from oversold), and veto everything marginal."
             )
         elif pct >= 40:
             regime = "MIXED"
             regime_advice = (
-                "Mixed market. Veto overextended entries on their merits "
-                "(run_5d > 15% or RSI > 70 with momentum turning down), but "
-                "allow entries with confirmed trend (ADX > 20, weekly up)."
+                "Mixed market with a positive undertone. The engine's "
+                "proposals are mostly sound here — only veto with clear "
+                "evidence: run_5d > 15% AND (RSI > 70 with rsi_3d_change < 0) "
+                "AND macd_hist_3d_change <= 0 together. A single overbought "
+                "or low-ADX flag is NOT enough — strong names keep running "
+                "even in mixed tapes. When in doubt, approve."
             )
         else:
             regime = "BEAR"
@@ -834,7 +864,7 @@ def _build_llm_context(
                 "against the weekly trend. Capital preservation comes first."
             )
         lines.append("")
-        lines.append(f"## Market Regime: {regime} — {ups}/{total} candidates above SMA200 ({pct:.0f}%)")
+        lines.append(f"## Market Regime: {regime} — {ups}/{total} candidates above SMA200 ({pct:.0f}%){momentum_line}")
         lines.append(regime_advice)
         lines.append("")
 
