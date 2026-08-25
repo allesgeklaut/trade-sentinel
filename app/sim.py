@@ -207,7 +207,6 @@ async def valuate() -> dict[str, Any]:
             "pnl_pct": round(pnl_pct, 2),
             "thesis": p.thesis or "",
             "buy_date": p.opened_at.strftime("%Y-%m-%d") if p.opened_at else "",
-            "peak_price": p.peak_price or None,
         })
 
     return {
@@ -266,11 +265,9 @@ async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str) -
             total_shares = pos.shares + shares
             pos.avg_cost = (pos.shares * pos.avg_cost + cost) / total_shares
             pos.shares = total_shares
-            if price > pos.peak_price:
-                pos.peak_price = price
         else:
             s.add(SimPosition(ticker=ticker, shares=shares, avg_cost=price,
-                              thesis=reason, peak_price=price))
+                              thesis=reason))
 
         trade = SimTrade(
             ticker=ticker, side="BUY", shares=shares, price=price,
@@ -321,57 +318,6 @@ async def _exec_sell(ticker: str, price: float, shares: float | None, reason: st
             "ticker": ticker, "side": "SELL", "shares": sell_shares, "price": price,
             "cash_after": round(acc.cash, 2), "reason": reason,
         }
-
-
-async def _risk_floor_sells(signals: dict[str, dict]) -> list[dict]:
-    """Pure-LLM risk floor: SELL any held position whose price has actually
-    fallen to the frozen initial stop or below the ATR trailing stop.
-
-    This is the ONLY engine-enforced exit in pure-LLM mode. It deliberately
-    does NOT react to SELL *signals* — the LLM owns discretionary exits, and
-    flushing positions on signals (as the earlier auto-stop layer did) made
-    the LLM churn and lose. Returns executed trade dicts.
-    """
-    _TRAILING_STOP_PCT = 12.0
-    async with Session() as s:
-        positions = (await s.scalars(select(SimPosition))).all()
-    executed: list[dict] = []
-    for pos in positions:
-        price = await _latest_close(pos.ticker)
-        if price is None or price <= 0:
-            continue
-        # Update the peak tracker before checking stops.
-        if price > pos.peak_price:
-            pos.peak_price = price
-        init_stop = pos.avg_cost * (1 - settings.sim_stop_pct / 100)
-        if price <= init_stop:
-            t = await _exec_sell(pos.ticker, price, None,
-                                 f"Initial stop: {price:.2f} <= {init_stop:.2f}")
-            if t:
-                executed.append(t)
-            continue
-        sig = signals.get(pos.ticker, {})
-        atr_stop = sig.get("snapshot", {}).get("atr_stop")
-        if atr_stop and price < atr_stop:
-            t = await _exec_sell(pos.ticker, price, None,
-                                 f"ATR stop hit: {price:.2f} < {atr_stop:.2f}")
-            if t:
-                executed.append(t)
-            continue
-        # Trailing stop from peak: sell if price dropped 12% from its high
-        # since entry. Catches crashes the LLM freezes through.
-        if pos.peak_price > 0:
-            stop_level = pos.peak_price * (1 - _TRAILING_STOP_PCT / 100)
-            if price <= stop_level:
-                t = await _exec_sell(
-                    pos.ticker, price, None,
-                    f"Trailing stop: {price:.2f} <= {stop_level:.2f} "
-                    f"(peak {pos.peak_price:.2f}, -{_TRAILING_STOP_PCT:.0f}%)")
-                if t:
-                    executed.append(t)
-    async with Session() as s:
-        await s.commit()
-    return executed
 
 
 async def _deterministic_propose(
@@ -788,25 +734,17 @@ def _build_llm_context(
     lines.append(f"Positions value: {valuation['positions_value']:.2f}")
     lines.append(f"Total equity: {valuation['total_equity']:.2f}")
     lines.append(f"Cumulative allowance deposited: {valuation['allowance_total']:.2f}")
-    if pure_llm:
-        lines.append(f"Reference: min cash floor {settings.sim_min_cash_pct}% = {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f} (guidance only — you decide)")
-        lines.append(f"Reference: max position size {settings.sim_max_position_pct}% = {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f} (guidance only — you decide)")
-    else:
-        lines.append(f"Min cash floor (buy-time only, {settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
-        lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
-    if not pure_llm:
-        lines.append(f"Max open positions: {settings.sim_max_positions}")
+    # Main-branch parity: hard limits in both modes — the engine enforces
+    # min-cash, max-position-% and max-positions on every LLM BUY.
+    lines.append(f"Min cash floor (buy-time only, {settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
+    lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
+    lines.append(f"Max open positions: {settings.sim_max_positions}")
     lines.append(f"Stop loss: {settings.sim_stop_pct:.0f}% (frozen at entry; ATR stop also applies)")
     lines.append("")
 
     if valuation["positions"]:
         lines.append("Open positions:")
         for p in valuation["positions"]:
-            stop_price = p["avg_cost"] * (1 - settings.sim_stop_pct / 100)
-            stop_str = (
-                f" | stop {stop_price:.2f}"
-                if pure_llm else ""
-            )
             thesis = p.get("thesis", "")
             buy_date = p.get("buy_date", "")
             # Show the entry thesis (why this position was bought) and the
@@ -816,17 +754,10 @@ def _build_llm_context(
                 # Truncate long theses to keep the line readable.
                 t = thesis if len(thesis) <= 80 else thesis[:77] + "..."
                 thesis_str += f" | thesis: {t}"
-            # Per-position drawdown from its own peak (trailing-stop info).
-            peak = p.get("peak_price")
-            peak_str = ""
-            if pure_llm and peak and peak > p["current_price"]:
-                peak_dd = (peak - p["current_price"]) / peak * 100
-                if peak_dd > 1:
-                    peak_str = f" | offHigh -{peak_dd:.0f}%"
             lines.append(
                 f"  - {p['ticker']}: {p['shares']} shares @ avg {p['avg_cost']:.2f} "
                 f"| current {p['current_price']:.2f} | value {p['value']:.2f} "
-                f"| P&L {p['pnl_pct']:+.2f}%{stop_str}{peak_str}{thesis_str}"
+                f"| P&L {p['pnl_pct']:+.2f}%{thesis_str}"
             )
     else:
         lines.append("Open positions: none")
@@ -1262,10 +1193,9 @@ async def _llm_decide(
 
     In hybrid mode (``pure_llm=False``) the LLM reviews deterministic
     proposals and can veto/approve/flip them. In pure-LLM mode
-    (``pure_llm=True``) there are no proposals — the LLM is the sole
-    decision-maker and is responsible for enforcing stop losses itself
-    (the prompt tells it to, and the context shows each position's stop
-    price).
+    (``pure_llm=True``) there are no proposals — the LLM picks the names and
+    the engine's hard sizing limits (min-cash floor, max-position-%,
+    max-positions cap) size every BUY. Both modes use the shared prompt.
 
     Builds a structured context with the portfolio state, signal summaries,
     and optional recent news, asks the LLM for a JSON array of decisions,
@@ -1280,7 +1210,7 @@ async def _llm_decide(
 
     global _last_llm_reasoning, _last_llm_summary
 
-    system_prompt = _PURE_LLM_SYSTEM_PROMPT if pure_llm else _LLM_SYSTEM_PROMPT
+    system_prompt = _LLM_SYSTEM_PROMPT  # shared prompt: main-branch parity
     # Recent trade history from the DB (newest first) so the LLM sees what it
     # did recently and can avoid round-trips / repeated mistakes.
     recent_trades: list[dict] = []
@@ -1375,7 +1305,7 @@ async def _llm_decide(
             max_position_pct=settings.sim_max_position_pct,
             max_positions=settings.sim_max_positions,
         ),
-        guarded=not pure_llm,
+        guarded=True,
         price_of=_price_of,
         value_of=_value_of,
     )
@@ -1386,22 +1316,6 @@ async def _llm_decide(
     async with Session() as s:
         existing = (await s.scalars(select(SimPosition))).all()
     held_tickers = {p.ticker.upper() for p in existing}
-
-    # Minimum calendar days before a fully-sold ticker may be re-bought.
-    # Blocks round-trips (sell Monday, re-buy Thursday at a higher price).
-    _REBUY_COOLDOWN_CALENDAR_DAYS = 14
-
-    # Last-sell date per ticker (from the trade log) for the re-buy cooldown.
-    last_sell: dict[str, datetime] = {}
-    async with Session() as s:
-        sells = (await s.scalars(
-            select(SimTrade).where(SimTrade.side == "SELL")
-        )).all()
-    for tr in sells:
-        if tr.created_at:
-            key = tr.ticker.upper()
-            if key not in last_sell or tr.created_at > last_sell[key]:
-                last_sell[key] = tr.created_at
 
     for decision in decisions:
         ticker = decision["ticker"]
@@ -1414,21 +1328,10 @@ async def _llm_decide(
             continue
 
         if action == "BUY":
-            # Round-trip guard: block re-buying a ticker fully sold within
-            # the cooldown window.
-            last_sold = last_sell.get(ticker.upper())
-            if last_sold is not None:
-                days_since = (_utcnow() - last_sold).days
-                if days_since < _REBUY_COOLDOWN_CALENDAR_DAYS:
-                    logger.info(
-                        "LLM BUY %s skipped (sold %d calendar days ago, "
-                        "re-buy cooldown %d)",
-                        ticker, days_since, _REBUY_COOLDOWN_CALENDAR_DAYS)
-                    continue
-            # Hybrid mode keeps the max-positions cap on LLM additions;
-            # pure-LLM mode lets the LLM decide the portfolio size (matches
-            # the good-era behaviour).
-            if (not pure_llm and settings.sim_max_positions > 0
+            # Max-positions cap: block NEW positions when at the cap, but
+            # still allow topping up tickers already held (mirrors the
+            # deterministic engine's behaviour).
+            if (settings.sim_max_positions > 0
                     and len(held_tickers) >= settings.sim_max_positions
                     and ticker.upper() not in held_tickers):
                 logger.info("LLM BUY %s skipped (max-positions cap %d)",
@@ -1640,21 +1543,10 @@ async def run_cycle() -> dict[str, Any]:
                 _set_progress("signals", "Gathering signals", started_at=started_at)
                 signals = await _gather_signals(tickers)
                 news = await _gather_news(signals)
-                # Pure-LLM mode: the engine enforces ONLY the true risk floor
-                # — auto-sell positions whose price has actually fallen to the
-                # frozen initial stop or the ATR trailing stop. It does NOT
-                # flush positions on SELL *signals* (the LLM owns discretionary
-                # exits) and makes no BUY proposals (the LLM picks entries).
-                _set_progress("stops", "Engine enforcing stop losses", started_at=started_at)
-                stop_trades = await _risk_floor_sells(signals)
-                if stop_trades:
-                    logger.info("  (pure-LLM) risk floor executed %d stop-outs: %s",
-                                len(stop_trades),
-                                ", ".join(t["ticker"] for t in stop_trades))
-                    # Re-valuate after stop-outs so the LLM sees the post-stop
-                    # portfolio (broken positions already removed, cash
-                    # replenished from the sells).
-                    valuation = await valuate()
+                # Pure-LLM mode (main-branch parity): the engine makes NO
+                # proposals and NO risk-floor sells — the LLM picks the names,
+                # and the engine's hard sizing limits (min-cash floor,
+                # max-position-%, max-positions cap) size every BUY.
                 _set_progress("decide", "LLM deciding (pure-LLM strategy)", started_at=started_at)
                 trades = await _llm_decide(valuation, [], signals, news, pure_llm=True)
                 _last_deterministic_trades = []
