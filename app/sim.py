@@ -1965,6 +1965,7 @@ def get_last_llm_summary() -> dict[str, Any]:
         "vetoes": vetoes,
         "fallback": is_fallback,
         "strategy": settings.sim_strategy,
+        "failure_marker": settings.sim_llm_failure_marker,
         "llm_called": llm_was_called,
     }
 
