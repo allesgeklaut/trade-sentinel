@@ -757,6 +757,10 @@ async def _hybrid_replay(
     veto_only: bool = False,
     no_llm_sells: bool = True,
     minimal_prompt: bool = False,
+    marker_gated: bool = False,
+    failure_marker: bool = False,
+    failure_stop_outs: int = 2,
+    failure_drawdown: float = 7.0,
 ) -> ReplayResult:
     """Replay the hybrid strategy (deterministic + LLM review).
 
@@ -833,6 +837,8 @@ async def _hybrid_replay(
     last_known_prices: dict[str, float] = {}
     llm_trades: list[dict] = list(pf.trades)  # full trade log (det + LLM)
     last_review_week: str | None = None
+    peak_equity: float = params.start_cash
+    recent_stop_outs: list[str] = []  # dates of recent stop-out SELLs
 
     for day_idx, day in enumerate(days, 1):
             # Monthly allowance deposit
@@ -884,16 +890,51 @@ async def _hybrid_replay(
 
             # --- 2 + 3. LLM review → reconcile → execute ---
             total_equity = pf.equity(prices)
-            # Fire the review on the first trading day of each calendar week
-            # (mirrors the live sim's weekly review): the LLM is consulted at
-            # most once per ISO week, anchored to the week, not a day counter.
-            # review_interval=1 still reviews every week; larger values skip
-            # intermediate weeks.
+            # Default cadence: fire the review on the first trading day of
+            # each calendar week (mirrors the live sim's weekly review) — the
+            # LLM is consulted at most once per ISO week, anchored to the
+            # week, not a day counter. review_interval=1 still reviews every
+            # week; larger values skip intermediate weeks.
             week = _current_week_from(day)
-            is_review_day = (
-                last_review_week is None
-                or _week_diff(week, last_review_week) >= review_interval
-            )
+            if marker_gated:
+                # Marker-gated mode: the deterministic engine's proposals ARE
+                # the marker — an LLM review is only worthwhile when there is
+                # something to veto/approve. The marker can fire on ANY day
+                # (not just the scheduled cadence); review_interval then acts
+                # only as a cooldown so proposals on consecutive days don't
+                # force a call every day.
+                is_review_day = bool(proposals) and (
+                    last_review_week is None
+                    or _week_diff(week, last_review_week) >= review_interval
+                )
+            elif failure_marker:
+                # Failure-marker mode: the deterministic engine usually works
+                # well — only consult the LLM when the engine shows signs of
+                # failure. Two failure signatures from the data:
+                #   1. Stop-out cascade: N+ stop-loss SELLs in the last 5
+                #      trading days (the engine bought into a falling tape).
+                #   2. Equity drawdown: equity > X% below its running peak
+                #      (the engine is bleeding without stopping).
+                # The marker fires on ANY day with NO cooldown — a fresh
+                # cascade triggers a call the same day (validated: no-cooldown
+                # beat the weekly-cooldown variant on the 60d window).
+                stop_outs_5d = sum(
+                    1 for t in pf.trades[-10:]
+                    if t["side"] == "SELL" and _is_stop_out(t["reason"])
+                    and t["date"] >= days[max(0, day_idx - 6)]
+                )
+                peak_equity = max(peak_equity, total_equity)
+                drawdown = (total_equity / peak_equity - 1) * 100 if peak_equity > 0 else 0.0
+                failure = stop_outs_5d >= failure_stop_outs or drawdown <= -failure_drawdown
+                is_review_day = failure
+                if failure:
+                    logger.info("  failure marker: stop_outs_5d=%d drawdown=%.1f%%",
+                                stop_outs_5d, drawdown)
+            else:
+                is_review_day = (
+                    last_review_week is None
+                    or _week_diff(week, last_review_week) >= review_interval
+                )
             if total_equity > 0 and (settings.llm_backends or settings.ollama_model) and is_review_day:
                 allowance_total = cumulative_invested
                 valuation = valuate_portfolio(_pf_to_positions(pf), pf.cash, prices, allowance_total)
@@ -1894,9 +1935,13 @@ async def _llm_walkforward(
     end: str | None,
     review_interval: int = 1,
     veto_only: bool = False,
-    no_llm_sells: bool = False,
+    no_llm_sells: bool = True,
     news: dict[str, list[dict]] | None = None,
     minimal_prompt: bool = False,
+    marker_gated: bool = False,
+    failure_marker: bool = False,
+    failure_stop_outs: int = 2,
+    failure_drawdown: float = 7.0,
 ) -> list[_WindowResult]:
     """Run N non-overlapping windows, each deterministic vs LLM.
 
@@ -1962,7 +2007,11 @@ async def _llm_walkforward(
                                    review_interval=review_interval,
                                    veto_only=veto_only,
                                    no_llm_sells=no_llm_sells,
-                                   minimal_prompt=minimal_prompt)
+                                   minimal_prompt=minimal_prompt,
+                                   marker_gated=marker_gated,
+                                   failure_marker=failure_marker,
+                                   failure_stop_outs=failure_stop_outs,
+                                   failure_drawdown=failure_drawdown)
         logger.info("window %d/%d %s..%s %s: return %.2f%%, dd %.2f%%, %d trades",
                     i, len(windows), w_start, w_end, mode_label,
                     llm.total_return_pct, llm.max_drawdown_pct, llm.n_trades)
@@ -2185,8 +2234,18 @@ async def _main(args: argparse.Namespace) -> None:
         days_per_window = args.days_per_window
         review_interval = getattr(args, "review_interval", 1)
         veto_only = getattr(args, "veto_only", False)
-        no_llm_sells = getattr(args, "no_llm_sells", False)
+        no_llm_sells = not getattr(args, "allow_llm_sells", False)
         minimal_prompt = getattr(args, "minimal_prompt", False)
+        marker_gated = getattr(args, "marker_gated", False)
+        failure_marker = getattr(args, "failure_marker", False)
+        failure_stop_outs = getattr(args, "failure_stop_outs", 2)
+        failure_drawdown = getattr(args, "failure_drawdown", 7.0)
+        if pure_llm and (marker_gated or failure_marker):
+            print("Cannot combine --pure-llm with --marker-gated / --failure-marker: "
+                  "the markers key off the deterministic engine's proposals and "
+                  "stop-outs, which do not exist in pure-LLM mode (the LLM would "
+                  "never be consulted). Run pure-LLM without markers.")
+            return
         try:
             results = await _llm_walkforward(
                 series, params, all_days,
@@ -2197,6 +2256,10 @@ async def _main(args: argparse.Namespace) -> None:
                 veto_only=veto_only,
                 no_llm_sells=no_llm_sells,
                 minimal_prompt=minimal_prompt,
+                marker_gated=marker_gated,
+                failure_marker=failure_marker,
+                failure_stop_outs=failure_stop_outs,
+                failure_drawdown=failure_drawdown,
             )
         except ValueError as e:
             print(f"Cannot run walk-forward: {e}")
@@ -2288,13 +2351,28 @@ def _build_parser() -> argparse.ArgumentParser:
     lwf.add_argument("--veto-only", action="store_true",
                      help="Hybrid: LLM may only veto/approve deterministic proposals "
                           "(no LLM-initiated BUY/SELL additions)")
-    lwf.add_argument("--no-llm-sells", action="store_true",
-                     help="Hybrid: block LLM-initiated SELLs (engine owns exits via "
-                          "stops and SELL signals; LLM owns entries)")
+    lwf.add_argument("--allow-llm-sells", action="store_true",
+                     help="Hybrid: allow LLM-initiated SELLs (default: engine owns "
+                          "exits via stops and SELL signals)")
     lwf.add_argument("--minimal-prompt", action="store_true",
                      help="Use the minimal system prompt: no methodology, no regime "
                           "guidance, no veto rules — just portfolio + signals and "
                           "BUY/SELL/HOLD instructions")
+    lwf.add_argument("--marker-gated", action="store_true",
+                     help="Deterministic marker: only consult the LLM on review "
+                          "days when the engine actually PROPOSES trades (no "
+                          "wasted calls on zero-proposal days)")
+    lwf.add_argument("--failure-marker", action="store_true",
+                     help="Failure marker: consult the LLM only when the engine "
+                          "shows failure — stop-out SELLs in 5 days or equity "
+                          "below its running peak. No cooldown: a fresh failure "
+                          "triggers a call the same day")
+    lwf.add_argument("--failure-stop-outs", type=int, default=2,
+                     help="With --failure-marker: stop-out SELLs in 5 days that "
+                          "count as failure (default 2)")
+    lwf.add_argument("--failure-drawdown", type=float, default=7.0,
+                     help="With --failure-marker: equity drawdown %% below peak "
+                          "that counts as failure (default 7.0)")
     lwf.add_argument("--trades", action="store_true", help="Print every LLM trade per window")
 
     return p
