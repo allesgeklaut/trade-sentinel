@@ -14,7 +14,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
 
@@ -36,7 +37,15 @@ from .db import (
 )
 from .market import candles, refresh
 from .screener import tickers as universe_tickers
-from .strategy import StrategyParams, propose_trades, reconcile_proposals, valuate_portfolio
+from .strategy import (
+    StrategyParams,
+    llm_buy_budget,
+    llm_sell_shares,
+    plan_llm_buys,
+    propose_trades,
+    reconcile_proposals,
+    valuate_portfolio,
+)
 
 logger = logging.getLogger("trade_sentinel.sim")
 
@@ -90,6 +99,42 @@ def _utcnow() -> datetime:
 
 def _current_month() -> str:
     return datetime.now(_TZ).strftime("%Y-%m")
+
+
+def _current_week() -> str:
+    """ISO calendar week key (YYYY-Www), anchored to the operator's local
+    timezone. Used for the weekly LLM portfolio review: the review fires on
+    the FIRST cycle of each new week, regardless of manual runs."""
+    return datetime.now(_TZ).strftime("%G-W%V")
+
+
+def _is_stop_out(reason: str) -> bool:
+    """True if a SELL was an automatic stop, not a signal-driven decision.
+
+    Mirrors optimize._is_stop_out: the engine stamps these reasons on
+    stop-loss exits ("Initial stop: ...", "ATR stop hit: ...",
+    "Trailing stop: ...", "Portfolio stop: ..."). Signal-driven SELLs say
+    "SELL signal (strength ...)".
+    """
+    r = reason.lower()
+    return any(r.startswith(p) for p in
+               ("initial stop", "atr stop", "trailing stop", "portfolio stop"))
+
+
+def _week_diff(current: str, last: str) -> int:
+    """Calendar-week distance between two ISO 'YYYY-Www' keys (>= 0).
+
+    Anchors each key to the Thursday of its ISO week and diffs those
+    dates, so year boundaries are counted correctly (e.g.
+    2026-W02 - 2025-W50 == 4, not 5). ``last`` is assumed to be <= ``current``.
+    """
+    cy, cw = (int(x) for x in current.split("-W"))
+    ly, lw = (int(x) for x in last.split("-W"))
+    jan4 = datetime(cy, 1, 4)
+    cur_thu = jan4 - timedelta(days=(jan4.weekday() - 3) % 7) + timedelta(weeks=cw - 1)
+    jan4 = datetime(ly, 1, 4)
+    last_thu = jan4 - timedelta(days=(jan4.weekday() - 3) % 7) + timedelta(weeks=lw - 1)
+    return round((cur_thu - last_thu).days / 7)
 
 
 async def _latest_close(ticker: str) -> float | None:
@@ -196,6 +241,8 @@ async def valuate() -> dict[str, Any]:
             "current_price": round(price, 4),
             "value": round(value, 2),
             "pnl_pct": round(pnl_pct, 2),
+            "thesis": p.thesis or "",
+            "buy_date": p.opened_at.strftime("%Y-%m-%d") if p.opened_at else "",
         })
 
     return {
@@ -234,8 +281,10 @@ async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str) -
     """
     if price <= 0 or max_budget < 1:
         return None
-    # Fractional shares — invest as much of the budget as possible
-    shares = round(max_budget / price, 4)
+    # Fractional shares — floor (not round) so cost never exceeds the
+    # budget; rounding up can push a high-priced ticker cents over the
+    # available cash and silently drop the buy.
+    shares = math.floor(max_budget / price * 10000) / 10000
     if shares < 0.0001:
         return None
     cost = shares * price
@@ -253,7 +302,8 @@ async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str) -
             pos.avg_cost = (pos.shares * pos.avg_cost + cost) / total_shares
             pos.shares = total_shares
         else:
-            s.add(SimPosition(ticker=ticker, shares=shares, avg_cost=price))
+            s.add(SimPosition(ticker=ticker, shares=shares, avg_cost=price,
+                              thesis=reason))
 
         trade = SimTrade(
             ticker=ticker, side="BUY", shares=shares, price=price,
@@ -474,7 +524,11 @@ _SIM_METHODOLOGY = (
     "days — you are chasing a short-term spike that is prone to reversion.\n"
     "  - **RSI > 70 AND rsi_3d_change < 0**: overbought and turning down — "
     "momentum is fading at the top.\n"
-    "  - **ADX < 15**: no real trend, just noise — the signal is not reliable.\n"
+    "  - **ADX < 15 AND macd_hist_3d_change <= 0 AND rsi_3d_change <= 0**: no "
+    "real trend AND no momentum turning up — the signal is noise. NOTE: ADX "
+    "is a lagging indicator that stays low at the START of trends; a low ADX "
+    "with rising MACD histogram or rising RSI is an early-trend entry, not "
+    "noise — do NOT veto those.\n"
     "Downgrading a BUY to HOLD is the highest-impact decision you can make: "
     "backtesting showed avoiding 4 catastrophic entries (each losing 15-38% "
     "within 20 days) outweighs missing 8 good entries, for a net +5% return "
@@ -517,7 +571,14 @@ _LLM_SYSTEM_PROMPT = (
     "else. Your HOLD on a proposed BUY will block it from executing. You may "
     "also veto a SELL, but be conservative (see GATING "
     "deterministic SELLs).\n"
-    "3. Respect risk management: do not buy if cash is too low; do not over-"
+    "3. ADAPT TO THE MARKET REGIME shown in the context: in a BULL regime "
+    "momentum persists, so do NOT veto strong entries merely for being "
+    "slightly overbought (RSI 70-78 or a hot 5-day run is normal in a "
+    "bull); reserve vetoes for confirmed reversals. In a BEAR regime be "
+    "aggressive — skip weak-trend and overbought entries entirely. In a "
+    "MIXED regime judge each entry on its own merits. A one-size-fits-all "
+    "RSI>70 veto rule loses money in bull markets.\n"
+    "3b. Respect risk management: do not buy if cash is too low; do not over-"
     "concentrate in a single ticker. The engine caps the number of open "
     "positions (it stops buying once the max position count is reached), so "
     "prioritize the strongest candidates.\n"
@@ -567,16 +628,170 @@ _LLM_SYSTEM_PROMPT = (
 )
 
 
+_PURE_LLM_METHODOLOGY = (
+    "## How to read the signals\n"
+    "The snapshot each ticker carries these indicators. Use them to rank "
+    "candidates and to manage open positions:\n"
+    "  - **action / strength**: a deterministic 0-100 score of the indicators "
+    "(strength = the bullish or bearish reading). Use it as a starting point, "
+    "not as a verdict.\n"
+    "  - **close vs sma50 vs sma200**: a genuine uptrend needs close > sma50 > "
+    "sma200 (downtrend is the mirror). Price stuck between the MAs = sideways.\n"
+    "  - **adx** (ADX-14): trend *strength*. ADX > 25 = strong, clean trend; "
+    "ADX < 20 = weak/choppy. High ADX makes a BUY far more trustworthy than "
+    "low ADX.\n"
+    "  - **rsi** (RSI-14): momentum. 40-55 and rising = pullback turning up "
+    "(good entry). 55-65 = moderately strong. > 70 = overbought — don't "
+    "chase. < 30 = oversold (often a bounce risk).\n"
+    "  - **rsi_3d_change**: the 3-day net change in RSI. Positive = momentum "
+    "recovering; negative = momentum deteriorating.\n"
+    "  - **macd / macd_signal / macd_hist**: momentum. macd > macd_signal = "
+    "bullish; macd_hist rising = momentum turning up.\n"
+    "  - **macd_hist_3d_change**: the 3-day net change in the MACD histogram. "
+    "Positive = histogram rising; negative = histogram falling.\n"
+    "  - **weekly_trend_up** (when provided): the slower weekly-chart filter "
+    "(weekly close > weekly SMA-50). A BUY against a down weekly trend is a "
+    "bear-market rally — risky. A position whose weekly trend has turned "
+    "down is structurally weaker.\n"
+    "  - **run_5d**: the 5-day run-up %. A BUY after a >15% spike is chasing "
+    "a short-term move prone to reversion.\n"
+    "  - **atr_stop**: trailing-volatility stop. Price below it = the trend "
+    "broke.\n"
+    "\n"
+    "## Managing exits\n"
+    "You are the ONLY mechanism that sells positions — no engine will do it "
+    "for you. Each cycle, review every open position and sell when the reason "
+    "you bought it is gone: the trend broke (price < sma50 < sma200 or weekly "
+    "trend down), momentum rolled over (RSI falling, MACD histogram "
+    "declining), or price is at/below its stop. Holding a broken position "
+    "traps capital that could earn elsewhere; act on your read.\n"
+    "\n"
+    "## Entry quality\n"
+    "Buying is when care matters most. Avoid entries that are too late: a BUY "
+    "after a >15% 5-day spike, RSI > 70 with momentum turning down, or ADX < "
+    "15 (no trend, just noise). Favor pullbacks that are turning up inside "
+    "an uptrend. Missing a move costs less than catching a falling knife.\n"
+)
+
+_PURE_LLM_SYSTEM_PROMPT = (
+    "You are the sole portfolio manager for a paper-trading simulation. "
+    "A deterministic risk floor runs alongside you: it auto-sells positions "
+    "that hit their initial stop or ATR trailing stop, but you make all buy "
+    "and discretionary sell decisions yourself.\n"
+    "You will receive the current portfolio state and a list of candidate "
+    "tickers with their technical indicators (signal action, strength, close "
+    "price, RSI, MACD). The signal action/strength is a deterministic "
+    "scoring of the indicators — use it as a starting point, but you decide "
+    "whether to act on it.\n"
+    "\n"
+    + _PURE_LLM_METHODOLOGY +
+    "Rules:\n"
+    "2. Decide the portfolio yourself: what to buy, what to hold, what to "
+    "sell, how much of the cash to deploy, and how many positions to hold. "
+    "Use the indicators and your exit-management principles; do not simply "
+    "echo the signal actions.\n"
+    "3. You are responsible for stop losses. Each open position shows its "
+    "initial stop price (a fixed % below the entry) and the signals include "
+    "an ATR trailing stop. Sell any position whose current price is at or "
+    "below either stop unless you have a strong indicator-based reason to "
+    "override. (The engine also auto-sells stop hits as a safety net, but "
+    "do not rely on it — act on your read.)\n"
+    "4. STABILITY RULES — do NOT rotate the portfolio. These are the most "
+    "important rules you have:\n"
+    "   - Never SELL and BUY in the same cycle (no 'sell X to buy Y' rotation). "
+    "Decide holds first; only propose new BUYs from cash that is already free.\n"
+    "   - Never re-buy a ticker you sold within the last 10 trading days — the "
+    "Recent Trades section shows your own activity. A round-trip (sell Monday, "
+    "re-buy Thursday) is churn and loses money on the spread. If you sold it, "
+    "you had a reason; that reason has not changed in 3 days.\n"
+    "   - Hold through short-term noise. A position that is down 3-5% on a "
+    "normal pullback inside an uptrend is NOT a sell — the engine's stop is "
+    "your safety net. Do not exit a position just because it is red today.\n"
+    "   - Sell when a position's thesis is broken; if the redeployed capital "
+    "goes into a stronger name, so be it, but don't manufacture trades.\n"
+    "   - The engine blocks re-buying a ticker sold within the last 10 "
+    "trading days — don't waste your output proposing those.\n"
+    "5. You decide how much cash to keep in reserve and how concentrated the "
+    "portfolio should be. The reference min-cash floor and max-position-% in "
+    "the portfolio state are guidance, not hard limits — you decide. There is "
+    "no limit on the number of positions you may hold.\n"
+    "6. Decisions must be grounded in the provided signals and indicators.\n"
+    "7. You may receive recent news headlines for supplementary context. News "
+    "can explain *why* indicators are moving, but do not make trades based on "
+    "news alone — the technical signals and risk rules take priority. Never "
+    "reference specific URLs in your output.\n"
+    "8. You may specify a partial position size per action using optional fields:\n"
+    "   - \"shares\": exact number of shares to trade (e.g. 3.5).\n"
+    "   - \"amount\": dollar amount to trade (e.g. 67.43). For SELL this is the"
+    " value of shares to sell; for BUY it is the dollars to invest.\n"
+    "   If neither is given, SELL sells the entire position and BUY is executed "
+    "as follows: when you send several BUYs in one cycle, the available cash is "
+    "split evenly between them; when you send a single BUY, it receives the full "
+    "available cash. Always use \"amount\" (or \"shares\") when you want a "
+    "specific size — otherwise your position sizing is left to the even split.\n"
+    "9. You decide position sizing. Do NOT sell a position just because its "
+    "price rose — let winners run.\n"
+    "10. Do NOT sell a position solely to restore cash — if you want more dry "
+    "powder, wait for the next allowance deposit or a stop-out to replenish "
+    "cash.\n"
+    "\n"
+    "Response format: begin with a 2-4 sentence prose summary of your overall "
+    "read and the decisions you made (write this even when you made no "
+    "changes), then the JSON array of decisions on a new line. Objects have "
+    'the fields "ticker", "action", "reason", and optional "shares" / '
+    '"amount". No code fences, no markdown — just the prose, then the JSON.\n'
+)
+
+
+_LLM_MINIMAL_SYSTEM_PROMPT = (
+    "You are a portfolio manager for a paper-trading simulation. "
+    "You will receive the current portfolio state and a table of candidate "
+    "tickers with technical indicators.\n"
+    "Review the portfolio and the signals, then decide whether to make "
+    "adjustments.\n"
+    "\n"
+    "Actions:\n"
+    '- BUY: open or add to a position.\n'
+    '- SELL: reduce or close a position.\n'
+    '- HOLD: do nothing.\n'
+    "You may specify a partial position size per action:\n"
+    '   - "shares": exact number of shares to trade (e.g. 3.5).\n'
+    '   - "amount": dollar amount to trade (e.g. 67.43). For SELL this is '
+    "the value of shares to sell; for BUY it is the dollars to invest.\n"
+    "   If neither is given, SELL sells the entire position and BUY invests "
+    "the maximum allowed by the risk rules.\n"
+    "\n"
+    'Return ONLY a JSON array of objects: '
+    '{"ticker": "...", "action": "BUY|SELL|HOLD", "reason": "..."}. '
+    'Optional "shares" / "amount" fields size the trade. '
+    "No markdown, no prose.\n"
+)
+
+
 def _build_llm_context(
     valuation: dict[str, Any],
     deterministic_trades: list[dict],
     signals: dict[str, dict],
     news: dict[str, list[dict]] | None = None,
+    pure_llm: bool = False,
+    trade_history: list[dict] | None = None,
+    minimal: bool = False,
 ) -> str:
     """Build the compact context string sent to the LLM.
 
     ``news`` is an optional dict of ``{"market": [...], "TICKER": [...]}``
     headline lists. If empty or None, the news section is omitted.
+
+    ``trade_history`` is an optional list of recent trade dicts
+    (``{"date", "side", "ticker", "shares", "price", "reason"}``), newest
+    first. When provided, a "Recent Trades" section is included so the LLM
+    can see what it did recently and avoid round-trips / repeated mistakes.
+    The list is truncated to the last 12 trades to keep the context compact.
+
+    ``pure_llm`` omits the deterministic-proposals section (the LLM is the
+    sole decision-maker), drops the max-positions line (no count cap in
+    pure-LLM mode), and shows each position's initial stop price so the LLM
+    can act on stop-loss hits itself.
     """
     from .news import format_news_for_context, format_market_news_for_context
 
@@ -588,6 +803,8 @@ def _build_llm_context(
     lines.append(f"Positions value: {valuation['positions_value']:.2f}")
     lines.append(f"Total equity: {valuation['total_equity']:.2f}")
     lines.append(f"Cumulative allowance deposited: {valuation['allowance_total']:.2f}")
+    # Main-branch parity: hard limits in both modes — the engine enforces
+    # min-cash, max-position-% and max-positions on every LLM BUY.
     lines.append(f"Min cash floor (buy-time only, {settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
     lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
     lines.append(f"Max open positions: {settings.sim_max_positions}")
@@ -597,44 +814,141 @@ def _build_llm_context(
     if valuation["positions"]:
         lines.append("Open positions:")
         for p in valuation["positions"]:
+            thesis = p.get("thesis", "")
+            buy_date = p.get("buy_date", "")
+            # Show the entry thesis (why this position was bought) and the
+            # holding period so the LLM can judge "is the thesis still valid?"
+            thesis_str = f" | since {buy_date}" if buy_date else ""
+            if thesis:
+                # Truncate long theses to keep the line readable.
+                t = thesis if len(thesis) <= 80 else thesis[:77] + "..."
+                thesis_str += f" | thesis: {t}"
             lines.append(
                 f"  - {p['ticker']}: {p['shares']} shares @ avg {p['avg_cost']:.2f} "
                 f"| current {p['current_price']:.2f} | value {p['value']:.2f} "
-                f"| P&L {p['pnl_pct']:+.2f}%"
+                f"| P&L {p['pnl_pct']:+.2f}%{thesis_str}"
             )
     else:
         lines.append("Open positions: none")
     lines.append("")
 
     # --- Signals summary ---
+    # The full signal table is shown — the LLM is the decision-maker in
+    # pure-LLM mode and needs to see every candidate, exactly as the good-era
+    # runs did. Truncating to "top N" starved it of context.
+    shown = sorted(signals.items()) if signals else []
     lines.append("## Signals (all candidate tickers)")
-    if signals:
+
+    # --- Market regime (breadth-derived) ---
+    # Count candidates above their SMA200 / weekly-up so the LLM can tell a
+    # strong bull market (momentum persists — be slow to veto RSI-hot
+    # entries) from a fragile one (veto aggressively). Omitted in minimal
+    # mode: the experiment is a prompt with no guidance or bias.
+    ups, total = 0, 0
+    run5s: list[float] = []
+    for ticker, sig in signals.items():
+        snap = sig.get("snapshot", {})
+        c = snap.get("close")
+        s2 = snap.get("sma200")
+        if c is not None and s2 is not None and s2 > 0:
+            total += 1
+            if c > s2:
+                ups += 1
+        r = snap.get("run_5d")
+        if r is not None:
+            run5s.append(r)
+    if total > 0 and not minimal:
+        pct = ups / total * 100
+        med_run5 = 0.0
+        if run5s:
+            run5s.sort()
+            med_run5 = run5s[len(run5s) // 2]
+            p25_run5 = run5s[len(run5s) // 4]
+            momentum_line = (f" | median 5d run {med_run5:+.1f}% "
+                             f"(p25 {p25_run5:+.1f}%)")
+        else:
+            momentum_line = ""
+        # A tape mid-pullback (median 5d run deeply negative) is a fragile
+        # regime even when breadth is high — entries made there stop out.
+        pullback = bool(run5s) and med_run5 < -2.5
+        if pct >= 60 and not pullback:
+            regime = "BULL"
+            regime_advice = (
+                "Broad-market uptrend. The engine's BUY proposals have "
+                "already passed its overextension gates (run_5d, RSI+momentum, "
+                "ADX) and in this regime the names keep running. Do NOT veto "
+                "any deterministic BUY proposal in a BULL regime — approve "
+                "them all; vetoing them only strands capital while the market "
+                "moves. You may veto deterministic SELLs only when the weekly "
+                "trend is clearly up with momentum turning up."
+            )
+        elif pullback:
+            regime = "PULLBACK"
+            regime_advice = (
+                "Market is mid-pullback (median 5d run is negative across "
+                "the tape). Entries made during pullbacks frequently stop "
+                "out within days. Be selective: only approve BUYs with "
+                "confirmed strength (ADX > 25, strong weekly trend, RSI "
+                "recovering from oversold), and veto everything marginal."
+            )
+        elif pct >= 40:
+            regime = "MIXED"
+            regime_advice = (
+                "Mixed market with a positive undertone. The engine's "
+                "proposals are mostly sound here — only veto with clear "
+                "evidence: run_5d > 15% AND (RSI > 70 with rsi_3d_change < 0) "
+                "AND macd_hist_3d_change <= 0 together. A single overbought "
+                "or low-ADX flag is NOT enough — strong names keep running "
+                "even in mixed tapes. When in doubt, approve."
+            )
+        else:
+            regime = "BEAR"
+            regime_advice = (
+                "Broad-market downtrend / fragile tape. Veto aggressively: "
+                "skip weak-trend entries (low ADX), RSI > 65, and any BUY "
+                "against the weekly trend. Capital preservation comes first."
+            )
+        lines.append("")
+        lines.append(f"## Market Regime: {regime} — {ups}/{total} candidates above SMA200 ({pct:.0f}%){momentum_line}")
+        lines.append(regime_advice)
+        lines.append("")
+
+    if shown:
+        atr_col = " {'atrStop':>9}" if pure_llm else ""
         lines.append(
             f"{'ticker':<10} {'action':<6} {'strength':>8} "
-            f"{'close':>10} {'rsi':>6} {'rsiΔ3':>6} {'adx':>5} {'wk':>3} {'macd':>10} {'mhΔ3':>7} {'run5d':>6}"
+            f"{'close':>10} {'rsi':>6} {'rsiΔ3':>6} {'adx':>5} {'wk':>3} {'macd':>10} {'mhΔ3':>7} {'run5d':>6} {'run20d':>7} {'run60d':>7} {'hi52d':>6}{atr_col}"
         )
-        for ticker, sig in sorted(signals.items()):
+        for ticker, sig in shown:
             snap = sig.get("snapshot", {})
             wk = "up" if snap.get("weekly_trend_up") else "dn"
             rsi_d = snap.get("rsi_3d_change")
             mh_d = snap.get("macd_hist_3d_change")
             run5 = snap.get("run_5d")
+            run20 = snap.get("run_20d")
+            run60 = snap.get("run_60d")
+            dist52 = snap.get("dist_52w_high")
+            atr_stop = snap.get("atr_stop")
             rsi_d_s = f"{rsi_d:+.1f}" if rsi_d is not None else "  -  "
             mh_d_s = f"{mh_d:+.2f}" if mh_d is not None else "  -  "
             run5_s = f"{run5:+.1f}%" if run5 is not None else "  -  "
+            run20_s = f"{run20:+.1f}%" if run20 is not None else "  -  "
+            run60_s = f"{run60:+.1f}%" if run60 is not None else "  -  "
+            dist52_s = f"{dist52:+.1f}%" if dist52 is not None else "  -  "
+            atr_s = f"{atr_stop:>9.2f}" if pure_llm and atr_stop is not None else ""
             lines.append(
                 f"{ticker:<10} {sig['action']:<6} {sig['strength']:>8} "
-                f"{snap.get('close', 0):>10.2f} {snap.get('rsi', 0):>6.1f} "
+                f"{(snap.get('close') or 0):>10.2f} {(snap.get('rsi') or 0):>6.1f} "
                 f"{rsi_d_s:>6} "
-                f"{snap.get('adx', 0):>5.0f} {wk:>3} "
-                f"{snap.get('macd', 0):>10.3f} {mh_d_s:>7} {run5_s:>6}"
+                f"{(snap.get('adx') or 0):>5.0f} {wk:>3} "
+                f"{(snap.get('macd') or 0):>10.3f} {mh_d_s:>7} {run5_s:>6} {run20_s:>7} {run60_s:>7} {dist52_s:>6}{atr_s}"
             )
     else:
         lines.append("(no signals available)")
     lines.append("")
 
     # --- Recent news (optional, supplementary) ---
-    if news:
+    if news and not minimal:
         lines.append("## Recent News (supplementary context — do not trade on news alone)")
         market_hl = news.get("market", [])
         if market_hl:
@@ -647,30 +961,50 @@ def _build_llm_context(
                 lines.append(format_news_for_context(ticker, hl))
         lines.append("")
 
-    # --- Deterministic proposed trades (pending — NOT yet executed) ---
-    lines.append("## Deterministic Proposed Trades (pending — your HOLD will veto)")
-    if deterministic_trades:
-        for t in deterministic_trades:
+    # --- Recent Trades (your own recent activity, for continuity) ---
+    if trade_history and not minimal:
+        lines.append("## Recent Trades (your last 12 actions — use this to avoid round-trips)")
+        for t in trade_history[:12]:
             shares = t.get("shares", "?")
-            if t["side"] == "BUY":
-                # Proposals carry a budget; show it so the LLM sees the size
-                shares = f"budget ${t.get('budget', 0):.0f}"
             lines.append(
-                f"  - {t['ticker']} {t['side']} ×{shares} @ "
-                f"{t.get('price', '?'):.2f} — {t.get('reason', '')}"
+                f"  - {t.get('date', '?')} {t['side']:<4} {t['ticker']:<10} "
+                f"×{shares} @ {t.get('price', '?'):.2f} — {t.get('reason', '')[:60]}"
             )
-    else:
-        lines.append("(no deterministic trades proposed)")
-    lines.append("")
+        lines.append("")
+
+    # --- Deterministic proposed trades (pending — NOT yet executed) ---
+    if not pure_llm:
+        lines.append("## Deterministic Proposed Trades (pending — your HOLD will veto)")
+        if deterministic_trades:
+            for t in deterministic_trades:
+                shares = t.get("shares", "?")
+                if t["side"] == "BUY":
+                    # Proposals carry a budget; show it so the LLM sees the size
+                    shares = f"budget ${t.get('budget', 0):.0f}"
+                lines.append(
+                    f"  - {t['ticker']} {t['side']} ×{shares} @ "
+                    f"{t.get('price', '?'):.2f} — {t.get('reason', '')}"
+                )
+        else:
+            lines.append("(no deterministic trades proposed)")
+        lines.append("")
 
     lines.append("## Your Decisions")
-    lines.append(
-        "Return ONLY a JSON array of objects: "
-        '{"ticker": "...", "action": "BUY|SELL|HOLD", "reason": "..."}. '
-        "For tickers listed above, HOLD = veto (block the proposed trade); "
-        "BUY/SELL = agree and execute. You may also add new BUY/SELL decisions "
-        "for tickers NOT in the proposed list. No markdown, no prose."
-    )
+    if pure_llm:
+        lines.append(
+            "Return ONLY a JSON array of objects: "
+            '{"ticker": "...", "action": "BUY|SELL|HOLD", "reason": "..."}. '
+            "BUY/SELL will execute; HOLD means do nothing for that ticker. "
+            "No markdown, no prose."
+        )
+    else:
+        lines.append(
+            "Return ONLY a JSON array of objects: "
+            '{"ticker": "...", "action": "BUY|SELL|HOLD", "reason": "..."}. '
+            "For tickers listed above, HOLD = veto (block the proposed trade); "
+            "BUY/SELL = agree and execute. You may also add new BUY/SELL decisions "
+            "for tickers NOT in the proposed list. No markdown, no prose."
+        )
     return "\n".join(lines)
 
 
@@ -879,12 +1213,16 @@ async def _llm_review_proposals(
     """
     global _last_llm_reasoning, _last_llm_summary
 
-    context = _build_llm_context(valuation, proposals, signals, news)
+    context = _build_llm_context(valuation, proposals, signals, news,
+                                minimal=settings.sim_llm_minimal_prompt)
     backend = await llm_mod.current_backend()
+
+    system_prompt = (_LLM_MINIMAL_SYSTEM_PROMPT if settings.sim_llm_minimal_prompt
+                     else _LLM_SYSTEM_PROMPT)
 
     try:
         out = await llm_mod.chat([
-            {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": context},
         ])
         content = out["text"]
@@ -942,8 +1280,26 @@ async def _llm_review_proposals(
     if total_equity <= 0:
         return executed, vetoed
 
-    min_cash = total_equity * (settings.sim_min_cash_pct / 100)
-    max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+    async def _price_of(ticker: str) -> float | None:
+        return await _latest_close(ticker)
+
+    async def _value_of(ticker: str) -> float:
+        async with Session() as s:
+            pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
+        price = await _latest_close(ticker) or 0.0
+        return (pos.shares * price) if pos else 0.0
+
+    plan = await plan_llm_buys(
+        decisions, valuation["cash"], total_equity,
+        StrategyParams(
+            min_cash_pct=settings.sim_min_cash_pct,
+            max_position_pct=settings.sim_max_position_pct,
+        ),
+        guarded=True,
+        price_of=_price_of,
+        value_of=_value_of,
+        exclude=proposal_tickers,
+    )
 
     for d in decisions:
         ticker_u = d["ticker"].upper()
@@ -960,42 +1316,22 @@ async def _llm_review_proposals(
             continue
 
         if action == "BUY":
-            acc = await _account()
-            if acc.cash < min_cash:
-                logger.info("LLM BUY %s skipped: cash %.2f < min_cash %.2f", d["ticker"], acc.cash, min_cash)
-                continue
-            async with Session() as s:
-                pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == d["ticker"]))
-            current_value = (pos.shares * price) if pos else 0
-            if current_value >= max_position_value:
-                continue
-            budget = min(acc.cash - min_cash, max_position_value - current_value)
-            if "shares" in d:
-                budget = min(budget, d["shares"] * price)
-            elif "amount" in d:
-                budget = min(budget, d["amount"])
-            if budget < 1:
+            budget = plan.get(ticker_u)
+            if budget is None:
                 continue
             t = await _exec_buy(d["ticker"], price, budget, f"LLM: {reason}")
             if t:
                 executed.append(t)
                 valuation = await valuate()
                 total_equity = valuation["total_equity"]
-                min_cash = total_equity * (settings.sim_min_cash_pct / 100)
-                max_position_value = total_equity * (settings.sim_max_position_pct / 100)
         elif action == "SELL":
-            target_shares: float | None = None
-            if "shares" in d:
-                target_shares = d["shares"]
-            elif "amount" in d:
-                target_shares = d["amount"] / price if price > 0 else None
-            t = await _exec_sell(d["ticker"], price, target_shares, f"LLM: {reason}")
-            if t:
-                executed.append(t)
-                valuation = await valuate()
-                total_equity = valuation["total_equity"]
-                min_cash = total_equity * (settings.sim_min_cash_pct / 100)
-                max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+            # Replay evidence (90-day bull window: -8.7% → +4.7%): the LLM's
+            # self-initiated SELLs (not proposed by the engine) are churn —
+            # it sells winners in bull markets. The engine owns exits via
+            # stop-losses and deterministic SELL signals. Skip LLM-initiated
+            # SELLs in hybrid mode; only SELLs tied to engine proposals
+            # (handled in the reconcile step above) execute.
+            logger.info("LLM-initiated SELL %s skipped (engine owns exits)", d["ticker"])
 
     return executed, vetoed
 
@@ -1005,16 +1341,22 @@ async def _llm_decide(
     deterministic_trades: list[dict],
     signals: dict[str, dict] | None = None,
     news: dict[str, list[dict]] | None = None,
+    pure_llm: bool = False,
 ) -> list[dict]:
-    """Hybrid strategy: let an LLM review/adjust deterministic candidates.
+    """LLM strategy: let an LLM decide what to buy/sell.
 
-    Builds a structured context with the portfolio state, deterministic
-    candidates, signal summaries, and optional recent news, asks the LLM for
-    a JSON array of decisions, then executes each BUY/SELL through the same
-    exec helpers.
+    In hybrid mode (``pure_llm=False``) the LLM reviews deterministic
+    proposals and can veto/approve/flip them. In pure-LLM mode
+    (``pure_llm=True``) there are no proposals — the LLM picks the names and
+    the engine's hard sizing limits (min-cash floor, max-position-%,
+    max-positions cap) size every BUY. Both modes use the shared prompt.
+
+    Builds a structured context with the portfolio state, signal summaries,
+    and optional recent news, asks the LLM for a JSON array of decisions,
+    then executes each BUY/SELL through the same exec helpers.
 
     If the LLM call fails or the response can't be parsed, falls back to the
-    deterministic trades.
+    deterministic trades (empty in pure-LLM mode, so effectively no trades).
     """
     # Default fallback
     if signals is None:
@@ -1022,12 +1364,29 @@ async def _llm_decide(
 
     global _last_llm_reasoning, _last_llm_summary
 
-    context = _build_llm_context(valuation, deterministic_trades, signals, news)
+    system_prompt = (_LLM_MINIMAL_SYSTEM_PROMPT if settings.sim_llm_minimal_prompt
+                     else _LLM_SYSTEM_PROMPT)  # shared prompt: main-branch parity
+    # Recent trade history from the DB (newest first) so the LLM sees what it
+    # did recently and can avoid round-trips / repeated mistakes.
+    recent_trades: list[dict] = []
+    async with Session() as s:
+        recent_rows = (await s.scalars(
+            select(SimTrade).order_by(SimTrade.created_at.desc()).limit(12)
+        )).all()
+    recent_trades = [
+        {"date": tr.created_at.strftime("%Y-%m-%d") if tr.created_at else "",
+         "side": tr.side, "ticker": tr.ticker, "shares": tr.shares,
+         "price": tr.price, "reason": tr.reason}
+        for tr in recent_rows
+    ]
+    context = _build_llm_context(valuation, deterministic_trades, signals, news,
+                                pure_llm=pure_llm, trade_history=recent_trades,
+                                minimal=settings.sim_llm_minimal_prompt)
     backend = await llm_mod.current_backend()
 
     try:
         out = await llm_mod.chat([
-            {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": context},
         ])
         content = out["text"]
@@ -1038,18 +1397,27 @@ async def _llm_decide(
                 err_detail += f" | status={e.response.status_code} body={e.response.text[:300]}"
             except Exception:
                 pass
-        logger.warning("LLM decide failed [%s] (backend=%s, model=%s); falling back to deterministic",
-                       err_detail, backend.get("name", "?"), backend.get("model", "?"))
-        _last_llm_reasoning = (
-            f"[LLM UNAVAILABLE — fell back to deterministic]\n"
-            f"Error: {err_detail}\n"
-            f"Backend: {backend.get('name', '?')}\n"
-            f"Model: {backend.get('model', '?')}\n\n"
-            f"Deterministic trades were executed instead:"
-        ) + ("\n" + "\n".join(
-            f"  - {t['ticker']} {t['side']} ×{t.get('shares', '?')} @ {t.get('price', '?'):.2f} — {t.get('reason', '')}"
-            for t in deterministic_trades
-        ) if deterministic_trades else "\n  (no deterministic trades either)")
+        mode = "pure-LLM" if pure_llm else "hybrid"
+        logger.warning("LLM decide failed [%s] (backend=%s, model=%s); falling back (%s)",
+                       err_detail, backend.get("name", "?"), backend.get("model", "?"), mode)
+        if pure_llm:
+            _last_llm_reasoning = (
+                f"[LLM UNAVAILABLE — no trades executed]\n"
+                f"Error: {err_detail}\n"
+                f"Backend: {backend.get('name', '?')}\n"
+                f"Model: {backend.get('model', '?')}"
+            )
+        else:
+            _last_llm_reasoning = (
+                f"[LLM UNAVAILABLE — fell back to deterministic]\n"
+                f"Error: {err_detail}\n"
+                f"Backend: {backend.get('name', '?')}\n"
+                f"Model: {backend.get('model', '?')}\n\n"
+                f"Deterministic trades were executed instead:"
+            ) + ("\n" + "\n".join(
+                f"  - {t['ticker']} {t['side']} ×{t.get('shares', '?')} @ {t.get('price', '?'):.2f} — {t.get('reason', '')}"
+                for t in deterministic_trades
+            ) if deterministic_trades else "\n  (no deterministic trades either)")
         _last_llm_summary = ""
         return list(deterministic_trades)
 
@@ -1057,7 +1425,7 @@ async def _llm_decide(
     _last_llm_reasoning = content
     decisions = _parse_llm_decisions(content)
     if decisions is None:
-        logger.warning("Could not parse LLM decisions; falling back to deterministic. Raw: %s", content[:500])
+        logger.warning("Could not parse LLM decisions; falling back. Raw: %s", content[:500])
         _last_llm_summary = ""
         return list(deterministic_trades)
 
@@ -1073,10 +1441,37 @@ async def _llm_decide(
     if total_equity <= 0:
         return []
 
-    min_cash = total_equity * (settings.sim_min_cash_pct / 100)
-    max_position_value = total_equity * (settings.sim_max_position_pct / 100)
-
     executed: list[dict] = []
+
+    # Plan all BUY budgets up front so unsized BUYs split the cash evenly
+    # instead of the first one taking everything.
+    async def _price_of(ticker: str) -> float | None:
+        return await _latest_close(ticker)
+
+    async def _value_of(ticker: str) -> float:
+        async with Session() as s:
+            pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
+        price = await _latest_close(ticker) or 0.0
+        return (pos.shares * price) if pos else 0.0
+
+    plan = await plan_llm_buys(
+        decisions, valuation["cash"], total_equity,
+        StrategyParams(
+            min_cash_pct=settings.sim_min_cash_pct,
+            max_position_pct=settings.sim_max_position_pct,
+            max_positions=settings.sim_max_positions,
+        ),
+        guarded=True,
+        price_of=_price_of,
+        value_of=_value_of,
+    )
+
+    # Track held tickers for the max-positions cap on LLM-initiated BUYs.
+    # Updated progressively as BUYs execute so the 2nd new BUY sees the 1st.
+    held_tickers: set[str] = set()
+    async with Session() as s:
+        existing = (await s.scalars(select(SimPosition))).all()
+    held_tickers = {p.ticker.upper() for p in existing}
 
     for decision in decisions:
         ticker = decision["ticker"]
@@ -1089,54 +1484,36 @@ async def _llm_decide(
             continue
 
         if action == "BUY":
-            acc = await _account()
-            if acc.cash < min_cash:
-                logger.info("LLM BUY %s skipped: cash %.2f < min_cash %.2f", ticker, acc.cash, min_cash)
+            # Max-positions cap: block NEW positions when at the cap, but
+            # still allow topping up tickers already held (mirrors the
+            # deterministic engine's behaviour).
+            if (settings.sim_max_positions > 0
+                    and len(held_tickers) >= settings.sim_max_positions
+                    and ticker.upper() not in held_tickers):
+                logger.info("LLM BUY %s skipped (max-positions cap %d)",
+                            ticker, settings.sim_max_positions)
                 continue
-
-            async with Session() as s:
-                pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
-            current_value = (pos.shares * price) if pos else 0
-            if current_value >= max_position_value:
-                logger.info("LLM BUY %s skipped: position at max (%.2f >= %.2f)", ticker, current_value, max_position_value)
-                continue
-
-            budget = min(acc.cash - min_cash, max_position_value - current_value)
-
-            # Optional partial size: "shares" or "amount" (dollars). Clamp
-            # to the risk-limited budget so we never breach cash/position limits.
-            if "shares" in decision:
-                budget = min(budget, decision["shares"] * price)
-            elif "amount" in decision:
-                budget = min(budget, decision["amount"])
-
-            if budget < 1:
-                logger.info("LLM BUY %s skipped: budget %.2f < $1", ticker, budget)
+            budget = plan.get(ticker.upper())
+            if budget is None:
+                logger.info("LLM BUY %s skipped (budget guard)", ticker)
                 continue
 
             t = await _exec_buy(ticker, price, budget, f"LLM: {reason}")
             if t:
                 executed.append(t)
+                held_tickers.add(ticker.upper())
                 # Update guards after each buy
                 valuation = await valuate()
                 total_equity = valuation["total_equity"]
-                min_cash = total_equity * (settings.sim_min_cash_pct / 100)
-                max_position_value = total_equity * (settings.sim_max_position_pct / 100)
 
         elif action == "SELL":
             # Optional partial size: "shares" (exact) or "amount" (dollars).
-            target_shares: float | None = None
-            if "shares" in decision:
-                target_shares = decision["shares"]
-            elif "amount" in decision:
-                target_shares = decision["amount"] / price
+            target_shares = llm_sell_shares(decision, price)
             t = await _exec_sell(ticker, price, target_shares, f"LLM: {reason}")
             if t:
                 executed.append(t)
                 valuation = await valuate()
                 total_equity = valuation["total_equity"]
-                min_cash = total_equity * (settings.sim_min_cash_pct / 100)
-                max_position_value = total_equity * (settings.sim_max_position_pct / 100)
 
         else:  # HOLD
             logger.info("LLM HOLD %s — %s", ticker, reason)
@@ -1235,7 +1612,6 @@ def _set_progress(stage: str, detail: str = "", *, running: bool = True,
     Called from run_cycle() at each stage. ``started_at`` is preserved across
     updates so the frontend can show an elapsed timer.
     """
-    from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
     if started_at is None:
         started_at = now
@@ -1322,19 +1698,91 @@ async def run_cycle() -> dict[str, Any]:
                 _set_progress("signals", "Gathering signals", started_at=started_at)
                 signals = await _gather_signals(tickers)
                 news = await _gather_news(signals)
+                # Pure-LLM mode (main-branch parity): the engine makes NO
+                # proposals and NO risk-floor sells — the LLM picks the names,
+                # and the engine's hard sizing limits (min-cash floor,
+                # max-position-%, max-positions cap) size every BUY.
                 _set_progress("decide", "LLM deciding (pure-LLM strategy)", started_at=started_at)
-                trades = await _llm_decide(valuation, [], signals, news)
+                trades = await _llm_decide(valuation, [], signals, news, pure_llm=True)
                 _last_deterministic_trades = []
             elif strategy == "hybrid":
-                _set_progress("signals", "Gathering signals", started_at=started_at)
-                signals = await _gather_signals(tickers)
-                news = await _gather_news(signals)
-                _set_progress("propose", "Deterministic engine proposing", started_at=started_at)
-                proposals = await _deterministic_propose(valuation, signals)
-                _set_progress("decide", "LLM reviewing proposals (hybrid)", started_at=started_at)
-                trades, vetoed = await _llm_review_proposals(valuation, proposals, signals, news)
-                _last_deterministic_trades = proposals
-                _last_llm_vetoes = vetoed
+                # Hybrid with a weekly review: the deterministic engine runs
+                # every cycle; the LLM reviews the proposals on the FIRST
+                # cycle of each calendar week (Europe/Vienna). Manual runs
+                # later in the same week do NOT trigger the LLM again — the
+                # review is anchored to the week, not to a run counter.
+                # On non-review cycles the deterministic proposals execute
+                # as-is — the engine manages daily risk, the LLM adds
+                # judgment once per week.
+                #
+                # Failure-marker mode (SIM_LLM_FAILURE_MARKER=true): the
+                # weekly cadence is replaced by a failure trigger — the LLM
+                # is consulted only when the engine shows signs of failure
+                # (2+ stop-out SELLs in the last 5 trading days, or equity
+                # >7% below its running peak). No cooldown: a fresh failure
+                # triggers a call the same day. This is the validated
+                # configuration (60d chop window: -0.8% vs -4.7% baseline).
+                review_interval = max(1, settings.sim_llm_review_interval)
+                week = _current_week()
+                async with Session() as s:
+                    acc = await s.get(SimAccount, 1)
+                    if acc is None:
+                        acc = SimAccount(id=1, cash=settings.sim_start_cash,
+                                         last_allowance_month=None)
+                        s.add(acc)
+                        await s.commit()
+                    last_review_week = acc.last_review_week
+                if settings.sim_llm_failure_marker:
+                    # --- failure marker: stop-out cascade / drawdown ---
+                    async with Session() as s:
+                        recent_trades = (await s.scalars(
+                            select(SimTrade).order_by(SimTrade.created_at.desc()).limit(10)
+                        )).all()
+                        peak_equity = (await s.scalar(
+                            select(func.max(SimSnapshot.total_equity))
+                        )) or 0.0
+                    # Mirror the replay's 5-trading-day window (optimize.py).
+                    cutoff = _utcnow() - timedelta(days=7)
+                    stop_outs_5d = sum(
+                        1 for t in recent_trades
+                        if t.side == "SELL" and _is_stop_out(t.reason)
+                        and t.created_at >= cutoff
+                    )
+                    drawdown = (valuation["total_equity"] / peak_equity - 1) * 100 if peak_equity > 0 else 0.0
+                    failure = stop_outs_5d >= 2 or drawdown <= -7.0
+                    if failure:
+                        logger.info("failure marker: stop_outs_5d=%d drawdown=%.1f%%",
+                                    stop_outs_5d, drawdown)
+                    is_review_cycle = failure
+                else:
+                    # Fire the review when the last review is more than
+                    # (review_interval - 1) weeks ago (or never happened).
+                    is_review_cycle = (
+                        last_review_week is None
+                        or _week_diff(week, last_review_week) >= review_interval
+                    )
+                if not is_review_cycle:
+                    _set_progress("decide", "Deterministic engine deciding (LLM review off-cycle)", started_at=started_at)
+                    trades = await _deterministic_decide(valuation)
+                    _last_deterministic_trades = trades
+                    _last_llm_vetoes = []
+                else:
+                    _set_progress("signals", "Gathering signals", started_at=started_at)
+                    signals = await _gather_signals(tickers)
+                    news = await _gather_news(signals)
+                    _set_progress("propose", "Deterministic engine proposing", started_at=started_at)
+                    proposals = await _deterministic_propose(valuation, signals)
+                    _set_progress("decide", "LLM reviewing proposals (hybrid)", started_at=started_at)
+                    trades, vetoed = await _llm_review_proposals(valuation, proposals, signals, news)
+                    _last_deterministic_trades = proposals
+                    _last_llm_vetoes = vetoed
+                    # Mark the week as reviewed — no more LLM calls until the
+                    # calendar week changes.
+                    async with Session() as s:
+                        acc = await s.get(SimAccount, 1)
+                        if acc is not None:
+                            acc.last_review_week = week
+                            await s.commit()
             else:
                 logger.warning("Unknown strategy '%s', falling back to deterministic", strategy)
                 _set_progress("decide", "Deterministic engine deciding (unknown strategy fallback)", started_at=started_at)
@@ -1748,7 +2196,6 @@ async def _scheduler_loop():
         target = now.replace(hour=settings.sim_run_hour, minute=settings.sim_run_minute, second=0, microsecond=0)
         if target <= now:
             # Already past today's run hour — schedule for tomorrow
-            from datetime import timedelta
             target = target + timedelta(days=1)
         wait_seconds = (target - now).total_seconds()
         logger.info("Sim scheduler: next run at %s (in %.0f seconds)", target, wait_seconds)
@@ -1948,13 +2395,19 @@ async def _build_sim_chat_context() -> str:
             rsi_d = snap.get("rsi_3d_change")
             mh_d = snap.get("macd_hist_3d_change")
             run5 = snap.get("run_5d")
+            run20 = snap.get("run_20d")
+            run60 = snap.get("run_60d")
+            dist52 = snap.get("dist_52w_high")
             rsi_d_s = f" | rsiΔ3 {rsi_d:+.1f}" if rsi_d is not None else ""
             mh_d_s = f" | mhΔ3 {mh_d:+.2f}" if mh_d is not None else ""
             run5_s = f" | run5d {run5:+.1f}%" if run5 is not None else ""
+            run20_s = f" | run20d {run20:+.1f}%" if run20 is not None else ""
+            run60_s = f" | run60d {run60:+.1f}%" if run60 is not None else ""
+            dist52_s = f" | hi52 {dist52:+.1f}%" if dist52 is not None else ""
             lines.append(
                 f"  {ticker}: {sig['action']} (strength {sig['strength']}) "
                 f"| RSI {snap.get('rsi', 0):.1f}{rsi_d_s} | ADX {snap.get('adx', 0):.0f} "
-                f"| wk {wk} | MACD {snap.get('macd', 0):.3f}{mh_d_s}{run5_s} "
+                f"| wk {wk} | MACD {snap.get('macd', 0):.3f}{mh_d_s}{run5_s}{run20_s}{run60_s}{dist52_s} "
                 f"| close {snap.get('close', 0):.2f}"
             )
     lines.append("")

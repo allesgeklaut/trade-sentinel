@@ -644,12 +644,142 @@ class TestBuildLLMContext:
         assert "AMD" in ctx
         assert "strong momentum" in ctx
 
+    def test_all_signals_shown_regardless_of_strength(self):
+        """The full signal table is always shown — the LLM is the
+        decision-maker and needs to see every candidate. (Truncation was
+        removed: it starved the LLM of context and caused churn.)"""
+        val = {"cash": 0, "positions_value": 0, "total_equity": 0,
+               "allowance_total": 0, "positions": []}
+        # 40 BUY signals with different strengths, plus weak SELLs.
+        signals = {
+            f"T{i:02d}": {"action": "BUY", "strength": i,
+                           "snapshot": {"close": 100.0, "rsi": 50.0, "macd": 0.0}}
+            for i in range(40)
+        }
+        for i in range(5):
+            signals[f"SELL{i:02d}"] = {"action": "SELL", "strength": 10,
+                                       "snapshot": {"close": 50.0, "rsi": 30.0, "macd": -0.5}}
+        ctx = sim._build_llm_context(val, [], signals)
+        # Every ticker appears — no truncation, no "hidden" notice.
+        assert "T00" in ctx
+        assert "T39" in ctx
+        assert "SELL00" in ctx
+        assert "SELL04" in ctx
+        assert "hidden" not in ctx
+        assert "all candidate tickers" in ctx
+
+    def test_context_shows_position_thesis(self):
+        """The context must show each position's entry thesis and holding
+        date so the LLM can judge 'is the thesis still valid?'"""
+        val = {
+            "cash": 0, "positions_value": 0, "total_equity": 0,
+            "allowance_total": 0,
+            "positions": [
+                {"ticker": "NVDA", "shares": 5, "avg_cost": 100.0,
+                 "current_price": 120.0, "value": 600.0, "pnl_pct": 20.0,
+                 "thesis": "AI infrastructure leader, strong uptrend",
+                 "buy_date": "2025-06-01"},
+            ],
+        }
+        ctx = sim._build_llm_context(val, [], {}, pure_llm=True)
+        assert "AI infrastructure leader" in ctx
+        assert "2025-06-01" in ctx
+        assert "thesis:" in ctx
+
+    def test_context_truncates_long_thesis(self):
+        """Long theses are truncated to 77 chars + ... to keep lines readable."""
+        long_thesis = "x" * 100
+        val = {
+            "cash": 0, "positions_value": 0, "total_equity": 0,
+            "allowance_total": 0,
+            "positions": [
+                {"ticker": "A", "shares": 1, "avg_cost": 10.0,
+                 "current_price": 10.0, "value": 10.0, "pnl_pct": 0.0,
+                 "thesis": long_thesis, "buy_date": "2025-01-01"},
+            ],
+        }
+        ctx = sim._build_llm_context(val, [], {}, pure_llm=True)
+        # The full 100-char thesis should not appear; the truncated version should.
+        assert long_thesis not in ctx
+        assert "xxx..." in ctx  # truncated to 77 chars + "..."
+
+    def test_context_no_thesis_shows_nothing(self):
+        """Positions without a thesis don't show a 'thesis:' line."""
+        val = {
+            "cash": 0, "positions_value": 0, "total_equity": 0,
+            "allowance_total": 0,
+            "positions": [
+                {"ticker": "A", "shares": 1, "avg_cost": 10.0,
+                 "current_price": 10.0, "value": 10.0, "pnl_pct": 0.0,
+                 "thesis": "", "buy_date": ""},
+            ],
+        }
+        ctx = sim._build_llm_context(val, [], {}, pure_llm=True)
+        assert "thesis:" not in ctx
+        assert "since" not in ctx
+
+    def test_context_includes_recent_trades(self):
+        """The Recent Trades section lets the LLM see its own recent activity
+        so it can avoid round-trips and repeated mistakes."""
+        val = {"cash": 0, "positions_value": 0, "total_equity": 0,
+               "allowance_total": 0, "positions": []}
+        history = [
+            {"date": "2025-06-10", "side": "SELL", "ticker": "ASML.AS",
+             "shares": 5.0, "price": 100.0, "reason": "momentum rolled over"},
+            {"date": "2025-06-08", "side": "BUY", "ticker": "NVDA",
+             "shares": 3.0, "price": 120.0, "reason": "pullback in uptrend"},
+        ]
+        ctx = sim._build_llm_context(val, [], {}, pure_llm=True,
+                                     trade_history=history)
+        assert "Recent Trades" in ctx
+        assert "ASML.AS" in ctx
+        assert "2025-06-10" in ctx
+        assert "momentum rolled over" in ctx
+
+    def test_context_truncates_trade_history_to_12(self):
+        """Only the last 12 trades are shown — the context stays compact."""
+        val = {
+            "cash": 0, "positions_value": 0, "total_equity": 0,
+            "allowance_total": 0, "positions": [],
+        }
+        history = [
+            {"date": f"2025-06-{i:02d}", "side": "BUY", "ticker": f"T{i:02d}",
+             "shares": 1.0, "price": 100.0, "reason": "test"}
+            for i in range(20)
+        ]
+        ctx = sim._build_llm_context(val, [], {}, pure_llm=True, trade_history=history)
+        assert "Recent Trades" in ctx
+        # Only the first 12 (by provided order) are shown.
+        assert "T00" in ctx  # first trade shown
+        assert "T19" not in ctx  # 20th trade truncated
+
+    def test_context_no_recent_trades_omits_section(self):
+        val = {
+            "cash": 0, "positions_value": 0, "total_equity": 0,
+            "allowance_total": 0, "positions": [],
+        }
+        ctx = sim._build_llm_context(val, [], {}, pure_llm=True)
+        assert "Recent Trades" not in ctx
+
 
 class TestLLMDecide:
     """Integration tests for _llm_decide: LLM decisions → executed trades.
 
     Mocks the Ollama HTTP call and _latest_close so no network is needed.
     """
+
+    @staticmethod
+    async def _backdate(tickers: list[str], days: int = 10) -> None:
+        """Backdate positions so the 5-day holding-period floor (anti-churn)
+        does not block test SELLs. Tests that seed-then-sell need this."""
+        from datetime import timedelta
+        from sqlalchemy import select as sa_select
+        async with sim.Session() as s:
+            for t in tickers:
+                pos = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == t))
+                if pos:
+                    pos.opened_at = sim._utcnow() - timedelta(days=days)
+            await s.commit()
 
     def _fake_http(self, monkeypatch, content: str):
         """Replace httpx.AsyncClient with a fake returning ``content``."""
@@ -674,6 +804,7 @@ class TestLLMDecide:
         """A SELL with 'amount' sells only that value; a BUY is clamped to budget."""
         # Seed a position: 30 shares of AAPL @ 100 = $3000
         await sim._exec_buy("AAPL", 100.0, 3000.0, "seed")
+        await self._backdate(["AAPL"])
 
         # LLM returns: sell $500 of AAPL, buy $99999 of MSFT (clamped by cash).
         decisions = json.dumps([
@@ -691,7 +822,12 @@ class TestLLMDecide:
             "cash": 10000.0, "positions_value": 3000.0, "total_equity": 13000.0,
             "allowance_total": 10000.0, "positions": [],
         }
-        executed = await sim._llm_decide(valuation, [], {})
+        # Provide a BUY signal for MSFT so its BUY decision has signal context.
+        signals = {
+            "MSFT": {"action": "BUY", "strength": 60,
+                     "snapshot": {"close": 50.0, "rsi": 55.0, "macd": 0.5}},
+        }
+        executed = await sim._llm_decide(valuation, [], signals)
 
         # Two trades executed
         assert len(executed) == 2
@@ -774,6 +910,7 @@ class TestLLMDecide:
     async def test_sell_without_size_sells_entire_position(self, with_cash, monkeypatch, llm_backend):
         """A SELL with no size field sells the whole position (default)."""
         await sim._exec_buy("AAPL", 100.0, 2000.0, "seed")  # 20 shares
+        await self._backdate(["AAPL"])
 
         decisions = json.dumps([
             {"ticker": "AAPL", "action": "SELL", "reason": "exit"},
@@ -1235,6 +1372,20 @@ class TestTimezoneConvention:
         month = sim._current_month()
         assert month == "2026-02", \
             f"Expected Vienna-local month '2026-02' at the UTC/Vienna boundary, got '{month}'"
+
+    def test_week_diff(self):
+        """_week_diff computes calendar-week distance, across year boundaries."""
+        # Same week
+        assert sim._week_diff("2026-W03", "2026-W03") == 0
+        # One week later
+        assert sim._week_diff("2026-W04", "2026-W03") == 1
+        # Ten weeks later
+        assert sim._week_diff("2026-W13", "2026-W03") == 10
+        # Year boundary: week 50 of 2025 -> week 2 of 2026 = 4 weeks
+        # (2025-W50 Thu is Dec 11; 2026-W02 Thu is Jan 8; 28 days apart).
+        assert sim._week_diff("2026-W02", "2025-W50") == 4
+        # Never reviewed: treat None specially in the caller, not here.
+        assert sim._week_diff("2026-W01", "2026-W01") == 0
 
 
 # ---------------------------------------------------------------------------

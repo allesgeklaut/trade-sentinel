@@ -102,7 +102,7 @@ docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize llm-ben
 
 ## LLM backends (model switching)
 
-The dashboard's AI chat, the sim bot's LLM reasoning, and the LLM sweep/benchmark all talk to whichever backend is active. You can switch models at runtime from the **dropdown in the top-right of the dashboard** — no restart needed, and the choice persists in the `/data` volume.
+The dashboard's AI chat, the sim bot's LLM reasoning, and the LLM benchmark all talk to whichever backend is active. You can switch models at runtime from the **dropdown in the top-right of the dashboard** — no restart needed, and the choice persists in the `/data` volume.
 
 ```dotenv
 # JSON list of backends (single line — dotenv can't parse multi-line values):
