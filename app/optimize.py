@@ -721,7 +721,7 @@ def _current_week_from(day: str) -> str:
     same weekly-review cadence as production.
     """
     from datetime import datetime
-    return datetime.strptime(day, "%Y-%m-%d").strftime("%Y-W%W")
+    return datetime.strptime(day, "%Y-%m-%d").strftime("%G-W%V")
 
 
 def _execute_proposal(pf: PaperPortfolio, p: dict) -> dict | None:

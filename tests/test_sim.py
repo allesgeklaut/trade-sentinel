@@ -1381,8 +1381,9 @@ class TestTimezoneConvention:
         assert sim._week_diff("2026-W04", "2026-W03") == 1
         # Ten weeks later
         assert sim._week_diff("2026-W13", "2026-W03") == 10
-        # Year boundary: week 50 of 2025 -> week 2 of 2026 = 5 weeks
-        assert sim._week_diff("2026-W02", "2025-W50") == 5
+        # Year boundary: week 50 of 2025 -> week 2 of 2026 = 4 weeks
+        # (2025-W50 Thu is Dec 11; 2026-W02 Thu is Jan 8; 28 days apart).
+        assert sim._week_diff("2026-W02", "2025-W50") == 4
         # Never reviewed: treat None specially in the caller, not here.
         assert sim._week_diff("2026-W01", "2026-W01") == 0
 
