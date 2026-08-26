@@ -108,6 +108,19 @@ def _current_week() -> str:
     return datetime.now(_TZ).strftime("%Y-W%W")
 
 
+def _is_stop_out(reason: str) -> bool:
+    """True if a SELL was an automatic stop, not a signal-driven decision.
+
+    Mirrors optimize._is_stop_out: the engine stamps these reasons on
+    stop-loss exits ("Initial stop: ...", "ATR stop hit: ...",
+    "Trailing stop: ...", "Portfolio stop: ..."). Signal-driven SELLs say
+    "SELL signal (strength ...)".
+    """
+    r = reason.lower()
+    return any(r.startswith(p) for p in
+               ("initial stop", "atr stop", "trailing stop", "portfolio stop"))
+
+
 def _week_diff(current: str, last: str) -> int:
     """Calendar-week distance between two 'YYYY-Www' keys (>= 0).
 
@@ -1697,6 +1710,14 @@ async def run_cycle() -> dict[str, Any]:
                 # On non-review cycles the deterministic proposals execute
                 # as-is — the engine manages daily risk, the LLM adds
                 # judgment once per week.
+                #
+                # Failure-marker mode (SIM_LLM_FAILURE_MARKER=true): the
+                # weekly cadence is replaced by a failure trigger — the LLM
+                # is consulted only when the engine shows signs of failure
+                # (2+ stop-out SELLs in the last 5 trading days, or equity
+                # >7% below its running peak). No cooldown: a fresh failure
+                # triggers a call the same day. This is the validated
+                # configuration (60d chop window: -0.8% vs -4.7% baseline).
                 review_interval = max(1, settings.sim_llm_review_interval)
                 week = _current_week()
                 async with Session() as s:
@@ -1707,12 +1728,32 @@ async def run_cycle() -> dict[str, Any]:
                         s.add(acc)
                         await s.commit()
                     last_review_week = acc.last_review_week
-                # Fire the review when the last review is more than
-                # (review_interval - 1) weeks ago (or never happened).
-                is_review_cycle = (
-                    last_review_week is None
-                    or _week_diff(week, last_review_week) >= review_interval
-                )
+                if settings.sim_llm_failure_marker:
+                    # --- failure marker: stop-out cascade / drawdown ---
+                    async with Session() as s:
+                        recent_trades = (await s.scalars(
+                            select(SimTrade).order_by(SimTrade.created_at.desc()).limit(10)
+                        )).all()
+                        peak_equity = (await s.scalar(
+                            select(func.max(SimSnapshot.total_equity))
+                        )) or 0.0
+                    stop_outs_5d = sum(
+                        1 for t in recent_trades
+                        if t.side == "SELL" and _is_stop_out(t.reason)
+                    )
+                    drawdown = (valuation["total_equity"] / peak_equity - 1) * 100 if peak_equity > 0 else 0.0
+                    failure = stop_outs_5d >= 2 or drawdown <= -7.0
+                    if failure:
+                        logger.info("failure marker: stop_outs_5d=%d drawdown=%.1f%%",
+                                    stop_outs_5d, drawdown)
+                    is_review_cycle = failure
+                else:
+                    # Fire the review when the last review is more than
+                    # (review_interval - 1) weeks ago (or never happened).
+                    is_review_cycle = (
+                        last_review_week is None
+                        or _week_diff(week, last_review_week) >= review_interval
+                    )
                 if not is_review_cycle:
                     _set_progress("decide", "Deterministic engine deciding (LLM review off-cycle)", started_at=started_at)
                     trades = await _deterministic_decide(valuation)
