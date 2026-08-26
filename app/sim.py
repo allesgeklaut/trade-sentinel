@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
 
@@ -105,7 +105,7 @@ def _current_week() -> str:
     """ISO calendar week key (YYYY-Www), anchored to the operator's local
     timezone. Used for the weekly LLM portfolio review: the review fires on
     the FIRST cycle of each new week, regardless of manual runs."""
-    return datetime.now(_TZ).strftime("%Y-W%W")
+    return datetime.now(_TZ).strftime("%G-W%V")
 
 
 def _is_stop_out(reason: str) -> bool:
@@ -122,14 +122,19 @@ def _is_stop_out(reason: str) -> bool:
 
 
 def _week_diff(current: str, last: str) -> int:
-    """Calendar-week distance between two 'YYYY-Www' keys (>= 0).
+    """Calendar-week distance between two ISO 'YYYY-Www' keys (>= 0).
 
-    Uses 53 as the per-year week cap (the ISO maximum) so year boundaries
-    don't undercount. ``last`` is assumed to be <= ``current``.
+    Anchors each key to the Thursday of its ISO week and diffs those
+    dates, so year boundaries are counted correctly (e.g.
+    2026-W02 - 2025-W50 == 4, not 5). ``last`` is assumed to be <= ``current``.
     """
     cy, cw = (int(x) for x in current.split("-W"))
     ly, lw = (int(x) for x in last.split("-W"))
-    return (cy - ly) * 53 + (cw - lw)
+    jan4 = datetime(cy, 1, 4)
+    cur_thu = jan4 - timedelta(days=(jan4.weekday() - 3) % 7) + timedelta(weeks=cw - 1)
+    jan4 = datetime(ly, 1, 4)
+    last_thu = jan4 - timedelta(days=(jan4.weekday() - 3) % 7) + timedelta(weeks=lw - 1)
+    return round((cur_thu - last_thu).days / 7)
 
 
 async def _latest_close(ticker: str) -> float | None:
@@ -1607,7 +1612,6 @@ def _set_progress(stage: str, detail: str = "", *, running: bool = True,
     Called from run_cycle() at each stage. ``started_at`` is preserved across
     updates so the frontend can show an elapsed timer.
     """
-    from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
     if started_at is None:
         started_at = now
@@ -1737,9 +1741,12 @@ async def run_cycle() -> dict[str, Any]:
                         peak_equity = (await s.scalar(
                             select(func.max(SimSnapshot.total_equity))
                         )) or 0.0
+                    # Mirror the replay's 5-trading-day window (optimize.py).
+                    cutoff = _utcnow() - timedelta(days=7)
                     stop_outs_5d = sum(
                         1 for t in recent_trades
                         if t.side == "SELL" and _is_stop_out(t.reason)
+                        and t.created_at >= cutoff
                     )
                     drawdown = (valuation["total_equity"] / peak_equity - 1) * 100 if peak_equity > 0 else 0.0
                     failure = stop_outs_5d >= 2 or drawdown <= -7.0
@@ -2189,7 +2196,6 @@ async def _scheduler_loop():
         target = now.replace(hour=settings.sim_run_hour, minute=settings.sim_run_minute, second=0, microsecond=0)
         if target <= now:
             # Already past today's run hour — schedule for tomorrow
-            from datetime import timedelta
             target = target + timedelta(days=1)
         wait_seconds = (target - now).total_seconds()
         logger.info("Sim scheduler: next run at %s (in %.0f seconds)", target, wait_seconds)
