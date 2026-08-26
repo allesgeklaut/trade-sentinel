@@ -94,6 +94,7 @@ def valuate_portfolio(
             "ticker": p["ticker"], "shares": p["shares"],
             "avg_cost": avg_cost, "current_price": price,
             "value": value, "pnl_pct": pnl_pct,
+            "thesis": p.get("thesis", ""), "buy_date": p.get("buy_date", ""),
         })
     return {
         "cash": cash,
@@ -290,6 +291,121 @@ def propose_trades(
             sector_values[sec] = sector_values.get(sec, 0) + budget
 
     return proposals
+
+
+def llm_buy_budget(
+    decision: dict,
+    cash: float,
+    equity: float,
+    price: float,
+    current_value: float,
+    params: StrategyParams,
+    guarded: bool,
+    unsized_remaining: int = 1,
+) -> float | None:
+    """Budget for an LLM BUY decision, or None to skip.
+
+    ``price`` is the execution price, ``current_value`` the value already
+    held in this ticker. ``guarded=True`` applies the hard risk limits (min
+    cash floor and max position %) — used in hybrid mode, matching the
+    deterministic engine. ``guarded=False`` lets the LLM decide sizing and
+    cash reserve; the only hard bounds are the actual cash balance and the
+    $1 minimum. In both modes the optional partial-size fields (``shares`` /
+    ``amount``) clamp the budget.
+
+    ``unsized_remaining``: number of pending BUY decisions (including this
+    one) that carry no ``shares``/``amount``. When the LLM issues several
+    unsized BUYs in one cycle, each gets an equal slice of the cash
+    (``cash / unsized_remaining``) instead of the first one taking
+    everything — mirroring the per-proposal cash reservation in
+    ``propose_trades``.
+    """
+    min_cash = equity * (params.min_cash_pct / 100)
+    max_position_value = equity * (params.max_position_pct / 100)
+
+    sized = "shares" in decision or "amount" in decision
+    if guarded:
+        if cash < min_cash:
+            return None
+        if current_value >= max_position_value:
+            return None
+        budget = min(cash - min_cash, max_position_value - current_value)
+    elif sized:
+        budget = cash
+    else:
+        budget = cash / max(1, unsized_remaining)
+
+    if "shares" in decision:
+        budget = min(budget, decision["shares"] * price)
+    elif "amount" in decision:
+        budget = min(budget, decision["amount"])
+
+    if budget < 1:
+        return None
+    return budget
+
+
+def llm_sell_shares(decision: dict, price: float) -> float | None:
+    """Shares to sell for an LLM SELL decision (None = entire position)."""
+    if "shares" in decision:
+        return float(decision["shares"])
+    if "amount" in decision:
+        return float(decision["amount"]) / price if price > 0 else None
+    return None
+
+
+async def plan_llm_buys(
+    decisions: list[dict],
+    cash: float,
+    equity: float,
+    params: StrategyParams,
+    guarded: bool,
+    price_of: callable,
+    value_of: callable,
+    exclude: set[str] | None = None,
+) -> dict[str, float]:
+    """Plan the execution budget for every LLM BUY decision in a batch.
+
+    Single source of truth for the budget math shared by the live sim and
+    the backtest replay. ``price_of(ticker)`` and ``value_of(ticker)`` are
+    async callables returning the execution price and the value already held
+    in the ticker (None price skips the ticker). ``exclude`` lists tickers
+    handled elsewhere (e.g. approved proposals in hybrid mode).
+
+    Returns ``{ticker: budget}`` in decision order. Unsized BUYs (no
+    ``shares`` / ``amount``) split the available cash evenly so the first
+    BUY does not consume everything; sized BUYs get their requested size
+    clamped to what is allowed. Each planned budget is deducted from a
+    running cash total so the sum never exceeds the available cash — a BUY
+    that no longer fits is skipped rather than silently dropped at
+    execution.
+    """
+    excluded = {t.upper() for t in (exclude or set())}
+    buys = [
+        d for d in decisions
+        if d.get("action") == "BUY" and d["ticker"].upper() not in excluded
+    ]
+    unsized = sum(1 for d in buys if "shares" not in d and "amount" not in d)
+    remaining_cash = cash
+    plan: dict[str, float] = {}
+    for d in buys:
+        ticker = d["ticker"].upper()
+        price = await price_of(ticker)
+        if price is None or price <= 0:
+            continue
+        is_unsized = "shares" not in d and "amount" not in d
+        budget = llm_buy_budget(
+            d, remaining_cash, equity, price, await value_of(ticker), params,
+            guarded=guarded,
+            unsized_remaining=max(1, unsized) if is_unsized else 1,
+        )
+        if is_unsized:
+            unsized -= 1
+        if budget is None:
+            continue
+        plan[ticker] = budget
+        remaining_cash -= budget
+    return plan
 
 
 def reconcile_proposals(

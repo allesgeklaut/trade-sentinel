@@ -201,6 +201,14 @@ async def select_backend(name: str, model: str | None = None) -> dict[str, Any]:
     return await current_backend()
 
 
+# ---------------------------------------------------------------------------
+# Chat API
+# ---------------------------------------------------------------------------
+
+# Requests carry no decoding options: the cloud model backend does not honor
+# Ollama seed/temperature, so pinning would be ignored anyway and only adds
+# false reproducibility expectations to backtests.
+
 async def chat(messages: list[dict[str, str]]) -> dict[str, Any]:
     """Send a chat request to the active backend.
 
@@ -386,10 +394,10 @@ async def _post_chat(
     )
     async with httpx.AsyncClient(timeout=timeout) as client:
         if backend["type"] == "ollama":
-            resp = await client.post(
-                backend["url"] + "/api/chat",
-                json={"model": backend["model"], "messages": messages, "stream": False},
-            )
+            req_body: dict[str, Any] = {
+                "model": backend["model"], "messages": messages, "stream": False,
+            }
+            resp = await client.post(backend["url"] + "/api/chat", json=req_body)
         else:
             payload: dict[str, Any] = {
                 "model": backend["model"] or "default",
