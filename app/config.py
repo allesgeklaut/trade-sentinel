@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     sim_max_run_5d: float = 12.0  # block BUYs after a 5-day run-up > this % (0 = disabled)
     sim_llm_review_interval: int = 1  # consult the LLM every N cycles (1=daily, 5=weekly)
     sim_llm_minimal_prompt: bool = False  # use the minimal system prompt (no methodology/regime rules)
+    sim_llm_failure_marker: bool = False  # hybrid: consult the LLM only on engine failure (stop-out cascade / drawdown)
     sim_run_hour: int = 22
     sim_run_minute: int = 30
 

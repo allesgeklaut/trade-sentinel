@@ -950,8 +950,10 @@ async def _hybrid_replay(
                                             pure_llm=pure_llm,
                                             trade_history=list(reversed(pf.trades[-15:]))[:12],
                                             minimal=minimal_prompt)
-                system_prompt = (_LLM_MINIMAL_SYSTEM_PROMPT if minimal_prompt
-                                 else _LLM_SYSTEM_PROMPT)  # shared prompt: main-branch parity
+                system_prompt = (
+                    _LLM_MINIMAL_SYSTEM_PROMPT if minimal_prompt
+                    else _PURE_LLM_SYSTEM_PROMPT if pure_llm
+                    else _LLM_SYSTEM_PROMPT)  # shared prompt: main-branch parity
                 logger.info("  llm phase: calling LLM (%d signals, %d proposals)...",
                             len(signals), len(proposals))
                 try:
