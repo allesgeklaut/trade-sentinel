@@ -890,51 +890,58 @@ async def _hybrid_replay(
 
             # --- 2 + 3. LLM review → reconcile → execute ---
             total_equity = pf.equity(prices)
-            # Default cadence: fire the review on the first trading day of
-            # each calendar week (mirrors the live sim's weekly review) — the
-            # LLM is consulted at most once per ISO week, anchored to the
-            # week, not a day counter. review_interval=1 still reviews every
-            # week; larger values skip intermediate weeks.
-            week = _current_week_from(day)
-            if marker_gated:
-                # Marker-gated mode: the deterministic engine's proposals ARE
-                # the marker — an LLM review is only worthwhile when there is
-                # something to veto/approve. The marker can fire on ANY day
-                # (not just the scheduled cadence); review_interval then acts
-                # only as a cooldown so proposals on consecutive days don't
-                # force a call every day.
-                is_review_day = bool(proposals) and (
-                    last_review_week is None
-                    or _week_diff(week, last_review_week) >= review_interval
-                )
-            elif failure_marker:
-                # Failure-marker mode: the deterministic engine usually works
-                # well — only consult the LLM when the engine shows signs of
-                # failure. Two failure signatures from the data:
-                #   1. Stop-out cascade: N+ stop-loss SELLs in the last 5
-                #      trading days (the engine bought into a falling tape).
-                #   2. Equity drawdown: equity > X% below its running peak
-                #      (the engine is bleeding without stopping).
-                # The marker fires on ANY day with NO cooldown — a fresh
-                # cascade triggers a call the same day (validated: no-cooldown
-                # beat the weekly-cooldown variant on the 60d window).
-                stop_outs_5d = sum(
-                    1 for t in pf.trades[-10:]
-                    if t["side"] == "SELL" and _is_stop_out(t["reason"])
-                    and t["date"] >= days[max(0, day_idx - 6)]
-                )
-                peak_equity = max(peak_equity, total_equity)
-                drawdown = (total_equity / peak_equity - 1) * 100 if peak_equity > 0 else 0.0
-                failure = stop_outs_5d >= failure_stop_outs or drawdown <= -failure_drawdown
-                is_review_day = failure
-                if failure:
-                    logger.info("  failure marker: stop_outs_5d=%d drawdown=%.1f%%",
-                                stop_outs_5d, drawdown)
+            # Pure-LLM mode: the LLM is the SOLE decision-maker — it must be
+            # consulted every trading day (the engine makes no proposals, so
+            # there is no weekly-review concept). The weekly cadence below
+            # only applies to hybrid mode.
+            if pure_llm:
+                is_review_day = True
             else:
-                is_review_day = (
-                    last_review_week is None
-                    or _week_diff(week, last_review_week) >= review_interval
-                )
+                # Default cadence: fire the review on the first trading day of
+                # each calendar week (mirrors the live sim's weekly review) —
+                # the LLM is consulted at most once per ISO week, anchored to
+                # the week, not a day counter. review_interval=1 still reviews
+                # every week; larger values skip intermediate weeks.
+                week = _current_week_from(day)
+                if marker_gated:
+                    # Marker-gated mode: the deterministic engine's proposals ARE
+                    # the marker — an LLM review is only worthwhile when there is
+                    # something to veto/approve. The marker can fire on ANY day
+                    # (not just the scheduled cadence); review_interval then acts
+                    # only as a cooldown so proposals on consecutive days don't
+                    # force a call every day.
+                    is_review_day = bool(proposals) and (
+                        last_review_week is None
+                        or _week_diff(week, last_review_week) >= review_interval
+                    )
+                elif failure_marker:
+                    # Failure-marker mode: the deterministic engine usually works
+                    # well — only consult the LLM when the engine shows signs of
+                    # failure. Two failure signatures from the data:
+                    #   1. Stop-out cascade: N+ stop-loss SELLs in the last 5
+                    #      trading days (the engine bought into a falling tape).
+                    #   2. Equity drawdown: equity > X% below its running peak
+                    #      (the engine is bleeding without stopping).
+                    # The marker fires on ANY day with NO cooldown — a fresh
+                    # cascade triggers a call the same day (validated: no-cooldown
+                    # beat the weekly-cooldown variant on the 60d window).
+                    stop_outs_5d = sum(
+                        1 for t in pf.trades[-10:]
+                        if t["side"] == "SELL" and _is_stop_out(t["reason"])
+                        and t["date"] >= days[max(0, day_idx - 6)]
+                    )
+                    peak_equity = max(peak_equity, total_equity)
+                    drawdown = (total_equity / peak_equity - 1) * 100 if peak_equity > 0 else 0.0
+                    failure = stop_outs_5d >= failure_stop_outs or drawdown <= -failure_drawdown
+                    is_review_day = failure
+                    if failure:
+                        logger.info("  failure marker: stop_outs_5d=%d drawdown=%.1f%%",
+                                    stop_outs_5d, drawdown)
+                else:
+                    is_review_day = (
+                        last_review_week is None
+                        or _week_diff(week, last_review_week) >= review_interval
+                    )
             if total_equity > 0 and (settings.llm_backends or settings.ollama_model) and is_review_day:
                 allowance_total = cumulative_invested
                 valuation = valuate_portfolio(_pf_to_positions(pf), pf.cash, prices, allowance_total)
@@ -1031,7 +1038,9 @@ async def _hybrid_replay(
                                     ", ".join(f"{p['side']} {p['ticker']}" for p in vetoed))
                 # Mark the week as reviewed — no more LLM calls until the
                 # calendar week changes (same anchoring as the live sim).
-                last_review_week = week
+                # Pure-LLM mode consults the LLM every day, so no week marker.
+                if not pure_llm:
+                    last_review_week = week
             else:
                 # No LLM configured, or not a review week: execute all
                 # proposals as-is (deterministic). On non-review weeks the
