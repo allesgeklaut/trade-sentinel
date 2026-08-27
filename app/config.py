@@ -26,6 +26,17 @@ class Settings(BaseSettings):
 
     paper_trading: bool = True
 
+    # --- Signal scoring variant -------------------------------------------
+    # "classic" = original weights (momentum-chasing: rewards 1d RSI rising +
+    # rising MACD histogram + extension). "pullback" = measured v2 weights:
+    # drop the hist-rising bonus, reward 5d RSI *falling* (pullback entries,
+    # +6.2% fwd vs -0.7% chasing), re-curve dist_above (sweet spot 2-50%,
+    # penalty >80%). Component attribution on 205 year-long entries showed
+    # the classic score's ranking is inverted (top tercile -3.3% vs bottom
+    # +4.7% fwd); pullback scoring fixes it (+7.1% spread) and wins the
+    # bull90 holdout (+12.3% vs +9.9%).
+    signal_scoring: str = "classic"
+
     # --- Autonomous paper-trading simulation -----------------------------
     sim_enabled: bool = True
     sim_monthly_allowance: float = 1000.0
