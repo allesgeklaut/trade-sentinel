@@ -768,6 +768,35 @@ _LLM_MINIMAL_SYSTEM_PROMPT = (
 )
 
 
+_LLM_MODE_AWARE_MINIMAL_PROMPT = (
+    "You are a portfolio manager for a paper-trading simulation. A "
+    "deterministic engine runs the day-to-day trading and manages all exits: "
+    "its pending proposed trades (new entries, stop-losses and SELL signals) "
+    "execute automatically, so you do not need to confirm or repeat them. "
+    "Your only job: add a small number of high-quality BUYs the engine did "
+    "not propose, using the free cash and open position slots shown in the "
+    "portfolio state. Any SELL you return is ignored, so return none.\n"
+    "\n"
+    "Only buy when the trend is real and not already extended:\n"
+    "  - Prefer: close > sma50 > sma200 (confirmed uptrend), ADX > 25 "
+    "(strong trend), RSI 45-65 (momentum without being overbought), MACD "
+    "above its signal line with a rising histogram, run_5d < 15% (not chasing "
+    "a spike).\n"
+    "  - Skip: run_5d > 15% (chasing), RSI > 70 (overbought), ADX < 20 "
+    "(chop, no trend), or momentum rolling over (RSI change and MACD histogram "
+    "change both negative).\n"
+    "Prefer names that are not already in the open positions. Size each BUY "
+    "with the optional \"amount\" field (dollars to invest) or \"shares\"; if "
+    "omitted the risk rules cap the size.\n"
+    "\n"
+    'Return ONLY a JSON array of objects: '
+    '{"ticker": "...", "action": "BUY", "reason": "..."}. '
+    'Optional "shares" / "amount" fields size a BUY. '
+    "Return an empty array [] if nothing deserves a new position. "
+    "No markdown, no prose.\n"
+)
+
+
 def _build_llm_context(
     valuation: dict[str, Any],
     deterministic_trades: list[dict],
@@ -776,6 +805,7 @@ def _build_llm_context(
     pure_llm: bool = False,
     trade_history: list[dict] | None = None,
     minimal: bool = False,
+    max_positions: int = 0,
 ) -> str:
     """Build the compact context string sent to the LLM.
 
@@ -792,6 +822,10 @@ def _build_llm_context(
     sole decision-maker), drops the max-positions line (no count cap in
     pure-LLM mode), and shows each position's initial stop price so the LLM
     can act on stop-loss hits itself.
+
+    ``max_positions`` overrides the reported position cap (0 = use
+    ``settings.sim_max_positions``) so the LLM sees the raised cap when the
+    caller grants it extra slots above the deterministic engine's limit.
     """
     from .news import format_news_for_context, format_market_news_for_context
 
@@ -807,7 +841,7 @@ def _build_llm_context(
     # min-cash, max-position-% and max-positions on every LLM BUY.
     lines.append(f"Min cash floor (buy-time only, {settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
     lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
-    lines.append(f"Max open positions: {settings.sim_max_positions}")
+    lines.append(f"Max open positions: {max_positions if max_positions > 0 else settings.sim_max_positions}")
     lines.append(f"Stop loss: {settings.sim_stop_pct:.0f}% (frozen at entry; ATR stop also applies)")
     lines.append("")
 
@@ -1214,10 +1248,12 @@ async def _llm_review_proposals(
     global _last_llm_reasoning, _last_llm_summary
 
     context = _build_llm_context(valuation, proposals, signals, news,
-                                minimal=settings.sim_llm_minimal_prompt)
+                                minimal=settings.sim_llm_minimal_prompt
+                                or settings.sim_llm_mode_aware_prompt)
     backend = await llm_mod.current_backend()
 
-    system_prompt = (_LLM_MINIMAL_SYSTEM_PROMPT if settings.sim_llm_minimal_prompt
+    system_prompt = (_LLM_MODE_AWARE_MINIMAL_PROMPT if settings.sim_llm_mode_aware_prompt
+                     else _LLM_MINIMAL_SYSTEM_PROMPT if settings.sim_llm_minimal_prompt
                      else _LLM_SYSTEM_PROMPT)
 
     try:
@@ -1364,7 +1400,8 @@ async def _llm_decide(
 
     global _last_llm_reasoning, _last_llm_summary
 
-    system_prompt = (_LLM_MINIMAL_SYSTEM_PROMPT if settings.sim_llm_minimal_prompt
+    system_prompt = (_LLM_MODE_AWARE_MINIMAL_PROMPT if settings.sim_llm_mode_aware_prompt
+                     else _LLM_MINIMAL_SYSTEM_PROMPT if settings.sim_llm_minimal_prompt
                      else _LLM_SYSTEM_PROMPT)  # shared prompt: main-branch parity
     # Recent trade history from the DB (newest first) so the LLM sees what it
     # did recently and can avoid round-trips / repeated mistakes.
@@ -1381,7 +1418,8 @@ async def _llm_decide(
     ]
     context = _build_llm_context(valuation, deterministic_trades, signals, news,
                                 pure_llm=pure_llm, trade_history=recent_trades,
-                                minimal=settings.sim_llm_minimal_prompt)
+                                minimal=settings.sim_llm_minimal_prompt
+                                or settings.sim_llm_mode_aware_prompt)
     backend = await llm_mod.current_backend()
 
     try:
@@ -1966,6 +2004,7 @@ def get_last_llm_summary() -> dict[str, Any]:
         "fallback": is_fallback,
         "strategy": settings.sim_strategy,
         "failure_marker": settings.sim_llm_failure_marker,
+        "mode_aware_prompt": settings.sim_llm_mode_aware_prompt,
         "llm_called": llm_was_called,
     }
 
