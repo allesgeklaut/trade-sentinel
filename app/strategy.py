@@ -57,6 +57,17 @@ class StrategyParams:
     stop_atr_mult: float = 2.0   # ATR multiple (stop_type="atr")
     use_atr_stop: bool = True
     max_run_5d: float = 12.0     # block BUYs after a 5-day run-up > this % (0 = disabled)
+    # Mirror of max_run_5d on the downside: block BUYs into a 5-day crash
+    # (bearish-bounce scoring reads falling knives as high-strength entries;
+    # pooled 21d forward returns of crash entries: -30% vs +7% for the
+    # rising tier). 0 = disabled.
+    min_run_5d: float = -15.0
+    # Block BUYs into parabolic extensions: dist_above SMA200 > this %.
+    # Entries above +100% averaged -13.2% forward vs +10% in the 20-50%
+    # sweet spot; 4 of 10 one-year stop-outs entered above +50%. The scoring
+    # *rewards* extension (+10 for dist_above > 5), so this guard closes the
+    # hole the score can't see. 0 = disabled.
+    max_dist_above: float = 80.0
     relaxed_hold_strength: int = 40
     relaxed_hold_limit: int = 3
     # Sector diversification cap: max % of equity in any one sector. 0 = disabled.
@@ -193,12 +204,34 @@ def propose_trades(
 
     # --- BUY phase ---
     max_run_5d = params.max_run_5d
+    min_run_5d = params.min_run_5d
+    max_dist_above = params.max_dist_above
+
+    def _entry_ok(sig: dict) -> bool:
+        """Entry-time guards shared by strict BUYs and the relaxed fallback.
+
+        Blocks the two entry shapes the data condemns: chasing a 5-day spike
+        (max_run_5d), catching a 5-day crash (min_run_5d — bearish-bounce
+        scoring reads falling knives as strong), and buying parabolic
+        extensions (max_dist_above — the score rewards being far above the
+        SMA200, but entries > +100% average -13% forward).
+        """
+        snap = sig.get("snapshot", {})
+        run5 = snap.get("run_5d")
+        if run5 is not None:
+            if max_run_5d > 0 and run5 > max_run_5d:
+                return False
+            if min_run_5d < 0 and run5 < min_run_5d:
+                return False
+        dist = snap.get("dist_above")
+        if max_dist_above > 0 and dist is not None and dist > max_dist_above:
+            return False
+        return True
+
     buy_candidates = [
         (t, sig) for t, sig in signals.items()
         if sig["action"] == "BUY"
-        and not (max_run_5d > 0
-                 and sig.get("snapshot", {}).get("run_5d") is not None
-                 and sig["snapshot"]["run_5d"] > max_run_5d)
+        and _entry_ok(sig)
     ]
     buy_candidates.sort(key=lambda x: x[1]["strength"], reverse=True)
 
@@ -208,9 +241,7 @@ def propose_trades(
         hold_candidates = [
             (t, sig) for t, sig in signals.items()
             if sig["action"] == "HOLD" and sig["strength"] >= params.relaxed_hold_strength
-            and not (max_run_5d > 0
-                     and sig.get("snapshot", {}).get("run_5d") is not None
-                     and sig["snapshot"]["run_5d"] > max_run_5d)
+            and _entry_ok(sig)
         ]
         hold_candidates.sort(key=lambda x: x[1]["strength"], reverse=True)
         buy_candidates = hold_candidates[:params.relaxed_hold_limit]

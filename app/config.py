@@ -37,6 +37,14 @@ class Settings(BaseSettings):
     sim_max_positions: int = 10
     sim_stop_pct: float = 15.0
     sim_max_run_5d: float = 12.0  # block BUYs after a 5-day run-up > this % (0 = disabled)
+    # Entry guards — opt-in (0 = disabled). Measured rationale in strategy.py:
+    # min_run_5d=-15 blocks falling-knife entries (pooled fwd -30%),
+    # max_dist_above=80 blocks parabolic entries (pooled fwd -13% at >100%).
+    # A/B verdict: fixes the stop-out cascade (win4: 7->2 stop-outs, -7.7->-0.4%)
+    # but costs right-tail returns in strong trends (win2: +20.5->+15.6%) —
+    # keep OFF until the scoring-side fix is evaluated on its own branch.
+    sim_min_run_5d: float = 0.0
+    sim_max_dist_above: float = 0.0
     sim_llm_review_interval: int = 1  # consult the LLM every N cycles (1=daily, 5=weekly)
     sim_llm_minimal_prompt: bool = False  # use the minimal system prompt (no methodology/regime rules)
     sim_llm_mode_aware_prompt: bool = False  # use the mode-aware minimal prompt (engine owns exits; LLM adds BUYs only)
