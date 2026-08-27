@@ -413,6 +413,11 @@ async def _deterministic_propose(
         stop_pct=settings.sim_stop_pct,
         use_atr_stop=True,
         max_run_5d=settings.sim_max_run_5d,
+        # Entry guards: block falling-knife (5d crash) and parabolic
+        # (dist_above SMA200) entries — see strategy.py for the measured
+        # rationale. Set the env vars to 0 to disable.
+        min_run_5d=settings.sim_min_run_5d,
+        max_dist_above=settings.sim_max_dist_above,
         relaxed_hold_strength=40,
         relaxed_hold_limit=3,
     )

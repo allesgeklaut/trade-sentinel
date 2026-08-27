@@ -183,6 +183,12 @@ class ReplayParams:
     # e.g. 15 = don't buy if price has risen more than 15% in the last 5 days
     # (chasing a short-term spike that's prone to reversion).
     max_run_5d: float = 0.0
+    # Mirror on the downside: block BUYs into a 5-day crash (falling-knife
+    # guard). Only active when negative; 0 disables.
+    min_run_5d: float = 0.0
+    # Block BUYs into parabolic extensions: dist_above SMA200 > this %.
+    # 0 = disabled.
+    max_dist_above: float = 0.0
 
 
 # Sector groupings for the global-large-cap universe. Used by the sector
@@ -645,6 +651,8 @@ def _replay_params_to_strategy(p: ReplayParams) -> StrategyParams:
         stop_atr_mult=p.stop_atr_mult,
         use_atr_stop=p.use_atr_stop,
         max_run_5d=p.max_run_5d,
+        min_run_5d=p.min_run_5d,
+        max_dist_above=p.max_dist_above,
         relaxed_hold_strength=p.relaxed_hold_strength,
         relaxed_hold_limit=p.relaxed_hold_limit,
         max_sector_pct=p.max_sector_pct,
@@ -708,6 +716,7 @@ def _signals_for_day_from_bytime(
                 "atr_stop": row.get("atr_stop"),
                 "run_5d": row.get("run_5d"),
                 "atr14": row.get("atr14"),
+                "dist_above": row.get("dist_above"),
             },
         }
     return signals
@@ -1547,6 +1556,11 @@ def _live_sim_params() -> ReplayParams:
         # the replay's buy candidates match what the engine would actually
         # have considered.
         max_run_5d=settings.sim_max_run_5d,
+        # Entry guards mirror the live sim's settings — they are OPT-IN
+        # (defaults 0 = disabled) because the A/B showed a return/dd
+        # trade-off, not a free lunch. See config.py + strategy.py.
+        min_run_5d=settings.sim_min_run_5d,
+        max_dist_above=settings.sim_max_dist_above,
     )
 
 
@@ -2142,14 +2156,20 @@ async def _main(args: argparse.Namespace) -> None:
         # the live sim doesn't set, so it stays opt-in via --regime.
         params = _live_sim_params()
         params.regime_filter = getattr(args, "regime", False)
+        if getattr(args, "no_entry_guards", False):
+            params.min_run_5d = 0.0
+            params.max_dist_above = 0.0
         res = _replay(series, params, start=args.start, end=args.end, regime=regime)
         label = "Backtest (live sim risk config)"
         if params.regime_filter:
             label += " + regime filter"
+        if getattr(args, "no_entry_guards", False):
+            label += " [guards OFF]"
         _print_result(res, label)
         print(f"  Risk config: max_positions={params.max_positions}, "
               f"stop={params.stop_type} {params.stop_pct:g}%, "
               f"atr_stop={params.use_atr_stop}, max_run_5d={params.max_run_5d:g}%, "
+              f"min_run_5d={params.min_run_5d:g}%, max_dist_above={params.max_dist_above:g}%, "
               f"max_pos_pct={params.max_position_pct:g}%, "
               f"min_cash_pct={params.min_cash_pct:g}%")
         if args.trades:
@@ -2276,6 +2296,9 @@ async def _main(args: argparse.Namespace) -> None:
                   "llm-walkforward needs the LLM. Aborting.")
             return
         params = _live_sim_params()
+        if getattr(args, "no_entry_guards", False):
+            params.min_run_5d = 0.0
+            params.max_dist_above = 0.0
         pure_llm = getattr(args, "pure_llm", False)
         n_windows = args.windows
         days_per_window = args.days_per_window
@@ -2337,6 +2360,9 @@ def _build_parser() -> argparse.ArgumentParser:
     b.add_argument("--cash", action="store_true", help="Print cash-utilization summary (idle cash, max-positions cap)")
     b.add_argument("--regime", action="store_true", help="Enable market regime filter (block BUYs when market < SMA200)")
     b.add_argument("--regime-ticker", default="URTH", help="Benchmark ticker for the regime filter")
+    b.add_argument("--no-entry-guards", action="store_true",
+                   help="Disable the falling-knife (min_run_5d) and parabolic-extension "
+                        "(max_dist_above) BUY blocks — A/B escape hatch for benchmarking")
 
     s = sub.add_parser("sweep", help="Grid-search thresholds")
     s.add_argument("--start", default=None)
@@ -2419,6 +2445,10 @@ def _build_parser() -> argparse.ArgumentParser:
                            "(default 0 = use the engine's max_positions). The "
                            "deterministic engine still caps at max_positions; "
                            "the extra slots above it belong to the LLM's picks.")
+    lwf.add_argument("--no-entry-guards", action="store_true",
+                      help="Disable the falling-knife (min_run_5d) and "
+                           "parabolic-extension (max_dist_above) BUY blocks in "
+                           "both the det and hybrid replays — A/B escape hatch")
     lwf.add_argument("--marker-gated", action="store_true",
                      help="Deterministic marker: only consult the LLM on review "
                           "days when the engine actually PROPOSES trades (no "

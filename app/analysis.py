@@ -331,6 +331,7 @@ def snapshot_from_row(x, net: float, bullish: float, bearish: float,
     snap["run_20d"] = norm(x.run_20d)
     snap["run_60d"] = norm(x.run_60d)
     snap["dist_52w_high"] = norm(x.dist_52w_high)
+    snap["dist_above"] = norm(x.dist_above)
     return snap
 
 
