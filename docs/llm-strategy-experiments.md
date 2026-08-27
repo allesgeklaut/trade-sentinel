@@ -87,13 +87,16 @@ previously-broken 60-day chop window while keeping the bull-window upside.
 
 ## 5. Best configuration
 
-**Hybrid + minimal prompt + engine-owns-exits + failure marker
+**Hybrid + mode-aware prompt + engine-owns-exits + failure marker
 (stop_outs=2, drawdown=7%, no cooldown)**
 
-Rationale: the only config competitive on all three windows — ties the
-best on the bull window (+5.5%), dramatically best on the chop window
-(-0.8 to -2.8%), acceptable on the short suite (-0.3%). The 5×30 short-suite
-cost is the price for fixing the long windows, where real money is at risk.
+Rationale (2026-08-27, post-parity-fix scoreboard): mode-aware beats the
+minimal prompt on every non-neutral window of the 5×30d suite (mean +0.78%
+vs +0.43%, worst +0.00% both) with equal bull-window behavior (the marker
+stays quiet — see §8 for why the old +5.5% "bull window alpha" was
+structural, not LLM). The 60d chop window remains the weak spot for both
+prompts (mode-aware -3.45%, minimal -2.78%); mode-aware wins the live slot
+on the suite average, not on the chop case.
 
 ## 6. Live deployment
 
@@ -102,7 +105,7 @@ Live sim runs (`.env`, gitignored):
 ```
 SIM_STRATEGY=hybrid
 SIM_LLM_REVIEW_INTERVAL=5
-SIM_LLM_MINIMAL_PROMPT=true
+SIM_LLM_MODE_AWARE_PROMPT=true
 SIM_LLM_FAILURE_MARKER=true
 ```
 
@@ -110,12 +113,78 @@ How it works live: the deterministic engine runs every cycle as primary;
 the LLM is consulted only when the engine shows failure — 2+ stop-out SELLs
 in 5 trading days, or equity >7% below its running peak (from SimSnapshot
 history) — with no cooldown. When the engine works, the LLM stays quiet
-(saves tokens, avoids churn).
+(saves tokens, avoids churn). The mode-aware prompt tells the LLM the
+engine owns exits and its only job is adding high-quality BUYs.
 
-## 7. Open items
+## 7. Entry-quality experiments (2026-08-27)
+
+Component attribution (95–205 BUY-signal entries, 21d forward returns)
+found the classic bullish score's ranking is partly inverted: the rising-
+MACD-histogram bonus marks late entries (-3.4% fwd when true, +8.9% when
+absent), 1d-RSI-rising chases (-0.7% vs +6.2% for 5d RSI *falling*), and
+the dist_above bonus rewards parabolic extension (-14.5% fwd above +100%
+SMA200; 4 of 10 one-year stop-outs entered above +50%).
+
+Two fixes were built, both **opt-in** (neither is live):
+
+1. **Entry guards** (`feature/mode-aware-prompt`, commit `00e0b50`):
+   `min_run_5d` (falling-knife block) + `max_dist_above` (parabolic block)
+   in `propose_trades`, defaults 0 = off. A/B: fixes the failure mode
+   (win4 chop: 7→2 stop-outs, -7.7%→-0.4%) but costs right-tail returns
+   (win2: +20.5%→+15.6% — the blocked "parabolic" names kept mooning).
+   Net ~wash on return, mild dd improvement. A trade-off, not a free lunch.
+
+2. **Pullback scoring** (`feature/scoring-extension-penalty`, commit
+   `b76bcb6`): `SIGNAL_SCORING=pullback` — drops the hist-rising bonus,
+   rewards 5d RSI decline into 40-65, re-curves dist_above. Ranking quality
+   on its fitting sample: classic -3.3% (inverted) → +7.1% tercile spread.
+   Full-replay A/B on the fitting year: 1yr mean +10.4% vs +5.0%.
+
+**The 8.5-year walkforward A/B overturned the pullback recommendation.**
+Both scorings ran the full 17-window sweep (train 504d / test 126d,
+2016→2026-07, per-window param search):
+
+| Metric | classic | pullback |
+|---|---|---|
+| OOS mean/window | **+5.76%** | +3.76% |
+| Compounded | **+144% (11.1%/yr)** | +80% (7.2%/yr) |
+| Windows won | **13/17** | 4/17 |
+| Worst window | -6.7% | -10.2% |
+| Mean max-dd | 14.6% | **13.1%** |
+| Mean Sharpe | 2.93 | 2.90 |
+
+Caveats: each arm searched its own params (not a pure scoring A/B), and
+classic's edge concentrates in the 2016–2024 bull era where chasing pays.
+But the evidence hierarchy is clear: the fitted 1-year edge loses to the
+8.5-year OOS record. **Live sim reverted to classic**; the pullback variant
+stays in the repo as a one-line flip if the regime turns choppy (it won
+both short-window tests in the 2025-10→2026-08 chop era).
+
+Methodology note: an earlier read of the first walkforward log claimed it
+"validated" pullback scoring out-of-sample. That was wrong — the run had
+no classic control arm. The proper A/B (this section) reversed the call.
+Recorded here so the mistake isn't repeated.
+
+## 8. Hybrid replay parity fix (2026-08-27, commit a54fb5b)
+
+`_hybrid_replay` used single-phase propose/execute while `_replay` uses
+two-phase (SELLs execute, then BUYs re-proposed against freed slots). A
+stop-out SELL blocked its own same-day re-entry BUY in the hybrid skeleton,
+a structural divergence that fabricated "+5.48% LLM alpha" on the 90d bull
+window with **zero** LLM calls. Fixed: non-review days now mirror `_replay`
+exactly (verified 0.00 delta on return/dd/sharpe/trades); review days keep
+single-phase (that's the live-sim LLM contract). Any pre-fix "LLM delta"
+numbers from long windows are contaminated and should not be trusted.
+
+## 9. Open items
 
 - Pure-LLM top-up gap: at the max-positions cap, the LLM proposes new
   tickers (blocked) instead of topping up held positions; allowance cash
   sits idle. Worth a follow-up if pure-LLM is pursued further.
 - The 60d chop window remains the hardest case; the failure marker is the
   best mitigation found so far, not a full fix.
+- Entry quality: guards + pullback scoring are both opt-in and unmerged.
+  The scoring ranking inversion is real but regime-dependent — revisit if
+  the market shifts back to the 2025-10→2026-08 chop pattern.
+- The walkforward sweep prefers ATR stops (7/17) over the live percent-15
+  (6/17); differences were small but worth a dedicated look someday.
