@@ -2263,6 +2263,18 @@ async def _scheduler_loop():
         except Exception as e:
             logger.error("Sim cycle failed: %s", e, exc_info=True)
 
+        # Monthly qv-mom portfolio: independent of the daily cycle, only acts
+        # on the last trading day of the month (no-op otherwise).
+        try:
+            from .monthly import run_monthly_cycle
+            monthly_result = await run_monthly_cycle()
+            if monthly_result.get("skipped"):
+                logger.info("Monthly scheduler: skipped — %s", monthly_result.get("reason"))
+            else:
+                logger.info("Monthly rebalance complete: %d trades", len(monthly_result.get("trades", [])))
+        except Exception as e:
+            logger.error("Monthly rebalance failed: %s", e, exc_info=True)
+
 
 def start_scheduler():
     """Start the background scheduler task (called from main.py lifespan)."""

@@ -1,5 +1,6 @@
 import json, logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -360,6 +361,49 @@ async def sim_reasoning():
 async def sim_raw_reasoning():
     """Return the raw LLM reasoning text (for debugging/full text view)."""
     return {"reasoning": sim.get_last_llm_reasoning()}
+
+# =====================================================================
+# Monthly qv-mom portfolio endpoints (separate paper portfolio)
+# =====================================================================
+
+@app.get('/api/monthly/status')
+async def monthly_status():
+    """Monthly portfolio snapshot: cash, positions, equity, config."""
+    from . import monthly
+    val = await monthly.monthly_valuate()
+    return {**val,
+            "sim_monthly_enabled": settings.sim_monthly_enabled,
+            "sim_monthly_universe": settings.sim_monthly_universe,
+            "sim_monthly_contribution": settings.sim_monthly_contribution,
+            "sim_monthly_target_n": settings.sim_monthly_target_n,
+            "next_rebalance": monthly.month_last_trading_day(datetime.now(timezone.utc)).strftime("%Y-%m-%d")}
+
+@app.get('/api/monthly/trades')
+async def monthly_trades(limit: int = Query(default=100, ge=1, le=500)):
+    """Monthly portfolio trade log (most recent first)."""
+    from . import monthly
+    return await monthly.get_trades(limit)
+
+@app.get('/api/monthly/equity')
+async def monthly_equity(limit: int = Query(default=365, ge=1, le=1000)):
+    """Monthly portfolio equity-curve snapshots (oldest-first)."""
+    from . import monthly
+    return await monthly.get_equity_curve(limit)
+
+@app.get('/api/monthly/rebalances')
+async def monthly_rebalances(limit: int = Query(default=24, ge=1, le=120)):
+    """Rebalance decision log: held before, picked, #new per month."""
+    from . import monthly
+    return await monthly.get_rebalances(limit)
+
+@app.post('/api/monthly/run')
+async def monthly_run():
+    """Manually trigger a monthly rebalance (idempotent per month)."""
+    from . import monthly
+    result = await monthly.run_rebalance()
+    if result.get("skipped"):
+        return result
+    return result
 
 @app.post('/api/sim/chat')
 async def sim_chat_endpoint(req: ChatRequest):
