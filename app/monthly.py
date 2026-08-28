@@ -228,7 +228,12 @@ def eligible_frame(rebal_date: pd.Timestamp, close: pd.DataFrame, vol: pd.DataFr
         ni = _ttm_as_of(rec.get("NetIncomeLoss", []), d)
         ocf = _ttm_as_of(rec.get("NetCashProvidedByUsedInOperatingActivities", []), d)
         capex = _ttm_as_of(rec.get("PaymentsToAcquirePropertyPlantAndEquipment", []), d)
-        sh = _latest_as_of(rec.get("CommonStockSharesOutstanding", []), d)
+        # share counts live under either tag depending on the filer (dei vs us-gaap)
+        sh = _latest_as_of(
+            rec.get("CommonStockSharesOutstanding", [])
+            + rec.get("EntityCommonStockSharesOutstanding", []),
+            d,
+        )
         if not eq or eq[1] <= 0 or ni is None or sh is None:
             continue
         roe = ni / eq[1]
