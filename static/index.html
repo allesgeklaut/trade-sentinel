@@ -2276,7 +2276,9 @@
                         ? `The bot ran <b>${n}</b> trade${n === 1 ? '' : 's'} purely from the rule engine.`
                         : 'No trades were proposed by the rule engine this cycle.';
                     const hint = (r.failure_marker && (r.strategy || '') === 'hybrid')
-                        ? ' Failure-marker mode is on: the LLM is consulted only when the engine shows signs of failure (stop-out cascade or drawdown) — it was not triggered this cycle.'
+                        ? (r.mode_aware_prompt
+                            ? ' Failure-marker + mode-aware mode is on: the LLM is consulted only when the engine shows signs of failure (stop-out cascade or drawdown), and its only job then is adding high-quality BUYs — it was not triggered this cycle.'
+                            : ' Failure-marker mode is on: the LLM is consulted only when the engine shows signs of failure (stop-out cascade or drawdown) — it was not triggered this cycle.')
                         : ' Switch <code>SIM_STRATEGY</code> to <code>hybrid</code> or <code>llm</code> in <code>.env</code> to involve the LLM.';
                     el.innerHTML =
                         '<div class="sim-empty" style="text-align:left;padding:8px 0">' +

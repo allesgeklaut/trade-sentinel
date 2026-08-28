@@ -26,6 +26,17 @@ class Settings(BaseSettings):
 
     paper_trading: bool = True
 
+    # --- Signal scoring variant -------------------------------------------
+    # "classic" = original weights (momentum-chasing: rewards 1d RSI rising +
+    # rising MACD histogram + extension). "pullback" = measured v2 weights:
+    # drop the hist-rising bonus, reward 5d RSI *falling* (pullback entries,
+    # +6.2% fwd vs -0.7% chasing), re-curve dist_above (sweet spot 2-50%,
+    # penalty >80%). Component attribution on 205 year-long entries showed
+    # the classic score's ranking is inverted (top tercile -3.3% vs bottom
+    # +4.7% fwd); pullback scoring fixes it (+7.1% spread) and wins the
+    # bull90 holdout (+12.3% vs +9.9%).
+    signal_scoring: str = "classic"
+
     # --- Autonomous paper-trading simulation -----------------------------
     sim_enabled: bool = True
     sim_monthly_allowance: float = 1000.0
@@ -37,8 +48,17 @@ class Settings(BaseSettings):
     sim_max_positions: int = 10
     sim_stop_pct: float = 15.0
     sim_max_run_5d: float = 12.0  # block BUYs after a 5-day run-up > this % (0 = disabled)
+    # Entry guards — opt-in (0 = disabled). Measured rationale in strategy.py:
+    # min_run_5d=-15 blocks falling-knife entries (pooled fwd -30%),
+    # max_dist_above=80 blocks parabolic entries (pooled fwd -13% at >100%).
+    # A/B verdict: fixes the stop-out cascade (win4: 7->2 stop-outs, -7.7->-0.4%)
+    # but costs right-tail returns in strong trends (win2: +20.5->+15.6%) —
+    # keep OFF until the scoring-side fix is evaluated on its own branch.
+    sim_min_run_5d: float = 0.0
+    sim_max_dist_above: float = 0.0
     sim_llm_review_interval: int = 1  # consult the LLM every N cycles (1=daily, 5=weekly)
     sim_llm_minimal_prompt: bool = False  # use the minimal system prompt (no methodology/regime rules)
+    sim_llm_mode_aware_prompt: bool = False  # use the mode-aware minimal prompt (engine owns exits; LLM adds BUYs only)
     sim_llm_failure_marker: bool = False  # hybrid: consult the LLM only on engine failure (stop-out cascade / drawdown)
     sim_run_hour: int = 22
     sim_run_minute: int = 30
