@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     sim_enabled: bool = True
     sim_monthly_allowance: float = 1000.0
     sim_start_cash: float = 0.0
-    sim_universe: str = "global-large-cap"
+    sim_universe: str = "diversified-plus"
     sim_strategy: str = "deterministic"  # deterministic | llm | hybrid
     sim_max_position_pct: float = 10.0
     sim_min_cash_pct: float = 5.0
