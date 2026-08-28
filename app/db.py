@@ -202,6 +202,121 @@ class SimChatMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
 
 
+# =====================================================================
+# Monthly qv-mom portfolio (separate paper portfolio, monthly rebalance)
+# =====================================================================
+
+class Fundamental(Base):
+    """Point-in-time fundamental fact (stockstrat qv-mom input).
+
+    Mirrors the XBRL-style fact format: one row per (ticker, tag, period)
+    with the value and the date it became public (``filed``). A rebalance on
+    date d only sees facts with end < d and filed <= d.
+
+    Tags follow the SEC XBRL names the scoring math expects:
+    NetIncomeLoss, StockholdersEquity, NetCashProvidedByUsedInOperatingActivities,
+    PaymentsToAcquirePropertyPlantAndEquipment, CommonStockSharesOutstanding.
+    """
+
+    __tablename__ = "fundamentals"
+    __table_args__ = (UniqueConstraint("ticker", "tag", "start", "end"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(32), index=True)
+    tag: Mapped[str] = mapped_column(String(64), index=True)
+    start: Mapped[str | None] = mapped_column(String(10), nullable=True)  # YYYY-MM-DD, None = instant fact
+    end: Mapped[str] = mapped_column(String(10))  # YYYY-MM-DD period end
+    filed: Mapped[str] = mapped_column(String(10))  # YYYY-MM-DD public date
+    val: Mapped[float] = mapped_column(Float)
+    currency: Mapped[str] = mapped_column(String(8), default="USD")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class MonthlyAccount(Base):
+    """Singleton row (id=1) tracking the monthly portfolio cash balance."""
+
+    __tablename__ = "monthly_account"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cash: Mapped[float] = mapped_column(Float, default=0)
+    last_allowance_month: Mapped[str | None] = mapped_column(String(7), nullable=True)  # YYYY-MM
+    last_rebalance_month: Mapped[str | None] = mapped_column(String(7), nullable=True)  # YYYY-MM
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class MonthlyPosition(Base):
+    """Current open positions in the monthly portfolio."""
+
+    __tablename__ = "monthly_positions"
+    __table_args__ = (UniqueConstraint("ticker"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(32), unique=True)
+    shares: Mapped[float] = mapped_column(Float)
+    avg_cost: Mapped[float] = mapped_column(Float)
+    opened_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class MonthlyTrade(Base):
+    """Executed trade log for the monthly portfolio."""
+
+    __tablename__ = "monthly_trades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(32), index=True)
+    side: Mapped[str] = mapped_column(String(4))  # BUY | SELL
+    shares: Mapped[float] = mapped_column(Float)
+    price: Mapped[float] = mapped_column(Float)
+    cash_after: Mapped[float] = mapped_column(Float)
+    reason: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class MonthlyAllowance(Base):
+    """Monthly imaginary deposit log for the monthly portfolio."""
+
+    __tablename__ = "monthly_allowances"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    amount: Mapped[float] = mapped_column(Float)
+    month: Mapped[str] = mapped_column(String(7), unique=True)  # YYYY-MM
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class MonthlySnapshot(Base):
+    """Equity-curve snapshot taken after each monthly rebalance."""
+
+    __tablename__ = "monthly_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    cash: Mapped[float] = mapped_column(Float)
+    positions_value: Mapped[float] = mapped_column(Float)
+    total_equity: Mapped[float] = mapped_column(Float)
+    allowance_total: Mapped[float] = mapped_column(Float, default=0)
+
+
+class MonthlyRebalance(Base):
+    """Audit log: one row per monthly rebalance decision.
+
+    ``picked`` / ``held_before`` are comma-joined ticker lists; ``snapshot``
+    holds the JSON eligibility frame (factor values per ticker) so every
+    decision is explainable after the fact, like stockstrat's holdings.csv.
+    """
+
+    __tablename__ = "monthly_rebalances"
+    __table_args__ = (UniqueConstraint("rebal_month",),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rebal_month: Mapped[str] = mapped_column(String(7))  # YYYY-MM (decision month)
+    rebal_date: Mapped[datetime] = mapped_column(DateTime)  # decision trading day
+    held_before: Mapped[str] = mapped_column(Text, default="")
+    picked: Mapped[str] = mapped_column(Text, default="")
+    n_new: Mapped[int] = mapped_column(Integer, default=0)
+    snapshot: Mapped[str] = mapped_column(Text, default="")  # JSON eligibility frame
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
 
 engine = create_async_engine(settings.database_url)
 Session = async_sessionmaker(engine, expire_on_commit=False)

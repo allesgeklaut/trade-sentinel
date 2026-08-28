@@ -67,6 +67,23 @@ class Settings(BaseSettings):
     sim_benchmark_enabled: bool = True
     sim_benchmark_ticker: str = "URTH"  # iShares MSCI World ETF
 
+    # --- Monthly qv-mom portfolio (separate paper portfolio) ---------------
+    # stockstrat qv-mom-v1: top-10 quality-value-momentum, monthly rebalance
+    # on the last trading day, hysteresis band, equal weight. Research record:
+    # stockstrat backtest 2016-11..2026-08 on diversified-plus (CAGR 29.9%)
+    # and S&P 500 (CAGR 20.4%); on the small curated universe the result sat
+    # inside the random-10 band — the edge is demonstrated on broad universes.
+    sim_monthly_enabled: bool = True
+    sim_monthly_universe: str = "diversified-plus"
+    sim_monthly_contribution: float = 1000.0
+    sim_monthly_start_cash: float = 0.0
+    sim_monthly_target_n: int = 10          # portfolio size
+    sim_monthly_hold_band: int = 20         # hysteresis: held names stay while in top-N of the ranking
+    sim_monthly_min_mcap: float = 5e9       # USD
+    sim_monthly_min_dollar_vol: float = 1e7  # USD, 20-day avg of close*volume
+    sim_monthly_min_history_days: int = 253  # trading days of valid closes required
+    sim_monthly_cost_oneway: float = 0.0010  # paper friction, one-way bps on notional swapped
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

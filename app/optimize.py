@@ -27,10 +27,11 @@ import json
 import logging
 import math
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import delete as sa_delete, func, select
 
 from .analysis import (
     MIN_CANDLES,
@@ -2128,7 +2129,173 @@ def _print_walkforward_summary(results: list[_WindowResult]) -> None:
     print(f"\n  Positive-return windows: {pos_windows}/{n}")
 
 
+async def _prune_candles(before: str, dry_run: bool) -> None:
+    """Delete candle rows strictly before `before` (YYYY-MM-DD).
+
+    Rationale: the monthly backtest cannot start earlier than the first month
+    with eligible fundamentals (~2022 for the yfinance feed), and the daily
+    engine only needs ~2y of history — old rows are dead weight. The FX
+    pseudo-tickers and every ticker keep everything after the cutoff."""
+    from .db import Candle
+    cutoff = datetime.fromisoformat(before).replace(tzinfo=timezone.utc)
+    async with Session() as s:
+        n = (await s.scalar(select(func.count()).select_from(Candle)
+                            .where(Candle.timestamp < cutoff))) or 0
+        total = (await s.scalar(select(func.count()).select_from(Candle))) or 0
+        if dry_run:
+            print(f"dry run: would delete {n} of {total} candles before {cutoff.date()}")
+            return
+        await s.execute(sa_delete(Candle).where(Candle.timestamp < cutoff))
+        await s.commit()
+        print(f"deleted {n} of {total} candles before {cutoff.date()}")
+
+
+async def _monthly_backtest(start: str | None, end: str | None, universe: str,
+                            contribution: float, verbose: bool) -> None:
+    """DCA backtest of the monthly qv-mom-v1 strategy on stored candles.
+
+    Mirrors stockstrat's run_dca: at the last trading day of each month,
+    deposit `contribution`, pick the top-N with hysteresis from point-in-time
+    fundamentals, and trade at that day's close (10 bps one-way on swapped
+    notional). Reports the money-weighted IRR like the stockstrat results.
+    """
+    from . import monthly as monthly_mod
+    from . import fundamentals as fundamentals_mod
+
+    tickers = universe_tickers(universe)
+    logger.info("Monthly backtest universe: %d tickers", len(tickers))
+
+    close, vol = await monthly_mod.load_frames(tickers, None)
+    if close.empty:
+        print("No candle data found. Run the monthly rebalance (or a data refresh) first.")
+        return
+    fund = await fundamentals_mod.load_fundamentals(tickers)
+    logger.info("Frames: %d days x %d tickers; fundamentals for %d tickers",
+                len(close), close.shape[1], len(fund))
+
+    idx = pd.DatetimeIndex(close.index)
+    if start:
+        idx = idx[idx >= pd.Timestamp(start)]
+    if end:
+        idx = idx[idx <= pd.Timestamp(end)]
+    if len(idx) < 300:
+        print(f"Not enough history ({len(idx)} days) for a monthly backtest "
+              f"(need > 252 trading days for momentum warmup).")
+        return
+
+    # last trading day of each month within the window
+    months: list[pd.Timestamp] = []
+    for ym in sorted({(d.year, d.month) for d in idx}):
+        sub = idx[(idx.year == ym[0]) & (idx.month == ym[1])]
+        if len(sub):
+            months.append(sub[-1])
+
+    # eligibility frame per rebalance date is the expensive part — cache by month
+    frame_cache: dict[pd.Timestamp, pd.DataFrame | None] = {}
+    for i, d in enumerate(months):
+        frame_cache[d] = await asyncio.to_thread(
+            monthly_mod.eligible_frame, d, close, vol, fund)
+        if (i + 1) % 12 == 0:
+            logger.info("eligibility %d/%d", i + 1, len(months))
+
+    # Drop dead months: yfinance fundamentals only cover ~4-5 years, so early
+    # rebalances have zero eligible names (the strategy would hold cash at 0%
+    # while contributions pile up — reporting IRR over that period would be
+    # meaningless, not conservative). Start at the first month with an
+    # eligible frame; the 253d momentum warmup needs no extra headroom because
+    # eligibility already requires the price history.
+    first_live = next((d for d in months
+                       if frame_cache[d] is not None and frame_cache[d]["eligible"].any()), None)
+    if first_live is None:
+        print("No month has eligible names (fundamentals coverage too thin?). "
+              "Run the monthly rebalance once to fetch fundamentals, then retry.")
+        return
+    if first_live != months[0]:
+        skipped = [d for d in months if d < first_live]
+        print(f"Trimming {len(skipped)} months before {first_live.date()}: "
+              f"no eligible names (fundamentals not yet public).")
+        months = [d for d in months if d >= first_live]
+
+    cost = settings.sim_monthly_cost_oneway
+    value, contributed = 0.0, 0.0
+    holdings: list[str] = []
+    weights: dict[str, float] | None = None
+    curve: list[tuple[pd.Timestamp, float, float]] = []
+    churns: list[float] = []
+    picks_hist: list[tuple[str, list[str]]] = []
+
+    def period_ret(d0: pd.Timestamp, d1: pd.Timestamp, names: list[str]) -> float:
+        if not names:
+            return 0.0
+        r = (close.loc[d1].reindex(names) / close.loc[d0].reindex(names) - 1.0).dropna()
+        return float(r.mean()) if len(r) else 0.0
+
+    for i, d in enumerate(months):
+        if i > 0:
+            value *= 1.0 + period_ret(months[i - 1], d, holdings)
+        value += contribution
+        contributed += contribution
+        frame = frame_cache[d]
+        picks, _ = monthly_mod.pick_portfolio(d, close, vol, fund, holdings, frame) if frame is not None else (holdings, None)
+        adds = len(set(picks) - set(holdings))
+        if holdings and picks:
+            turn = adds / max(len(picks), 1)
+        elif holdings or picks:
+            turn = 1.0
+        else:
+            turn = 0.0
+        value *= 1.0 - turn * cost      # name swaps
+        value -= contribution * cost    # deploying fresh cash
+        churns.append(turn)
+        curve.append((d, value, contributed))
+        if picks != holdings:
+            picks_hist.append((d.strftime("%Y-%m"), list(picks)))
+        holdings = list(picks)
+
+    n_years = max((months[-1] - months[0]).days / 365.25, 1e-9)
+    # money-weighted IRR: contribution * sum((1+r)^k) = final value
+    n = len(months)
+
+    def f(r: float) -> float:
+        return contribution * sum((1.0 + r) ** k for k in range(n)) - value
+
+    lo, hi = -0.90, 1.0
+    if f(lo) > 0:
+        irr = -1.0
+    else:
+        for _ in range(200):
+            mid = (lo + hi) / 2.0
+            if f(mid) < 0:
+                lo = mid
+            else:
+                hi = mid
+        irr = (1.0 + (lo + hi) / 2.0) ** 12 - 1.0
+
+    print(f"\n=== Monthly qv-mom backtest [{universe}] {months[0].date()}..{months[-1].date()} ===")
+    print(f"  contributions: {n} x ${contribution:,.0f} = ${contributed:,.0f}")
+    print(f"  final value:   ${value:,.0f}  (multiple {value / max(contributed, 1e-9):.2f}x)")
+    print(f"  money-weighted IRR: {irr:.2%}/yr   avg monthly turnover: {sum(churns) / len(churns):.1%}")
+    print(f"  (paper costs: {cost * 1e4:.0f} bps one-way; fundamentals are yfinance point-in-time approximations)")
+    if verbose:
+        print("\nLast 12 rebalances:")
+        for m, picks in picks_hist[-12:]:
+            print(f"  {m}: {', '.join(picks)}")
+
+
 async def _main(args: argparse.Namespace) -> None:
+    if args.command == "prune-candles":
+        await _prune_candles(args.before, args.dry_run)
+        return
+
+    if args.command == "monthly-backtest":
+        await _monthly_backtest(
+            args.start, args.end,
+            args.universe or settings.sim_monthly_universe,
+            args.contribution if args.contribution is not None else settings.sim_monthly_contribution,
+            args.picks,
+        )
+        return
+
     tickers = _candidate_tickers()
     logger.info("Loading series for %d tickers...", len(tickers))
     series = await _load_series(tickers)
@@ -2465,6 +2632,23 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="With --failure-marker: equity drawdown %% below peak "
                           "that counts as failure (default 7.0)")
     lwf.add_argument("--trades", action="store_true", help="Print every LLM trade per window")
+
+    mb = sub.add_parser("monthly-backtest",
+                        help="DCA backtest of the monthly qv-mom strategy on stored candles")
+    mb.add_argument("--start", default=None, help="YYYY-MM-DD inclusive start")
+    mb.add_argument("--end", default=None, help="YYYY-MM-DD inclusive end")
+    mb.add_argument("--universe", default=None,
+                    help="Universe name (default: sim_monthly_universe)")
+    mb.add_argument("--contribution", type=float, default=None,
+                    help="Monthly contribution in USD (default: sim_monthly_contribution)")
+    mb.add_argument("--picks", action="store_true", help="Print the last 12 rebalance picks")
+
+    pc = sub.add_parser("prune-candles",
+                        help="Delete candle rows before a cutoff date (frees DB space, "
+                             "does not affect the daily engine which only needs ~2y)")
+    pc.add_argument("--before", default="2016-01-01",
+                    help="YYYY-MM-DD: delete candles strictly before this date (default 2016-01-01)")
+    pc.add_argument("--dry-run", action="store_true", help="Only report what would be deleted")
 
     return p
 

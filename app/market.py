@@ -26,7 +26,11 @@ RANGES = {
 }
 
 def yahoo_history(ticker, period="2y"):
-    frame=yf.Ticker(ticker).history(period=period,interval="1d",auto_adjust=False,actions=False,raise_errors=True)
+    # auto_adjust=True: split/dividend-adjusted OHLC. The monthly qv-mom
+    # strategy needs adjusted closes for 12-1 momentum (a raw close series
+    # fakes a crash at every ex-dividend/split date); the daily technical
+    # engine uses the same series, so indicators are consistent everywhere.
+    frame=yf.Ticker(ticker).history(period=period,interval="1d",auto_adjust=True,actions=False,raise_errors=True)
     if frame.empty: raise ValueError(f"No Yahoo Finance daily data for {ticker}")
     frame=frame.replace([np.inf,-np.inf],np.nan).dropna(subset=["Open","High","Low","Close"])
     if frame.empty: raise ValueError(f"No valid Yahoo Finance daily data for {ticker}")
