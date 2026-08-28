@@ -194,26 +194,31 @@ class ReplayParams:
 
 # Sector groupings for the global-large-cap universe. Used by the sector
 # diversification cap to prevent correlated positions from concentrating risk.
+# Covers both global-large-cap and diversified-plus (the + extensions added
+# 2026-08: semis, networking, defence primes, electrification, cyber, AI apps).
 SECTORS: dict[str, set[str]] = {
-    "semiconductors": {"NVDA", "AMD", "AVGO", "TSM", "ASML.AS", "MU", "ARM",
+    "semiconductors": {"NVDA", "AMD", "AVGO", "TSM", "ASML.AS", "ASML", "MU", "ARM",
                        "MRVL", "QCOM", "ANET", "SOXX", "SMH", "IFX.DE",
-                       "BESI.AS", "NEM.DE", "NOKIA.HE", "ENR.DE", "TER"},
+                       "BESI.AS", "NEM.DE", "NOKIA.HE", "ENR.DE", "TER",
+                       "AMAT", "LRCX", "KLAC", "SMCI"},
     "hyperscalers": {"MSFT", "GOOGL", "AMZN", "META", "ORCL", "PLTR", "NOW",
                      "CRM", "ADBE", "SNOW", "DDOG", "MDB", "AI", "SOUN",
                      "PATH", "UPST", "TEM", "RGTI", "IONQ", "RKLB", "CRWV",
-                     "FIG", "CRCL"},
+                     "FIG", "CRCL", "APP"},
     "european_tech": {"SAP.DE", "SIE.DE", "AMS.MC", "DSY.PA", "AI.PA",
                      "HO.PA", "SAAB-B.ST", "SOF.BR"},
-    "space_defense": {"SPCX", "ASTS", "LUNR", "RDW", "KTOS", "PL", "IRDM"},
-    "data_center_energy": {"ETN", "GEV", "CEG", "VST", "VRT"},
-    "industrial": {"ROK"},
-    "cybersecurity": {"CRWD", "PANW"},
+    "space_defense": {"SPCX", "ASTS", "LUNR", "RDW", "KTOS", "PL", "IRDM",
+                      "LMT", "RTX"},
+    "data_center_energy": {"ETN", "GEV", "CEG", "VST", "VRT", "PWR", "HUBB"},
+    "industrial": {"ROK", "ISRG", "CGNX", "DELL"},
+    "networking_legacy_it": {"IBM", "CSCO", "NET", "ZS"},
+    "cybersecurity": {"CRWD", "PANW", "ZS", "NET"},
     "medical": {"ISRG", "SYK", "MDT", "SHL.DE", "CRSP", "VEEV", "GH", "BNTX"},
     "pharma": {"LLY", "JNJ", "UNH", "PFE", "TMO", "XLV"},
     "financials": {"JPM", "GS", "V", "BLK", "XLF"},
     "consumer": {"WMT", "PG", "COST", "KO", "HD", "XLP"},
     "energy": {"XOM", "CVX", "XLE"},
-    "utilities_bonds": {"NEE", "TLT", "XLU"},
+    "utilities_bonds": {"NEE", "TLT", "XLU", "GLD"},
     "broad_etf": {"QQQ", "SPY", "VOO", "VT", "URTH"},
 }
 
