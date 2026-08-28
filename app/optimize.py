@@ -183,6 +183,12 @@ class ReplayParams:
     # e.g. 15 = don't buy if price has risen more than 15% in the last 5 days
     # (chasing a short-term spike that's prone to reversion).
     max_run_5d: float = 0.0
+    # Mirror on the downside: block BUYs into a 5-day crash (falling-knife
+    # guard). Only active when negative; 0 disables.
+    min_run_5d: float = 0.0
+    # Block BUYs into parabolic extensions: dist_above SMA200 > this %.
+    # 0 = disabled.
+    max_dist_above: float = 0.0
 
 
 # Sector groupings for the global-large-cap universe. Used by the sector
@@ -645,6 +651,8 @@ def _replay_params_to_strategy(p: ReplayParams) -> StrategyParams:
         stop_atr_mult=p.stop_atr_mult,
         use_atr_stop=p.use_atr_stop,
         max_run_5d=p.max_run_5d,
+        min_run_5d=p.min_run_5d,
+        max_dist_above=p.max_dist_above,
         relaxed_hold_strength=p.relaxed_hold_strength,
         relaxed_hold_limit=p.relaxed_hold_limit,
         max_sector_pct=p.max_sector_pct,
@@ -708,6 +716,7 @@ def _signals_for_day_from_bytime(
                 "atr_stop": row.get("atr_stop"),
                 "run_5d": row.get("run_5d"),
                 "atr14": row.get("atr14"),
+                "dist_above": row.get("dist_above"),
             },
         }
     return signals
@@ -757,6 +766,8 @@ async def _hybrid_replay(
     veto_only: bool = False,
     no_llm_sells: bool = True,
     minimal_prompt: bool = False,
+    mode_aware: bool = False,
+    llm_max_positions: int = 0,
     marker_gated: bool = False,
     failure_marker: bool = False,
     failure_stop_outs: int = 2,
@@ -790,7 +801,7 @@ async def _hybrid_replay(
     news section is omitted from the context, same as a live cycle with
     SEARXNG_URL unset.
     """
-    from .sim import _LLM_SYSTEM_PROMPT, _LLM_MINIMAL_SYSTEM_PROMPT, _PURE_LLM_SYSTEM_PROMPT, _build_llm_context, _parse_llm_decisions, _week_diff
+    from .sim import _LLM_SYSTEM_PROMPT, _LLM_MINIMAL_SYSTEM_PROMPT, _LLM_MODE_AWARE_MINIMAL_PROMPT, _PURE_LLM_SYSTEM_PROMPT, _build_llm_context, _parse_llm_decisions, _week_diff
 
     # Build the global timeline and per-ticker day index (same as _replay).
     all_days: set[str] = set()
@@ -867,6 +878,11 @@ async def _hybrid_replay(
                 equity_curve.append({"time": day, "equity": 0.0})
                 invested_curve.append(cumulative_invested)
                 continue
+
+            # Track per-position peaks (mirrors _replay) so the ATR trailing
+            # stop and any future trailing logic see the same state in both
+            # engines.
+            pf.update_peaks(prices)
 
             # --- 1. Deterministic PROPOSE phase (no mutation) ---
             signals = _signals_for_day(series, by_time, day, params)
@@ -949,9 +965,11 @@ async def _hybrid_replay(
                 context = _build_llm_context(valuation, proposals, signals, news,
                                             pure_llm=pure_llm,
                                             trade_history=list(reversed(pf.trades[-15:]))[:12],
-                                            minimal=minimal_prompt)
+                                            minimal=minimal_prompt or mode_aware,
+                                            max_positions=llm_max_positions)
                 system_prompt = (
-                    _LLM_MINIMAL_SYSTEM_PROMPT if minimal_prompt
+                    _LLM_MODE_AWARE_MINIMAL_PROMPT if mode_aware
+                    else _LLM_MINIMAL_SYSTEM_PROMPT if minimal_prompt
                     else _PURE_LLM_SYSTEM_PROMPT if pure_llm
                     else _LLM_SYSTEM_PROMPT)  # shared prompt: main-branch parity
                 logger.info("  llm phase: calling LLM (%d signals, %d proposals)...",
@@ -1010,14 +1028,21 @@ async def _hybrid_replay(
                             if price is None or price <= 0 or action == "HOLD":
                                 continue
                             if action == "BUY":
-                                # Max-positions cap: block NEW positions when at
-                                # the cap, but still allow topping up tickers
-                                # already held.
-                                if (params.max_positions > 0
-                                        and len(held_tickers) >= params.max_positions
+                                # Max-positions cap: block NEW positions when
+                                # at the cap, but still allow topping up
+                                # tickers already held. ``llm_max_positions``
+                                # raises the cap for LLM BUYs only — the
+                                # deterministic engine still caps at
+                                # ``params.max_positions``; the extra slots
+                                # belong to the LLM's picks.
+                                cap = (llm_max_positions
+                                       if llm_max_positions > 0
+                                       else params.max_positions)
+                                if (cap > 0
+                                        and len(held_tickers) >= cap
                                         and tu not in held_tickers):
                                     logger.info("  llm BUY %s skipped (max-positions cap %d)",
-                                                tu, params.max_positions)
+                                                tu, cap)
                                     continue
                                 budget = plan.get(tu)
                                 if budget is None:
@@ -1044,11 +1069,27 @@ async def _hybrid_replay(
                 if not pure_llm:
                     last_review_week = week
             else:
-                # No LLM configured, or not a review week: execute all
-                # proposals as-is (deterministic). On non-review weeks the
-                # engine runs alone — the LLM only reviews once per week.
+                # No LLM configured, or not a review day: execute all
+                # proposals as-is (deterministic). On non-review days the
+                # engine runs alone — the LLM only reviews on review days.
+                #
+                # Two-phase propose/execute, mirroring _replay exactly: SELLs
+                # execute first, then BUYs are RE-PROPOSED against the
+                # post-SELL state so a freed slot can be refilled the same
+                # day. Without this, a stop-out SELL and a same-day re-entry
+                # BUY (both proposed in one batch) would be blocked by the
+                # max-positions cap — a structural divergence from the det
+                # benchmark that masqueraded as "LLM alpha" (+5.48% on the
+                # 90d bull window with ZERO LLM calls). On review days we
+                # keep the single-phase batch because the LLM reviews the
+                # pre-SELL proposal list (that's what the live sim shows it).
                 for p in proposals:
-                    _execute_proposal(pf, p)
+                    if p["side"] == "SELL":
+                        _execute_proposal(pf, p)
+                proposals2 = _deterministic_propose_replay(pf, by_time, prices, day, params)
+                for p in proposals2:
+                    if p["side"] == "BUY":
+                        _execute_proposal(pf, p)
 
             # Record equity
             total_equity = pf.equity(prices)
@@ -1515,6 +1556,11 @@ def _live_sim_params() -> ReplayParams:
         # the replay's buy candidates match what the engine would actually
         # have considered.
         max_run_5d=settings.sim_max_run_5d,
+        # Entry guards mirror the live sim's settings — they are OPT-IN
+        # (defaults 0 = disabled) because the A/B showed a return/dd
+        # trade-off, not a free lunch. See config.py + strategy.py.
+        min_run_5d=settings.sim_min_run_5d,
+        max_dist_above=settings.sim_max_dist_above,
     )
 
 
@@ -1949,6 +1995,8 @@ async def _llm_walkforward(
     no_llm_sells: bool = True,
     news: dict[str, list[dict]] | None = None,
     minimal_prompt: bool = False,
+    mode_aware: bool = False,
+    llm_max_positions: int = 0,
     marker_gated: bool = False,
     failure_marker: bool = False,
     failure_stop_outs: int = 2,
@@ -2019,6 +2067,8 @@ async def _llm_walkforward(
                                    veto_only=veto_only,
                                    no_llm_sells=no_llm_sells,
                                    minimal_prompt=minimal_prompt,
+                                   mode_aware=mode_aware,
+                                   llm_max_positions=llm_max_positions,
                                    marker_gated=marker_gated,
                                    failure_marker=failure_marker,
                                    failure_stop_outs=failure_stop_outs,
@@ -2106,14 +2156,20 @@ async def _main(args: argparse.Namespace) -> None:
         # the live sim doesn't set, so it stays opt-in via --regime.
         params = _live_sim_params()
         params.regime_filter = getattr(args, "regime", False)
+        if getattr(args, "no_entry_guards", False):
+            params.min_run_5d = 0.0
+            params.max_dist_above = 0.0
         res = _replay(series, params, start=args.start, end=args.end, regime=regime)
         label = "Backtest (live sim risk config)"
         if params.regime_filter:
             label += " + regime filter"
+        if getattr(args, "no_entry_guards", False):
+            label += " [guards OFF]"
         _print_result(res, label)
         print(f"  Risk config: max_positions={params.max_positions}, "
               f"stop={params.stop_type} {params.stop_pct:g}%, "
               f"atr_stop={params.use_atr_stop}, max_run_5d={params.max_run_5d:g}%, "
+              f"min_run_5d={params.min_run_5d:g}%, max_dist_above={params.max_dist_above:g}%, "
               f"max_pos_pct={params.max_position_pct:g}%, "
               f"min_cash_pct={params.min_cash_pct:g}%")
         if args.trades:
@@ -2240,6 +2296,9 @@ async def _main(args: argparse.Namespace) -> None:
                   "llm-walkforward needs the LLM. Aborting.")
             return
         params = _live_sim_params()
+        if getattr(args, "no_entry_guards", False):
+            params.min_run_5d = 0.0
+            params.max_dist_above = 0.0
         pure_llm = getattr(args, "pure_llm", False)
         n_windows = args.windows
         days_per_window = args.days_per_window
@@ -2247,6 +2306,8 @@ async def _main(args: argparse.Namespace) -> None:
         veto_only = getattr(args, "veto_only", False)
         no_llm_sells = not getattr(args, "allow_llm_sells", False)
         minimal_prompt = getattr(args, "minimal_prompt", False)
+        mode_aware = getattr(args, "mode_aware_prompt", False)
+        llm_max_positions = getattr(args, "llm_max_positions", 0)
         marker_gated = getattr(args, "marker_gated", False)
         failure_marker = getattr(args, "failure_marker", False)
         failure_stop_outs = getattr(args, "failure_stop_outs", 2)
@@ -2267,6 +2328,8 @@ async def _main(args: argparse.Namespace) -> None:
                 veto_only=veto_only,
                 no_llm_sells=no_llm_sells,
                 minimal_prompt=minimal_prompt,
+                mode_aware=mode_aware,
+                llm_max_positions=llm_max_positions,
                 marker_gated=marker_gated,
                 failure_marker=failure_marker,
                 failure_stop_outs=failure_stop_outs,
@@ -2297,6 +2360,9 @@ def _build_parser() -> argparse.ArgumentParser:
     b.add_argument("--cash", action="store_true", help="Print cash-utilization summary (idle cash, max-positions cap)")
     b.add_argument("--regime", action="store_true", help="Enable market regime filter (block BUYs when market < SMA200)")
     b.add_argument("--regime-ticker", default="URTH", help="Benchmark ticker for the regime filter")
+    b.add_argument("--no-entry-guards", action="store_true",
+                   help="Disable the falling-knife (min_run_5d) and parabolic-extension "
+                        "(max_dist_above) BUY blocks — A/B escape hatch for benchmarking")
 
     s = sub.add_parser("sweep", help="Grid-search thresholds")
     s.add_argument("--start", default=None)
@@ -2366,9 +2432,23 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="Hybrid: allow LLM-initiated SELLs (default: engine owns "
                           "exits via stops and SELL signals)")
     lwf.add_argument("--minimal-prompt", action="store_true",
-                     help="Use the minimal system prompt: no methodology, no regime "
-                          "guidance, no veto rules — just portfolio + signals and "
-                          "BUY/SELL/HOLD instructions")
+                      help="Use the minimal system prompt: no methodology, no regime "
+                           "guidance, no veto rules — just portfolio + signals and "
+                           "BUY/SELL/HOLD instructions")
+    lwf.add_argument("--mode-aware-prompt", action="store_true",
+                      help="Use the mode-aware minimal prompt: tells the LLM the engine "
+                           "owns exits (its SELLs are ignored, proposals auto-execute) "
+                           "and its only job is to add high-quality BUYs, with a compact "
+                           "entry-quality rubric. Implies the minimal context.")
+    lwf.add_argument("--llm-max-positions", type=int, default=0,
+                      help="Raise the max-positions cap for LLM BUYs only "
+                           "(default 0 = use the engine's max_positions). The "
+                           "deterministic engine still caps at max_positions; "
+                           "the extra slots above it belong to the LLM's picks.")
+    lwf.add_argument("--no-entry-guards", action="store_true",
+                      help="Disable the falling-knife (min_run_5d) and "
+                           "parabolic-extension (max_dist_above) BUY blocks in "
+                           "both the det and hybrid replays — A/B escape hatch")
     lwf.add_argument("--marker-gated", action="store_true",
                      help="Deterministic marker: only consult the LLM on review "
                           "days when the engine actually PROPOSES trades (no "
