@@ -483,7 +483,12 @@ def _snapshot_json(frame: pd.DataFrame | None) -> str:
 
 
 async def refresh_data(tickers: list[str]) -> tuple[list[str], dict[str, str]]:
-    """Refresh candles (+ FX pairs) and fundamentals for the universe."""
+    """Refresh candles (+ FX pairs) and fundamentals for the universe.
+
+    Fundamentals source priority: SEC EDGAR for US filers (real filed dates,
+    history to ~2009), yfinance fallback for CIK-less listings (ETFs, European
+    exchanges). Same split as the stockstrat research pipeline."""
+    from . import edgar
     from .market import refresh
     refresh_errors: list[str] = []
     wanted = list(tickers) + sorted({pm[0] for t in tickers if (pm := fundamentals_mod._suffix_fx(t))})
@@ -492,7 +497,11 @@ async def refresh_data(tickers: list[str]) -> tuple[list[str], dict[str, str]]:
             await refresh(t, "10y")
         except Exception as e:
             refresh_errors.append(f"{t}: {e}")
-    fund_status = await fundamentals_mod.refresh_universe(tickers=tickers)
+    fund_status: dict[str, str]
+    if settings.sim_monthly_fundamentals_source == "edgar":
+        fund_status = await edgar.refresh_universe_mixed(tickers=tickers)
+    else:
+        fund_status = await fundamentals_mod.refresh_universe(tickers=tickers)
     return refresh_errors, fund_status
 
 

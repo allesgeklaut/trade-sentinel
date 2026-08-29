@@ -216,10 +216,18 @@ class Fundamental(Base):
     Tags follow the SEC XBRL names the scoring math expects:
     NetIncomeLoss, StockholdersEquity, NetCashProvidedByUsedInOperatingActivities,
     PaymentsToAcquirePropertyPlantAndEquipment, CommonStockSharesOutstanding.
+
+    ``source`` records where the fact came from: 'edgar' (SEC companyfacts,
+    real filed dates, 2007+) or 'yfinance' (quarterly/annual statements,
+    filed = period_end + 45d approximation).
     """
 
     __tablename__ = "fundamentals"
-    __table_args__ = (UniqueConstraint("ticker", "tag", "start", "end"),)
+    # 'filed' is part of the unique key on purpose: EDGAR re-reports the same
+    # span in later filings (restatements), and point-in-time correctness needs
+    # every filed version kept — a rebalance must see the version that was
+    # public then, not the latest restatement. Dedup happens at read time.
+    __table_args__ = (UniqueConstraint("ticker", "tag", "start", "end", "filed", "source"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     ticker: Mapped[str] = mapped_column(String(32), index=True)
@@ -229,6 +237,25 @@ class Fundamental(Base):
     filed: Mapped[str] = mapped_column(String(10))  # YYYY-MM-DD public date
     val: Mapped[float] = mapped_column(Float)
     currency: Mapped[str] = mapped_column(String(8), default="USD")
+    source: Mapped[str] = mapped_column(String(16), default="yfinance")  # edgar | yfinance
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class SecCik(Base):
+    """Ticker -> SEC CIK mapping (SEC company_tickers.json snapshot).
+
+    Cached in the DB so EDGAR fetches don't re-download the ~10k-row file on
+    every run. ``cik = 0`` marks tickers checked and confirmed without a CIK
+    (ETFs, foreign listings): they fall back to yfinance fundamentals.
+    """
+
+    __tablename__ = "sec_ciks"
+    __table_args__ = (UniqueConstraint("ticker",),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(32), unique=True)
+    cik: Mapped[int] = mapped_column(Integer)  # 0 = known no-CIK
+    name: Mapped[str] = mapped_column(String(128), default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
@@ -352,3 +379,47 @@ async def init_db():
             )
         except Exception:
             pass  # column already exists
+        # Migration for fundamentals: add the `source` column (edgar|yfinance)
+        # and rebuild the unique constraint to (ticker, tag, start, end, filed,
+        # source) — EDGAR re-reports spans in later filings and point-in-time
+        # correctness needs every filed version kept. SQLite can't ALTER a
+        # UNIQUE constraint — rebuild the table the SQL-safe way.
+        from sqlalchemy import inspect as sa_inspect
+        insp = await conn.run_sync(lambda sync_conn: sa_inspect(sync_conn))
+        has_fund = await conn.run_sync(lambda sc: insp.has_table("fundamentals"))
+        cols = {c["name"] for c in (await conn.run_sync(lambda sc: insp.get_columns("fundamentals")))} if has_fund else set()
+        uq_cols: set[str] = set()
+        if has_fund:
+            uqs = await conn.run_sync(lambda sc: insp.get_unique_constraints("fundamentals"))
+            for uq in uqs:
+                uq_cols.update(uq.get("column_names", []))
+        need_rebuild = has_fund and ("source" not in cols or "filed" not in uq_cols)
+        if need_rebuild:
+            await conn.execute(text("""
+                CREATE TABLE fundamentals_new (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    ticker VARCHAR(32) NOT NULL,
+                    tag VARCHAR(64) NOT NULL,
+                    start VARCHAR(10),
+                    "end" VARCHAR(10) NOT NULL,
+                    filed VARCHAR(10) NOT NULL,
+                    val FLOAT NOT NULL,
+                    currency VARCHAR(8) NOT NULL DEFAULT 'USD',
+                    source VARCHAR(16) NOT NULL DEFAULT 'yfinance',
+                    updated_at DATETIME NOT NULL,
+                    UNIQUE (ticker, tag, start, "end", filed, source)
+                )
+            """))
+            await conn.execute(text("""
+                INSERT INTO fundamentals_new
+                    (id, ticker, tag, start, "end", filed, val, currency, source, updated_at)
+                SELECT id, ticker, tag, start, "end", filed, val, currency,
+                       source, updated_at
+                FROM fundamentals
+            """))
+            await conn.execute(text("DROP TABLE fundamentals"))
+            await conn.execute(text("ALTER TABLE fundamentals_new RENAME TO fundamentals"))
+            await conn.execute(text(
+                "CREATE INDEX ix_fundamentals_ticker ON fundamentals (ticker)"))
+            await conn.execute(text(
+                "CREATE INDEX ix_fundamentals_tag ON fundamentals (tag)"))

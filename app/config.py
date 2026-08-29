@@ -83,6 +83,7 @@ class Settings(BaseSettings):
     sim_monthly_min_dollar_vol: float = 1e7  # USD, 20-day avg of close*volume
     sim_monthly_min_history_days: int = 253  # trading days of valid closes required
     sim_monthly_cost_oneway: float = 0.0010  # paper friction, one-way bps on notional swapped
+    sim_monthly_fundamentals_source: str = "edgar"  # edgar (US filers) + yfinance fallback | yfinance-only
 
     model_config = SettingsConfigDict(
         env_file=".env",
