@@ -235,10 +235,10 @@ async def refresh_universe(universe: str | None = None, tickers: list[str] | Non
                 continue
             async with Session() as s:
                 for f in facts:
-                    stmt = sqlite_insert(Fundamental).values(ticker=t, **f)
+                    stmt = sqlite_insert(Fundamental).values(ticker=t, source="yfinance", **f)
                     stmt = stmt.on_conflict_do_update(
-                        index_elements=["ticker", "tag", "start", "end"],
-                        set_={"filed": stmt.excluded.filed, "val": stmt.excluded.val,
+                        index_elements=["ticker", "tag", "start", "end", "filed", "source"],
+                        set_={"val": stmt.excluded.val,
                               "currency": stmt.excluded.currency,
                               "updated_at": stmt.excluded.updated_at},
                     )
@@ -252,12 +252,22 @@ async def refresh_universe(universe: str | None = None, tickers: list[str] | Non
 
 
 def _load_fundamentals_rows(tickers: list[str], rows: list) -> dict[str, dict[str, list[dict]]]:
-    """Build {ticker: {tag: [fact, ...]}} from Fundamental ORM rows."""
-    out: dict[str, dict[str, list[dict]]] = {}
+    """Build {ticker: {tag: [fact, ...]}} from Fundamental ORM rows.
+
+    When a ticker has facts from both sources (edgar + yfinance), EDGAR wins:
+    its filed dates are real and its values as-reported. Dropping the yfinance
+    rows for those tickers avoids mixing a restated view into a point-in-time
+    series."""
+    by_ticker_source: dict[str, dict[str, list]] = {}
     for r in rows:
-        out.setdefault(r.ticker, {}).setdefault(r.tag, []).append({
-            "start": r.start, "end": r.end, "filed": r.filed, "val": r.val,
-        })
+        by_ticker_source.setdefault(r.ticker, {}).setdefault(getattr(r, "source", "yfinance"), []).append(r)
+    out: dict[str, dict[str, list[dict]]] = {}
+    for t, by_src in by_ticker_source.items():
+        chosen = by_src.get("edgar") or by_src.get("yfinance") or []
+        for r in chosen:
+            out.setdefault(t, {}).setdefault(r.tag, []).append({
+                "start": r.start, "end": r.end, "filed": r.filed, "val": r.val,
+            })
     return out
 
 

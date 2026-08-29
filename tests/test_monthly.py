@@ -51,6 +51,8 @@ async def mem_db(monkeypatch):
     monkeypatch.setattr(db_mod, "Session", session_factory)
     import app.fundamentals as fund_mod
     monkeypatch.setattr(fund_mod, "Session", session_factory)
+    import app.edgar as edgar_mod
+    monkeypatch.setattr(edgar_mod, "Session", session_factory)
 
     async with session_factory() as s:
         s.add(MonthlyAccount(id=1, cash=settings.sim_monthly_start_cash))
@@ -389,3 +391,108 @@ async def test_run_monthly_cycle_gate(mem_db, monkeypatch):
 
 async def _coro(value):
     return value
+
+# ---------------------------------------------------------------------------
+# EDGAR source (app.edgar)
+# ---------------------------------------------------------------------------
+
+def _companyfacts_payload() -> dict:
+    """Minimal companyfacts-shaped payload: NI with a restatement, shares
+    under dei, equity incl. a fallback-tag hole, capex as negative."""
+    return {
+        "facts": {
+            "us-gaap": {
+                "StockholdersEquity": {"units": {"USD": [
+                    {"start": None, "end": "2020-06-30", "filed": "2020-08-05", "val": 2e9},
+                    {"start": None, "end": "2021-06-30", "filed": "2021-08-05", "val": 3e9},
+                ]}},
+                "NetIncomeLoss": {"units": {"USD": [
+                    {"start": "2020-07-01", "end": "2021-06-30", "filed": "2021-08-05", "val": 5e8},
+                ]}},
+                # issuer switched tags in 2022 -> primary NI has a hole for FY2022
+                "NetIncomeLossAvailableToCommonStockholdersBasic": {"units": {"USD": [
+                    {"start": "2021-07-01", "end": "2022-06-30", "filed": "2022-08-04", "val": 6e8},
+                ]}},
+                "PaymentsToAcquirePropertyPlantAndEquipment": {"units": {"USD": [
+                    {"start": "2021-07-01", "end": "2022-06-30", "filed": "2022-08-04", "val": -1e8},
+                ]}},
+                "NetCashProvidedByUsedInOperatingActivities": {"units": {"USD": [
+                    {"start": "2021-07-01", "end": "2022-06-30", "filed": "2022-08-04", "val": 9e8},
+                ]}},
+            },
+            "dei": {
+                "EntityCommonStockSharesOutstanding": {"units": {"shares": [
+                    {"start": None, "end": "2021-06-30", "filed": "2021-08-05", "val": 1e8},
+                ]}},
+            },
+        }
+    }
+
+
+def test_parse_companyfacts_incl_fallbacks_and_dei():
+    from app.edgar import _parse_companyfacts
+    rec = _parse_companyfacts(_companyfacts_payload())
+    # primary tags present
+    assert "NetIncomeLoss" in rec and "StockholdersEquity" in rec
+    # dei shares mapped under the us-gaap-style name the strategy reads
+    assert rec["EntityCommonStockSharesOutstanding"][0]["val"] == 1e8
+    # fallback gap fill: NI now includes the FY2022 period from the alt tag
+    ni_ends = {e["end"] for e in rec["NetIncomeLoss"]}
+    assert "2022-06-30" in ni_ends
+    # fallback alt tags are consumed (not left as separate entries)
+    assert "NetIncomeLossAvailableToCommonStockholdersBasic" not in rec
+
+
+def test_edgar_facts_are_point_in_time_via_ttm():
+    """End-to-end: parse -> store shape -> TTM as of a date sees only public facts."""
+    from app.edgar import _parse_companyfacts
+    from app import monthly
+    rec = _parse_companyfacts(_companyfacts_payload())
+    d_late = pd.Timestamp("2022-09-30")   # FY2022 filed 2022-08-04 => public
+    assert monthly._ttm_as_of(rec["NetIncomeLoss"], d_late) == 6e8
+    d_early = pd.Timestamp("2022-07-01")  # before the FY2022 filing
+    assert monthly._ttm_as_of(rec["NetIncomeLoss"], d_early) == 5e8
+    # ROE input: equity instant fact as of date
+    eq = monthly._latest_as_of(rec["StockholdersEquity"], pd.Timestamp("2021-09-01"))
+    assert eq == ("2021-06-30", 3e9)
+
+
+async def test_load_prefers_edgar_over_yfinance(mem_db):
+    """When both sources exist for a ticker, the loader must serve EDGAR only."""
+    from app.db import Fundamental
+    from app import fundamentals as fund_mod
+    async with mem_db() as s:
+        s.add(Fundamental(ticker="EEE", tag="StockholdersEquity", start=None,
+                          end="2024-06-30", filed="2024-08-14", val=5e9,
+                          currency="USD", source="yfinance"))
+        s.add(Fundamental(ticker="EEE", tag="StockholdersEquity", start=None,
+                          end="2024-06-30", filed="2024-07-30", val=4e9,
+                          currency="USD", source="edgar"))
+        # yfinance-only ticker keeps working
+        s.add(Fundamental(ticker="FFF", tag="StockholdersEquity", start=None,
+                          end="2024-06-30", filed="2024-08-14", val=7e9,
+                          currency="USD", source="yfinance"))
+        await s.commit()
+    out = await fund_mod.load_fundamentals(["EEE", "FFF"])
+    assert out["EEE"]["StockholdersEquity"] == [
+        {"start": None, "end": "2024-06-30", "filed": "2024-07-30", "val": 4e9}]
+    assert out["FFF"]["StockholdersEquity"][0]["val"] == 7e9
+
+
+async def test_ensure_cik_map_uses_cache_and_handles_unknown(mem_db, monkeypatch):
+    from app import edgar
+    from app.db import SecCik
+    # pre-seed the cache: AAA known, BBB known-no-CIK
+    async with mem_db() as s:
+        s.add(SecCik(ticker="AAA", cik=123456))
+        s.add(SecCik(ticker="BBB", cik=0))
+        await s.commit()
+    # CCC unknown: would trigger a download; monkeypatch it out
+    def fail_get(url):
+        raise AssertionError("network hit for already-cached tickers")
+    monkeypatch.setattr(edgar, "_http_get", fail_get)
+    with pytest.raises(AssertionError):
+        await edgar.ensure_cik_map(["CCC"])
+    # cached tickers resolve without network
+    m = await edgar.ensure_cik_map(["AAA", "BBB"])
+    assert m == {"AAA": 123456, "BBB": 0}

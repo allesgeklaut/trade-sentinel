@@ -2280,7 +2280,8 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
     print(f"  contributions: {n} x ${contribution:,.0f} = ${contributed:,.0f}")
     print(f"  final value:   ${value:,.0f}  (multiple {value / max(contributed, 1e-9):.2f}x)")
     print(f"  money-weighted IRR: {irr:.2%}/yr   avg monthly turnover: {sum(churns) / len(churns):.1%}")
-    print(f"  (paper costs: {cost * 1e4:.0f} bps one-way; fundamentals are yfinance point-in-time approximations)")
+    print(f"  (paper costs: {cost * 1e4:.0f} bps one-way; fundamentals: SEC EDGAR point-in-time "
+          f"for US filers, yfinance approximation for CIK-less listings)")
     if verbose:
         print("\nLast 12 rebalances:")
         for m, picks in picks_hist[-12:]:
