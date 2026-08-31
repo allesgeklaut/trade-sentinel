@@ -405,6 +405,25 @@ async def monthly_run():
         return result
     return result
 
+@app.post('/api/monthly/refresh')
+async def monthly_refresh():
+    """Refresh candle data for the monthly portfolio's holdings (+ FX pairs)
+    so valuation/equity use current prices, without running a rebalance."""
+    from . import monthly
+    from sqlalchemy import select
+    async with monthly.Session() as s:
+        held = [p.ticker for p in (await s.scalars(select(monthly.MonthlyPosition))).all()]
+    pairs = sorted({pm[0] for t in held if (pm := monthly.fundamentals_mod._suffix_fx(t))})
+    from .market import refresh
+    refreshed, errors = [], []
+    for t in held + pairs:
+        try:
+            await refresh(t, "2y")
+            refreshed.append(t)
+        except Exception as e:
+            errors.append(f"{t}: {e}")
+    return {"refreshed": refreshed, "errors": errors}
+
 @app.post('/api/sim/chat')
 async def sim_chat_endpoint(req: ChatRequest):
     """Interactive chat with the sim portfolio manager LLM.
