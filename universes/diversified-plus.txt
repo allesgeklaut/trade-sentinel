@@ -1,0 +1,177 @@
+# trade-sentinel "diversified" universe + stockstrat extensions.
+#
+# Base: the trade-sentinel diversified.txt (92 symbols), reconstructed from
+# screenshots. Everything below the "+ EXTENSIONS" marker was added by
+# stockstrat and is NOT part of the original list. Extensions are US-listed
+# (SEC point-in-time EDGAR data, same quality as the rest of the US names),
+# except GLD which is a benchmark ETF.
+#
+# Research universe only: inclusion is not a recommendation.
+
+# --- original diversified universe (trade-sentinel) ---
+
+# AI compute, semiconductors and networking
+NVDA
+AMD
+AVGO
+TSM
+ASML.AS
+MU
+ARM
+MRVL
+QCOM
+ANET
+VRT
+
+# Hyperscalers and AI platforms
+MSFT
+GOOGL
+AMZN
+META
+ORCL
+PLTR
+NOW
+CRM
+ADBE
+SNOW
+DDOG
+MDB
+
+# AI applications, data, voice and automation
+AI
+SOUN
+PATH
+UPST
+TEM
+RGTI
+IONQ
+RKLB
+
+# AI infrastructure and recent AI-focused IPOs
+CRWV
+FIG
+CRCL
+
+# Space, connectivity and defence technology
+SPCX
+ASTS
+LUNR
+RDW
+KTOS
+PL
+IRDM
+
+# Global AI and technology listings
+SAP.DE
+SIE.DE
+IFX.DE
+AMS.MC
+DSY.PA
+AI.PA
+BESI.AS
+NEM.DE
+SOF.BR
+
+# European semiconductors, telecom infrastructure & deep tech
+NOKIA.HE
+ENR.DE
+HO.PA
+SAAB-B.ST
+
+# Data center power, cooling & energy infrastructure
+ETN
+GEV
+CEG
+VST
+
+# Industrial automation & robotics
+TER
+ROK
+
+# Cybersecurity infrastructure
+CRWD
+PANW
+
+# Biotech (section header lost between screenshots)
+GH
+BNTX
+
+# --- Diversifying sectors (added to reduce concentration risk) ---
+
+# Healthcare and pharma
+LLY
+JNJ
+UNH
+PFE
+TMO
+
+# Financials
+JPM
+GS
+V
+BLK
+
+# Consumer staples and discretionary
+WMT
+PG
+COST
+KO
+HD
+
+# Energy
+XOM
+CVX
+
+# Utilities and broad bonds
+NEE
+TLT
+
+# Broad benchmarks for relative context
+QQQ
+SOXX
+SMH
+SPY
+VOO
+XLF
+XLE
+XLV
+XLU
+VT
+
+# --- + EXTENSIONS (stockstrat additions, not in the original list) ---
+
+# Semis & AI hardware (US-listed -> EDGAR point-in-time)
+AMAT
+LRCX
+KLAC
+DELL
+SMCI
+
+# Networking / AI infrastructure
+IBM
+CSCO
+
+# ASML on the NYSE: same company as ASML.AS, but with real EDGAR filings
+ASML
+
+# Defence primes
+LMT
+RTX
+
+# Electrification & grid buildout
+HUBB
+PWR
+
+# Robotics (surgical + machine vision)
+ISRG
+CGNX
+
+# Cybersecurity
+ZS
+NET
+
+# AI applications
+APP
+
+# Diversifier benchmark
+GLD
