@@ -172,6 +172,15 @@ def load_frames_sync(tickers: list[str], rows: list, asof: datetime | None = Non
     drop = [c for c in close.columns if c.endswith("=X")]
     close = close.drop(columns=drop)
     vol = vol.drop(columns=[c for c in vol.columns if c not in close.columns])
+    # FX-only calendar rows: currency pairs also print on days US equities
+    # don't trade (holidays, today-before-tonight's-close). A trailing row
+    # without a single stock close would make eligible_frame see every
+    # ticker as invalid on the rebalance date — drop rows where the
+    # remaining (stock) columns are all NaN. This runs *after* FX
+    # conversion: a stock missing the FX-only day stays NaN there, so
+    # all-NaN rows identify themselves.
+    close = close.dropna(how="all")
+    vol = vol.reindex(columns=close.columns).loc[close.index]
     close = close.reindex(columns=[t for t in tickers if t in close.columns])
     vol = vol.reindex(columns=close.columns)
     return close, vol
