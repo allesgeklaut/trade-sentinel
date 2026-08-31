@@ -1639,6 +1639,10 @@
                     const n = r.refreshed.length, errs = r.errors.length;
                     ptrShowResult(errs === 0,
                         errs ? `${n} updated, ${errs} failed` : `Sim updated (${n} tickers)`);
+                } else if (document.getElementById('monthly-view').style.display !== 'none') {
+                    // Monthly view: re-read status/trades/equity/rebalances.
+                    await loadMonthlyAll();
+                    ptrShowResult(true, 'Monthly updated');
                 }
                 await new Promise(r => setTimeout(r, 1200));
                 ptrReset();
