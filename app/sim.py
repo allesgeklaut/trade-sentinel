@@ -2246,6 +2246,20 @@ async def _scheduler_loop():
         logger.info("Sim scheduler: next run at %s (in %.0f seconds)", target, wait_seconds)
         await asyncio.sleep(wait_seconds)
 
+        # Monthly qv-mom portfolio first: it only acts on the last trading
+        # day of the month, and a missed month has no catch-up — it must run
+        # even when the daily cycle is skipped below (a manual run holding
+        # the lock at wake time), or the whole month is silently missed.
+        try:
+            from .monthly import run_monthly_cycle
+            monthly_result = await run_monthly_cycle()
+            if monthly_result.get("skipped"):
+                logger.info("Monthly scheduler: skipped — %s", monthly_result.get("reason"))
+            else:
+                logger.info("Monthly rebalance complete: %d trades", len(monthly_result.get("trades", [])))
+        except Exception as e:
+            logger.error("Monthly rebalance failed: %s", e, exc_info=True)
+
         try:
             # Skip if a manual run is in flight (e.g. the user clicked "Run
             # Bot Now" shortly before the scheduled time). The lock check in

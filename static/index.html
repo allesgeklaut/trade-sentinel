@@ -910,6 +910,19 @@
             display: block
         }
 
+        #monthly-view {
+            display: none;
+            max-width: 1400px;
+            margin: auto;
+            padding: 18px
+        }
+
+        #monthly-trades, #monthly-positions, #monthly-rebalances {
+            max-height: 320px;
+            overflow-y: auto;
+            overflow-x: auto
+        }
+
         .sim-section {
             border: 1px solid #1d6030;
             padding: 14px;
@@ -1042,7 +1055,8 @@
     <header><b>TRADE SENTINEL // PAPER-ONLY RESEARCH TERMINAL</b>
         <div class="nav-toggle"><button id="nav-dashboard" class="nav-active"
                 onclick="showView('dashboard')">Dashboard</button><button id="nav-sim"
-                onclick="showView('sim')">Simulation</button></div><span id="status">loading</span>
+                onclick="showView('sim')">Simulation</button><button id="nav-monthly"
+                onclick="showView('monthly')">Monthly</button></div><span id="status">loading</span>
         <select id="llm-model" title="Active LLM backend / model" onchange="switchLLMModel()">
             <option value="">loading models…</option>
         </select>
@@ -1159,6 +1173,49 @@
                 <button type="button" onclick="clearSimChatHistory()" title="Clear conversation history">Clear</button>
             </form>
             <div id="sim-chat-trades" style="margin-top:6px"></div>
+        </div>
+    </section>
+    <section id="monthly-view">
+        <div class="sim-section">
+            <div id="monthly-summary"></div>
+        </div>
+        <div class="sim-section">
+            <div class="sim-section-title">Equity Curve (vs contributed)</div>
+            <div id="monthly-chart"></div>
+        </div>
+        <div class="sim-grid2">
+            <div class="sim-section">
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">POSITIONS</h3>
+                <div id="monthly-positions"></div>
+            </div>
+            <div class="sim-section">
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">REBALANCE LOG</h3>
+                <div id="monthly-rebalances"></div>
+            </div>
+        </div>
+        <div class="sim-grid2">
+            <div class="sim-section">
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">TRADE LOG</h3>
+                <div id="monthly-trades"></div>
+            </div>
+            <div class="sim-section">
+                <div class="bench-label">STRATEGY</div>
+                <div id="monthly-info" class="sim-empty" style="text-align:left;padding:8px 0">
+                    <b>qv-mom-v1 (top-10)</b> — deterministic quality-value-momentum picker from the
+                    stockstrat research repo. Monthly rebalance on the last trading day; holds 10
+                    equal-weight names; a held name keeps its slot while it ranks in the top 20
+                    (hysteresis — keeps turnover ~1-2 names/month). Score = percentile rank of ROE +
+                    12-1 momentum + 1/P-FCF from point-in-time fundamentals. No stops — the band is
+                    the risk control. Funded by a monthly allowance like the sim portfolio.
+                </div>
+            </div>
+        </div>
+        <div class="sim-section">
+            <div class="bench-label">ACTIONS</div>
+            <div class="sim-actions">
+                <button id="monthly-run-btn" onclick="runMonthly()">Rebalance Now</button>
+            </div>
+            <div id="monthly-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
         </div>
     </section>
     <div id="explain-backdrop-container">
@@ -1582,6 +1639,15 @@
                     const n = r.refreshed.length, errs = r.errors.length;
                     ptrShowResult(errs === 0,
                         errs ? `${n} updated, ${errs} failed` : `Sim updated (${n} tickers)`);
+                } else if (document.getElementById('monthly-view').style.display !== 'none') {
+                    // Monthly view: refresh candles for the holdings (+ FX
+                    // pairs) so valuation/equity reflect current prices,
+                    // then re-read everything.
+                    const r = await api('monthly/refresh', { method: 'POST' });
+                    await loadMonthlyAll();
+                    const n = r.refreshed.length, errs = r.errors.length;
+                    ptrShowResult(errs === 0,
+                        errs ? `${n} updated, ${errs} failed` : `Monthly updated (${n} tickers)`);
                 }
                 await new Promise(r => setTimeout(r, 1200));
                 ptrReset();
@@ -1950,7 +2016,7 @@
         async function loadUniverses() {
             let u = await api('screener/universes');
             $('#universe').innerHTML = u.map(x => `<option>${escapeHtml(x)}</option>`).join('');
-            $('#universe').value = 'global-large-cap';
+            $('#universe').value = 'diversified-plus';
             showScreen();
         }
         function timeAgo(iso) {
@@ -2122,20 +2188,124 @@
         function showView(view) {
             const dash = document.getElementById('dashboard-view');
             const sim = document.getElementById('sim-view');
+            const monthly = document.getElementById('monthly-view');
             const navDash = document.getElementById('nav-dashboard');
             const navSim = document.getElementById('nav-sim');
+            const navMonthly = document.getElementById('nav-monthly');
+            navDash.classList.remove('nav-active');
+            navSim.classList.remove('nav-active');
+            navMonthly.classList.remove('nav-active');
+            sim.classList.remove('active');
+            monthly.style.display = 'none';
             if (view === 'sim') {
                 dash.style.display = 'none';
                 sim.classList.add('active');
-                navDash.classList.remove('nav-active');
                 navSim.classList.add('nav-active');
                 if (!simLoaded) { simLoaded = true; loadSimAll(); }
+            } else if (view === 'monthly') {
+                dash.style.display = 'none';
+                monthly.style.display = 'block';
+                navMonthly.classList.add('nav-active');
+                if (!monthlyLoaded) { monthlyLoaded = true; loadMonthlyAll(); }
             } else {
                 dash.style.display = 'grid';
-                sim.classList.remove('active');
                 navDash.classList.add('nav-active');
-                navSim.classList.remove('nav-active');
             }
+        }
+
+        // ===================== Monthly qv-mom portfolio =====================
+        let monthlyLoaded = false;
+        let monthlyChart = null;
+
+        async function loadMonthlyStatus() {
+            try {
+                const s = await api('monthly/status');
+                const gain = s.allowance_total > 0 ? (s.total_equity / s.allowance_total * 100 - 100) : null;
+                const m = [
+                    ['Total Equity', s.total_equity != null ? '$' + s.total_equity.toFixed(2) : '—'],
+                    ['Contributed', s.allowance_total != null ? '$' + s.allowance_total.toFixed(2) : '—'],
+                    ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(1) + '%' : '—'],
+                    ['Cash', s.cash != null ? '$' + s.cash.toFixed(2) : '—'],
+                    ['Universe', s.sim_monthly_universe || '—'],
+                    ['Next Rebalance', s.next_rebalance || '—'],
+                ];
+                document.getElementById('monthly-summary').innerHTML = m.map(([k, v]) => `<span class="metric">${k}<br><b>${v}</b></span>`).join('');
+                const pos = s.positions || [];
+                document.getElementById('monthly-positions').innerHTML = pos.length ? `<table><tr><th>Ticker</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>P&L%</th></tr>${pos.map(p => {
+                    const pnl = p.pnl_pct;
+                    const cls = pnl > 0 ? 'buy' : pnl < 0 ? 'sell' : '';
+                    return `<tr><td>${escapeHtml(p.ticker)}</td><td>${escapeHtml(String(p.shares))}</td><td>$${p.avg_cost.toFixed(2)}</td><td>$${p.current_price.toFixed(2)}</td><td>$${p.value.toFixed(2)}</td><td class="${cls}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</td></tr>`;
+                }).join('')}</table>` : '<div class="sim-empty">No open positions — waiting for first rebalance.</div>';
+            } catch (e) { document.getElementById('monthly-summary').innerHTML = 'Error: ' + escapeHtml(e.message); }
+        }
+
+        async function loadMonthlyTrades() {
+            try {
+                const t = await api('monthly/trades?limit=50');
+                document.getElementById('monthly-trades').innerHTML = t.length ? `<table><tr><th>Time (Europe/Vienna)</th><th>Ticker</th><th>Side</th><th>Shares</th><th>Price</th><th>Reason</th></tr>${t.map(x => `<tr><td>${escapeHtml(fmtVienna(x.date, true))}</td><td>${escapeHtml(x.ticker)}</td><td class="${x.side === 'BUY' ? 'buy' : 'sell'}">${escapeHtml(x.side)}</td><td>${escapeHtml(String(x.shares))}</td><td>$${x.price.toFixed(2)}</td><td style="text-align:left">${escapeHtml(x.reason || '')}</td></tr>`).join('')}</table>` : '<div class="sim-empty">No trades yet — the first rebalance runs on the next month-end.</div>';
+            } catch (e) { document.getElementById('monthly-trades').innerHTML = 'Error: ' + escapeHtml(e.message); }
+        }
+
+        async function loadMonthlyEquity() {
+            const [snaps, live] = await Promise.all([
+                api('monthly/equity?limit=365').catch(() => null),
+                api('monthly/status').catch(() => null),
+            ]);
+            if (monthlyChart) { monthlyChart.remove(); monthlyChart = null; }
+            if (!snaps || !snaps.length) {
+                document.getElementById('monthly-chart').innerHTML = '<div class="sim-empty">No data yet — equity is tracked after each monthly rebalance.</div>';
+                return;
+            }
+            // Live point: today's valuation, so the curve reflects current
+            // prices between rebalances (deduped if today IS a snapshot day).
+            const points = snaps.map(s => ({ time: s.date, value: s.total_equity }));
+            const last = snaps[snaps.length - 1];
+            if (live && live.total_equity != null) {
+                const today = new Date().toISOString().slice(0, 10);
+                if (last.time < today) points.push({ time: today, value: live.total_equity });
+            }
+            document.getElementById('monthly-chart').innerHTML = '';
+            monthlyChart = LightweightCharts.createChart(document.getElementById('monthly-chart'), {
+                height: 320, layout: { background: { color: '#071009' }, textColor: '#b7ffc0' },
+                grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } },
+                timeScale: { timeVisible: false, secondsVisible: false },
+            });
+            const equity = monthlyChart.addLineSeries({ color: '#42ff72', lineWidth: 2 });
+            equity.setData(points);
+            const contrib = monthlyChart.addLineSeries({ color: '#ff9f43', lineWidth: 1 });
+            contrib.setData(snaps.map(s => ({ time: s.date, value: s.allowance_total })));
+            monthlyChart.timeScale().fitContent();
+        }
+
+        async function loadMonthlyRebalances() {
+            try {
+                const r = await api('monthly/rebalances?limit=24');
+                document.getElementById('monthly-rebalances').innerHTML = r.length ? `<table><tr><th>Month</th><th>Date</th><th>Picked</th><th>#New</th></tr>${r.map(x => `<tr><td>${escapeHtml(x.month)}</td><td>${escapeHtml(x.date)}</td><td style="text-align:left;font-size:11px">${escapeHtml(x.picked.join(', '))}</td><td>${x.n_new}</td></tr>`).join('')}</table>` : '<div class="sim-empty">No rebalances yet.</div>';
+            } catch (e) { document.getElementById('monthly-rebalances').innerHTML = 'Error: ' + escapeHtml(e.message); }
+        }
+
+        async function runMonthly() {
+            const btn = document.getElementById('monthly-run-btn');
+            const status = document.getElementById('monthly-run-status');
+            btn.disabled = true;
+            status.textContent = 'Rebalancing… (refreshes 10y candles + fundamentals for the whole universe — can take a few minutes)';
+            try {
+                const r = await api('monthly/run', { method: 'POST' });
+                if (r.skipped) {
+                    status.textContent = 'Skipped: ' + (r.reason || 'unknown');
+                } else {
+                    status.textContent = `Rebalanced ${r.month}: ${r.picks.length} picks, ${r.trades.length} trades.`;
+                    loadMonthlyAll();
+                }
+            } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
+            btn.disabled = false;
+        }
+
+        async function loadMonthlyAll() {
+            await Promise.all([
+                loadMonthlyStatus(), loadMonthlyTrades(), loadMonthlyEquity(),
+                loadMonthlyRebalances(),
+            ]);
         }
 
         async function loadSimStatus() {
