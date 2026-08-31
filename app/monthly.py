@@ -20,7 +20,6 @@ the candles cache (FX pairs stored as pseudo-tickers, e.g. EURUSD=X), so
 market cap / dollar volume / momentum are comparable across the universe.
 """
 import asyncio
-import json
 import logging
 import math
 from datetime import datetime, timedelta, timezone
@@ -37,6 +36,12 @@ from .db import (Candle, MonthlyAccount, MonthlyAllowance, MonthlyPosition,
 from .screener import tickers as universe_tickers
 
 logger = logging.getLogger("trade_sentinel.monthly")
+
+# Serializes rebalances: the month-idempotence check runs before the
+# multi-minute refresh_data, so two overlapping invocations (scheduler +
+# manual UI run) would both pass the gate and double-deposit the allowance /
+# duplicate trades. Mirrors sim._run_cycle_lock.
+_rebalance_lock: asyncio.Lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -379,8 +384,9 @@ async def monthly_valuate() -> dict[str, Any]:
 
     positions_value = 0.0
     pos_list: list[dict[str, Any]] = []
+    px_map = await _price_usd_map([p.ticker for p in positions])
     for p in positions:
-        price = await _price(p.ticker)
+        price = px_map.get(p.ticker)
         if price is None:
             price = p.avg_cost
         value = p.shares * price
@@ -404,12 +410,74 @@ async def monthly_valuate() -> dict[str, Any]:
     }
 
 
-async def _price(ticker: str) -> float | None:
-    """Latest close for `ticker` from the candle cache."""
+def _fx_close_series(rows: list, asof: pd.Timestamp | None = None) -> pd.Series:
+    """FX pair closes from candle rows as a naive-UTC-indexed Series."""
+    s = pd.Series(dtype=float)
+    for r in rows:
+        ts = pd.Timestamp(r.timestamp)
+        if ts.tzinfo is not None:
+            ts = ts.tz_localize(None)
+        if asof is None or ts <= asof:
+            s[ts] = r.close
+    return s.sort_index() if len(s) else s
+
+
+def _convert_usd(price: float, ts: pd.Timestamp, fx: pd.Series, mode: str) -> float:
+    """Local close -> USD at the FX rate prevailing at `ts`."""
+    if fx is None or fx.empty:
+        return price  # no FX data — documented fallback: assume USD
+    rate = fx
+    idx = pd.DatetimeIndex(rate.index)
+    if idx.tz is not None:  # DateTime round-trips attach UTC; compare naive
+        rate = rate.copy()
+        rate.index = idx.tz_localize(None)
+    r = rate.asof(ts)
+    if r is None or pd.isna(r) or r == 0:
+        return price
+    return price * float(r) if mode == "mul" else price / float(r)
+
+
+async def _price_usd_map(tickers: list[str]) -> dict[str, float | None]:
+    """{ticker: latest USD-converted close} for the given tickers.
+
+    The strategy decides on USD-converted closes (load_frames_sync), so
+    execution and valuation must book the same converted price — a raw
+    local-currency close booked as USD would misstate exposure by the FX
+    rate and ignore FX moves in pnl/equity. Same suffix->FX mapping."""
+    from sqlalchemy import select as _select
+
+    wanted = set(tickers)
+    pairs = sorted({pm[0] for t in tickers if (pm := fundamentals_mod._suffix_fx(t))})
     async with Session() as s:
-        row = (await s.scalars(select(Candle).where(Candle.ticker == ticker)
-                               .order_by(Candle.timestamp.desc()).limit(1))).first()
-        return float(row.close) if row else None
+        rows = (await s.scalars(
+            _select(Candle).where(Candle.ticker.in_(wanted | set(pairs)))
+            .order_by(Candle.timestamp))).all()
+    pair_close = {p: _fx_close_series([r for r in rows if r.ticker == p])
+                  for p in pairs}
+    latest: dict[str, tuple[float, pd.Timestamp]] = {}
+    for r in rows:  # timestamp ASC — later assignments win
+        if r.ticker in wanted:
+            ts = pd.Timestamp(r.timestamp)
+            if ts.tzinfo is not None:
+                ts = ts.tz_localize(None)
+            latest[r.ticker] = (float(r.close), ts)
+    out: dict[str, float | None] = {}
+    for t in tickers:
+        px_ts = latest.get(t)
+        if px_ts is None:
+            out[t] = None
+            continue
+        price, ts = px_ts
+        pm = fundamentals_mod._suffix_fx(t)
+        if pm:
+            price = _convert_usd(price, ts, pair_close.get(pm[0], pd.Series(dtype=float)), pm[1])
+        out[t] = price
+    return out
+
+
+async def _price(ticker: str) -> float | None:
+    """Latest USD-converted close for `ticker` from the candle cache."""
+    return (await _price_usd_map([ticker])).get(ticker)
 
 
 async def _deposit_allowance() -> dict[str, Any]:
@@ -510,6 +578,16 @@ async def run_rebalance(force: bool = False) -> dict[str, Any]:
     month, or manually). Deposits the allowance first, refreshes data, picks
     with hysteresis, then executes SELLs (freed slots) and equal-weight BUYs.
     Idempotent per month unless ``force``."""
+    # Non-blocking acquire: the idempotence gate below runs before the
+    # multi-minute data refresh, so a queued second invocation would pass
+    # the gate too and double-deposit / duplicate trades.
+    if _rebalance_lock.locked():
+        return {"skipped": True, "reason": "already running"}
+    async with _rebalance_lock:
+        return await _run_rebalance_locked(force)
+
+
+async def _run_rebalance_locked(force: bool) -> dict[str, Any]:
     month = datetime.now(timezone.utc).strftime("%Y-%m")
     async with Session() as s:
         acc = await s.get(MonthlyAccount, 1)
@@ -550,12 +628,21 @@ async def run_rebalance(force: bool = False) -> dict[str, Any]:
         await s.commit()
 
     trades: list[dict] = []
-    valuation = await monthly_valuate()
-    price_map = {p["ticker"]: p["current_price"] for p in valuation["positions"]}
-    # SELLs first: held names no longer picked (frees cash for the BUYs)
+    # USD-converted prices for everything we might touch (held + picked):
+    # the decision ran on FX-converted closes, so trades must book the same
+    # USD prices — one DB pass, shared by SELLs and BUYs below.
+    price_map = await _price_usd_map(sorted(set(picks) | set(held_before)))
+    # SELLs first: held names no longer picked (frees cash for the BUYs).
+    # A held name without candles falls back to avg_cost (the valuation
+    # convention) — never sell at 0.
+    async with Session() as s:
+        costs = {p.ticker: p.avg_cost for p in
+                 (await s.scalars(select(MonthlyPosition))).all()}
     for t in held_before:
         if t not in picks:
-            price = price_map.get(t) or await _price(t) or 0.0
+            price = price_map.get(t)
+            if not price:
+                price = costs.get(t) or 0.0
             r = await _exec_sell(t, price, "monthly rebalance: out of top band")
             if r:
                 trades.append(r)
@@ -563,7 +650,7 @@ async def run_rebalance(force: bool = False) -> dict[str, Any]:
     valuation = await monthly_valuate()
     weight = valuation["total_equity"] / max(len(picks), 1)
     for t in picks:
-        price = price_map.get(t) or await _price(t)
+        price = price_map.get(t)
         if not price:
             continue
         held_pos = next((p for p in valuation["positions"] if p["ticker"] == t), None)
@@ -608,7 +695,7 @@ async def get_trades(limit: int = 100) -> list[dict]:
                                 .order_by(MonthlyTrade.created_at.desc()).limit(limit))).all()
     return [{"ticker": r.ticker, "side": r.side, "shares": r.shares, "price": r.price,
              "cash_after": round(r.cash_after, 2), "reason": r.reason,
-             "date": r.created_at.strftime("%Y-%m-%d %H:%M")} for r in rows]
+             "date": r.created_at.isoformat()} for r in rows]
 
 
 async def get_equity_curve(limit: int = 365) -> list[dict]:

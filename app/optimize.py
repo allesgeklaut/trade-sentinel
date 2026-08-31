@@ -2183,9 +2183,8 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
         idx = idx[idx >= pd.Timestamp(start)]
     if end:
         idx = idx[idx <= pd.Timestamp(end)]
-    if len(idx) < 300:
-        print(f"Not enough history ({len(idx)} days) for a monthly backtest "
-              f"(need > 252 trading days for momentum warmup).")
+    if len(idx) == 0:
+        print("No trading days in the requested window.")
         return
 
     # last trading day of each month within the window
@@ -2194,6 +2193,17 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
         sub = idx[(idx.year == ym[0]) & (idx.month == ym[1])]
         if len(sub):
             months.append(sub[-1])
+
+    # Momentum warmup uses closes *before* the window (--start filters only
+    # the rebalance months, the full frame is loaded). Early months whose
+    # warmup is thin simply have no eligible names and get trimmed below —
+    # only refuse when even the LAST month can't reach 253 days of history.
+    n_days_to_first = int((close.index <= months[-1]).sum())
+    if n_days_to_first < settings.sim_monthly_min_history_days:
+        print(f"Not enough history ({n_days_to_first} trading days up to "
+              f"{months[-1].date()}; need {settings.sim_monthly_min_history_days} "
+              f"for momentum warmup).")
+        return
 
     # eligibility frame per rebalance date is the expensive part — cache by month
     frame_cache: dict[pd.Timestamp, pd.DataFrame | None] = {}
@@ -2224,8 +2234,6 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
     cost = settings.sim_monthly_cost_oneway
     value, contributed = 0.0, 0.0
     holdings: list[str] = []
-    weights: dict[str, float] | None = None
-    curve: list[tuple[pd.Timestamp, float, float]] = []
     churns: list[float] = []
     picks_hist: list[tuple[str, list[str]]] = []
 
@@ -2242,22 +2250,20 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
         contributed += contribution
         frame = frame_cache[d]
         picks, _ = monthly_mod.pick_portfolio(d, close, vol, fund, holdings, frame) if frame is not None else (holdings, None)
+        # turnover = fraction of the portfolio's slots swapped this month:
+        # buys of new names plus sells of dropped names, each leg one-way
         adds = len(set(picks) - set(holdings))
-        if holdings and picks:
-            turn = adds / max(len(picks), 1)
-        elif holdings or picks:
-            turn = 1.0
-        else:
-            turn = 0.0
-        value *= 1.0 - turn * cost      # name swaps
-        value -= contribution * cost    # deploying fresh cash
+        drops = len(set(holdings) - set(picks))
+        turn = (adds + drops) / max(max(len(picks), len(holdings)), 1)
+        # The fresh contribution is deployed by buying new/rebalanced names —
+        # charging it separately would double-count the swap leg on entry
+        # months. One-way cost on swapped notional only.
+        value *= 1.0 - turn * cost
         churns.append(turn)
-        curve.append((d, value, contributed))
         if picks != holdings:
             picks_hist.append((d.strftime("%Y-%m"), list(picks)))
         holdings = list(picks)
 
-    n_years = max((months[-1] - months[0]).days / 365.25, 1e-9)
     # money-weighted IRR: contribution * sum((1+r)^k) = final value
     n = len(months)
 
