@@ -36,6 +36,25 @@ class DateTime(TypeDecorator):
         return value
 
 
+class OptionalDateStr(TypeDecorator):
+    """Nullable date-string column stored as '' instead of NULL.
+
+    SQLite treats NULLs as distinct in UNIQUE constraints, so instant facts
+    (start=None) stored as real NULLs never matched the (ticker, tag, start,
+    end, filed, source) conflict target — every refresh inserted a fresh
+    duplicate set. Storing '' makes the unique key total; reads map '' back
+    to None so the fact helpers keep their None-means-instant convention."""
+
+    impl = String
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        return "" if value is None else value
+
+    def process_result_value(self, value, dialect):
+        return value or None
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -232,7 +251,7 @@ class Fundamental(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     ticker: Mapped[str] = mapped_column(String(32), index=True)
     tag: Mapped[str] = mapped_column(String(64), index=True)
-    start: Mapped[str | None] = mapped_column(String(10), nullable=True)  # YYYY-MM-DD, None = instant fact
+    start: Mapped[str | None] = mapped_column(OptionalDateStr(10), nullable=True)  # '' stored; reads as None = instant fact
     end: Mapped[str] = mapped_column(String(10))  # YYYY-MM-DD period end
     filed: Mapped[str] = mapped_column(String(10))  # YYYY-MM-DD public date
     val: Mapped[float] = mapped_column(Float)
@@ -384,6 +403,10 @@ async def init_db():
         # source) — EDGAR re-reports spans in later filings and point-in-time
         # correctness needs every filed version kept. SQLite can't ALTER a
         # UNIQUE constraint — rebuild the table the SQL-safe way.
+        # NULL starts are normalized to '' (see OptionalDateStr): NULLs are
+        # distinct in SQLite UNIQUE constraints, so instant facts never hit
+        # the upsert's conflict target and duplicated on every refresh —
+        # the rebuild dedupes those while it's at it.
         from sqlalchemy import inspect as sa_inspect
         insp = await conn.run_sync(lambda sync_conn: sa_inspect(sync_conn))
         has_fund = await conn.run_sync(lambda sc: insp.has_table("fundamentals"))
@@ -394,6 +417,51 @@ async def init_db():
             for uq in uqs:
                 uq_cols.update(uq.get("column_names", []))
         need_rebuild = has_fund and ("source" not in cols or "filed" not in uq_cols)
+        if has_fund and not need_rebuild:
+            # Schema is current — but pre-OptionalDateStr DBs may still hold
+            # start=NULL rows (NULLs escaped the UNIQUE constraint and the
+            # upsert duplicated them). Normalize + dedupe in place if so.
+            null_starts = (await conn.execute(
+                text("SELECT COUNT(*) FROM fundamentals WHERE start IS NULL")
+            )).scalar()
+            if null_starts:
+                await conn.execute(text("""
+                    CREATE TABLE fundamentals_new (
+                        id INTEGER NOT NULL PRIMARY KEY,
+                        ticker VARCHAR(32) NOT NULL,
+                        tag VARCHAR(64) NOT NULL,
+                        start VARCHAR(10),
+                        "end" VARCHAR(10) NOT NULL,
+                        filed VARCHAR(10) NOT NULL,
+                        val FLOAT NOT NULL,
+                        currency VARCHAR(8) NOT NULL DEFAULT 'USD',
+                        source VARCHAR(16) NOT NULL DEFAULT 'yfinance',
+                        updated_at DATETIME NOT NULL,
+                        UNIQUE (ticker, tag, start, "end", filed, source)
+                    )
+                """))
+                await conn.execute(text("""
+                    INSERT INTO fundamentals_new
+                        (id, ticker, tag, start, "end", filed, val, currency, source, updated_at)
+                    SELECT id, ticker, tag, COALESCE(start, ''), "end", filed, val, currency,
+                           source, updated_at
+                    FROM fundamentals f
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM fundamentals g
+                        WHERE g.ticker = f.ticker AND g.tag = f.tag
+                          AND COALESCE(g.start, '') = COALESCE(f.start, '')
+                          AND g."end" = f."end" AND g.filed = f.filed
+                          AND g.source = f.source
+                          AND (g.updated_at > f.updated_at
+                               OR (g.updated_at = f.updated_at AND g.id > f.id))
+                    )
+                """))
+                await conn.execute(text("DROP TABLE fundamentals"))
+                await conn.execute(text("ALTER TABLE fundamentals_new RENAME TO fundamentals"))
+                await conn.execute(text(
+                    "CREATE INDEX ix_fundamentals_ticker ON fundamentals (ticker)"))
+                await conn.execute(text(
+                    "CREATE INDEX ix_fundamentals_tag ON fundamentals (tag)"))
         if need_rebuild:
             await conn.execute(text("""
                 CREATE TABLE fundamentals_new (
@@ -410,12 +478,30 @@ async def init_db():
                     UNIQUE (ticker, tag, start, "end", filed, source)
                 )
             """))
-            await conn.execute(text("""
+            # Old schemas (created before the EDGAR work on this branch) may
+            # lack the `source` column — SELECT would fail on it, so detect
+            # and substitute the literal default for those rows. When the
+            # column is absent the source is identical for every row, so
+            # that join condition drops out entirely.
+            source_expr = "source" if "source" in cols else "'yfinance'"
+            source_cond = "AND g.source = f.source" if "source" in cols else ""
+            # start=NULL rows collide once normalized to '' (they were
+            # duplicating silently) — keep the newest by updated_at.
+            await conn.execute(text(f"""
                 INSERT INTO fundamentals_new
                     (id, ticker, tag, start, "end", filed, val, currency, source, updated_at)
-                SELECT id, ticker, tag, start, "end", filed, val, currency,
-                       source, updated_at
-                FROM fundamentals
+                SELECT id, ticker, tag, COALESCE(start, ''), "end", filed, val, currency,
+                       {source_expr}, updated_at
+                FROM fundamentals f
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM fundamentals g
+                    WHERE g.ticker = f.ticker AND g.tag = f.tag
+                      AND COALESCE(g.start, '') = COALESCE(f.start, '')
+                      AND g."end" = f."end" AND g.filed = f.filed
+                      {source_cond}
+                      AND (g.updated_at > f.updated_at
+                           OR (g.updated_at = f.updated_at AND g.id > f.id))
+                )
             """))
             await conn.execute(text("DROP TABLE fundamentals"))
             await conn.execute(text("ALTER TABLE fundamentals_new RENAME TO fundamentals"))

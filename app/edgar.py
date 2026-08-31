@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
@@ -60,15 +61,6 @@ TAG_FALLBACKS = {
 ALL_TAGS = sorted(set(US_GAAP_TAGS) | set(DEI_TAGS)
                   | {a for alts in TAG_FALLBACKS.values() for a in alts})
 
-DURATION_TAGS = {
-    "NetIncomeLoss",
-    "NetCashProvidedByUsedInOperatingActivities",
-    "PaymentsToAcquirePropertyPlantAndEquipment",
-    "NetIncomeLossAvailableToCommonStockholdersBasic",
-    "ProfitLoss",
-    "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
-}
-
 UA = {"User-Agent": "trade-sentinel paper-trading research (private deployment)",
       "Accept": "*/*"}
 
@@ -82,14 +74,15 @@ def _http_get(url: str, retries: int = 4, backoff: float = 2.0) -> bytes:
             req = urllib.request.Request(url, headers=UA)
             with urllib.request.urlopen(req, timeout=30) as r:
                 return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise  # permanent: no companyfacts for this CIK — don't retry
+            last = e
+            time.sleep(backoff * (i + 1))
         except Exception as e:  # noqa: BLE001 - network errors vary
             last = e
             time.sleep(backoff * (i + 1))
     raise RuntimeError(f"GET {url} failed after {retries} tries: {last}")
-
-
-def _http_get_async(url: str) -> bytes:
-    return _http_get(url)
 
 
 # ---------------------------------------------------------------------------
@@ -123,8 +116,6 @@ async def ensure_cik_map(tickers: list[str], force: bool = False) -> dict[str, i
                 if hit:
                     cik, name = by_ticker[hit]
                     out[t] = cik
-                    if t != hit:
-                        out.setdefault(t, cik)  # requested alias maps to the hit
                 else:
                     out[t] = 0  # known no-CIK
             return out
@@ -187,8 +178,8 @@ def fetch_companyfacts(cik: int) -> dict[str, list[dict]]:
     url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
     try:
         payload = json.loads(_http_get(url))
-    except Exception as e:  # noqa: BLE001
-        if "404" in str(e):
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
             return {}  # ETF/trust with a CIK but no companyfacts
         raise
     return _parse_companyfacts(payload)
@@ -215,9 +206,14 @@ async def refresh_edgar(tickers: list[str] | None = None, force: bool = False,
     last_refresh = {t: ts for t, ts in rows}
 
     statuses: dict[str, str] = {}
-    todo = [t for t in sorted(tickers)
-            if t in ciks and ciks[t] and t not in last_refresh] if not force else \
-           [t for t in sorted(tickers) if t in ciks and ciks[t]]
+    if force:
+        todo = [t for t in sorted(tickers) if t in ciks and ciks[t]]
+    else:
+        # refetch tickers with no EDGAR rows yet, or whose newest row is older
+        # than STALE_AFTER_DAYS (same staleness rule as the yfinance path)
+        todo = [t for t in sorted(tickers) if t in ciks and ciks[t]
+                and (t not in last_refresh
+                     or last_refresh[t].timestamp() <= cutoff)]
 
     fetched = 0
     for t in todo:
@@ -230,7 +226,6 @@ async def refresh_edgar(tickers: list[str] | None = None, force: bool = False,
             async with Session() as s:
                 for tag, entries in facts.items():
                     for e in entries:
-                        duration = tag in DURATION_TAGS
                         stmt = sqlite_insert(Fundamental).values(
                             ticker=t, tag=tag, start=e.get("start"),
                             end=e["end"], filed=e["filed"], val=float(e["val"]),
@@ -253,10 +248,10 @@ async def refresh_edgar(tickers: list[str] | None = None, force: bool = False,
         # SEC fair-access: stay under ~10 req/s
         await asyncio.sleep(0.12)
 
-    # tickers not attempted (fresh) were skipped in this pass
+    # tickers with a CIK that were not refetched this pass are fresh (skipped)
     for t in sorted(tickers):
         if t not in statuses and t in ciks and ciks[t]:
-            statuses[t] = "skipped" if t in last_refresh else "no-cik-mapping"
+            statuses[t] = "skipped"
     for t in sorted(tickers):
         if t not in statuses:
             statuses[t] = "no-cik (yfinance fallback)"

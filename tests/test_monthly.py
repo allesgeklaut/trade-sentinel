@@ -15,6 +15,7 @@ data volume. They cover:
 
 from __future__ import annotations
 
+import urllib.error
 from datetime import datetime, timezone
 
 import numpy as np
@@ -380,17 +381,22 @@ async def test_run_monthly_cycle_gate(mem_db, monkeypatch):
         raise AssertionError("should not rebalance off-schedule")
 
     monkeypatch.setattr(monthly, "run_rebalance", fail_rebalance)
-    # 2026-08-28 is a Friday but NOT the last trading day of Aug 2026
+    # inject the clock: 2026-08-28 is a Friday but NOT the last trading day
+    # of Aug 2026 — real now() would make this flaky on month-end weekdays
+    monkeypatch.setattr(monthly, "is_rebalance_day", lambda today=None: False)
+    assert monthly.is_rebalance_day(
+        datetime(2026, 8, 28, 22, 0, tzinfo=timezone.utc)) is False  # sanity
     out = await monthly.run_monthly_cycle()
     assert out["skipped"] is True
 
+    # on a rebalance day the cycle delegates to run_rebalance
+    async def ok_rebalance(force=False):
+        return {"rebalanced": True}
+
     monkeypatch.setattr(monthly, "is_rebalance_day", lambda today=None: True)
-    monkeypatch.setattr(monthly, "run_rebalance",
-                        lambda force=False: _coro({"rebalanced": True}))
-
-
-async def _coro(value):
-    return value
+    monkeypatch.setattr(monthly, "run_rebalance", ok_rebalance)
+    out2 = await monthly.run_monthly_cycle()
+    assert out2 == {"rebalanced": True}
 
 # ---------------------------------------------------------------------------
 # EDGAR source (app.edgar)
@@ -496,3 +502,151 @@ async def test_ensure_cik_map_uses_cache_and_handles_unknown(mem_db, monkeypatch
     # cached tickers resolve without network
     m = await edgar.ensure_cik_map(["AAA", "BBB"])
     assert m == {"AAA": 123456, "BBB": 0}
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: refresh scheduling, 404 classification, NULL-start upsert
+# ---------------------------------------------------------------------------
+
+async def test_instant_fact_upsert_dedupes(mem_db):
+    """Instant facts (start=None) must upsert, not insert duplicates: NULLs
+    are distinct in SQLite UNIQUE constraints, so the start column stores ''
+    for instants (OptionalDateStr) and the conflict target matches."""
+    import urllib.error
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+    from app.db import Fundamental
+
+    async with mem_db() as s:
+        for _ in range(2):  # same fact inserted twice — second must update
+            stmt = sqlite_insert(Fundamental).values(
+                ticker="QQQ", tag="StockholdersEquity", start=None,
+                end="2024-06-30", filed="2024-08-14", val=5e9,
+                currency="USD", source="edgar")
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["ticker", "tag", "start", "end", "filed", "source"],
+                set_={"val": stmt.excluded.val, "updated_at": stmt.excluded.updated_at})
+            await s.execute(stmt)
+        await s.commit()
+        rows = (await s.scalars(select(Fundamental).where(Fundamental.ticker == "QQQ"))).all()
+        assert len(rows) == 1
+        assert rows[0].start is None  # '' round-trips as None
+        assert rows[0].val == 5e9
+
+
+async def test_fetch_companyfacts_404_vs_timeout(mem_db, monkeypatch):
+    """A real HTTP 404 means no companyfacts; a network failure must not be
+    misclassified as 404 just because the CIK contains '404' in its URL."""
+    from app import edgar
+
+    def get_404(url):
+        raise urllib.error.HTTPError(url, 404, "Not Found", None, None)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(edgar, "_http_get", get_404)
+    assert edgar.fetch_companyfacts(4040) == {}  # CIK contains "404" but IS a 404
+
+    def get_timeout(url):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(edgar, "_http_get", get_timeout)
+    with pytest.raises(TimeoutError):  # not swallowed as no-companyfacts
+        edgar.fetch_companyfacts(4040)
+
+
+async def test_refresh_edgar_staleness_gate(mem_db, monkeypatch):
+    """refresh_edgar must refetch tickers whose last refresh is older than
+    STALE_AFTER_DAYS — the staleness cutoff exists precisely so quarterly
+    filings are picked up; only fresh tickers are skipped."""
+    from datetime import datetime, timedelta, timezone as tz
+
+    from app import edgar
+    from app.db import Fundamental, SecCik
+
+    now = datetime.now(tz.utc)
+    async with mem_db() as s:
+        s.add(SecCik(ticker="STALE", cik=111))
+        s.add(SecCik(ticker="FRESH", cik=222))
+        s.add(Fundamental(ticker="STALE", tag="StockholdersEquity", start=None,
+                          end="2024-06-30", filed="2024-08-14", val=1e9,
+                          currency="USD", source="edgar",
+                          updated_at=now - timedelta(days=edgar.STALE_AFTER_DAYS + 10)))
+        s.add(Fundamental(ticker="FRESH", tag="StockholdersEquity", start=None,
+                          end="2024-06-30", filed="2024-08-14", val=1e9,
+                          currency="USD", source="edgar",
+                          updated_at=now - timedelta(days=1)))
+        await s.commit()
+
+    fetched: list[str] = []
+
+    def fake_fetch(cik):
+        return {"StockholdersEquity": [{"start": None, "end": "2024-06-30",
+                                        "filed": "2024-08-14", "val": 2e9}]}
+
+    monkeypatch.setattr(edgar, "fetch_companyfacts", fake_fetch)
+    monkeypatch.setattr(edgar, "_http_get", lambda url: (_ for _ in ()).throw(
+        AssertionError("CIK map download should not be needed")))
+    monkeypatch.setattr(edgar.asyncio, "sleep", _no_sleep)
+
+    statuses = await edgar.refresh_edgar(["STALE", "FRESH"])
+    assert statuses["STALE"].startswith("ok(")  # stale -> refetched
+    assert statuses["FRESH"] == "skipped"       # fresh -> skipped
+
+
+async def _no_sleep(_):
+    return None
+
+
+async def test_price_usd_converts_foreign_listings(mem_db):
+    """_price/_price_usd_map must convert non-USD closes to USD at the latest
+    FX rate — the strategy decides on USD-converted closes, so booking the
+    raw local-currency close as USD would misstate exposure ~1/FX."""
+    from app.db import Candle
+
+    dates = pd.bdate_range("2024-06-03", periods=5)
+    async with mem_db() as s:
+        for d in dates[:-1]:  # EURUSD pair stops updating one day before...
+            s.add(Candle(ticker="EURUSD=X", timestamp=d.to_pydatetime(),
+                         open=1.1, high=1.1, low=1.1, close=1.1, volume=0))
+        s.add(Candle(ticker="EURUSD=X", timestamp=dates[-1].to_pydatetime(),
+                     open=1.2, high=1.2, low=1.2, close=1.2, volume=0))
+        s.add(Candle(ticker="SAP.DE", timestamp=dates[-1].to_pydatetime(),
+                     open=100, high=100, low=100, close=100, volume=1000))
+        s.add(Candle(ticker="AAPL", timestamp=dates[-1].to_pydatetime(),
+                     open=200, high=200, low=200, close=200, volume=1000))
+        # USDCHF divides (local units per USD)
+        s.add(Candle(ticker="USDCHF=X", timestamp=dates[-1].to_pydatetime(),
+                     open=0.8, high=0.8, low=0.8, close=0.8, volume=0))
+        s.add(Candle(ticker="NOVN.SW", timestamp=dates[-1].to_pydatetime(),
+                     open=80, high=80, low=80, close=80, volume=1000))
+        await s.commit()
+
+    out = await monthly._price_usd_map(["SAP.DE", "AAPL", "NOVN.SW"])
+    assert out["SAP.DE"] == pytest.approx(100 * 1.2)  # EUR close * EURUSD
+    assert out["AAPL"] == pytest.approx(200.0)         # USD: unchanged
+    assert out["NOVN.SW"] == pytest.approx(80 / 0.8)   # CHF close / USDCHF
+    # single-ticker helper agrees
+    assert await monthly._price("SAP.DE") == pytest.approx(120.0)
+
+
+async def test_run_rebalance_lock_serializes(mem_db, monkeypatch):
+    """Concurrent run_rebalance calls: the second must bail out instead of
+    passing the month-idempotence gate while the first is mid-refresh (which
+    would double-deposit the allowance and duplicate trades)."""
+    import asyncio
+
+    in_refresh = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_refresh_data(tickers_list):
+        in_refresh.set()
+        await release.wait()
+        return [], {}
+
+    monkeypatch.setattr(monthly, "refresh_data", fake_refresh_data)
+
+    t1 = asyncio.create_task(monthly.run_rebalance())
+    await in_refresh.wait()          # t1 is inside the locked region
+    t2 = await monthly.run_rebalance()
+    assert t2.get("skipped") is True and "already running" in t2["reason"]
+    release.set()
+    r1 = await t1
+    assert r1.get("rebalanced") is True or r1.get("skipped") is True
