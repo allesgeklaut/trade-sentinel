@@ -1640,9 +1640,14 @@
                     ptrShowResult(errs === 0,
                         errs ? `${n} updated, ${errs} failed` : `Sim updated (${n} tickers)`);
                 } else if (document.getElementById('monthly-view').style.display !== 'none') {
-                    // Monthly view: re-read status/trades/equity/rebalances.
+                    // Monthly view: refresh candles for the holdings (+ FX
+                    // pairs) so valuation/equity reflect current prices,
+                    // then re-read everything.
+                    const r = await api('monthly/refresh', { method: 'POST' });
                     await loadMonthlyAll();
-                    ptrShowResult(true, 'Monthly updated');
+                    const n = r.refreshed.length, errs = r.errors.length;
+                    ptrShowResult(errs === 0,
+                        errs ? `${n} updated, ${errs} failed` : `Monthly updated (${n} tickers)`);
                 }
                 await new Promise(r => setTimeout(r, 1200));
                 ptrReset();
@@ -2242,11 +2247,22 @@
         }
 
         async function loadMonthlyEquity() {
-            const snaps = await api('monthly/equity?limit=365').catch(() => null);
+            const [snaps, live] = await Promise.all([
+                api('monthly/equity?limit=365').catch(() => null),
+                api('monthly/status').catch(() => null),
+            ]);
             if (monthlyChart) { monthlyChart.remove(); monthlyChart = null; }
             if (!snaps || !snaps.length) {
                 document.getElementById('monthly-chart').innerHTML = '<div class="sim-empty">No data yet — equity is tracked after each monthly rebalance.</div>';
                 return;
+            }
+            // Live point: today's valuation, so the curve reflects current
+            // prices between rebalances (deduped if today IS a snapshot day).
+            const points = snaps.map(s => ({ time: s.date, value: s.total_equity }));
+            const last = snaps[snaps.length - 1];
+            if (live && live.total_equity != null) {
+                const today = new Date().toISOString().slice(0, 10);
+                if (last.time < today) points.push({ time: today, value: live.total_equity });
             }
             document.getElementById('monthly-chart').innerHTML = '';
             monthlyChart = LightweightCharts.createChart(document.getElementById('monthly-chart'), {
@@ -2255,7 +2271,7 @@
                 timeScale: { timeVisible: false, secondsVisible: false },
             });
             const equity = monthlyChart.addLineSeries({ color: '#42ff72', lineWidth: 2 });
-            equity.setData(snaps.map(s => ({ time: s.date, value: s.total_equity })));
+            equity.setData(points);
             const contrib = monthlyChart.addLineSeries({ color: '#ff9f43', lineWidth: 1 });
             contrib.setData(snaps.map(s => ({ time: s.date, value: s.allowance_total })));
             monthlyChart.timeScale().fitContent();
