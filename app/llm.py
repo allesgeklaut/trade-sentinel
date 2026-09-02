@@ -10,8 +10,8 @@ Supports two wire protocols, both discovered and selectable at runtime:
 Backends are configured through the ``LLM_BACKENDS`` JSON env var, e.g.::
 
     LLM_BACKENDS=[
-      {"name":"local llama","type":"openai","url":"http://192.168.0.46:4000","model":"qwen3.8-27b","api_key":"sk-..."},
-      {"name":"ollama","type":"ollama","url":"http://192.168.0.46:11434","model":"deepseek-v4-flash:0731-cloud"}
+      {"name":"local llama","type":"openai","url":"http://your-server-ip:4000","model":"qwen3.8-27b","api_key":"sk-..."},
+      {"name":"ollama","type":"ollama","url":"http://host.docker.internal:11434","model":"deepseek-v4-flash:0731-cloud"}
     ]
 
 The actively selected backend is persisted to a small JSON file so the choice
