@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     llm_reasoning_effort: str = ""
 
     # --- SearXNG news search (optional) -------------------------------
-    searxng_url: str = ""  # e.g. "http://192.168.0.46:8081"; empty = disabled
+    searxng_url: str = ""  # e.g. "http://your-server-ip:8081"; empty = disabled
     searxng_timeout: float = 10.0
 
     paper_trading: bool = True

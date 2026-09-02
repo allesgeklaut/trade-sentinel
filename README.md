@@ -106,7 +106,7 @@ The dashboard's AI chat, the sim bot's LLM reasoning, and the LLM benchmark all 
 
 ```dotenv
 # JSON list of backends (single line — dotenv can't parse multi-line values):
-LLM_BACKENDS=[{"name":"llama-server","type":"openai","url":"http://192.168.0.46:8084","model":"Qwen3.8-27B-IQ4_XS.gguf"},{"name":"ollama","type":"ollama","url":"http://host.docker.internal:11434","model":"qwen3:32b"}]
+LLM_BACKENDS=[{"name":"llama-server","type":"openai","url":"http://your-server-ip:8084","model":"Qwen3.8-27B-IQ4_XS.gguf"},{"name":"ollama","type":"ollama","url":"http://host.docker.internal:11434","model":"qwen3:32b"}]
 ```
 
 - `type: "openai"` — OpenAI-compatible `/v1/chat/completions`; works with llama.cpp **llama-server**, vLLM, LiteLLM, etc.
