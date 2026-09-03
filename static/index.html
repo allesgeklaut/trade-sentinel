@@ -2201,7 +2201,8 @@
                         }
                         if (tickMarkType === 0) return String(Y);
                         if (tickMarkType === 1) return M;
-                        if (tickMarkType === 2) return `${D} ${M}`;
+                        // Day ticks and anything finer (intraday) share the
+                        // same "D M" label on this daily-candle chart.
                         return `${D} ${M}`;
                     },
                 },

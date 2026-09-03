@@ -49,11 +49,6 @@ def _current_month() -> str:
     """Operator-local calendar month key (YYYY-MM), matching sim._current_month."""
     return datetime.now(_TZ).strftime("%Y-%m")
 
-# Anchor for the allowance "month" key: the same operator-local timezone the
-# sim portfolio uses (settings.allowance_tz), so both portfolios' cumulative
-# contributed figures step at the same calendar-month boundary and the two
-# equity curves are directly comparable.
-_TZ = ZoneInfo(settings.allowance_tz)
 
 # Serializes rebalances: the month-idempotence check runs before the
 # multi-minute refresh_data, so two overlapping invocations (scheduler +
@@ -212,7 +207,7 @@ async def load_frames(tickers: list[str], asof: datetime | None = None) -> tuple
         q = select(Candle).order_by(Candle.timestamp)
         if asof is not None:
             q = q.where(Candle.timestamp <= asof)
-        rows = (await s.scalars(q)).all()
+        rows = list((await s.scalars(q)).all())
     return await asyncio.to_thread(load_frames_sync, tickers, rows, asof)
 
 
@@ -507,15 +502,17 @@ async def _price(ticker: str) -> float | None:
     return (await _price_usd_map([ticker])).get(ticker)
 
 
-async def _deposit_allowance() -> dict[str, Any]:
+async def deposit_allowance() -> dict[str, Any]:
     """Deposit the monthly allowance if a new operator-local month has begun.
 
-    Deposits at the START of the month (first cycle that sees the new month
-    key), mirroring sim.deposit_allowance — not at the month-end rebalance.
-    This keeps the cumulative "contributed" figure in lockstep with the sim
-    portfolio's so the two equity curves compare like-for-like; the month-end
-    rebalance then invests whatever cash has accumulated (including this
-    deposit).
+    Called from the daily scheduler and /api/monthly/status to fund the
+    account at the START of the month (mirroring sim.deposit_allowance), and
+    from run_rebalance() as a no-op fallback when the daily path missed a
+    month. Deposits at the start of the month — not at the month-end
+    rebalance — keeps the cumulative "contributed" figure in lockstep with the
+    sim portfolio's so the two equity curves compare like-for-like; the
+    month-end rebalance then invests whatever cash has accumulated (including
+    this deposit). Idempotent per operator-local month.
     """
     month = _current_month()
     async with Session() as s:
@@ -533,12 +530,6 @@ async def _deposit_allowance() -> dict[str, Any]:
                     settings.sim_monthly_contribution, month, acc.cash)
         return {"deposited": True, "amount": settings.sim_monthly_contribution,
                 "month": month, "cash": acc.cash}
-
-
-async def deposit_allowance() -> dict[str, Any]:
-    """Public wrapper so the daily scheduler path can fund the account at the
-    start of the month (same idempotence as _deposit_allowance)."""
-    return await _deposit_allowance()
 
 
 async def _exec_buy(ticker: str, price: float, budget: float, reason: str) -> dict | None:
@@ -624,18 +615,28 @@ async def take_snapshot() -> dict[str, Any]:
     Skipped while a rebalance is running: the rebalance writes its own
     authoritative post-trade snapshot, and a daily mark racing it mid-execution
     (cash moved, buys incomplete) would record a distorted equity point.
+
+    Uses a lock-guarded body rather than a locked()-then-valuate check:
+    checking `locked()` and valuating outside the lock races a manual
+    rebalance that starts in between, and the mark would then read
+    mid-execution state (cash already moved, buys incomplete). Holding the
+    lock for the whole snapshot makes it atomic with respect to the
+    rebalance instead. (asyncio.Lock.acquire()'s uncontended fast path sets
+    the flag synchronously, so no other task can slip in between the
+    `locked()` check and the acquire — no await happens between them.)
     """
     if _rebalance_lock.locked():
         return {"skipped": True, "reason": "rebalance in progress"}
-    post = await monthly_valuate()
-    async with Session() as s:
-        s.add(MonthlySnapshot(cash=post["cash"], positions_value=post["positions_value"],
-                              total_equity=post["total_equity"],
-                              allowance_total=post["allowance_total"]))
-        await s.commit()
-    logger.info("Monthly daily snapshot: equity %.2f (cash %.2f, positions %.2f)",
-                post["total_equity"], post["cash"], post["positions_value"])
-    return {"snapshotted": True, "total_equity": post["total_equity"]}
+    async with _rebalance_lock:
+        post = await monthly_valuate()
+        async with Session() as s:
+            s.add(MonthlySnapshot(cash=post["cash"], positions_value=post["positions_value"],
+                                  total_equity=post["total_equity"],
+                                  allowance_total=post["allowance_total"]))
+            await s.commit()
+        logger.info("Monthly daily snapshot: equity %.2f (cash %.2f, positions %.2f)",
+                    post["total_equity"], post["cash"], post["positions_value"])
+        return {"snapshotted": True, "total_equity": post["total_equity"]}
 
 
 async def refresh_data(tickers: list[str]) -> tuple[list[str], dict[str, str]]:
@@ -683,7 +684,7 @@ async def _run_rebalance_locked(force: bool) -> dict[str, Any]:
         if acc is not None and acc.last_rebalance_month == month and not force:
             return {"skipped": True, "reason": f"already rebalanced {month}"}
 
-    allowance = await _deposit_allowance()
+    allowance = await deposit_allowance()
     tickers = universe_tickers(settings.sim_monthly_universe)
     refresh_errors, fund_status = await refresh_data(tickers)
 

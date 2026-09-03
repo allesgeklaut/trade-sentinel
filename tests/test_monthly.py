@@ -15,6 +15,7 @@ data volume. They cover:
 
 from __future__ import annotations
 
+import asyncio
 import urllib.error
 from datetime import datetime, timezone
 
@@ -266,9 +267,9 @@ def test_month_last_trading_day():
 # ---------------------------------------------------------------------------
 
 async def test_deposit_allowance_once_per_month(mem_db, monkeypatch):
-    r1 = await monthly._deposit_allowance()
+    r1 = await monthly.deposit_allowance()
     assert r1["deposited"] is True
-    r2 = await monthly._deposit_allowance()
+    r2 = await monthly.deposit_allowance()
     assert r2["deposited"] is False
     val = await monthly.monthly_valuate()
     assert val["cash"] == settings.sim_monthly_contribution
@@ -276,7 +277,7 @@ async def test_deposit_allowance_once_per_month(mem_db, monkeypatch):
 
 
 async def test_exec_buy_sell(mem_db):
-    await monthly._deposit_allowance()  # fund the account
+    await monthly.deposit_allowance()  # fund the account
     t1 = await monthly._exec_buy("AAA", 50.0, 1000.0, "test")
     assert t1 is not None and t1["cost"] == 1000.0
     val = await monthly.monthly_valuate()
@@ -443,7 +444,7 @@ async def test_take_snapshot_records_daily_equity(mem_db):
         s.add(Candle(ticker="AAA", timestamp=datetime(2026, 9, 1, tzinfo=timezone.utc),
                      open=60, high=60, low=60, close=60, volume=1000))
         await s.commit()
-    await monthly._deposit_allowance()
+    await monthly.deposit_allowance()
     await monthly._exec_buy("AAA", 50.0, 500.0, "test")  # 10 shares @ 50
     r = await monthly.take_snapshot()
     assert r["snapshotted"] is True
@@ -491,7 +492,7 @@ async def test_refresh_holdings_no_rebalance(mem_db, monkeypatch):
 
     monkeypatch.setattr("app.market.refresh", fake_refresh)
 
-    await monthly._deposit_allowance()
+    await monthly.deposit_allowance()
     await monthly._exec_buy("AAA", 50.0, 500.0, "test")
     val_before = await monthly.monthly_valuate()
     async with mem_db() as s:
@@ -508,6 +509,64 @@ async def test_refresh_holdings_no_rebalance(mem_db, monkeypatch):
     assert val["positions"][0]["value"] == pytest.approx(600.0)
     assert val["cash"] == val_before["cash"]  # no deposit sneaked in
     assert val["allowance_total"] == settings.sim_monthly_contribution
+
+
+async def test_daily_snapshot_loop_disabled_funds_nothing(mem_db, monkeypatch):
+    """With sim_monthly_enabled=False the daily scheduler must not deposit,
+    refresh or snapshot — the gate mirrors monthly.run_monthly_cycle()."""
+    from app import sim as sim_mod
+
+    calls: list[str] = []
+
+    async def fake_deposit():
+        calls.append("deposit")
+        return {"deposited": False}
+
+    async def fake_refresh():
+        calls.append("refresh")
+        return {"refreshed": [], "errors": []}
+
+    async def fake_snapshot():
+        calls.append("snapshot")
+        return {"snapshotted": True}
+
+    monkeypatch.setattr(monthly, "deposit_allowance", fake_deposit)
+    monkeypatch.setattr(monthly, "refresh_holdings", fake_refresh)
+    monkeypatch.setattr(monthly, "take_snapshot", fake_snapshot)
+
+    # Drive exactly two loop iterations: the first sleep returns so the loop
+    # body runs once, the second raises the sentinel to end the task. (Raising
+    # CancelledError from sleep would cancel the task BEFORE the body runs,
+    # making the assertions vacuous.)
+    class _TwoPasses(Exception):
+        pass
+
+    sleep_calls = {"n": 0}
+
+    async def fake_sleep(_seconds):
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] >= 2:
+            raise _TwoPasses()
+
+    monkeypatch.setattr(sim_mod.asyncio, "sleep", fake_sleep)
+
+    async def run_two_passes():
+        try:
+            await sim_mod._daily_monthly_snapshot_loop()
+        except _TwoPasses:
+            pass
+
+    # Disabled: the loop iterates but performs no deposits/refreshes/snapshots.
+    monkeypatch.setattr(sim_mod.settings, "sim_monthly_enabled", False)
+    await run_two_passes()
+    assert calls == []
+    assert sleep_calls["n"] == 2  # loop kept its schedule while disabled
+
+    # Enabled: the body runs (deposit -> refresh -> snapshot).
+    monkeypatch.setattr(sim_mod.settings, "sim_monthly_enabled", True)
+    sleep_calls["n"] = 0  # reset pass counter for the second run
+    await run_two_passes()
+    assert calls == ["deposit", "refresh", "snapshot"]
 
 # ---------------------------------------------------------------------------
 # EDGAR source (app.edgar)
