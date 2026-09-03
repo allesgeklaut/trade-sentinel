@@ -37,6 +37,12 @@ class Settings(BaseSettings):
     # bull90 holdout (+12.3% vs +9.9%).
     signal_scoring: str = "classic"
 
+    # Timezone anchor for the calendar-month allowance deposits of BOTH
+    # paper portfolios (sim + monthly qv-mom). Sharing one anchor means their
+    # cumulative "contributed" figures step at the same moment, so the two
+    # equity curves are directly comparable.
+    allowance_tz: str = "Europe/Vienna"
+
     # --- Autonomous paper-trading simulation -----------------------------
     sim_enabled: bool = True
     sim_monthly_allowance: float = 1000.0

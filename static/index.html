@@ -1180,7 +1180,15 @@
             <div id="monthly-summary"></div>
         </div>
         <div class="sim-section">
-            <div class="sim-section-title">Equity Curve (vs contributed)</div>
+            <div class="sim-section-title">Equity Curve (vs contributed &amp; daily sim)</div>
+            <div style="display:flex;gap:16px;margin-bottom:8px;flex-wrap:wrap">
+                <span style="color:#42ff72;font-size:12px">● Monthly</span>
+                <span style="color:#4d9fff;font-size:12px">● Sim (daily)</span>
+                <span style="color:#ff9f43;font-size:12px">● Contributed</span>
+                <span style="flex:1"></span>
+                <button id="cmp-pct" class="range-btn range-active" onclick="setCompareMode('pct')" title="Each curve as % of its contributed total — fair comparison even when contributed differs">% View</button>
+                <button id="cmp-usd" class="range-btn" onclick="setCompareMode('usd')" title="Absolute dollars">$ View</button>
+            </div>
             <div id="monthly-chart"></div>
         </div>
         <div class="sim-grid2">
@@ -2206,7 +2214,10 @@
                 dash.style.display = 'none';
                 monthly.style.display = 'block';
                 navMonthly.classList.add('nav-active');
-                if (!monthlyLoaded) { monthlyLoaded = true; loadMonthlyAll(); }
+                // Reload on EVERY visit (not just the first): the daily
+                // scheduler writes a new snapshot each day, so a stale
+                // chart from a previous visit would hide today's point.
+                loadMonthlyAll();
             } else {
                 dash.style.display = 'grid';
                 navDash.classList.add('nav-active');
@@ -2214,8 +2225,15 @@
         }
 
         // ===================== Monthly qv-mom portfolio =====================
-        let monthlyLoaded = false;
         let monthlyChart = null;
+
+        // Compare line: the daily sim portfolio's equity curve, overlaid on
+        // the Monthly chart. Both are plotted as % of their contributed total
+        // (allowance_total), because the two portfolios receive the same
+        // $1000/month but at different times (sim at month start, monthly
+        // historically at month end) — absolute dollars would compare apples
+        // to oranges.
+        let compareMode = 'pct';
 
         async function loadMonthlyStatus() {
             try {
@@ -2247,9 +2265,10 @@
         }
 
         async function loadMonthlyEquity() {
-            const [snaps, live] = await Promise.all([
+            const [snaps, live, simSnaps] = await Promise.all([
                 api('monthly/equity?limit=365').catch(() => null),
                 api('monthly/status').catch(() => null),
+                api('sim/equity?limit=365').catch(() => null),
             ]);
             if (monthlyChart) { monthlyChart.remove(); monthlyChart = null; }
             if (!snaps || !snaps.length) {
@@ -2257,24 +2276,73 @@
                 return;
             }
             // Live point: today's valuation, so the curve reflects current
-            // prices between rebalances (deduped if today IS a snapshot day).
-            const points = snaps.map(s => ({ time: s.date, value: s.total_equity }));
-            const last = snaps[snaps.length - 1];
+            // prices between snapshots (deduped if today IS a snapshot day).
+            // Each point carries its own contributed total — the allowance
+            // steps $1000 at every month start, and dividing by the WRONG
+            // vintage would spike the pct curve.
+            const points = snaps.map(s => ({ time: s.date, value: s.total_equity, contributed: s.allowance_total }));
+            const last = points[points.length - 1];
             if (live && live.total_equity != null) {
                 const today = new Date().toISOString().slice(0, 10);
-                if (last.time < today) points.push({ time: today, value: live.total_equity });
+                if (last.time < today) points.push({ time: today, value: live.total_equity, contributed: live.allowance_total });
             }
+            const toPct = p => p.contributed > 0 ? (p.value / p.contributed * 100) : p.value;
+            // Sim overlay: same data the Simulation tab plots. The sim's
+            // contributed total can differ from the monthly's (deposit timing
+            // drift), so each sim point is normalized by ITS OWN
+            // contributed value in pct mode.
+            const byDay = new Map();  // collapse intraday snapshots -> last per day
+            for (const s of (simSnaps || [])) {
+                byDay.set(new Date(s.at).toISOString().slice(0, 10),
+                    { value: s.total_equity, contributed: s.allowance_total });
+            }
+            const simPoints = [...byDay.entries()].map(([time, p]) => ({
+                time,
+                value: compareMode === 'pct' ? toPct(p) : p.value,
+            })).sort((a, b) => a.time < b.time ? -1 : 1);
             document.getElementById('monthly-chart').innerHTML = '';
             monthlyChart = LightweightCharts.createChart(document.getElementById('monthly-chart'), {
                 height: 320, layout: { background: { color: '#071009' }, textColor: '#b7ffc0' },
                 grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } },
                 timeScale: { timeVisible: false, secondsVisible: false },
+                localization: compareMode === 'pct' ? { priceFormatter: fmtPct } : {},
             });
-            const equity = monthlyChart.addLineSeries({ color: '#42ff72', lineWidth: 2 });
-            equity.setData(points);
-            const contrib = monthlyChart.addLineSeries({ color: '#ff9f43', lineWidth: 1 });
-            contrib.setData(snaps.map(s => ({ time: s.date, value: s.allowance_total })));
+            const monthlyLine = monthlyChart.addLineSeries({
+                color: '#42ff72', lineWidth: 2, priceScaleId: 'right',
+                priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+            });
+            monthlyLine.setData(points.map(p => ({ time: p.time, value: compareMode === 'pct' ? toPct(p) : p.value })));
+            if (simPoints.length) {
+                const simLine = monthlyChart.addLineSeries({
+                    color: '#4d9fff', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed,
+                    priceScaleId: compareMode === 'pct' ? 'right' : 'left',
+                    priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+                });
+                simLine.setData(simPoints);
+                if (compareMode !== 'pct') {
+                    // USD mode: contributed totals can differ (e.g. 2000 vs
+                    // 1000), so plot the sim on a hidden left scale — a
+                    // shared scale would squash the smaller portfolio.
+                    monthlyChart.priceScale('left').applyOptions({ visible: false });
+                }
+            }
+            // Contributed baseline (orange): the monthly portfolio's own
+            // allowance_total steps; in pct mode it is the flat 100 line.
+            const contrib = monthlyChart.addLineSeries({
+                color: '#ff9f43', lineWidth: 1, priceScaleId: 'right',
+                priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+            });
+            contrib.setData(points.map(p => ({ time: p.time, value: compareMode === 'pct' ? 100 : p.contributed })));
             monthlyChart.timeScale().fitContent();
+        }
+
+        function fmtPct(v) { return v.toFixed(1) + '%'; }
+
+        function setCompareMode(mode) {
+            compareMode = mode;
+            document.getElementById('cmp-pct').classList.toggle('range-active', mode === 'pct');
+            document.getElementById('cmp-usd').classList.toggle('range-active', mode === 'usd');
+            loadMonthlyEquity();
         }
 
         async function loadMonthlyRebalances() {

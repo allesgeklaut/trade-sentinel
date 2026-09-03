@@ -370,6 +370,10 @@ async def sim_raw_reasoning():
 async def monthly_status():
     """Monthly portfolio snapshot: cash, positions, equity, config."""
     from . import monthly
+    # Deposit the allowance when a new month has begun (start-of-month, same
+    # timing as the sim portfolio) so viewing the tab reflects the deposit
+    # immediately instead of waiting for the nightly scheduler pass.
+    await monthly.deposit_allowance()
     val = await monthly.monthly_valuate()
     return {**val,
             "sim_monthly_enabled": settings.sim_monthly_enabled,
