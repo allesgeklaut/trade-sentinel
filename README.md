@@ -2,7 +2,7 @@
 
 A self-hosted, paper-only stock research dashboard. Market data is switched globally with **one environment variable**; all providers normalize historical daily OHLCV data into the same local SQLite cache, so charts, signals, autocomplete, and screening use the selected backend consistently.
 
-![Mobile screenshot: stock chart with signal metrics](docs/screenshot-mobile.jpg)
+![Desktop screenshot: AAPL chart with BUY signal, key metric chips and local screener](docs/screenshot-desktop.jpg)
 
 ## Choose a provider
 
