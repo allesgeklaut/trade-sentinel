@@ -190,6 +190,49 @@
             min-width: 90px
         }
 
+        /* Signal chips layout: one flex row that wraps, so the metric chips
+           pack tightly instead of leaving ragged gaps. */
+        .signal-chips {
+            display: flex;
+            flex-wrap: wrap;
+            margin: -5px /* pull in the chips' outer margins */
+        }
+
+        /* Secondary indicators hidden behind the "All indicators" toggle. */
+        .signal-chips.signal-rest-hidden {
+            display: none
+        }
+
+        .signal-more-btn {
+            /* Full-width slim disclosure bar under the chip grid — a TUI
+               style "▼ 15 MORE" separator. Owning its whole row means it is
+               always aligned, regardless of where the chips wrap. The dashed
+               top rule doubles as the visual divider; hover just brightens. */
+            align-self: stretch;
+            width: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            height: 22px;
+            padding: 0;
+            margin: 10px 5px 0;
+            font-size: 10px;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            color: #7aaa81;
+            background: transparent;
+            border: none;
+            border-top: 1px dashed #12351c;
+            border-radius: 0;
+            cursor: pointer;
+            transition: color .15s ease
+        }
+
+        .signal-more-btn:hover {
+            color: #42ff72
+        }
+
         /* --- Responsive / mobile --- */
         /* Mobile tab switcher for the chart/chat column: instead of stacking
            the chart (which pushes the chat far down the page) we show one
@@ -2083,15 +2126,44 @@
             }
         }
 
+        // Signal chips shown by default; everything else hides behind the
+        // "all indicators" expander. Kept deliberately short — the headline
+        // numbers a trader glances at: price, the composite verdict, the
+        // risk dial, and the trend context.
+        const PRIMARY_SIGNAL_KEYS = ['close', 'net_score', 'strength', 'rsi', 'sma200', 'atr_stop', 'adx', 'run_5d'];
+        // Persist the collapsed state across ticker switches/reloads.
+        let showAllSignals = false;
+
+        function toggleSignalMore() {
+            showAllSignals = !showAllSignals;
+            // Pure DOM swap — no request needed: flip the hidden class and
+            // the bar label.
+            const rest = document.querySelector('.signal-rest');
+            const btn = document.getElementById('signal-more-btn');
+            if (rest) rest.classList.toggle('signal-rest-hidden', !showAllSignals);
+            if (btn) {
+                btn.textContent = showAllSignals ? '▲ less' : (btn.dataset.label || '▼ more');
+                btn.setAttribute('aria-expanded', String(showAllSignals));
+                btn.title = showAllSignals ? 'Hide the secondary indicators' : 'Show every indicator from the snapshot';
+            }
+        }
+
         function draw(d) {
             let s = d.snapshot;
+            const entries = s && Object.keys(s).length ? Object.entries(s) : null;
+            const primary = entries ? entries.filter(([k]) => PRIMARY_SIGNAL_KEYS.includes(k)) : null;
+            const rest = entries ? entries.filter(([k]) => !PRIMARY_SIGNAL_KEYS.includes(k)) : null;
+            const chip = ([k, v]) =>
+                `<span class=metric title="${escapeHtml(GLOSSARY[k] || '')}">${escapeHtml(k)}<br><b>${escapeHtml(String(v))}</b></span>`;
+            const moreBtn = rest && rest.length
+                ? `<button id="signal-more-btn" class="signal-more-btn" data-label="▼ ${rest.length} more" onclick="toggleSignalMore()" aria-expanded="${showAllSignals}" title="Show every indicator from the snapshot">${showAllSignals ? '▲ less' : '▼ ' + rest.length + ' more'}</button>`
+                : '';
             $('#signal').innerHTML =
                 `<h2 class="${escapeHtml(d.action.toLowerCase())}">${escapeHtml(d.action)}</h2>` +
                 `<p>${escapeHtml(d.reason)}</p>` +
-                (s && Object.keys(s).length
-                    ? Object.entries(s).map(([k, v]) =>
-                        `<span class=metric>${escapeHtml(k)}<br><b>${escapeHtml(String(v))}</b></span>`
-                    ).join('')
+                (entries
+                    ? `<div class="signal-chips">${primary.map(chip).join('')}</div>` +
+                      (rest.length ? `<div class="signal-chips signal-rest${showAllSignals ? '' : ' signal-rest-hidden'}">${rest.map(chip).join('')}</div>` : '') + moreBtn
                     : '<span style="color:#7aaa81">No indicators available — insufficient data for analysis.</span>');
             $('#chart').innerHTML = '';
             const chartOpts = {
