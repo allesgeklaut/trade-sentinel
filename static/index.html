@@ -733,6 +733,69 @@
             border: 1px solid #12351c
         }
 
+        /* Desktop: the dashboard grid stretches the screener panel to the
+           full row height (the chart+chat column is the tallest), but the
+           list was capped at 480px, leaving a large dead area inside the
+           panel. Flex the panel so the scroll area fills ALL leftover
+           height instead. Two gotchas:
+           - <details> wraps its children in an anonymous content box, so
+             flexing `details` alone does nothing — the flex chain must go
+             through the ::details-content pseudo-element.
+           - contain:size on the panel keeps the long list from feeding
+             back into the grid row sizing (the middle chart+chat column
+             stays the height reference). */
+        @media (min-width: 901px) {
+            .screen-panel {
+                display: flex;
+                flex-direction: column;
+                contain: size
+            }
+
+            .screen-panel>details {
+                display: flex;
+                flex-direction: column;
+                flex: 1;
+                min-height: 0
+            }
+        }
+
+        /* Only enable the fill layout where ::details-content is supported;
+           elsewhere the 480px cap above still applies. */
+        @supports selector(details::details-content) {
+            @media (min-width: 901px) {
+                .screen-panel details::details-content {
+                    display: flex;
+                    flex-direction: column;
+                    flex: 1;
+                    min-height: 0
+                }
+
+                /* When closed, the content box must actually disappear —
+                   with display:flex above it would keep stretching to fill
+                   the panel even though its children are "hidden". */
+                .screen-panel details:not([open])::details-content {
+                    display: none
+                }
+
+                .screen-panel #screen {
+                    flex: 1;
+                    min-height: 0;
+                    display: flex;
+                    flex-direction: column
+                }
+
+                .screen-panel .screener-scroll {
+                    flex: 1;
+                    min-height: 0;
+                    max-height: none
+                }
+
+                .screen-panel .screener-updated {
+                    flex: none
+                }
+            }
+        }
+
         .screener-scroll table {
             margin: 0
         }
@@ -2035,6 +2098,7 @@
                     : '<span style="color:#7aaa81">No indicators available — insufficient data for analysis.</span>');
             $('#chart').innerHTML = '';
             const chartOpts = {
+                autoSize: true,
                 height: 420,
                 layout: { background: { color: '#071009' }, textColor: '#b7ffc0' },
                 grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } },
