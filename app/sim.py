@@ -89,8 +89,10 @@ _SIM_REFRESH_PERIOD = "2y"
 # ---------------------------------------------------------------------------
 
 # Used only for _current_month(): the monthly allowance is a calendar-month
-# concept, so we anchor it to the operator's local timezone (Europe/Vienna).
-_TZ = ZoneInfo("Europe/Vienna")
+# concept, so we anchor it to the operator's local timezone. Shared with the
+# monthly qv-mom portfolio (allowance_tz) so both contributed figures step on
+# the same calendar boundary and stay comparable.
+_TZ = ZoneInfo(settings.allowance_tz)
 
 
 def _utcnow() -> datetime:
@@ -2231,6 +2233,7 @@ async def reset_benchmark() -> None:
 # ---------------------------------------------------------------------------
 
 _scheduler_task: asyncio.Task | None = None
+_daily_snapshot_task: asyncio.Task | None = None
 
 
 async def _scheduler_loop():
@@ -2278,19 +2281,78 @@ async def _scheduler_loop():
             logger.error("Sim cycle failed: %s", e, exc_info=True)
 
 
+async def _daily_monthly_snapshot_loop():
+    # Imported here (not at module top) to avoid a circular import:
+    # monthly imports market/screener lazily at call time.
+    from .monthly import deposit_allowance, refresh_holdings, take_snapshot
+
+    """Background loop that marks the Monthly qv-mom portfolio once a day.
+
+    Sequence (all idempotent):
+      1. Deposit the allowance when a new operator-local month has begun
+         (START of month, mirroring the sim portfolio's deposit timing so the
+         two "contributed" figures stay in lockstep).
+      2. Refresh candles for the current holdings so valuation uses current
+         prices.
+      3. Write one MonthlySnapshot so the Monthly equity curve moves daily
+         instead of only at month-end rebalances.
+
+    The last-trading-day rebalance still runs in _scheduler_loop; on those
+    days take_snapshot() skips itself while the rebalance lock is held, and
+    the rebalance's own post-trade snapshot is recorded instead.
+
+    Disabled while sim_monthly_enabled is False: the loop keeps sleeping on
+    its schedule but performs no deposits, refreshes or snapshots, matching
+    the gate in monthly.run_monthly_cycle().
+    """
+    while True:
+        now = _utcnow()
+        # Daily mark runs 5 minutes before the main cycle so it never contends
+        # with the rebalance that _scheduler_loop fires at sim_run_hour.
+        target = now.replace(hour=settings.sim_run_hour, minute=settings.sim_run_minute,
+                             second=0, microsecond=0) - timedelta(minutes=5)
+        if target <= now:
+            # Today's mark already passed — schedule for tomorrow
+            target = target + timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        logger.info("Monthly daily snapshot: next run at %s (in %.0f seconds)", target, wait_seconds)
+        await asyncio.sleep(wait_seconds)
+        if not settings.sim_monthly_enabled:
+            continue
+        try:
+            deposit = await deposit_allowance()
+            if deposit.get("deposited"):
+                logger.info("Monthly daily scheduler: allowance deposited for %s", deposit.get("month"))
+            refresh = await refresh_holdings()
+            if refresh.get("errors"):
+                logger.warning("Monthly daily scheduler: refresh errors: %s", refresh["errors"])
+            snap = await take_snapshot()
+            if snap.get("skipped"):
+                logger.info("Monthly daily scheduler: snapshot skipped — %s", snap.get("reason"))
+            else:
+                logger.info("Monthly daily scheduler: snapshot equity=%.2f", snap.get("total_equity", 0))
+        except Exception as e:
+            logger.error("Monthly daily snapshot failed: %s", e, exc_info=True)
+
+
 def start_scheduler():
     """Start the background scheduler task (called from main.py lifespan)."""
-    global _scheduler_task
+    global _scheduler_task, _daily_snapshot_task
     if _scheduler_task is None or _scheduler_task.done():
         _scheduler_task = asyncio.create_task(_scheduler_loop())
+    if _daily_snapshot_task is None or _daily_snapshot_task.done():
+        _daily_snapshot_task = asyncio.create_task(_daily_monthly_snapshot_loop())
 
 
 def stop_scheduler():
     """Stop the background scheduler task."""
-    global _scheduler_task
+    global _scheduler_task, _daily_snapshot_task
     if _scheduler_task and not _scheduler_task.done():
         _scheduler_task.cancel()
     _scheduler_task = None
+    if _daily_snapshot_task and not _daily_snapshot_task.done():
+        _daily_snapshot_task.cancel()
+    _daily_snapshot_task = None
 
 
 # ---------------------------------------------------------------------------
