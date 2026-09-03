@@ -173,10 +173,12 @@
             margin-bottom: 0
         }
 
-        /* Ensure the chart canvas stays inside its panel border with a
-           safety gap below for the chart library's axis labels. */
+        /* The chart canvas must stay inside the panel border. Historically
+           this needed a huge 192px padding-bottom "safety gap" because the
+           fixed-size canvas overflowed its container; with autoSize:true on
+           the chart (container-driven sizing) the canvas fits exactly, so
+           only overflow:hidden remains as a guard. */
         .chart-panel {
-            padding-bottom: 192px;
             overflow: hidden
         }
 
@@ -1070,11 +1072,6 @@
         #sim-chart {
             height: 320px;
             margin-bottom: 0
-        }
-
-        /* Same safety gap for the simulation chart panel. */
-        #sim-chart {
-            margin-bottom: 96px
         }
 
         .sim-actions {
