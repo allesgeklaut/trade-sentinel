@@ -2,7 +2,7 @@
 
 A self-hosted, paper-only stock research dashboard. Market data is switched globally with **one environment variable**; all providers normalize historical daily OHLCV data into the same local SQLite cache, so charts, signals, autocomplete, and screening use the selected backend consistently.
 
-![Mobile screenshot: stock chart with signal metrics](docs/screenshot-mobile.jpg)
+![Desktop screenshot: AAPL chart with BUY signal, key metric chips and local screener](docs/screenshot-desktop.jpg)
 
 ## Choose a provider
 
@@ -118,4 +118,4 @@ LLM_BACKENDS=[{"name":"llama-server","type":"openai","url":"http://your-server-i
 
 ## Timezone convention
 
-All `created_at` / `updated_at` timestamps are stored as tz-aware UTC in SQLite. The autonomous paper-trading scheduler runs at `SIM_RUN_HOUR`:`SIM_RUN_MINUTE` **UTC** (set `22 30` to run at 22:30 UTC). The monthly allowance deposit is the one exception: it is anchored to the operator's local timezone (`Europe/Vienna` by default) so the "monthly" deposit lands on the local calendar month boundary. The frontend displays the sim chart axis labels and trade log times in the operator's local timezone (`Europe/Vienna`), converting the stored UTC ISO strings on the client.
+All `created_at` / `updated_at` timestamps are stored as tz-aware UTC in SQLite. The autonomous paper-trading scheduler runs at `SIM_RUN_HOUR`:`SIM_RUN_MINUTE` **UTC** (set `22 30` to run at 22:30 UTC). The monthly allowance deposits for BOTH paper portfolios (sim + monthly qv-mom) are anchored to the operator's local timezone (`ALLOWANCE_TZ`, `Europe/Vienna` by default) so the deposits land on the local calendar month boundary — and at the *start* of the month, so the two portfolios' cumulative "contributed" figures step in lockstep and their equity curves are directly comparable. The monthly qv-mom portfolio additionally takes a daily equity snapshot (right before the main nightly cycle), so its curve moves every day instead of only at month-end rebalances. The frontend displays the sim chart axis labels and trade log times in the operator's local timezone (`Europe/Vienna`), converting the stored UTC ISO strings on the client.

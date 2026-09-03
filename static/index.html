@@ -12,8 +12,7 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="Trade Sentinel">
     <title>Trade Sentinel</title>
-    <script
-        src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"
+    <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"
         integrity="sha384-OK7vELvjHdhUFi31JYioPIcRHTROLdcDa6ZsNWgvgLaKj+9JqhU0Ad8g4wz3CXjA"
         crossorigin="anonymous"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked@13.0.3/marked.min.js"
@@ -79,6 +78,11 @@
             border-bottom: 1px solid #1d6030;
             display: flex;
             justify-content: space-between
+        }
+
+        header b {
+            font-size: 12px;
+            letter-spacing: .3px
         }
 
         button,
@@ -169,10 +173,12 @@
             margin-bottom: 0
         }
 
-        /* Ensure the chart canvas stays inside its panel border with a
-           safety gap below for the chart library's axis labels. */
+        /* The chart canvas must stay inside the panel border. Historically
+           this needed a huge 192px padding-bottom "safety gap" because the
+           fixed-size canvas overflowed its container; with autoSize:true on
+           the chart (container-driven sizing) the canvas fits exactly, so
+           only overflow:hidden remains as a guard. */
         .chart-panel {
-            padding-bottom: 192px;
             overflow: hidden
         }
 
@@ -182,6 +188,50 @@
             padding: 10px;
             margin: 5px;
             min-width: 90px
+        }
+
+        /* Signal chips layout: one flex row that wraps, so the metric chips
+           pack tightly instead of leaving ragged gaps. */
+        .signal-chips {
+            display: flex;
+            flex-wrap: wrap;
+            margin: -5px
+                /* pull in the chips' outer margins */
+        }
+
+        /* Secondary indicators hidden behind the "All indicators" toggle. */
+        .signal-chips.signal-rest-hidden {
+            display: none
+        }
+
+        .signal-more-btn {
+            /* Full-width slim disclosure bar under the chip grid — a TUI
+               style "▼ 15 MORE" separator. Owning its whole row means it is
+               always aligned, regardless of where the chips wrap. The dashed
+               top rule doubles as the visual divider; hover just brightens. */
+            align-self: stretch;
+            width: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            height: 22px;
+            padding: 0;
+            margin: 10px 5px 0;
+            font-size: 10px;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            color: #7aaa81;
+            background: transparent;
+            border: none;
+            border-top: 1px dashed #12351c;
+            border-radius: 0;
+            cursor: pointer;
+            transition: color .15s ease
+        }
+
+        .signal-more-btn:hover {
+            color: #42ff72
         }
 
         /* --- Responsive / mobile --- */
@@ -613,13 +663,12 @@
             height: 14px;
             margin-left: 2px;
             vertical-align: text-bottom;
-            background: linear-gradient(
-                to bottom,
-                #42ff72 0%, #42ff72 30%,
-                transparent 30%, transparent 100%
-            );
+            background: linear-gradient(to bottom,
+                    #42ff72 0%, #42ff72 30%,
+                    transparent 30%, transparent 100%);
             animation: ai-caret 1s steps(2, jump-none) infinite;
         }
+
         .ai-msg.assistant.pending:empty::after {
             /* No text yet — show three pulsing dots instead of a caret. */
             content: '● ● ●';
@@ -632,13 +681,29 @@
             animation: ai-pulse 1.2s ease-in-out infinite;
             vertical-align: middle;
         }
+
         @keyframes ai-caret {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0; }
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0;
+            }
         }
+
         @keyframes ai-pulse {
-            0%, 100% { opacity: 0.3; }
-            50% { opacity: 1; }
+
+            0%,
+            100% {
+                opacity: 0.3;
+            }
+
+            50% {
+                opacity: 1;
+            }
         }
 
         table {
@@ -684,15 +749,22 @@
             overflow: hidden;
             margin-top: 4px
         }
+
         .screener-bar-fill {
             position: absolute;
-            top: 0; left: 0; bottom: 0;
+            top: 0;
+            left: 0;
+            bottom: 0;
             background: #1d6030;
             transition: width 0.3s ease
         }
+
         .screener-bar-label {
             position: absolute;
-            top: 0; left: 0; right: 0; bottom: 0;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -707,8 +779,78 @@
             border: 1px solid #12351c
         }
 
+        /* Desktop: the dashboard grid stretches the screener panel to the
+           full row height (the chart+chat column is the tallest), but the
+           list was capped at 480px, leaving a large dead area inside the
+           panel. Flex the panel so the scroll area fills ALL leftover
+           height instead. Two gotchas:
+           - <details> wraps its children in an anonymous content box, so
+             flexing `details` alone does nothing — the flex chain must go
+             through the ::details-content pseudo-element.
+           - contain:size on the panel keeps the long list from feeding
+             back into the grid row sizing (the middle chart+chat column
+             stays the height reference). */
+        @media (min-width: 901px) {
+            .screen-panel {
+                display: flex;
+                flex-direction: column;
+                contain: size
+            }
+
+            .screen-panel>details {
+                display: flex;
+                flex-direction: column;
+                flex: 1;
+                min-height: 0
+            }
+        }
+
+        /* Only enable the fill layout where ::details-content is supported;
+           elsewhere the 480px cap above still applies. */
+        @supports selector(details::details-content) {
+            @media (min-width: 901px) {
+                .screen-panel details::details-content {
+                    display: flex;
+                    flex-direction: column;
+                    flex: 1;
+                    min-height: 0
+                }
+
+                /* When closed, the content box must actually disappear —
+                   with display:flex above it would keep stretching to fill
+                   the panel even though its children are "hidden". */
+                .screen-panel details:not([open])::details-content {
+                    display: none
+                }
+
+                .screen-panel #screen {
+                    flex: 1;
+                    min-height: 0;
+                    display: flex;
+                    flex-direction: column
+                }
+
+                .screen-panel .screener-scroll {
+                    flex: 1;
+                    min-height: 0;
+                    max-height: none
+                }
+
+                .screen-panel .screener-updated {
+                    flex: none
+                }
+            }
+        }
+
         .screener-scroll table {
             margin: 0
+        }
+
+        /* Slimmer horizontal padding: the 6-col table must fit the narrow
+           screener column without a horizontal scrollbar even on desktop. */
+        .screener-scroll td,
+        .screener-scroll th {
+            padding: 6px 4px
         }
 
         .screener-scroll thead th {
@@ -720,7 +862,7 @@
         }
 
         /* Mobile: collapsible screener panel via <details> */
-        .screen-panel details > summary {
+        .screen-panel details>summary {
             cursor: pointer;
             list-style: none;
             color: #b7ffc0;
@@ -728,7 +870,7 @@
             margin-bottom: 6px
         }
 
-        .screen-panel details > summary::-webkit-details-marker {
+        .screen-panel details>summary::-webkit-details-marker {
             display: none
         }
 
@@ -917,7 +1059,9 @@
             padding: 18px
         }
 
-        #monthly-trades, #monthly-positions, #monthly-rebalances {
+        #monthly-trades,
+        #monthly-positions,
+        #monthly-rebalances {
             max-height: 320px;
             overflow-y: auto;
             overflow-x: auto
@@ -939,7 +1083,9 @@
         /* Scrollable log tables so a long trade history doesn't push the
            page down; the section header stays fixed, the table scrolls.
            overflow-x:auto keeps wide tables from bleeding out on mobile. */
-        #sim-trades, #sim-positions, #sim-allowances {
+        #sim-trades,
+        #sim-positions,
+        #sim-allowances {
             max-height: 320px;
             overflow-y: auto;
             overflow-x: auto
@@ -961,14 +1107,22 @@
             margin-bottom: 18px
         }
 
+        /* Grid items default to min-width:auto, so a wide table inside would
+           stretch the section past the viewport on mobile instead of letting
+           the inner overflow-x:auto scroll handle it. Force children to be
+           able to shrink to the column width. */
+        .sim-grid2>.sim-section {
+            min-width: 0;
+            max-width: 100%
+        }
+
+        .sim-grid2>.sim-section>* {
+            max-width: 100%
+        }
+
         #sim-chart {
             height: 320px;
             margin-bottom: 0
-        }
-
-        /* Same safety gap for the simulation chart panel. */
-        #sim-chart {
-            margin-bottom: 96px
         }
 
         .sim-actions {
@@ -1015,30 +1169,100 @@
                 margin-bottom: 0
             }
 
-            .sim-grid2 .sim-grid2 > .sim-section {
+            .sim-grid2 .sim-grid2>.sim-section {
                 margin-bottom: 12px
             }
 
-            /* Compact tables on mobile: smaller padding + font so the 6-col
-               trade log (Time/Ticker/Side/Shares/Price/Reason) fits without
-               horizontal scroll when possible, and scrolls cleanly when not. */
+            /* Tables scroll horizontally inside their clipped wrapper
+               instead of stretching the panel wider than the screen. */
+            .sim-grid2>.sim-section {
+                overflow-x: hidden
+            }
+
+            /* Compact tables on mobile: smaller padding + font. Never break
+               INSIDE a word or number — "Ticker" must not split into
+               "Tick er" and "$266.43" into "$266. 43". Columns size to their
+               widest token; the wrapper scrolls horizontally when needed. */
             #sim-trades table,
             #sim-positions table,
-            #sim-allowances table {
-                font-size: 11px
+            #sim-allowances table,
+            #monthly-trades table,
+            #monthly-positions table,
+            #monthly-rebalances table {
+                font-size: 11px;
+                table-layout: auto
             }
+
             #sim-trades td,
             #sim-trades th,
             #sim-positions td,
             #sim-positions th,
             #sim-allowances td,
-            #sim-allowances th {
+            #sim-allowances th,
+            #monthly-trades td,
+            #monthly-trades th,
+            #monthly-positions td,
+            #monthly-positions th,
+            #monthly-rebalances td,
+            #monthly-rebalances th {
                 padding: 3px 4px
+            }
+
+            /* Trade logs are the widest tables (6 columns); 3px horizontal
+               padding buys back the last few px so Reason fits without any
+               inner horizontal scroll on ~360px screens. */
+            #sim-trades td,
+            #sim-trades th,
+            #monthly-trades td,
+            #monthly-trades th {
+                padding: 3px 3px
+            }
+
+            /* Positions/log values stay on one line so tickers, prices and
+               percentages never wrap mid-value; headers may still stack at
+               word boundaries ("Avg" / "Cost") to save width. Only the Reason
+               cell may wrap. */
+            #sim-positions td,
+            #monthly-positions td,
+            #sim-allowances td,
+            #sim-allowances th,
+            #monthly-rebalances td,
+            #monthly-rebalances th,
+            #sim-trades td:not(:last-child),
+            #monthly-trades td:not(:last-child) {
+                white-space: nowrap
+            }
+
+            /* The trade log scrolls vertically, so give Reason all leftover
+               width: it wraps to multiple lines while every other column
+               (Time is a compact "14:04") stays on one line. min-width keeps
+               it from collapsing when a reason is short; on very narrow
+               screens 90px still leaves room for the fixed columns. */
+            #sim-trades th:last-child,
+            #sim-trades td:last-child,
+            #monthly-trades th:last-child,
+            #monthly-trades td:last-child {
+                width: 55%;
+                min-width: 80px;
+                white-space: normal;
+                word-break: normal;
+                overflow-wrap: break-word
             }
         }
 
         .bench-metric {
             border-color: #ff9f43 !important
+        }
+
+        /* Full-width date divider row inside trade logs. */
+        .log-date-row td {
+            background: #0a2412;
+            color: #42ff72;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: .5px;
+            padding: 3px 4px;
+            text-align: left
         }
 
         .bench-label {
@@ -1051,12 +1275,13 @@
 </head>
 
 <body>
-    <div id="ptr-indicator" class="ptr-indicator"><span id="ptr-arrow">↓</span><span id="ptr-text">Pull to refresh</span></div>
+    <div id="ptr-indicator" class="ptr-indicator"><span id="ptr-arrow">↓</span><span id="ptr-text">Pull to
+            refresh</span></div>
     <header><b>TRADE SENTINEL // PAPER-ONLY RESEARCH TERMINAL</b>
         <div class="nav-toggle"><button id="nav-dashboard" class="nav-active"
-                onclick="showView('dashboard')">Dashboard</button><button id="nav-sim"
-                onclick="showView('sim')">Simulation</button><button id="nav-monthly"
-                onclick="showView('monthly')">Monthly</button></div><span id="status">loading</span>
+                onclick="showView('dashboard')">Dashboard</button><button id="nav-sim" onclick="showView('sim')">Daily
+                Sim</button><button id="nav-monthly" onclick="showView('monthly')">Monthly Sim</button></div><span
+            id="status">loading</span>
         <select id="llm-model" title="Active LLM backend / model" onchange="switchLLMModel()">
             <option value="">loading models…</option>
         </select>
@@ -1100,9 +1325,14 @@
             <details id="screen-details" open>
                 <summary>Screen results</summary>
                 <p><select id="universe"></select> <button onclick="runScreen(this)">Update</button>
-                <button onclick="refreshUniverse(this)" title="Only fetch tickers with missing or stale data">Refresh</button>
-                <button onclick="loadDeepHistory(this)" title="Fetch 10y of history for optimization/backtest">Load 10y</button></p><small>Ranks cached
-                    daily candles by trend, 20/60d momentum, RSI and relative volume. <b>Update</b> re-downloads ~2y and re-ranks. <b>Refresh</b> only fills gaps. <b>Load 10y</b> fetches deep history for backtesting.</small>
+                    <button onclick="refreshUniverse(this)"
+                        title="Only fetch tickers with missing or stale data">Refresh</button>
+                    <button onclick="loadDeepHistory(this)" title="Fetch 10y of history for optimization/backtest">Load
+                        10y</button>
+                </p><small>Ranks cached
+                    daily candles by trend, 20/60d momentum, RSI and relative volume. <b>Update</b> re-downloads ~2y and
+                    re-ranks. <b>Refresh</b> only fills gaps. <b>Load 10y</b> fetches deep history for
+                    backtesting.</small>
                 <div id="screener-status" style="margin-top:6px;font-size:12px;color:#7aaa81;min-height:14px"></div>
                 <div id="screen">No screen run yet.</div>
             </details>
@@ -1114,9 +1344,15 @@
         </div>
         <div class="sim-section">
             <div class="sim-section-title">Equity Curve</div>
-            <div style="display:flex;gap:16px;margin-bottom:8px">
+            <div style="display:flex;gap:16px;margin-bottom:8px;flex-wrap:wrap;align-items:center">
                 <span style="color:#42ff72;font-size:12px">● Bot</span>
                 <span style="color:#ff9f43;font-size:12px">● Benchmark (DCA)</span>
+                <span style="color:#7aaa81;font-size:12px">● Contributed</span>
+                <span style="flex:1"></span>
+                <button id="sim-cmp-pct" class="range-btn range-active" onclick="setSimCompareMode('pct')"
+                    title="Each curve as % of its contributed allowance — fair growth comparison">% View</button>
+                <button id="sim-cmp-usd" class="range-btn" onclick="setSimCompareMode('usd')" title="Absolute dollars">$
+                    View</button>
             </div>
             <div id="sim-chart"></div>
         </div>
@@ -1162,7 +1398,8 @@
         </div>
         <div class="sim-section">
             <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">CHAT WITH PORTFOLIO MANAGER</h3>
-            <div class="ai-hint" style="margin-bottom:8px">Ask the LLM to explain decisions, or request actions like "sell AMZN to buy NVDA". If the LLM agrees, trades execute immediately (respecting risk limits).</div>
+            <div class="ai-hint" style="margin-bottom:8px">Ask the LLM to explain decisions, or request actions like
+                "sell AMZN to buy NVDA". If the LLM agrees, trades execute immediately (respecting risk limits).</div>
             <div id="sim-chat-thread" class="ai-thread" style="max-height:320px">
                 <div class="ai-empty">Start a conversation with the portfolio manager.</div>
             </div>
@@ -1180,7 +1417,18 @@
             <div id="monthly-summary"></div>
         </div>
         <div class="sim-section">
-            <div class="sim-section-title">Equity Curve (vs contributed)</div>
+            <div class="sim-section-title">Equity Curve (vs contributed &amp; daily sim)</div>
+            <div style="display:flex;gap:16px;margin-bottom:8px;flex-wrap:wrap">
+                <span style="color:#42ff72;font-size:12px">● Monthly</span>
+                <span style="color:#4d9fff;font-size:12px">● Daily sim</span>
+                <span style="color:#ff9f43;font-size:12px">● Contributed</span>
+                <span style="flex:1"></span>
+                <button id="cmp-pct" class="range-btn range-active" onclick="setCompareMode('pct')"
+                    title="Each curve as % of its contributed total — fair comparison even when contributed differs">%
+                    View</button>
+                <button id="cmp-usd" class="range-btn" onclick="setCompareMode('usd')" title="Absolute dollars">$
+                    View</button>
+            </div>
             <div id="monthly-chart"></div>
         </div>
         <div class="sim-grid2">
@@ -1402,7 +1650,7 @@
             }
             if (!resp.ok) {
                 let msg = 'HTTP ' + resp.status;
-                try { msg += ': ' + await resp.text(); } catch (_) {}
+                try { msg += ': ' + await resp.text(); } catch (_) { }
                 opts.onError && opts.onError(msg);
                 return;
             }
@@ -1886,22 +2134,59 @@
             }
         }
 
+        // Signal chips shown by default; everything else hides behind the
+        // "all indicators" expander. Kept deliberately short — the headline
+        // numbers a trader glances at: price, the composite verdict, the
+        // risk dial, and the trend context.
+        const PRIMARY_SIGNAL_KEYS = ['close', 'net_score', 'strength', 'rsi', 'sma200', 'atr_stop', 'adx', 'run_5d'];
+        // Persist the collapsed state across ticker switches/reloads.
+        let showAllSignals = false;
+
+        function toggleSignalMore() {
+            showAllSignals = !showAllSignals;
+            // Pure DOM swap — no request needed: flip the hidden class and
+            // the bar label.
+            const rest = document.querySelector('.signal-rest');
+            const btn = document.getElementById('signal-more-btn');
+            if (rest) rest.classList.toggle('signal-rest-hidden', !showAllSignals);
+            if (btn) {
+                btn.textContent = showAllSignals ? '▲ less' : (btn.dataset.label || '▼ more');
+                btn.setAttribute('aria-expanded', String(showAllSignals));
+                btn.title = showAllSignals ? 'Hide the secondary indicators' : 'Show every indicator from the snapshot';
+            }
+        }
+
         function draw(d) {
             let s = d.snapshot;
+            const entries = s && Object.keys(s).length ? Object.entries(s) : null;
+            const primary = entries ? entries.filter(([k]) => PRIMARY_SIGNAL_KEYS.includes(k)) : null;
+            const rest = entries ? entries.filter(([k]) => !PRIMARY_SIGNAL_KEYS.includes(k)) : null;
+            const chip = ([k, v]) =>
+                `<span class=metric title="${escapeHtml(GLOSSARY[k] || '')}">${escapeHtml(k)}<br><b>${escapeHtml(String(v))}</b></span>`;
+            const moreBtn = rest && rest.length
+                ? `<button id="signal-more-btn" class="signal-more-btn" data-label="▼ ${rest.length} more" onclick="toggleSignalMore()" aria-expanded="${showAllSignals}" title="Show every indicator from the snapshot">${showAllSignals ? '▲ less' : '▼ ' + rest.length + ' more'}</button>`
+                : '';
             $('#signal').innerHTML =
                 `<h2 class="${escapeHtml(d.action.toLowerCase())}">${escapeHtml(d.action)}</h2>` +
                 `<p>${escapeHtml(d.reason)}</p>` +
-                (s && Object.keys(s).length
-                    ? Object.entries(s).map(([k, v]) =>
-                        `<span class=metric>${escapeHtml(k)}<br><b>${escapeHtml(String(v))}</b></span>`
-                    ).join('')
+                (entries
+                    ? `<div class="signal-chips">${primary.map(chip).join('')}</div>` +
+                    (rest.length ? `<div class="signal-chips signal-rest${showAllSignals ? '' : ' signal-rest-hidden'}">${rest.map(chip).join('')}</div>` : '') + moreBtn
                     : '<span style="color:#7aaa81">No indicators available — insufficient data for analysis.</span>');
             $('#chart').innerHTML = '';
             const chartOpts = {
+                autoSize: true,
                 height: 420,
                 layout: { background: { color: '#071009' }, textColor: '#b7ffc0' },
                 grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } },
                 timeScale: {
+                    // Tick types (v4): 0 = year start, 1 = month start,
+                    // 2 = day start, 3 = time. Year boundaries must show the
+                    // YEAR ("2025") — returning day/month there produced
+                    // nonsense like a bold "2 Jan" where "2025" belongs, and
+                    // months then repeated twice ("2 Jan" … "Jan" … "May").
+                    rightOffset: 6,
+                    barSpacing: 6,
                     tickMarkFormatter: (time, tickMarkType, locale) => {
                         const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
                         let M, D, Y;
@@ -1914,9 +2199,10 @@
                             const dt = new Date(time * 1000);
                             M = MONTHS[dt.getUTCMonth()]; D = dt.getUTCDate(); Y = dt.getUTCFullYear();
                         }
-                        if (tickMarkType === 0) return `${D} ${M}`;
-                        if (tickMarkType === 1 || tickMarkType === 2) return M;
-                        if (tickMarkType === 3) return String(Y);
+                        if (tickMarkType === 0) return String(Y);
+                        if (tickMarkType === 1) return M;
+                        // Day ticks and anything finer (intraday) share the
+                        // same "D M" label on this daily-candle chart.
                         return `${D} ${M}`;
                     },
                 },
@@ -1926,7 +2212,12 @@
                 upColor: '#42ff72', downColor: '#ff5c70',
                 borderVisible: false, wickUpColor: '#42ff72', wickDownColor: '#ff5c70',
             }).setData(d.candles || []);
-            chart.timeScale().fitContent();
+            // fitContent() clamps the first candle to the exact left edge,
+            // clipping its axis label ("Sep" -> "ep"). A logical range with
+            // a small left margin keeps that label fully visible.
+            const n = (d.candles || []).length;
+            if (n > 0) chart.timeScale().setVisibleLogicalRange({ from: -2, to: n + 6 });
+            else chart.timeScale().fitContent();
         }
 
         async function refreshData(btn) {
@@ -2206,7 +2497,10 @@
                 dash.style.display = 'none';
                 monthly.style.display = 'block';
                 navMonthly.classList.add('nav-active');
-                if (!monthlyLoaded) { monthlyLoaded = true; loadMonthlyAll(); }
+                // Reload on EVERY visit (not just the first): the daily
+                // scheduler writes a new snapshot each day, so a stale
+                // chart from a previous visit would hide today's point.
+                loadMonthlyAll();
             } else {
                 dash.style.display = 'grid';
                 navDash.classList.add('nav-active');
@@ -2214,8 +2508,15 @@
         }
 
         // ===================== Monthly qv-mom portfolio =====================
-        let monthlyLoaded = false;
         let monthlyChart = null;
+
+        // Compare line: the daily sim portfolio's equity curve, overlaid on
+        // the Monthly chart. Both are plotted as % of their contributed total
+        // (allowance_total), because the two portfolios receive the same
+        // $1000/month but at different times (sim at month start, monthly
+        // historically at month end) — absolute dollars would compare apples
+        // to oranges.
+        let compareMode = 'pct';
 
         async function loadMonthlyStatus() {
             try {
@@ -2234,7 +2535,7 @@
                 document.getElementById('monthly-positions').innerHTML = pos.length ? `<table><tr><th>Ticker</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>P&L%</th></tr>${pos.map(p => {
                     const pnl = p.pnl_pct;
                     const cls = pnl > 0 ? 'buy' : pnl < 0 ? 'sell' : '';
-                    return `<tr><td>${escapeHtml(p.ticker)}</td><td>${escapeHtml(String(p.shares))}</td><td>$${p.avg_cost.toFixed(2)}</td><td>$${p.current_price.toFixed(2)}</td><td>$${p.value.toFixed(2)}</td><td class="${cls}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</td></tr>`;
+                    return `<tr><td>${escapeHtml(p.ticker)}</td><td>${p.shares.toFixed(4)}</td><td>$${p.avg_cost.toFixed(2)}</td><td>$${p.current_price.toFixed(2)}</td><td>$${p.value.toFixed(2)}</td><td class="${cls}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</td></tr>`;
                 }).join('')}</table>` : '<div class="sim-empty">No open positions — waiting for first rebalance.</div>';
             } catch (e) { document.getElementById('monthly-summary').innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
@@ -2242,14 +2543,15 @@
         async function loadMonthlyTrades() {
             try {
                 const t = await api('monthly/trades?limit=50');
-                document.getElementById('monthly-trades').innerHTML = t.length ? `<table><tr><th>Time (Europe/Vienna)</th><th>Ticker</th><th>Side</th><th>Shares</th><th>Price</th><th>Reason</th></tr>${t.map(x => `<tr><td>${escapeHtml(fmtVienna(x.date, true))}</td><td>${escapeHtml(x.ticker)}</td><td class="${x.side === 'BUY' ? 'buy' : 'sell'}">${escapeHtml(x.side)}</td><td>${escapeHtml(String(x.shares))}</td><td>$${x.price.toFixed(2)}</td><td style="text-align:left">${escapeHtml(x.reason || '')}</td></tr>`).join('')}</table>` : '<div class="sim-empty">No trades yet — the first rebalance runs on the next month-end.</div>';
+                document.getElementById('monthly-trades').innerHTML = t.length ? renderTradeLog(t) : '<div class="sim-empty">No trades yet — the first rebalance runs on the next month-end.</div>';
             } catch (e) { document.getElementById('monthly-trades').innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
 
         async function loadMonthlyEquity() {
-            const [snaps, live] = await Promise.all([
+            const [snaps, live, simSnaps] = await Promise.all([
                 api('monthly/equity?limit=365').catch(() => null),
                 api('monthly/status').catch(() => null),
+                api('sim/equity?limit=365').catch(() => null),
             ]);
             if (monthlyChart) { monthlyChart.remove(); monthlyChart = null; }
             if (!snaps || !snaps.length) {
@@ -2257,24 +2559,74 @@
                 return;
             }
             // Live point: today's valuation, so the curve reflects current
-            // prices between rebalances (deduped if today IS a snapshot day).
-            const points = snaps.map(s => ({ time: s.date, value: s.total_equity }));
-            const last = snaps[snaps.length - 1];
+            // prices between snapshots (deduped if today IS a snapshot day).
+            // Each point carries its own contributed total — the allowance
+            // steps $1000 at every month start, and dividing by the WRONG
+            // vintage would spike the pct curve.
+            const points = snaps.map(s => ({ time: s.date, value: s.total_equity, contributed: s.allowance_total }));
+            const last = points[points.length - 1];
             if (live && live.total_equity != null) {
                 const today = new Date().toISOString().slice(0, 10);
-                if (last.time < today) points.push({ time: today, value: live.total_equity });
+                if (last.time < today) points.push({ time: today, value: live.total_equity, contributed: live.allowance_total });
             }
+            const toPct = p => p.contributed > 0 ? (p.value / p.contributed * 100) : p.value;
+            // Sim overlay: same data the Simulation tab plots. The sim's
+            // contributed total can differ from the monthly's (deposit timing
+            // drift), so each sim point is normalized by ITS OWN
+            // contributed value in pct mode.
+            const byDay = new Map();  // collapse intraday snapshots -> last per day
+            for (const s of (simSnaps || [])) {
+                byDay.set(new Date(s.at).toISOString().slice(0, 10),
+                    { value: s.total_equity, contributed: s.allowance_total });
+            }
+            const simPoints = [...byDay.entries()].map(([time, p]) => ({
+                time,
+                value: compareMode === 'pct' ? toPct(p) : p.value,
+            })).sort((a, b) => a.time < b.time ? -1 : 1);
             document.getElementById('monthly-chart').innerHTML = '';
             monthlyChart = LightweightCharts.createChart(document.getElementById('monthly-chart'), {
+                autoSize: true,
                 height: 320, layout: { background: { color: '#071009' }, textColor: '#b7ffc0' },
                 grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } },
                 timeScale: { timeVisible: false, secondsVisible: false },
+                localization: compareMode === 'pct' ? { priceFormatter: fmtPct } : {},
             });
-            const equity = monthlyChart.addLineSeries({ color: '#42ff72', lineWidth: 2 });
-            equity.setData(points);
-            const contrib = monthlyChart.addLineSeries({ color: '#ff9f43', lineWidth: 1 });
-            contrib.setData(snaps.map(s => ({ time: s.date, value: s.allowance_total })));
+            const monthlyLine = monthlyChart.addLineSeries({
+                color: '#42ff72', lineWidth: 2, priceScaleId: 'right',
+                priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+            });
+            monthlyLine.setData(points.map(p => ({ time: p.time, value: compareMode === 'pct' ? toPct(p) : p.value })));
+            if (simPoints.length) {
+                const simLine = monthlyChart.addLineSeries({
+                    color: '#4d9fff', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed,
+                    priceScaleId: compareMode === 'pct' ? 'right' : 'left',
+                    priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+                });
+                simLine.setData(simPoints);
+                if (compareMode !== 'pct') {
+                    // USD mode: contributed totals can differ (e.g. 2000 vs
+                    // 1000), so plot the sim on a hidden left scale — a
+                    // shared scale would squash the smaller portfolio.
+                    monthlyChart.priceScale('left').applyOptions({ visible: false });
+                }
+            }
+            // Contributed baseline (orange): the monthly portfolio's own
+            // allowance_total steps; in pct mode it is the flat 100 line.
+            const contrib = monthlyChart.addLineSeries({
+                color: '#ff9f43', lineWidth: 1, priceScaleId: 'right',
+                priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+            });
+            contrib.setData(points.map(p => ({ time: p.time, value: compareMode === 'pct' ? 100 : p.contributed })));
             monthlyChart.timeScale().fitContent();
+        }
+
+        function fmtPct(v) { return v.toFixed(1) + '%'; }
+
+        function setCompareMode(mode) {
+            compareMode = mode;
+            document.getElementById('cmp-pct').classList.toggle('range-active', mode === 'pct');
+            document.getElementById('cmp-usd').classList.toggle('range-active', mode === 'usd');
+            loadMonthlyEquity();
         }
 
         async function loadMonthlyRebalances() {
@@ -2326,7 +2678,7 @@
                 document.getElementById('sim-positions').innerHTML = pos.length ? `<table><tr><th>Ticker</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>P&L%</th></tr>${pos.map(p => {
                     const pnl = p.pnl_pct;
                     const cls = pnl > 0 ? 'buy' : pnl < 0 ? 'sell' : '';
-                    return `<tr><td>${escapeHtml(p.ticker)}</td><td>${escapeHtml(String(p.shares))}</td><td>$${p.avg_cost.toFixed(2)}</td><td>$${p.current_price.toFixed(2)}</td><td>$${p.value.toFixed(2)}</td><td class="${cls}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</td></tr>`;
+                    return `<tr><td>${escapeHtml(p.ticker)}</td><td>${p.shares.toFixed(4)}</td><td>$${p.avg_cost.toFixed(2)}</td><td>$${p.current_price.toFixed(2)}</td><td>$${p.value.toFixed(2)}</td><td class="${cls}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</td></tr>`;
                 }).join('')}</table>` : '<div class="sim-empty">No open positions.</div>';
             } catch (e) { document.getElementById('sim-summary').innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
@@ -2356,17 +2708,69 @@
         }
 
         function viennaTickMarkFormatter(time, tickMarkType) {
+            // Tick types (v4): 0 = year start, 1 = month start, 2 = day
+            // start, 3+ = time. Same mapping rules as the dashboard chart.
             const p = viennaTimeParts(time);
-            if (tickMarkType === 0) return `${p.day} ${p.month} ${p.hour}:${p.minute}`;
-            if (tickMarkType === 1 || tickMarkType === 2) return p.month;
-            return p.year;
+            if (tickMarkType === 0) return p.year;
+            if (tickMarkType === 1) return p.month;
+            if (tickMarkType === 2) return `${p.day} ${p.month}`;
+            return `${p.hour}:${p.minute}`;
+        }
+
+        // Trade-log timestamp helpers. The date goes into a full-width
+        // divider row between day groups, so the Time column only holds
+        // "14:04" (~40px) instead of a full timestamp (~180px) — the freed
+        // width goes to the Reason column, which wraps since the log
+        // scrolls vertically anyway.
+        function fmtLogDate(iso) {
+            return new Intl.DateTimeFormat('en-GB', {
+                timeZone: VIENNA_TZ,
+                weekday: 'short', day: '2-digit', month: 'short', year: 'numeric',
+            }).format(new Date(iso));
+        }
+
+        function fmtLogTime(iso) {
+            return new Intl.DateTimeFormat('en-GB', {
+                timeZone: VIENNA_TZ,
+                hour: '2-digit', minute: '2-digit', hour12: false,
+            }).format(new Date(iso));
+        }
+
+        // Render trades with full-width date divider rows between day
+        // groups; per-row time is HH:MM only. cls: optional row class.
+        function renderTradeLog(rows) {
+            if (!rows.length) return '';
+            let html = '<table><thead><tr><th>Time</th><th>Ticker</th><th>Side</th><th>Shares</th><th>Price</th><th style="text-align:left">Reason</th></tr></thead><tbody>';
+            let lastDate = null;
+            for (const x of rows) {
+                const d = fmtLogDate(x.at || x.date);
+                if (d !== lastDate) {
+                    html += `<tr class="log-date-row"><td colspan="6">${escapeHtml(d)}</td></tr>`;
+                    lastDate = d;
+                }
+                html += `<tr><td>${escapeHtml(fmtLogTime(x.at || x.date))}</td><td>${escapeHtml(x.ticker)}</td><td class="${x.side === 'BUY' ? 'buy' : 'sell'}">${escapeHtml(x.side)}</td><td>${x.shares.toFixed(4)}</td><td>$${x.price.toFixed(2)}</td><td style="text-align:left">${escapeHtml(x.reason || '')}</td></tr>`;
+            }
+            return html + '</tbody></table>';
         }
 
         async function loadSimTrades() {
             try {
                 const t = await api('sim/trades?limit=50');
-                document.getElementById('sim-trades').innerHTML = t.length ? `<table><tr><th>Time (Europe/Vienna)</th><th>Ticker</th><th>Side</th><th>Shares</th><th>Price</th><th>Reason</th></tr>${t.map(x => `<tr><td>${escapeHtml(fmtVienna(x.at, true))}</td><td>${escapeHtml(x.ticker)}</td><td class="${x.side === 'BUY' ? 'buy' : 'sell'}">${escapeHtml(x.side)}</td><td>${escapeHtml(String(x.shares))}</td><td>$${x.price.toFixed(2)}</td><td style="text-align:left">${escapeHtml(x.reason || '')}</td></tr>`).join('')}</table>` : '<div class="sim-empty">No trades yet — run the bot to start.</div>';
+                document.getElementById('sim-trades').innerHTML = t.length ? renderTradeLog(t) : '<div class="sim-empty">No trades yet — run the bot to start.</div>';
             } catch (e) { document.getElementById('sim-trades').innerHTML = 'Error: ' + escapeHtml(e.message); }
+        }
+
+        // Compare line mode for the Daily Sim chart. In pct mode each curve
+        // is plotted as % of its own contributed allowance total — the sim
+        // and benchmark can receive deposits at different times, so absolute
+        // dollars would compare apples to oranges.
+        let simCompareMode = 'pct';
+
+        function setSimCompareMode(mode) {
+            simCompareMode = mode;
+            document.getElementById('sim-cmp-pct').classList.toggle('range-active', mode === 'pct');
+            document.getElementById('sim-cmp-usd').classList.toggle('range-active', mode === 'usd');
+            loadSimEquity();
         }
 
         async function loadSimEquity() {
@@ -2379,8 +2783,25 @@
                 document.getElementById('sim-chart').innerHTML = '<div class="sim-empty">No data yet — run the bot to start tracking.</div>';
                 return;
             }
+            // Live point: today's valuation so the curve reflects current
+            // prices between snapshots. Each point carries its own contributed
+            // total — the allowance steps $1000 at every month start, and
+            // dividing by the WRONG vintage would spike the pct curve.
+            const points = snaps.map(s => ({ time: s.at, value: s.total_equity, contributed: s.allowance_total }));
+            try {
+                const live = await api('sim/status');
+                if (live && live.total_equity != null) {
+                    const last = points[points.length - 1];
+                    const lastDay = new Date(last.time).toISOString().slice(0, 10);
+                    const today = new Date().toISOString().slice(0, 10);
+                    if (lastDay < today) points.push({ time: new Date().toISOString(), value: live.total_equity, contributed: live.allowance_total });
+                }
+            } catch (e) { /* chart falls back to snapshots only */ }
+            const toPct = p => p.contributed > 0 ? (p.value / p.contributed * 100) : p.value;
+            const val = p => simCompareMode === 'pct' ? toPct(p) : p.value;
             document.getElementById('sim-chart').innerHTML = '';
             simChart = LightweightCharts.createChart(document.getElementById('sim-chart'), {
+                autoSize: true,
                 height: 320, layout: { background: { color: '#071009' }, textColor: '#b7ffc0' },
                 grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } },
                 timeScale: {
@@ -2392,13 +2813,35 @@
                         const p = viennaTimeParts(time);
                         return `${p.day} ${p.month} '${p.year.slice(2)}  ${p.hour}:${p.minute}`;
                     },
-                }
+                    ...(simCompareMode === 'pct' ? { priceFormatter: fmtPct } : {}),
+                },
             });
-            const line = simChart.addLineSeries({ color: '#42ff72', lineWidth: 2 });
-            line.setData(snaps.map(s => ({ time: Math.floor(new Date(s.at).getTime() / 1000), value: s.total_equity })));
+            const line = simChart.addLineSeries({
+                color: '#42ff72', lineWidth: 2,
+                priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+            });
+            line.setData(points.map(p => ({ time: Math.floor(new Date(p.time).getTime() / 1000), value: val(p) })));
+            // Contributed baseline (grey dotted): the sim's allowance_total
+            // steps; in pct mode it is the flat 100 line.
+            const contribLine = simChart.addLineSeries({
+                color: '#7aaa81', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted,
+                priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+            });
+            contribLine.setData(points.map(p => ({ time: Math.floor(new Date(p.time).getTime() / 1000), value: simCompareMode === 'pct' ? 100 : p.contributed })));
+            // Benchmark: same pct normalization by ITS OWN contributed total —
+            // both receive the same $1000/month but timing can drift.
             if (bench && bench.equity_curve && bench.equity_curve.length) {
-                const benchLine = simChart.addLineSeries({ color: '#ff9f43', lineWidth: 2 });
-                benchLine.setData(bench.equity_curve.map(s => ({ time: Math.floor(new Date(s.at).getTime() / 1000), value: s.total_equity })));
+                const benchPoints = bench.equity_curve.map(s => ({
+                    time: Math.floor(new Date(s.at).getTime() / 1000),
+                    value: simCompareMode === 'pct'
+                        ? (s.allowance_total > 0 ? s.total_equity / s.allowance_total * 100 : s.total_equity)
+                        : s.total_equity,
+                }));
+                const benchLine = simChart.addLineSeries({
+                    color: '#ff9f43', lineWidth: 2,
+                    priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+                });
+                benchLine.setData(benchPoints);
             }
             simChart.timeScale().fitContent();
         }
@@ -2474,7 +2917,7 @@
                     for (const c of r.changes) {
                         const changeLabel = c.change_type === 'override' ? '🔄 Override'
                             : c.change_type === 'new' ? '➕ New'
-                            : c.change_type === 'dropped' ? '⏭ Dropped' : '';
+                                : c.change_type === 'dropped' ? '⏭ Dropped' : '';
                         const actClass = c.action === 'BUY' ? 'buy' : c.action === 'SELL' ? 'sell' : 'hold';
                         const detLabel = c.det_action || '—';
                         const detClass = detLabel === 'BUY' ? 'buy' : detLabel === 'SELL' ? 'sell' : '';
