@@ -195,7 +195,8 @@
         .signal-chips {
             display: flex;
             flex-wrap: wrap;
-            margin: -5px /* pull in the chips' outer margins */
+            margin: -5px
+                /* pull in the chips' outer margins */
         }
 
         /* Secondary indicators hidden behind the "All indicators" toggle. */
@@ -2170,7 +2171,7 @@
                 `<p>${escapeHtml(d.reason)}</p>` +
                 (entries
                     ? `<div class="signal-chips">${primary.map(chip).join('')}</div>` +
-                      (rest.length ? `<div class="signal-chips signal-rest${showAllSignals ? '' : ' signal-rest-hidden'}">${rest.map(chip).join('')}</div>` : '') + moreBtn
+                    (rest.length ? `<div class="signal-chips signal-rest${showAllSignals ? '' : ' signal-rest-hidden'}">${rest.map(chip).join('')}</div>` : '') + moreBtn
                     : '<span style="color:#7aaa81">No indicators available — insufficient data for analysis.</span>');
             $('#chart').innerHTML = '';
             const chartOpts = {
