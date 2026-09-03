@@ -12,8 +12,7 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="Trade Sentinel">
     <title>Trade Sentinel</title>
-    <script
-        src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"
+    <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"
         integrity="sha384-OK7vELvjHdhUFi31JYioPIcRHTROLdcDa6ZsNWgvgLaKj+9JqhU0Ad8g4wz3CXjA"
         crossorigin="anonymous"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked@13.0.3/marked.min.js"
@@ -618,13 +617,12 @@
             height: 14px;
             margin-left: 2px;
             vertical-align: text-bottom;
-            background: linear-gradient(
-                to bottom,
-                #42ff72 0%, #42ff72 30%,
-                transparent 30%, transparent 100%
-            );
+            background: linear-gradient(to bottom,
+                    #42ff72 0%, #42ff72 30%,
+                    transparent 30%, transparent 100%);
             animation: ai-caret 1s steps(2, jump-none) infinite;
         }
+
         .ai-msg.assistant.pending:empty::after {
             /* No text yet — show three pulsing dots instead of a caret. */
             content: '● ● ●';
@@ -637,13 +635,29 @@
             animation: ai-pulse 1.2s ease-in-out infinite;
             vertical-align: middle;
         }
+
         @keyframes ai-caret {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0; }
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0;
+            }
         }
+
         @keyframes ai-pulse {
-            0%, 100% { opacity: 0.3; }
-            50% { opacity: 1; }
+
+            0%,
+            100% {
+                opacity: 0.3;
+            }
+
+            50% {
+                opacity: 1;
+            }
         }
 
         table {
@@ -689,15 +703,22 @@
             overflow: hidden;
             margin-top: 4px
         }
+
         .screener-bar-fill {
             position: absolute;
-            top: 0; left: 0; bottom: 0;
+            top: 0;
+            left: 0;
+            bottom: 0;
             background: #1d6030;
             transition: width 0.3s ease
         }
+
         .screener-bar-label {
             position: absolute;
-            top: 0; left: 0; right: 0; bottom: 0;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -725,7 +746,7 @@
         }
 
         /* Mobile: collapsible screener panel via <details> */
-        .screen-panel details > summary {
+        .screen-panel details>summary {
             cursor: pointer;
             list-style: none;
             color: #b7ffc0;
@@ -733,7 +754,7 @@
             margin-bottom: 6px
         }
 
-        .screen-panel details > summary::-webkit-details-marker {
+        .screen-panel details>summary::-webkit-details-marker {
             display: none
         }
 
@@ -922,7 +943,9 @@
             padding: 18px
         }
 
-        #monthly-trades, #monthly-positions, #monthly-rebalances {
+        #monthly-trades,
+        #monthly-positions,
+        #monthly-rebalances {
             max-height: 320px;
             overflow-y: auto;
             overflow-x: auto
@@ -944,7 +967,9 @@
         /* Scrollable log tables so a long trade history doesn't push the
            page down; the section header stays fixed, the table scrolls.
            overflow-x:auto keeps wide tables from bleeding out on mobile. */
-        #sim-trades, #sim-positions, #sim-allowances {
+        #sim-trades,
+        #sim-positions,
+        #sim-allowances {
             max-height: 320px;
             overflow-y: auto;
             overflow-x: auto
@@ -1033,7 +1058,7 @@
                 margin-bottom: 0
             }
 
-            .sim-grid2 .sim-grid2 > .sim-section {
+            .sim-grid2 .sim-grid2>.sim-section {
                 margin-bottom: 12px
             }
 
@@ -1056,6 +1081,7 @@
                 font-size: 11px;
                 table-layout: auto
             }
+
             #sim-trades td,
             #sim-trades th,
             #sim-positions td,
@@ -1070,6 +1096,7 @@
             #monthly-rebalances th {
                 padding: 3px 4px
             }
+
             /* Trade logs are the widest tables (6 columns); 3px horizontal
                padding buys back the last few px so Reason fits without any
                inner horizontal scroll on ~360px screens. */
@@ -1079,6 +1106,7 @@
             #monthly-trades th {
                 padding: 3px 3px
             }
+
             /* Positions/log values stay on one line so tickers, prices and
                percentages never wrap mid-value; headers may still stack at
                word boundaries ("Avg" / "Cost") to save width. Only the Reason
@@ -1136,12 +1164,13 @@
 </head>
 
 <body>
-    <div id="ptr-indicator" class="ptr-indicator"><span id="ptr-arrow">↓</span><span id="ptr-text">Pull to refresh</span></div>
+    <div id="ptr-indicator" class="ptr-indicator"><span id="ptr-arrow">↓</span><span id="ptr-text">Pull to
+            refresh</span></div>
     <header><b>TRADE SENTINEL // PAPER-ONLY RESEARCH TERMINAL</b>
         <div class="nav-toggle"><button id="nav-dashboard" class="nav-active"
-                onclick="showView('dashboard')">Dashboard</button><button id="nav-sim"
-                onclick="showView('sim')">Daily Sim</button><button id="nav-monthly"
-                onclick="showView('monthly')">Monthly Sim</button></div><span id="status">loading</span>
+                onclick="showView('dashboard')">Dashboard</button><button id="nav-sim" onclick="showView('sim')">Daily
+                Sim</button><button id="nav-monthly" onclick="showView('monthly')">Monthly Sim</button></div><span
+            id="status">loading</span>
         <select id="llm-model" title="Active LLM backend / model" onchange="switchLLMModel()">
             <option value="">loading models…</option>
         </select>
@@ -1185,9 +1214,14 @@
             <details id="screen-details" open>
                 <summary>Screen results</summary>
                 <p><select id="universe"></select> <button onclick="runScreen(this)">Update</button>
-                <button onclick="refreshUniverse(this)" title="Only fetch tickers with missing or stale data">Refresh</button>
-                <button onclick="loadDeepHistory(this)" title="Fetch 10y of history for optimization/backtest">Load 10y</button></p><small>Ranks cached
-                    daily candles by trend, 20/60d momentum, RSI and relative volume. <b>Update</b> re-downloads ~2y and re-ranks. <b>Refresh</b> only fills gaps. <b>Load 10y</b> fetches deep history for backtesting.</small>
+                    <button onclick="refreshUniverse(this)"
+                        title="Only fetch tickers with missing or stale data">Refresh</button>
+                    <button onclick="loadDeepHistory(this)" title="Fetch 10y of history for optimization/backtest">Load
+                        10y</button>
+                </p><small>Ranks cached
+                    daily candles by trend, 20/60d momentum, RSI and relative volume. <b>Update</b> re-downloads ~2y and
+                    re-ranks. <b>Refresh</b> only fills gaps. <b>Load 10y</b> fetches deep history for
+                    backtesting.</small>
                 <div id="screener-status" style="margin-top:6px;font-size:12px;color:#7aaa81;min-height:14px"></div>
                 <div id="screen">No screen run yet.</div>
             </details>
@@ -1204,8 +1238,10 @@
                 <span style="color:#ff9f43;font-size:12px">● Benchmark (DCA)</span>
                 <span style="color:#7aaa81;font-size:12px">● Contributed</span>
                 <span style="flex:1"></span>
-                <button id="sim-cmp-pct" class="range-btn range-active" onclick="setSimCompareMode('pct')" title="Each curve as % of its contributed allowance — fair growth comparison">% View</button>
-                <button id="sim-cmp-usd" class="range-btn" onclick="setSimCompareMode('usd')" title="Absolute dollars">$ View</button>
+                <button id="sim-cmp-pct" class="range-btn range-active" onclick="setSimCompareMode('pct')"
+                    title="Each curve as % of its contributed allowance — fair growth comparison">% View</button>
+                <button id="sim-cmp-usd" class="range-btn" onclick="setSimCompareMode('usd')" title="Absolute dollars">$
+                    View</button>
             </div>
             <div id="sim-chart"></div>
         </div>
@@ -1251,7 +1287,8 @@
         </div>
         <div class="sim-section">
             <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">CHAT WITH PORTFOLIO MANAGER</h3>
-            <div class="ai-hint" style="margin-bottom:8px">Ask the LLM to explain decisions, or request actions like "sell AMZN to buy NVDA". If the LLM agrees, trades execute immediately (respecting risk limits).</div>
+            <div class="ai-hint" style="margin-bottom:8px">Ask the LLM to explain decisions, or request actions like
+                "sell AMZN to buy NVDA". If the LLM agrees, trades execute immediately (respecting risk limits).</div>
             <div id="sim-chat-thread" class="ai-thread" style="max-height:320px">
                 <div class="ai-empty">Start a conversation with the portfolio manager.</div>
             </div>
@@ -1275,8 +1312,11 @@
                 <span style="color:#4d9fff;font-size:12px">● Daily sim</span>
                 <span style="color:#ff9f43;font-size:12px">● Contributed</span>
                 <span style="flex:1"></span>
-                <button id="cmp-pct" class="range-btn range-active" onclick="setCompareMode('pct')" title="Each curve as % of its contributed total — fair comparison even when contributed differs">% View</button>
-                <button id="cmp-usd" class="range-btn" onclick="setCompareMode('usd')" title="Absolute dollars">$ View</button>
+                <button id="cmp-pct" class="range-btn range-active" onclick="setCompareMode('pct')"
+                    title="Each curve as % of its contributed total — fair comparison even when contributed differs">%
+                    View</button>
+                <button id="cmp-usd" class="range-btn" onclick="setCompareMode('usd')" title="Absolute dollars">$
+                    View</button>
             </div>
             <div id="monthly-chart"></div>
         </div>
@@ -1499,7 +1539,7 @@
             }
             if (!resp.ok) {
                 let msg = 'HTTP ' + resp.status;
-                try { msg += ': ' + await resp.text(); } catch (_) {}
+                try { msg += ': ' + await resp.text(); } catch (_) { }
                 opts.onError && opts.onError(msg);
                 return;
             }
@@ -1999,6 +2039,13 @@
                 layout: { background: { color: '#071009' }, textColor: '#b7ffc0' },
                 grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } },
                 timeScale: {
+                    // Tick types (v4): 0 = year start, 1 = month start,
+                    // 2 = day start, 3 = time. Year boundaries must show the
+                    // YEAR ("2025") — returning day/month there produced
+                    // nonsense like a bold "2 Jan" where "2025" belongs, and
+                    // months then repeated twice ("2 Jan" … "Jan" … "May").
+                    rightOffset: 6,
+                    barSpacing: 6,
                     tickMarkFormatter: (time, tickMarkType, locale) => {
                         const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
                         let M, D, Y;
@@ -2011,9 +2058,9 @@
                             const dt = new Date(time * 1000);
                             M = MONTHS[dt.getUTCMonth()]; D = dt.getUTCDate(); Y = dt.getUTCFullYear();
                         }
-                        if (tickMarkType === 0) return `${D} ${M}`;
-                        if (tickMarkType === 1 || tickMarkType === 2) return M;
-                        if (tickMarkType === 3) return String(Y);
+                        if (tickMarkType === 0) return String(Y);
+                        if (tickMarkType === 1) return M;
+                        if (tickMarkType === 2) return `${D} ${M}`;
                         return `${D} ${M}`;
                     },
                 },
@@ -2023,7 +2070,12 @@
                 upColor: '#42ff72', downColor: '#ff5c70',
                 borderVisible: false, wickUpColor: '#42ff72', wickDownColor: '#ff5c70',
             }).setData(d.candles || []);
-            chart.timeScale().fitContent();
+            // fitContent() clamps the first candle to the exact left edge,
+            // clipping its axis label ("Sep" -> "ep"). A logical range with
+            // a small left margin keeps that label fully visible.
+            const n = (d.candles || []).length;
+            if (n > 0) chart.timeScale().setVisibleLogicalRange({ from: -2, to: n + 6 });
+            else chart.timeScale().fitContent();
         }
 
         async function refreshData(btn) {
@@ -2514,10 +2566,13 @@
         }
 
         function viennaTickMarkFormatter(time, tickMarkType) {
+            // Tick types (v4): 0 = year start, 1 = month start, 2 = day
+            // start, 3+ = time. Same mapping rules as the dashboard chart.
             const p = viennaTimeParts(time);
-            if (tickMarkType === 0) return `${p.day} ${p.month} ${p.hour}:${p.minute}`;
-            if (tickMarkType === 1 || tickMarkType === 2) return p.month;
-            return p.year;
+            if (tickMarkType === 0) return p.year;
+            if (tickMarkType === 1) return p.month;
+            if (tickMarkType === 2) return `${p.day} ${p.month}`;
+            return `${p.hour}:${p.minute}`;
         }
 
         // Trade-log timestamp helpers. The date goes into a full-width
@@ -2720,7 +2775,7 @@
                     for (const c of r.changes) {
                         const changeLabel = c.change_type === 'override' ? '🔄 Override'
                             : c.change_type === 'new' ? '➕ New'
-                            : c.change_type === 'dropped' ? '⏭ Dropped' : '';
+                                : c.change_type === 'dropped' ? '⏭ Dropped' : '';
                         const actClass = c.action === 'BUY' ? 'buy' : c.action === 'SELL' ? 'sell' : 'hold';
                         const detLabel = c.det_action || '—';
                         const detClass = detLabel === 'BUY' ? 'buy' : detLabel === 'SELL' ? 'sell' : '';
