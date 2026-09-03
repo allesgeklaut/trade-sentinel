@@ -2282,6 +2282,10 @@ async def _scheduler_loop():
 
 
 async def _daily_monthly_snapshot_loop():
+    # Imported here (not at module top) to avoid a circular import:
+    # monthly imports market/screener lazily at call time.
+    from .monthly import deposit_allowance, refresh_holdings, take_snapshot
+
     """Background loop that marks the Monthly qv-mom portfolio once a day.
 
     Sequence (all idempotent):
@@ -2296,6 +2300,10 @@ async def _daily_monthly_snapshot_loop():
     The last-trading-day rebalance still runs in _scheduler_loop; on those
     days take_snapshot() skips itself while the rebalance lock is held, and
     the rebalance's own post-trade snapshot is recorded instead.
+
+    Disabled while sim_monthly_enabled is False: the loop keeps sleeping on
+    its schedule but performs no deposits, refreshes or snapshots, matching
+    the gate in monthly.run_monthly_cycle().
     """
     while True:
         now = _utcnow()
@@ -2309,8 +2317,9 @@ async def _daily_monthly_snapshot_loop():
         wait_seconds = (target - now).total_seconds()
         logger.info("Monthly daily snapshot: next run at %s (in %.0f seconds)", target, wait_seconds)
         await asyncio.sleep(wait_seconds)
+        if not settings.sim_monthly_enabled:
+            continue
         try:
-            from .monthly import deposit_allowance, refresh_holdings, take_snapshot
             deposit = await deposit_allowance()
             if deposit.get("deposited"):
                 logger.info("Monthly daily scheduler: allowance deposited for %s", deposit.get("month"))

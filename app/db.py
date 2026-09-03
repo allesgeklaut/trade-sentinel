@@ -330,7 +330,13 @@ class MonthlyAllowance(Base):
 
 
 class MonthlySnapshot(Base):
-    """Equity-curve snapshot taken after each monthly rebalance."""
+    """Equity-curve point for the monthly portfolio.
+
+    Written daily by the scheduler (one mark per day so the equity curve
+    moves every day) and once more by the month-end rebalance after trade
+    execution, so rebalance days carry both the daily mark and the
+    post-trade state.
+    """
 
     __tablename__ = "monthly_snapshots"
 

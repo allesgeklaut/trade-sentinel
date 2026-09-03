@@ -19,6 +19,16 @@ from . import llm as llm_mod
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 logger = logging.getLogger("trade_sentinel.main")
 
+# Uvicorn installs no handlers for the root logger, so app loggers
+# ("trade_sentinel.*") emit nothing at INFO: scheduler runs, allowance
+# deposits and cycle completions were all invisible in `docker compose logs`.
+# Route app logs to stdout at INFO (uvicorn.access stays as configured by
+# uvicorn itself). Idempotent: guard so --reload / test re-imports don't
+# duplicate handlers.
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
 @asynccontextmanager
 async def lifespan(app):
     await init_db()
@@ -372,8 +382,10 @@ async def monthly_status():
     from . import monthly
     # Deposit the allowance when a new month has begun (start-of-month, same
     # timing as the sim portfolio) so viewing the tab reflects the deposit
-    # immediately instead of waiting for the nightly scheduler pass.
-    await monthly.deposit_allowance()
+    # immediately instead of waiting for the nightly scheduler pass. Skipped
+    # when the monthly portfolio is disabled — a tab visit must not fund it.
+    if settings.sim_monthly_enabled:
+        await monthly.deposit_allowance()
     val = await monthly.monthly_valuate()
     return {**val,
             "sim_monthly_enabled": settings.sim_monthly_enabled,
