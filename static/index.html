@@ -845,6 +845,13 @@
             margin: 0
         }
 
+        /* Slimmer horizontal padding: the 6-col table must fit the narrow
+           screener column without a horizontal scrollbar even on desktop. */
+        .screener-scroll td,
+        .screener-scroll th {
+            padding: 6px 4px
+        }
+
         .screener-scroll thead th {
             position: sticky;
             top: 0;
