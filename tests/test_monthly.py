@@ -398,6 +398,117 @@ async def test_run_monthly_cycle_gate(mem_db, monkeypatch):
     out2 = await monthly.run_monthly_cycle()
     assert out2 == {"rebalanced": True}
 
+
+# ---------------------------------------------------------------------------
+# Daily snapshot + start-of-month deposit (curve-alignment with sim)
+# ---------------------------------------------------------------------------
+
+async def test_deposit_allowance_at_month_start(mem_db, monkeypatch):
+    """The monthly portfolio must deposit at the START of the operator-local
+    month (same as sim.deposit_allowance), not only at the month-end
+    rebalance — otherwise its contributed total trails the sim's and the two
+    equity curves are not comparable. It also must NOT depend on UTC."""
+    from zoneinfo import ZoneInfo
+
+    # Simulate an operator-local time early in a month whose UTC month differs
+    # (2026-09-01 00:30 Vienna == 2026-08-31 22:30 UTC): the old UTC key would
+    # have deposited for "2026-08" here, the shared anchor must use "2026-09".
+    fake_now = datetime(2026, 8, 31, 22, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(monthly, "_current_month", lambda: fake_now.astimezone(
+        ZoneInfo(monthly.settings.allowance_tz)).strftime("%Y-%m"))
+    r1 = await monthly.deposit_allowance()
+    assert r1["deposited"] is True
+    assert r1["month"] == "2026-09"  # operator-local month, not UTC's 2026-08
+    r2 = await monthly.deposit_allowance()  # same month -> idempotent
+    assert r2["deposited"] is False
+    val = await monthly.monthly_valuate()
+    assert val["allowance_total"] == settings.sim_monthly_contribution
+
+
+async def test_deposit_month_key_matches_sim_anchor(mem_db):
+    """Both portfolios must compute the same month key at the same instant so
+    contributed steps at the same boundary."""
+    from app import sim as sim_mod
+    assert monthly._current_month() == sim_mod._current_month()
+    assert monthly._TZ == sim_mod._TZ
+
+
+async def test_take_snapshot_records_daily_equity(mem_db):
+    """take_snapshot() writes a MonthlySnapshot from the live valuation —
+    the mechanism that makes the Monthly curve move every day."""
+    from app.db import Candle
+
+    # seed a price so valuation uses the fresh close, not the avg_cost fallback
+    async with mem_db() as s:
+        s.add(Candle(ticker="AAA", timestamp=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                     open=60, high=60, low=60, close=60, volume=1000))
+        await s.commit()
+    await monthly._deposit_allowance()
+    await monthly._exec_buy("AAA", 50.0, 500.0, "test")  # 10 shares @ 50
+    r = await monthly.take_snapshot()
+    assert r["snapshotted"] is True
+    curve = await monthly.get_equity_curve()
+    assert len(curve) == 1
+    pt = curve[-1]
+    assert pt["total_equity"] == pytest.approx(1100.0)  # 500 cash + 10*60
+    assert pt["allowance_total"] == settings.sim_monthly_contribution
+
+
+async def test_take_snapshot_skips_during_rebalance(mem_db, monkeypatch):
+    """While a rebalance holds the lock, the daily mark must skip — the
+    rebalance writes its own authoritative post-trade snapshot and a racing
+    daily mark mid-execution would distort the curve."""
+    import asyncio
+
+    lock_held = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_locked_rebalance():
+        # simulate the real run_rebalance: hold the lock while working
+        async with monthly._rebalance_lock:
+            lock_held.set()
+            await release.wait()
+        return {"rebalanced": True}
+
+    task = asyncio.create_task(fake_locked_rebalance())
+    await lock_held.wait()
+    r = await monthly.take_snapshot()
+    assert r.get("skipped") is True and "rebalance" in r["reason"]
+    release.set()
+    await task
+    # after the lock frees, a snapshot is allowed again
+    r2 = await monthly.take_snapshot()
+    assert r2["snapshotted"] is True
+
+
+async def test_refresh_holdings_no_rebalance(mem_db, monkeypatch):
+    """refresh_holdings refreshes candles for held tickers (+ FX pairs) only —
+    no deposits, no trades, no rebalance side effects."""
+    from app.db import Candle
+
+    async def fake_refresh(ticker, period):
+        return []
+
+    monkeypatch.setattr("app.market.refresh", fake_refresh)
+
+    await monthly._deposit_allowance()
+    await monthly._exec_buy("AAA", 50.0, 500.0, "test")
+    val_before = await monthly.monthly_valuate()
+    async with mem_db() as s:
+        s.add(Candle(ticker="AAA", timestamp=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                     open=60, high=60, low=60, close=60, volume=1000))
+        await s.commit()
+
+    out = await monthly.refresh_holdings()
+    assert out["refreshed"] == ["AAA"] and out["errors"] == []
+    val = await monthly.monthly_valuate()
+    # valuation now prices AAA at the fresh 60 close (600) — refresh only
+    # touched data, the position is unchanged
+    assert len(val["positions"]) == 1
+    assert val["positions"][0]["value"] == pytest.approx(600.0)
+    assert val["cash"] == val_before["cash"]  # no deposit sneaked in
+    assert val["allowance_total"] == settings.sim_monthly_contribution
+
 # ---------------------------------------------------------------------------
 # EDGAR source (app.edgar)
 # ---------------------------------------------------------------------------
