@@ -1,14 +1,16 @@
 from datetime import datetime
-from functools import partial
 import asyncio
+import logging
 import httpx
-import pandas as pd
 import numpy as np
 import yfinance as yf
 from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from .db import Candle, Session
 from .config import settings
+
+logger = logging.getLogger("trade_sentinel.market")
+
 
 def provider():
     value=settings.market_data_provider.lower().strip()
@@ -95,7 +97,49 @@ async def candles(ticker, period=None):
         rows=(await s.scalars(select(Candle).where(Candle.ticker==ticker).order_by(Candle.timestamp))).all()
     # Filter by period if requested (slice the last N rows)
     if period:
-        period_counts = {"6m":126,"2y":504,"5y":1260,"10y":2520,"max":5000}  # ~252 trading days/year
-        count = period_counts.get(period)
+        count = PERIOD_COUNTS.get(period)  # ~252 trading days/year
         if count: rows = rows[-count:]
     return [{"time":r.timestamp.strftime("%Y-%m-%d"),"open":r.open,"high":r.high,"low":r.low,"close":r.close,"volume":r.volume} for r in rows]
+
+
+# Chart-slice sizes per range preset (~252 trading days/year). Shared by the
+# API layer (dashboard endpoint) so both sides agree on how much to trim.
+PERIOD_COUNTS = {"6m":126,"2y":504,"5y":1260,"10y":2520,"max":5000}
+
+
+async def refresh_many(tickers, period="2y", *, concurrency: int = 4, on_result=None, work=None):
+    """Refresh candle data for many tickers with bounded concurrency.
+
+    Input is deduplicated while preserving order. Returns ``(refreshed,
+    errors)`` where errors are "TICKER: message" strings and ``refreshed``
+    lists the tickers that completed without error, in input order (not
+    completion order). ``on_result(ticker, ok, error_or_None)`` fires after
+    each ticker completes — success or failure — so callers can update
+    progress UI while the batch is still running. Pass ``work`` to run a
+    custom per-ticker coroutine instead of :func:`refresh` (used by the
+    screener to bundle per-symbol scoring with the fetch).
+    """
+    ordered = list(dict.fromkeys(tickers))
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+    errors: list[str] = []
+    ok_flags: dict[str, bool] = {}
+
+    async def _one(ticker: str) -> None:
+        async with semaphore:
+            err: str | None = None
+            try:
+                if work is not None:
+                    await work(ticker)
+                else:
+                    await refresh(ticker, period)
+            except Exception as e:
+                err = str(e)
+                errors.append(f"{ticker}: {e}")
+                logger.warning("refresh %s failed: %s", ticker, e)
+            ok_flags[ticker] = err is None
+        if on_result is not None:
+            on_result(ticker, err is None, err)
+
+    await asyncio.gather(*(_one(t) for t in ordered))
+    refreshed = [t for t in ordered if ok_flags.get(t)]
+    return refreshed, errors

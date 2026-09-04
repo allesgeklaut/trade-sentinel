@@ -1,6 +1,6 @@
-import json, logging
+import json, logging, re
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -9,7 +9,7 @@ from sqlalchemy import select
 from pydantic import BaseModel
 from .config import settings
 from .db import Watchlist, Session, init_db
-from .market import refresh, candles, search, info, provider
+from .market import refresh, refresh_many, candles, search, info, provider, PERIOD_COUNTS
 from .analysis import compute, persist, history, MIN_CANDLES
 from .screener import universe_names, run, results, refresh_incremental, load_deep_history, get_screener_progress
 from . import sim
@@ -46,6 +46,16 @@ async def lifespan(app):
     if settings.sim_enabled:
         sim.stop_scheduler()
 app=FastAPI(title="Trade Sentinel",lifespan=lifespan)
+_TICKER_RE = re.compile(r"^[A-Z0-9.\-^=]{1,32}$")
+
+@app.middleware("http")
+async def security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    return response
+
 @app.get('/healthz')
 async def health(): return {"ok":True,"paper_trading":settings.paper_trading,"market_data_provider":provider()}
 @app.get('/api/watchlist')
@@ -54,13 +64,18 @@ async def watchlist():
 @app.post('/api/watchlist/{ticker}')
 async def add(ticker:str):
     ticker=ticker.upper()
+    if not _TICKER_RE.match(ticker):
+        raise HTTPException(422, f"Invalid ticker symbol: {ticker!r}")
     async with Session() as s:
         if not await s.get(Watchlist,ticker): s.add(Watchlist(ticker=ticker)); await s.commit()
     return {"ticker":ticker}
 @app.delete('/api/watchlist/{ticker}')
 async def remove(ticker:str):
+    ticker=ticker.upper()
+    if not _TICKER_RE.match(ticker):
+        raise HTTPException(422, f"Invalid ticker symbol: {ticker!r}")
     async with Session() as s:
-        x=await s.get(Watchlist,ticker.upper())
+        x=await s.get(Watchlist,ticker)
         if x: await s.delete(x); await s.commit()
     return {"ok":True}
 @app.get('/api/info/{ticker}')
@@ -73,36 +88,26 @@ async def ticker_info(ticker:str):
 @app.get('/api/symbols')
 async def symbols(q:str=Query(min_length=2,max_length=80)):
     try: return await search(q)
-    except ValueError as e: raise HTTPException(400,str(e))
-    except Exception as e: raise HTTPException(502,f"{provider()} symbol search failed: {e}")
+    except ValueError as e: raise HTTPException(400,str(e)) from e
+    except Exception as e: raise HTTPException(502,f"{provider()} symbol search failed: {e}") from e
 @app.post('/api/refresh/{ticker}')
 async def fetch(ticker:str, period:str=None):
     try: await refresh(ticker.upper(), period); return {"ok":True}
-    except Exception as e: raise HTTPException(400,str(e))
+    except Exception as e: raise HTTPException(400,str(e)) from e
 
 @app.post('/api/refresh-watchlist')
 async def refresh_watchlist(period: str = "2y"):
     """Refresh candle data for every watchlist ticker. Returns per-ticker status."""
     async with Session() as s:
         tickers = [x.ticker for x in (await s.scalars(select(Watchlist).order_by(Watchlist.ticker))).all()]
-    refreshed, errors = [], []
-    for t in tickers:
-        try:
-            await refresh(t, period); refreshed.append(t)
-        except Exception as e:
-            errors.append(f"{t}: {e}"); logger.warning("watchlist refresh %s failed: %s", t, e)
+    refreshed, errors = await refresh_many(tickers, period)
     return {"refreshed": refreshed, "errors": errors, "total": len(tickers)}
 
 @app.post('/api/sim/refresh')
 async def sim_refresh(period: str = "2y"):
     """Refresh candle data for all sim holdings + benchmark so valuations use live prices."""
     tickers = await sim.held_tickers()
-    refreshed, errors = [], []
-    for t in tickers:
-        try:
-            await refresh(t, period); refreshed.append(t)
-        except Exception as e:
-            errors.append(f"{t}: {e}"); logger.warning("sim refresh %s failed: %s", t, e)
+    refreshed, errors = await refresh_many(tickers, period)
     return {"refreshed": refreshed, "errors": errors, "total": len(tickers)}
 @app.get('/api/dashboard/{ticker}')
 async def dashboard(ticker:str, period:str=None):
@@ -111,8 +116,7 @@ async def dashboard(ticker:str, period:str=None):
     candles_for_chart = list(all_rows)
     # Slice candles for the chart based on the selected range
     if period:
-        period_counts = {"6m":126,"2y":504,"5y":1260,"10y":2520,"max":5000}
-        count = period_counts.get(period)
+        count = PERIOD_COUNTS.get(period)
         if count: candles_for_chart = candles_for_chart[-count:]
     try:
         r = compute(all_rows)
@@ -135,17 +139,17 @@ async def list_universes(): return universe_names()
 @app.post('/api/screener/run/{universe}')
 async def screen_run(universe:str):
     try: return await run(universe)
-    except ValueError as e: raise HTTPException(404,str(e))
+    except ValueError as e: raise HTTPException(404,str(e)) from e
 @app.post('/api/screener/refresh/{universe}')
 async def screen_refresh(universe: str):
     """Incrementally refresh candle data — only fetches tickers with missing or stale data."""
     try: return await refresh_incremental(universe)
-    except ValueError as e: raise HTTPException(404, str(e))
+    except ValueError as e: raise HTTPException(404, str(e)) from e
 @app.post('/api/screener/load_deep/{universe}')
 async def screen_load_deep(universe: str, period: str = '10y'):
     """Fetch deep history (default 10y) for all tickers — for optimization/backtest."""
     try: return await load_deep_history(universe, period)
-    except ValueError as e: raise HTTPException(404, str(e))
+    except ValueError as e: raise HTTPException(404, str(e)) from e
 @app.get('/api/screener/status')
 async def screener_status():
     """Current/last screener operation progress for the frontend poller.
@@ -161,7 +165,7 @@ async def screen_results(universe:str):
     try:
         if universe not in universe_names(): raise ValueError('Unknown universe')
         return await results(universe)
-    except ValueError as e: raise HTTPException(404,str(e))
+    except ValueError as e: raise HTTPException(404,str(e)) from e
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -296,7 +300,7 @@ async def llm_select(req: LLMSelectRequest):
     try:
         match = await llm_mod.select_backend(req.backend, req.model)
     except ValueError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404, str(e)) from e
     return {
         "ok": True,
         "backend": match["name"],
@@ -311,7 +315,7 @@ async def llm_select(req: LLMSelectRequest):
 async def sim_status():
     """Portfolio snapshot: cash, positions, equity, P&L."""
     val = await sim.valuate()
-    allowance_result = await sim.deposit_allowance()  # ensures account exists
+    await sim.deposit_allowance()  # ensures account exists
     return {**val, "sim_enabled": settings.sim_enabled, "sim_strategy": settings.sim_strategy,
             "sim_universe": settings.sim_universe,
             "benchmark_enabled": settings.sim_benchmark_enabled,
@@ -392,7 +396,7 @@ async def monthly_status():
             "sim_monthly_universe": settings.sim_monthly_universe,
             "sim_monthly_contribution": settings.sim_monthly_contribution,
             "sim_monthly_target_n": settings.sim_monthly_target_n,
-            "next_rebalance": monthly.month_last_trading_day(datetime.now(timezone.utc)).strftime("%Y-%m-%d")}
+            "next_rebalance": monthly.month_last_trading_day(datetime.now(UTC)).strftime("%Y-%m-%d")}
 
 @app.get('/api/monthly/trades')
 async def monthly_trades(limit: int = Query(default=100, ge=1, le=500)):
@@ -430,14 +434,7 @@ async def monthly_refresh():
     async with monthly.Session() as s:
         held = [p.ticker for p in (await s.scalars(select(monthly.MonthlyPosition))).all()]
     pairs = sorted({pm[0] for t in held if (pm := monthly.fundamentals_mod._suffix_fx(t))})
-    from .market import refresh
-    refreshed, errors = [], []
-    for t in held + pairs:
-        try:
-            await refresh(t, "2y")
-            refreshed.append(t)
-        except Exception as e:
-            errors.append(f"{t}: {e}")
+    refreshed, errors = await refresh_many(held + pairs, "2y")
     return {"refreshed": refreshed, "errors": errors}
 
 @app.post('/api/sim/chat')

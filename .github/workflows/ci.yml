@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main, feature/**]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --frozen --dev
+      - name: Lint
+        run: uv run ruff check app tests
+      - name: Run tests
+        run: uv run pytest -q

@@ -5,14 +5,11 @@ All tests mock httpx.AsyncClient so no network is required.
 
 from __future__ import annotations
 
-import asyncio
-import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app import news
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

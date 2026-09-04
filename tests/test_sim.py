@@ -13,23 +13,23 @@ data volume.  They cover:
 from __future__ import annotations
 
 import json
+import random
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 from sqlalchemy import StaticPool
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app import sim
 from app.config import settings
 from app.db import (
     Base,
     SimAccount,
-    SimBenchmarkAccount,
     SimPosition,
     SimSnapshot,
     SimTrade,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -773,6 +773,7 @@ class TestLLMDecide:
         """Backdate positions so the 5-day holding-period floor (anti-churn)
         does not block test SELLs. Tests that seed-then-sell need this."""
         from datetime import timedelta
+
         from sqlalchemy import select as sa_select
         async with sim.Session() as s:
             for t in tickers:
@@ -976,9 +977,6 @@ class TestRunCycleResetsLLMState:
 # Year-long simulation with synthetic market data
 # ---------------------------------------------------------------------------
 
-import random
-from datetime import datetime, timedelta
-
 
 def _gen_synthetic_candles(start_price: float, daily_drift: float,
                            n: int = 500, seed: int = 42) -> list[dict]:
@@ -1034,7 +1032,7 @@ class TestYearLongSimulation:
 
     def test_synthetic_data_sanity(self):
         """Generated data should have valid OHLCV shape and expected trends."""
-        for ticker, rows in self.SYNTHETIC.items():
+        for rows in self.SYNTHETIC.values():
             assert len(rows) == 500
             assert all(r["close"] > 0 for r in rows)
             assert all(r["high"] >= r["close"] for r in rows)
@@ -1050,8 +1048,8 @@ class TestYearLongSimulation:
     async def test_one_year_deterministic(self, mem_db, monkeypatch):
         """Run 12 monthly cycles and verify benchmark DCA + bot behavior."""
         from sqlalchemy import select as sa_select
+
         from app.db import (
-            SimAllowance,
             SimBenchmarkSnapshot,
             SimSnapshot,
         )
@@ -1143,16 +1141,15 @@ class TestYearLongSimulation:
         assert len(bench_snaps) == 12
 
         # 4b. Stored created_at must be tz-aware UTC (Batch 2 convention)
-        from datetime import timezone as tz
         for snap in sim_snaps:
             assert snap.created_at.tzinfo is not None, \
                 "SimSnapshot.created_at must be tz-aware"
-            assert snap.created_at.utcoffset() == tz.utc.utcoffset(None), \
+            assert snap.created_at.utcoffset() == UTC.utcoffset(None), \
                 "SimSnapshot.created_at must be UTC"
         for snap in bench_snaps:
             assert snap.created_at.tzinfo is not None, \
                 "SimBenchmarkSnapshot.created_at must be tz-aware"
-            assert snap.created_at.utcoffset() == tz.utc.utcoffset(None), \
+            assert snap.created_at.utcoffset() == UTC.utcoffset(None), \
                 "SimBenchmarkSnapshot.created_at must be UTC"
 
         # 5. Bot made at least one trade over the year
@@ -1195,8 +1192,6 @@ class TestTopUpAtCap:
         """When the portfolio is at the max-positions cap, a held ticker with
         a continuing BUY signal should still get a top-up proposal. A new
         ticker with a BUY signal should NOT get a proposal (cap blocks new)."""
-        from app.analysis import BUY_THRESHOLD, SELL_THRESHOLD
-        from app.db import SimPosition
 
         # Seed 10 positions (at the cap) at a low cost basis so they're well
         # below the max_position_pct ceiling and can be topped up.
@@ -1322,10 +1317,9 @@ class TestTimezoneConvention:
 
     async def test_utcnow_is_tz_aware(self):
         """sim._utcnow() must return a tz-aware UTC datetime."""
-        from datetime import timezone as tz
         t = sim._utcnow()
         assert t.tzinfo is not None
-        assert t.utcoffset() == tz.utc.utcoffset(None)
+        assert t.utcoffset() == UTC.utcoffset(None)
 
     async def test_simtrade_created_at_is_tz_aware_utc(self, with_cash):
         """A logged trade's created_at must be tz-aware UTC after a buy."""
@@ -1335,8 +1329,7 @@ class TestTimezoneConvention:
             trade = await s.scalar(sa_select(SimTrade).order_by(SimTrade.created_at.desc()))
             assert trade is not None
             assert trade.created_at.tzinfo is not None
-            from datetime import timezone as tz
-            assert trade.created_at.utcoffset() == tz.utc.utcoffset(None)
+            assert trade.created_at.utcoffset() == UTC.utcoffset(None)
 
     async def test_current_month_is_vienna_local(self, monkeypatch):
         """_current_month() must return a YYYY-MM string (Vienna calendar).
@@ -1348,11 +1341,11 @@ class TestTimezoneConvention:
         We verify the boundary: 23:30 UTC on 2026-01-31 is 00:30 on
         2026-02-01 in Vienna, so _current_month() must return '2026-02'.
         """
-        from datetime import datetime, timezone
+        from datetime import datetime
         from zoneinfo import ZoneInfo
 
         vienna = ZoneInfo("Europe/Vienna")
-        fake_utc = datetime(2026, 1, 31, 23, 30, tzinfo=timezone.utc)
+        fake_utc = datetime(2026, 1, 31, 23, 30, tzinfo=UTC)
         assert fake_utc.astimezone(vienna).strftime("%Y-%m") == "2026-02"
 
         # Freeze sim._TZ's "now" by patching datetime.now globally for the call.

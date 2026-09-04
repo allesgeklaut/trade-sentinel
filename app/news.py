@@ -143,7 +143,7 @@ async def gather_news_for_candidates(
     values = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
     result: dict[str, list[dict]] = {}
-    for key, val in zip(keys, values):
+    for key, val in zip(keys, values, strict=False):
         if isinstance(val, Exception):
             logger.warning("news gather failed for '%s': %s", key, val)
             continue
