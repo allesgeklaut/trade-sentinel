@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from zoneinfo import ZoneInfo
 from typing import Any
 
@@ -35,16 +35,14 @@ from .db import (
     SimTrade,
     Session,
 )
-from .market import candles, refresh
+from .market import candles, refresh, refresh_many
 from .screener import tickers as universe_tickers
 from .strategy import (
     StrategyParams,
-    llm_buy_budget,
     llm_sell_shares,
     plan_llm_buys,
     propose_trades,
     reconcile_proposals,
-    valuate_portfolio,
 )
 
 logger = logging.getLogger("trade_sentinel.sim")
@@ -96,7 +94,7 @@ _TZ = ZoneInfo(settings.allowance_tz)
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _current_month() -> str:
@@ -887,7 +885,7 @@ def _build_llm_context(
     # mode: the experiment is a prompt with no guidance or bias.
     ups, total = 0, 0
     run5s: list[float] = []
-    for ticker, sig in signals.items():
+    for sig in signals.values():
         snap = sig.get("snapshot", {})
         c = snap.get("close")
         s2 = snap.get("sma200")
@@ -1657,7 +1655,7 @@ def _set_progress(stage: str, detail: str = "", *, running: bool = True,
     Called from run_cycle() at each stage. ``started_at`` is preserved across
     updates so the frontend can show an elapsed timer.
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     if started_at is None:
         started_at = now
     _run_progress.update({
@@ -1712,13 +1710,9 @@ async def run_cycle() -> dict[str, Any]:
             # 2. Refresh candles for the universe
             _set_progress("refresh", "Refreshing candle data", started_at=started_at)
             tickers = await _candidate_tickers()
-            refresh_errors: list[str] = []
-            for t in tickers:
-                try:
-                    await refresh(t, _SIM_REFRESH_PERIOD)
-                except Exception as e:
-                    refresh_errors.append(f"{t}: {e}")
-            _set_progress("refresh", f"Refreshed {len(tickers)} tickers", started_at=started_at)
+            _, refresh_errors = await refresh_many(tickers, _SIM_REFRESH_PERIOD)
+            detail = f" ({len(refresh_errors)} failed)" if refresh_errors else ""
+            _set_progress("refresh", f"Refreshed {len(tickers)} tickers{detail}", started_at=started_at)
 
             # 2b. Refresh benchmark ticker and run benchmark DCA
             benchmark_result = {"deposited": False, "skipped": True}

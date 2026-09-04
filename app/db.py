@@ -1,6 +1,6 @@
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
-from sqlalchemy import String, Float, Integer, UniqueConstraint, Text
+from sqlalchemy import String, Float, Integer, UniqueConstraint, Text, event
 from sqlalchemy import DateTime as _DateTime
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -10,7 +10,7 @@ from .config import settings
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class DateTime(TypeDecorator):
@@ -32,7 +32,7 @@ class DateTime(TypeDecorator):
 
     def process_result_value(self, value, dialect):
         if value is not None and value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
+            return value.replace(tzinfo=UTC)
         return value
 
 
@@ -370,7 +370,38 @@ class MonthlyRebalance(Base):
 
 
 
-engine = create_async_engine(settings.database_url)
+def _configure_sqlite_pragmas(dbapi_conn, _record) -> None:
+    """Set durability/concurrency pragmas on every new SQLite connection."""
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA busy_timeout=5000")
+    cursor.close()
+
+
+def _should_apply_sqlite_pragmas(url: str) -> bool:
+    return url.startswith("sqlite")
+
+
+def create_db_engine(database_url: str):
+    """Create the app's async engine with SQLite tuning applied.
+
+    WAL + synchronous=NORMAL: durable-enough commits without fsync-per-write.
+    busy_timeout: writers queue briefly instead of failing with 'database is
+    locked' when the nightly scheduler and a manual API call overlap.
+    foreign_keys: SQLite defaults to OFF; SQLAlchemy never enables it for you.
+    pool_pre_ping: drop connections silently invalidated by container restarts.
+    """
+    engine = create_async_engine(database_url, connect_args={"timeout": 5}, pool_pre_ping=True)
+    if _should_apply_sqlite_pragmas(database_url):
+        event.listen(engine.sync_engine, "connect", _configure_sqlite_pragmas)
+    return engine
+
+
+# Note: WAL mode persists in the DB file itself, so it only needs setting
+# once per database — but re-applying it per connection is harmless.
+engine = create_db_engine(settings.database_url)
 Session = async_sessionmaker(engine, expire_on_commit=False)
 
 

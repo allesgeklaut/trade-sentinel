@@ -39,7 +39,6 @@ The returned dict shape (consumed by ``main.py`` and the chat system prompt):
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
