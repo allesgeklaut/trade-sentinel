@@ -6,13 +6,14 @@ result persistence can be exercised without touching the real volume.
 
 from __future__ import annotations
 
+from datetime import UTC
+
 import pytest
 from sqlalchemy import StaticPool
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app import screener
 from app.db import Base, ScreenerResult
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -347,6 +348,102 @@ class TestSignalColumn:
 
 
 # ---------------------------------------------------------------------------
+# refresh_many integration: progress reporting + incremental refresh
+# ---------------------------------------------------------------------------
+
+class TestRefreshManyWiring:
+    async def test_run_reports_progress_and_clears_flag(self, tmp_path, monkeypatch, mem_db):
+        """run() must drive the progress poller: per-ticker callbacks bump
+        `done`, and the final state clears `running` with no error."""
+        monkeypatch.setattr(screener, "_UNIVERSES_DIR", tmp_path)
+        (tmp_path / "prog.txt").write_text("AAPL\nMSFT\nNVDA\n")
+
+        async def mock_refresh(ticker, period="2y"):
+            pass
+
+        async def mock_candles(ticker, period=None):
+            from datetime import datetime, timedelta
+            base = datetime(2022, 1, 3)
+            return [
+                {
+                    "timestamp": (base + timedelta(days=i)).strftime("%Y-%m-%d"),
+                    "open": 100.0 + 0.1 * i,
+                    "high": 100.5 + 0.1 * i,
+                    "low": 99.5 + 0.1 * i,
+                    "close": 100.0 + 0.1 * i,
+                    "volume": 1_000_000.0,
+                }
+                for i in range(250)
+            ]
+
+        monkeypatch.setattr(screener, "refresh", mock_refresh)
+        monkeypatch.setattr(screener, "candles", mock_candles)
+
+        await screener.run("prog")
+
+        progress = screener.get_screener_progress()
+        assert progress["running"] is False
+        assert progress["done"] == 3
+        assert progress["total"] == 3
+        assert progress["op"] == "update"
+
+    async def test_refresh_incremental_skips_fresh_tickers(self, tmp_path, monkeypatch, mem_db):
+        """Tickers with recent candles must not be re-fetched; only stale or
+        missing ones get a refresh call. Progress total still covers the
+        whole universe."""
+        monkeypatch.setattr(screener, "_UNIVERSES_DIR", tmp_path)
+        (tmp_path / "inc.txt").write_text("FRESH\nSTALE\nMISSING\n")
+
+        async def mock_refresh(ticker, period="2y"):
+            pass
+
+        monkeypatch.setattr(screener, "refresh", mock_refresh)
+
+        # Seed candles: FRESH has a recent latest candle, STALE is old,
+        # MISSING has none at all.
+        from datetime import datetime, timedelta
+
+        from app.db import Candle
+        async with mem_db() as s:
+            s.add(Candle(ticker="FRESH", timestamp=datetime.now(UTC),
+                         open=1, high=1, low=1, close=1, volume=1))
+            s.add(Candle(ticker="STALE", timestamp=datetime.now(UTC) - timedelta(days=30),
+                         open=1, high=1, low=1, close=1, volume=1))
+            await s.commit()
+
+        result = await screener.refresh_incremental("inc", max_age_days=3)
+
+        assert result["skipped"] == 1
+        assert result["refreshed"] == 2
+        assert result["total"] == 3
+        assert result["errors"] == []
+
+        progress = screener.get_screener_progress()
+        assert progress["running"] is False
+        assert progress["total"] == 3
+        assert progress["op"] == "refresh"
+
+    async def test_refresh_incremental_counts_failures_as_errors(self, tmp_path, monkeypatch, mem_db):
+        """A failing refresh lands in errors but doesn't abort the batch."""
+        monkeypatch.setattr(screener, "_UNIVERSES_DIR", tmp_path)
+        (tmp_path / "err.txt").write_text("OKTICKER\nBADTICKER\n")
+
+        async def mock_refresh(ticker, period="2y"):
+            if ticker == "BADTICKER":
+                raise ValueError("no such symbol")
+            pass
+
+        monkeypatch.setattr(screener, "refresh", mock_refresh)
+
+        result = await screener.refresh_incremental("err")
+
+        assert result["refreshed"] == 1
+        assert result["errors"] == ["BADTICKER: no such symbol"]
+        progress = screener.get_screener_progress()
+        assert progress["running"] is False
+
+
+# ---------------------------------------------------------------------------
 # init_db() ALTER TABLE migration guard (idempotent)
 # ---------------------------------------------------------------------------
 
@@ -356,7 +453,8 @@ class TestMigrationGuard:
         new action/strength columns. The ALTER TABLE guard should no-op on
         the second call when the columns already exist."""
         from sqlalchemy import StaticPool
-        from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
         import app.db as db_mod
 
         engine = create_async_engine(
@@ -375,12 +473,13 @@ class TestMigrationGuard:
 
         # Verify the columns exist by inserting a row with action/strength
         async with session_factory() as s:
+            from datetime import datetime
+
             from app.db import ScreenerResult
-            from datetime import datetime, timezone
             s.add(ScreenerResult(
                 universe="test", ticker="X", score=50.0, trend="NEUTRAL",
                 return_20d=0.0, return_60d=0.0, rsi=50.0, relative_volume=1.0,
-                close=100.0, updated_at=datetime.now(timezone.utc),
+                close=100.0, updated_at=datetime.now(UTC),
                 action="HOLD", strength=42.0,
             ))
             await s.commit()

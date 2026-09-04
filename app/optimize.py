@@ -27,7 +27,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 import pandas as pd
@@ -46,7 +46,6 @@ from .db import Candle, Session
 from .screener import tickers as universe_tickers
 from .strategy import (
     StrategyParams,
-    llm_buy_budget,
     llm_sell_shares,
     plan_llm_buys,
     propose_trades,
@@ -289,7 +288,7 @@ def _max_drawdown(equity: list[float], invested: list[float] | None = None) -> f
     # much capital has been deposited.
     peak_ratio = -math.inf
     max_dd = 0.0
-    for e, inv in zip(equity, invested):
+    for e, inv in zip(equity, invested, strict=False):
         if inv <= 0:
             continue
         ratio = e / inv
@@ -491,9 +490,6 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
             elif risk_off and dd < params.portfolio_stop_pct / 2:
                 # Re-engage when drawdown recovers to half the stop level.
                 risk_off = False
-
-        min_cash = total_equity * (params.min_cash_pct / 100)
-        max_position_value = total_equity * (params.max_position_pct / 100)
 
         # Update peak prices for trailing stop tracking.
         pf.update_peaks(prices)
@@ -852,10 +848,8 @@ async def _hybrid_replay(
     last_deposit_month: str | None = None
     cumulative_invested = params.start_cash
     last_known_prices: dict[str, float] = {}
-    llm_trades: list[dict] = list(pf.trades)  # full trade log (det + LLM)
     last_review_week: str | None = None
     peak_equity: float = params.start_cash
-    recent_stop_outs: list[str] = []  # dates of recent stop-out SELLs
 
     for day_idx, day in enumerate(days, 1):
             # Monthly allowance deposit
@@ -1019,8 +1013,8 @@ async def _hybrid_replay(
                             decisions, pf.cash, pf.equity(prices),
                             _replay_params_to_strategy(params),
                             guarded=True,
-                            price_of=lambda t: _aval(prices.get(t)),
-                            value_of=lambda t: _aval(pf.positions.get(t, 0) * prices.get(t, 0)),
+                            price_of=lambda t, _prices=prices: _aval(_prices.get(t)),
+                            value_of=lambda t, _prices=prices: _aval(pf.positions.get(t, 0) * _prices.get(t, 0)),
                             exclude=proposal_tickers,
                         )
                         held_tickers = set(pf.positions.keys())
@@ -1420,7 +1414,7 @@ def _trade_outcomes(
 
     portfolio_states = _reconstruct_portfolio_states(trades)
     cases: list[TradeCase] = []
-    for tr, state in zip(trades, portfolio_states):
+    for tr, state in zip(trades, portfolio_states, strict=False):
         ticker = tr["ticker"]
         side = tr["side"]
         price = tr["price"]
@@ -1471,13 +1465,13 @@ def _select_cases(
         by_ticker.setdefault(c.ticker, []).append(c)
 
     worst: list[TradeCase] = []
-    for ticker, group in by_ticker.items():
+    for group in by_ticker.values():
         group.sort(key=lambda c: c.badness, reverse=True)
         worst.append(group[0])  # each ticker's worst single decision
     worst.sort(key=lambda c: c.badness, reverse=True)
 
     controls: list[TradeCase] = []
-    for ticker, group in by_ticker.items():
+    for group in by_ticker.values():
         group.sort(key=lambda c: c.badness)  # lowest badness = decision was right
         controls.append(group[0])
     controls.sort(key=lambda c: c.badness)
@@ -1921,7 +1915,7 @@ def _print_cash_summary(res: ReplayResult, params: ReplayParams) -> None:
     n_days = len(res.equity_curve)
     cash_pcts = [
         (c / e["equity"]) * 100 if e["equity"] > 0 else 0.0
-        for c, e in zip(res.cash_curve, res.equity_curve)
+        for c, e in zip(res.cash_curve, res.equity_curve, strict=False)
     ]
     avg_cash_pct = sum(cash_pcts) / n_days
     at_cap = sum(1 for n in res.position_count_curve
@@ -1947,7 +1941,7 @@ def _print_cash_summary(res: ReplayResult, params: ReplayParams) -> None:
     # Monthly breakdown
     from collections import defaultdict
     monthly = defaultdict(list)
-    for e, c, n in zip(res.equity_curve, res.cash_curve, res.position_count_curve):
+    for e, c, n in zip(res.equity_curve, res.cash_curve, res.position_count_curve, strict=False):
         monthly[e["time"][:7]].append((c, n, e["equity"]))
     print(f"\n  {'month':<8} {'avg_cash_%':>10} {'avg_pos':>8} {'end_cash':>11}")
     for m in sorted(monthly):
@@ -2142,7 +2136,7 @@ async def _prune_candles(before: str, dry_run: bool) -> None:
     engine only needs ~2y of history — old rows are dead weight. The FX
     pseudo-tickers and every ticker keep everything after the cutoff."""
     from .db import Candle
-    cutoff = datetime.fromisoformat(before).replace(tzinfo=timezone.utc)
+    cutoff = datetime.fromisoformat(before).replace(tzinfo=UTC)
     async with Session() as s:
         n = (await s.scalar(select(func.count()).select_from(Candle)
                             .where(Candle.timestamp < cutoff))) or 0
