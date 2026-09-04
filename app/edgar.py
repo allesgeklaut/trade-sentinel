@@ -20,7 +20,7 @@ import logging
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -196,7 +196,7 @@ async def refresh_edgar(tickers: list[str] | None = None, force: bool = False,
         tickers = universe_tickers(settings.sim_monthly_universe)
     tickers = list(tickers)
     ciks = await ensure_cik_map(tickers)
-    cutoff = datetime.now(timezone.utc).timestamp() - STALE_AFTER_DAYS * 86400
+    cutoff = datetime.now(UTC).timestamp() - STALE_AFTER_DAYS * 86400
 
     async with Session() as s:
         rows = (await s.execute(

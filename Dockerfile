@@ -2,8 +2,8 @@ FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends tzdata && rm -rf /var/lib/apt/lists/*
 RUN useradd -m -u 1000 appuser
 WORKDIR /app
-COPY pyproject.toml ./
-RUN uv sync --no-dev
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
 COPY app ./app
 COPY static ./static
 COPY universes ./universes

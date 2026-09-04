@@ -19,7 +19,7 @@ PaymentsToAcquirePropertyPlantAndEquipment.
 """
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 import pandas as pd
 from sqlalchemy import func
@@ -207,7 +207,7 @@ async def refresh_universe(universe: str | None = None, tickers: list[str] | Non
     pairs = sorted({pm[0] for t in tickers if (pm := _suffix_fx(t))})
     rates = await _fx_rates_from_candles(pairs)
 
-    cutoff = datetime.now(timezone.utc).timestamp() - STALE_AFTER_DAYS * 86400
+    cutoff = datetime.now(UTC).timestamp() - STALE_AFTER_DAYS * 86400
     statuses: dict[str, str] = {}
 
     # which tickers need a (re)fetch?

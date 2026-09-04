@@ -15,7 +15,9 @@ from app import optimize
 from app.analysis import compute
 from app.optimize import (
     ReplayParams,
+    TradeCase,
     _is_stop_out,
+    _reconstruct_portfolio_states,
     _replay,
     _row_action,
     _row_strength,
@@ -24,8 +26,6 @@ from app.optimize import (
     _snapshot_for_day,
     _split_windows,
     _trade_outcomes,
-    _reconstruct_portfolio_states,
-    TradeCase,
 )
 
 
@@ -130,7 +130,7 @@ class TestSplitWindows:
         # i=4 (train 4-7, test 8-9) → 3 windows
         assert len(wins) == 3
         # Each test window is strictly after its train window.
-        for train_s, train_e, test_s, test_e in wins:
+        for _train_s, train_e, test_s, _test_e in wins:
             assert train_e < test_s
 
 
@@ -336,7 +336,7 @@ class TestReplayTopUpAtCap:
         assert res.cash_curve and res.equity_curve
         cash_pcts = [
             (c / e["equity"]) * 100 if e["equity"] > 0 else 100.0
-            for c, e in zip(res.cash_curve, res.equity_curve)
+            for c, e in zip(res.cash_curve, res.equity_curve, strict=False)
         ]
         # Skip the first ~20 days while positions are being opened; the test
         # is about the steady state where the cap is hit and cash should
@@ -764,7 +764,6 @@ class TestPureLLMAutoStops:
     async def test_pure_llm_llm_still_decides_buys(self, monkeypatch):
         """The auto-stop layer must not take over BUY decisions — the LLM
         keeps full buy discretion."""
-        import json as _json
 
         from app import llm as llm_mod
 
@@ -1086,7 +1085,7 @@ class TestWalkforwardSummary:
     """_print_walkforward_summary must report mean + worst + best deltas."""
 
     def test_summary_prints_mean_worst_best(self, capsys):
-        from app.optimize import ReplayResult, _WindowResult, _print_walkforward_summary
+        from app.optimize import ReplayResult, _print_walkforward_summary, _WindowResult
         wr1 = _WindowResult(
             start="d1", end="d2",
             det=ReplayResult(params=ReplayParams(), total_return_pct=1.0,
@@ -1118,7 +1117,7 @@ class TestLlmWalkforwardWindows:
     there is enough history, and overlap from the front when there isn't."""
 
     def test_non_overlapping_when_enough_days(self, monkeypatch):
-        from app.optimize import _llm_walkforward, ReplayResult, ReplayParams
+        from app.optimize import ReplayParams, ReplayResult, _llm_walkforward
         # 120 days, 4 windows of 30 → non-overlapping.
         all_days = [f"2025-01-{i:02d}" for i in range(1, 121)]
 
@@ -1153,7 +1152,7 @@ class TestLlmWalkforwardWindows:
             assert llm_calls[i][1] < llm_calls[i + 1][0], "windows overlap"
 
     def test_overlapping_when_not_enough_days(self, monkeypatch):
-        from app.optimize import _llm_walkforward, ReplayParams
+        from app.optimize import ReplayParams, _llm_walkforward
         # 90 days, 4 windows of 30 → need 120, only 90. The 4th window
         # overlaps the 3rd at the front. We get 4 windows total.
         all_days = [f"2025-01-{i:02d}" for i in range(1, 91)]
@@ -1183,7 +1182,7 @@ class TestLlmWalkforwardWindows:
         assert len(results) == 4
 
     def test_too_few_days_raises(self, monkeypatch):
-        from app.optimize import _llm_walkforward, ReplayParams
+        from app.optimize import ReplayParams, _llm_walkforward
         all_days = [f"2025-01-{i:02d}" for i in range(1, 11)]  # 10 days
 
         async def fake_backend():
@@ -1208,7 +1207,6 @@ class TestReviewInterval:
     week, and review_interval>1 skips that many weeks between reviews."""
 
     async def test_llm_called_only_on_review_days(self, monkeypatch):
-        import json as _json
 
         from app import llm as llm_mod
 
@@ -1253,7 +1251,6 @@ class TestReviewInterval:
         assert res.n_trades > 0
 
     async def test_review_interval_1_calls_once_per_week(self, monkeypatch):
-        import json as _json
 
         from app import llm as llm_mod
 
@@ -1283,10 +1280,10 @@ class TestReviewInterval:
 
         # 14 days in the synthetic series (no weekends, Aug 1-14 = weeks
         # 30, 31, 32), review every 1 → LLM called once per week (3 calls).
-        res = await optimize._hybrid_replay(series, params,
-                                            start="2025-08-01", end="2025-08-14",
-                                            pure_llm=False,
-                                            review_interval=1)
+        await optimize._hybrid_replay(series, params,
+                                      start="2025-08-01", end="2025-08-14",
+                                      pure_llm=False,
+                                      review_interval=1)
         assert call_count[0] == 3, (
             f"expected 3 LLM calls (once per calendar week) with "
             f"review_interval=1, got {call_count[0]}"

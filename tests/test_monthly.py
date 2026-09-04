@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import urllib.error
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import numpy as np
 import pandas as pd
@@ -25,11 +25,9 @@ import pytest
 from sqlalchemy import StaticPool, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app import fundamentals as fundamentals_mod
 from app import monthly
 from app.config import settings
-from app.db import Base, MonthlyAccount, MonthlyPosition, MonthlyTrade
-
+from app.db import Base, MonthlyAccount
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -246,7 +244,7 @@ def test_pick_portfolio_end_to_end():
 # ---------------------------------------------------------------------------
 
 def test_is_rebalance_day():
-    tz = timezone.utc
+    tz = UTC
     # 2026-08-31 is a Monday and the last weekday of August
     assert monthly.is_rebalance_day(datetime(2026, 8, 31, 22, 0, tzinfo=tz))
     assert not monthly.is_rebalance_day(datetime(2026, 8, 30, 22, 0, tzinfo=tz))  # Sunday
@@ -257,7 +255,7 @@ def test_is_rebalance_day():
 
 
 def test_month_last_trading_day():
-    tz = timezone.utc
+    tz = UTC
     out = monthly.month_last_trading_day(datetime(2026, 8, 15, tzinfo=tz))
     assert out.date() == datetime(2026, 8, 31).date() and out.weekday() == 0
 
@@ -318,7 +316,7 @@ async def test_run_rebalance_executes_and_is_idempotent(mem_db, monkeypatch):
     #     T10/T11 worse so the top-10 excludes them
     async with mem_db() as s:
         for t in tickers:
-            for ts, px in zip(dates, close[t]):
+            for ts, px in zip(dates, close[t], strict=False):
                 s.add(Candle(ticker=t, timestamp=ts.to_pydatetime(), open=px, high=px,
                              low=px, close=px, volume=2e6))
         quality = {t: (10 - i) for i, t in enumerate(tickers)}  # T00 best
@@ -386,7 +384,7 @@ async def test_run_monthly_cycle_gate(mem_db, monkeypatch):
     # of Aug 2026 — real now() would make this flaky on month-end weekdays
     monkeypatch.setattr(monthly, "is_rebalance_day", lambda today=None: False)
     assert monthly.is_rebalance_day(
-        datetime(2026, 8, 28, 22, 0, tzinfo=timezone.utc)) is False  # sanity
+        datetime(2026, 8, 28, 22, 0, tzinfo=UTC)) is False  # sanity
     out = await monthly.run_monthly_cycle()
     assert out["skipped"] is True
 
@@ -414,7 +412,7 @@ async def test_deposit_allowance_at_month_start(mem_db, monkeypatch):
     # Simulate an operator-local time early in a month whose UTC month differs
     # (2026-09-01 00:30 Vienna == 2026-08-31 22:30 UTC): the old UTC key would
     # have deposited for "2026-08" here, the shared anchor must use "2026-09".
-    fake_now = datetime(2026, 8, 31, 22, 30, tzinfo=timezone.utc)
+    fake_now = datetime(2026, 8, 31, 22, 30, tzinfo=UTC)
     monkeypatch.setattr(monthly, "_current_month", lambda: fake_now.astimezone(
         ZoneInfo(monthly.settings.allowance_tz)).strftime("%Y-%m"))
     r1 = await monthly.deposit_allowance()
@@ -441,7 +439,7 @@ async def test_take_snapshot_records_daily_equity(mem_db):
 
     # seed a price so valuation uses the fresh close, not the avg_cost fallback
     async with mem_db() as s:
-        s.add(Candle(ticker="AAA", timestamp=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        s.add(Candle(ticker="AAA", timestamp=datetime(2026, 9, 1, tzinfo=UTC),
                      open=60, high=60, low=60, close=60, volume=1000))
         await s.commit()
     await monthly.deposit_allowance()
@@ -459,7 +457,6 @@ async def test_take_snapshot_skips_during_rebalance(mem_db, monkeypatch):
     """While a rebalance holds the lock, the daily mark must skip — the
     rebalance writes its own authoritative post-trade snapshot and a racing
     daily mark mid-execution would distort the curve."""
-    import asyncio
 
     lock_held = asyncio.Event()
     release = asyncio.Event()
@@ -496,7 +493,7 @@ async def test_refresh_holdings_no_rebalance(mem_db, monkeypatch):
     await monthly._exec_buy("AAA", 50.0, 500.0, "test")
     val_before = await monthly.monthly_valuate()
     async with mem_db() as s:
-        s.add(Candle(ticker="AAA", timestamp=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        s.add(Candle(ticker="AAA", timestamp=datetime(2026, 9, 1, tzinfo=UTC),
                      open=60, high=60, low=60, close=60, volume=1000))
         await s.commit()
 
@@ -621,8 +618,8 @@ def test_parse_companyfacts_incl_fallbacks_and_dei():
 
 def test_edgar_facts_are_point_in_time_via_ttm():
     """End-to-end: parse -> store shape -> TTM as of a date sees only public facts."""
-    from app.edgar import _parse_companyfacts
     from app import monthly
+    from app.edgar import _parse_companyfacts
     rec = _parse_companyfacts(_companyfacts_payload())
     d_late = pd.Timestamp("2022-09-30")   # FY2022 filed 2022-08-04 => public
     assert monthly._ttm_as_of(rec["NetIncomeLoss"], d_late) == 6e8
@@ -635,8 +632,8 @@ def test_edgar_facts_are_point_in_time_via_ttm():
 
 async def test_load_prefers_edgar_over_yfinance(mem_db):
     """When both sources exist for a ticker, the loader must serve EDGAR only."""
-    from app.db import Fundamental
     from app import fundamentals as fund_mod
+    from app.db import Fundamental
     async with mem_db() as s:
         s.add(Fundamental(ticker="EEE", tag="StockholdersEquity", start=None,
                           end="2024-06-30", filed="2024-08-14", val=5e9,
@@ -682,8 +679,8 @@ async def test_instant_fact_upsert_dedupes(mem_db):
     """Instant facts (start=None) must upsert, not insert duplicates: NULLs
     are distinct in SQLite UNIQUE constraints, so the start column stores ''
     for instants (OptionalDateStr) and the conflict target matches."""
-    import urllib.error
     from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
     from app.db import Fundamental
 
     async with mem_db() as s:
@@ -726,12 +723,12 @@ async def test_refresh_edgar_staleness_gate(mem_db, monkeypatch):
     """refresh_edgar must refetch tickers whose last refresh is older than
     STALE_AFTER_DAYS — the staleness cutoff exists precisely so quarterly
     filings are picked up; only fresh tickers are skipped."""
-    from datetime import datetime, timedelta, timezone as tz
+    from datetime import datetime, timedelta
 
     from app import edgar
     from app.db import Fundamental, SecCik
 
-    now = datetime.now(tz.utc)
+    now = datetime.now(UTC)
     async with mem_db() as s:
         s.add(SecCik(ticker="STALE", cik=111))
         s.add(SecCik(ticker="FRESH", cik=222))
@@ -744,8 +741,6 @@ async def test_refresh_edgar_staleness_gate(mem_db, monkeypatch):
                           currency="USD", source="edgar",
                           updated_at=now - timedelta(days=1)))
         await s.commit()
-
-    fetched: list[str] = []
 
     def fake_fetch(cik):
         return {"StockholdersEquity": [{"start": None, "end": "2024-06-30",
@@ -801,7 +796,6 @@ async def test_run_rebalance_lock_serializes(mem_db, monkeypatch):
     """Concurrent run_rebalance calls: the second must bail out instead of
     passing the month-idempotence gate while the first is mid-refresh (which
     would double-deposit the allowance and duplicate trades)."""
-    import asyncio
 
     in_refresh = asyncio.Event()
     release = asyncio.Event()

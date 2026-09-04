@@ -13,8 +13,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from app.analysis import compute, MIN_CANDLES
-
+from app.analysis import MIN_CANDLES, compute
 
 # ---------------------------------------------------------------------------
 # helpers

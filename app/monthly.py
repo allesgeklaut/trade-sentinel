@@ -22,7 +22,7 @@ market cap / dollar volume / momentum are comparable across the universe.
 import asyncio
 import logging
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -384,7 +384,7 @@ def is_rebalance_day(today: datetime | None = None) -> bool:
     Heuristic: the last calendar day of the month walked back to a weekday.
     A holiday on the final weekday is accepted as an approximation for paper
     trading (documented caveat)."""
-    now = today or datetime.now(timezone.utc)
+    now = today or datetime.now(UTC)
     return now.weekday() < 5 and now.date() == month_last_trading_day(now).date()
 
 
@@ -678,7 +678,7 @@ async def run_rebalance(force: bool = False) -> dict[str, Any]:
 
 
 async def _run_rebalance_locked(force: bool) -> dict[str, Any]:
-    month = datetime.now(timezone.utc).strftime("%Y-%m")
+    month = datetime.now(UTC).strftime("%Y-%m")
     async with Session() as s:
         acc = await s.get(MonthlyAccount, 1)
         if acc is not None and acc.last_rebalance_month == month and not force:
@@ -692,7 +692,7 @@ async def _run_rebalance_locked(force: bool) -> dict[str, Any]:
     fund = await fundamentals_mod.load_fundamentals(tickers)
     # tz-naive date: candle timestamps are stored naive (UTC), so the slice
     # index must be naive too (mixing tz-aware would raise in pandas).
-    d = pd.Timestamp(datetime.now(timezone.utc).replace(tzinfo=None).date())
+    d = pd.Timestamp(datetime.now(UTC).replace(tzinfo=None).date())
     frame = await asyncio.to_thread(eligible_frame, d, close, vol, fund)
     if frame is None:
         return {"skipped": True, "reason": "no eligible frame",
