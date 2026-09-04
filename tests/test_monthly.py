@@ -58,6 +58,12 @@ async def mem_db(monkeypatch):
         s.add(MonthlyAccount(id=1, cash=settings.sim_monthly_start_cash))
         await s.commit()
     yield session_factory
+    # Dispose the engine AFTER the test's event loop closed: aiosqlite runs
+    # every connection on a dedicated worker thread that schedules its result
+    # back onto the loop. Without dispose, that outlives the loop and each
+    # pending operation crashes with "RuntimeError: Event loop is closed"
+    # (surfaced by pytest as PytestUnhandledThreadExceptionWarning).
+    await engine.dispose()
 
 
 def _make_close(n_days: int = 400, tickers=("AAA", "BBB", "CCC")) -> pd.DataFrame:
