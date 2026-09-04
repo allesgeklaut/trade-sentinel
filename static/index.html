@@ -1419,9 +1419,9 @@
         <div class="sim-section">
             <div class="sim-section-title">Equity Curve (vs contributed &amp; daily sim)</div>
             <div style="display:flex;gap:16px;margin-bottom:8px;flex-wrap:wrap">
-                <span style="color:#42ff72;font-size:12px">● Monthly</span>
-                <span style="color:#4d9fff;font-size:12px">● Daily sim</span>
-                <span style="color:#ff9f43;font-size:12px">● Contributed</span>
+                <span style="color:#4d9fff;font-size:12px">● Monthly</span>
+                <span style="color:#42ff72;font-size:12px">● Daily sim (Bot)</span>
+                <span style="color:#7aaa81;font-size:12px">● Contributed</span>
                 <span style="flex:1"></span>
                 <button id="cmp-pct" class="range-btn range-active" onclick="setCompareMode('pct')"
                     title="Each curve as % of its contributed total — fair comparison even when contributed differs">%
@@ -2592,13 +2592,14 @@
                 localization: compareMode === 'pct' ? { priceFormatter: fmtPct } : {},
             });
             const monthlyLine = monthlyChart.addLineSeries({
-                color: '#42ff72', lineWidth: 2, priceScaleId: 'right',
+                color: '#4d9fff', lineWidth: 2, priceScaleId: 'right',
                 priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
             });
             monthlyLine.setData(points.map(p => ({ time: p.time, value: compareMode === 'pct' ? toPct(p) : p.value })));
             if (simPoints.length) {
+                // The Bot is green on its own tab; keep it green here too.
                 const simLine = monthlyChart.addLineSeries({
-                    color: '#4d9fff', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed,
+                    color: '#42ff72', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed,
                     priceScaleId: compareMode === 'pct' ? 'right' : 'left',
                     priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
                 });
@@ -2610,10 +2611,11 @@
                     monthlyChart.priceScale('left').applyOptions({ visible: false });
                 }
             }
-            // Contributed baseline (orange): the monthly portfolio's own
-            // allowance_total steps; in pct mode it is the flat 100 line.
+            // Contributed baseline (grey dotted, same as the Daily Sim
+            // chart): the monthly portfolio's own allowance_total steps; in
+            // pct mode it is the flat 100 line.
             const contrib = monthlyChart.addLineSeries({
-                color: '#ff9f43', lineWidth: 1, priceScaleId: 'right',
+                color: '#7aaa81', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, priceScaleId: 'right',
                 priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
             });
             contrib.setData(points.map(p => ({ time: p.time, value: compareMode === 'pct' ? 100 : p.contributed })));
