@@ -32,7 +32,11 @@ def yahoo_history(ticker, period="2y"):
     # strategy needs adjusted closes for 12-1 momentum (a raw close series
     # fakes a crash at every ex-dividend/split date); the daily technical
     # engine uses the same series, so indicators are consistent everywhere.
-    frame=yf.Ticker(ticker).history(period=period,interval="1d",auto_adjust=True,actions=False,raise_errors=True)
+    # hide_exceptions=False (global yfinance config) is the non-deprecated
+    # replacement for raise_errors=True: fetch failures raise instead of
+    # returning None.
+    yf.config.debug.hide_exceptions = False
+    frame=yf.Ticker(ticker).history(period=period,interval="1d",auto_adjust=True,actions=False)
     if frame.empty: raise ValueError(f"No Yahoo Finance daily data for {ticker}")
     frame=frame.replace([np.inf,-np.inf],np.nan).dropna(subset=["Open","High","Low","Close"])
     if frame.empty: raise ValueError(f"No valid Yahoo Finance daily data for {ticker}")
