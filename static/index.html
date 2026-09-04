@@ -1067,6 +1067,14 @@
             overflow-x: auto
         }
 
+        /* Explicit height like #chart/#sim-chart: with autoSize:true the
+           chart derives its size from the container, and a bare div would
+           collapse to 0px (2px canvas) once the chart instance is removed
+           and not immediately recreated. */
+        #monthly-chart {
+            height: 320px
+        }
+
         .sim-section {
             border: 1px solid #1d6030;
             padding: 14px;
@@ -2497,10 +2505,11 @@
                 dash.style.display = 'none';
                 monthly.style.display = 'block';
                 navMonthly.classList.add('nav-active');
-                // Reload on EVERY visit (not just the first): the daily
-                // scheduler writes a new snapshot each day, so a stale
-                // chart from a previous visit would hide today's point.
-                loadMonthlyAll();
+                // Load once, like the daily sim view. Fresh data is still
+                // obtainable via pull-to-refresh (monthly/refresh +
+                // loadMonthlyAll) and the "Rebalance Now" button, both of
+                // which call loadMonthlyAll() explicitly.
+                if (!monthlyLoaded) { monthlyLoaded = true; loadMonthlyAll(); }
             } else {
                 dash.style.display = 'grid';
                 navDash.classList.add('nav-active');
@@ -2509,6 +2518,7 @@
 
         // ===================== Monthly qv-mom portfolio =====================
         let monthlyChart = null;
+        let monthlyLoaded = false;
 
         // Compare line: the daily sim portfolio's equity curve, overlaid on
         // the Monthly chart. Both are plotted as % of their contributed total
