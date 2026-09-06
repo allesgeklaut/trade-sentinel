@@ -1430,6 +1430,7 @@
                 <span style="color:#4d9fff;font-size:12px">● Monthly</span>
                 <span style="color:#42ff72;font-size:12px">● Daily sim (Bot)</span>
                 <span style="color:#7aaa81;font-size:12px">● Contributed</span>
+                <span style="color:#ff9f43;font-size:12px">● DCA benchmark</span>
                 <span style="flex:1"></span>
                 <button id="cmp-pct" class="range-btn range-active" onclick="setCompareMode('pct')"
                     title="Each curve as % of its contributed total — fair comparison even when contributed differs">%
@@ -2558,10 +2559,11 @@
         }
 
         async function loadMonthlyEquity() {
-            const [snaps, live, simSnaps] = await Promise.all([
+            const [snaps, live, simSnaps, bench] = await Promise.all([
                 api('monthly/equity?limit=365').catch(() => null),
                 api('monthly/status').catch(() => null),
                 api('sim/equity?limit=365').catch(() => null),
+                api('sim/benchmark').catch(() => null),
             ]);
             if (monthlyChart) { monthlyChart.remove(); monthlyChart = null; }
             if (!snaps || !snaps.length) {
@@ -2572,8 +2574,17 @@
             // prices between snapshots (deduped if today IS a snapshot day).
             // Each point carries its own contributed total — the allowance
             // steps $1000 at every month start, and dividing by the WRONG
-            // vintage would spike the pct curve.
-            const points = snaps.map(s => ({ time: s.date, value: s.total_equity, contributed: s.allowance_total }));
+            // vintage would spike the pct curve. One point per day, the LAST
+            // snapshot winning — the daily mark overwrites a same-day
+            // rebalance snapshot. Deduping is also required: lightweight-charts
+            // line series throw on duplicate timestamps and never render.
+            const monthlyByDay = new Map();
+            for (const s of snaps) {
+                monthlyByDay.set(s.date, { value: s.total_equity, contributed: s.allowance_total });
+            }
+            const points = [...monthlyByDay.entries()]
+                .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                .sort((a, b) => a.time < b.time ? -1 : 1);
             const last = points[points.length - 1];
             if (live && live.total_equity != null) {
                 const today = new Date().toISOString().slice(0, 10);
@@ -2590,6 +2601,18 @@
                     { value: s.total_equity, contributed: s.allowance_total });
             }
             const simPoints = [...byDay.entries()].map(([time, p]) => ({
+                time,
+                value: compareMode === 'pct' ? toPct(p) : p.value,
+            })).sort((a, b) => a.time < b.time ? -1 : 1);
+            // DCA benchmark overlay (orange, same series the Daily Sim chart
+            // plots): the URTH control portfolio, normalized by ITS OWN
+            // contributed total so pct mode shares the 100 baseline.
+            const benchByDay = new Map();  // collapse intraday snapshots -> last per day
+            for (const s of ((bench && bench.equity_curve) || [])) {
+                benchByDay.set(new Date(s.at).toISOString().slice(0, 10),
+                    { value: s.total_equity, contributed: s.allowance_total });
+            }
+            const benchPoints = [...benchByDay.entries()].map(([time, p]) => ({
                 time,
                 value: compareMode === 'pct' ? toPct(p) : p.value,
             })).sort((a, b) => a.time < b.time ? -1 : 1);
@@ -2629,6 +2652,13 @@
                 priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
             });
             contrib.setData(points.map(p => ({ time: p.time, value: compareMode === 'pct' ? 100 : p.contributed })));
+            // Benchmark on top (matches the Daily Sim chart's layering).
+            if (benchPoints.length) {
+                monthlyChart.addLineSeries({
+                    color: '#ff9f43', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dotted,
+                    priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+                }).setData(benchPoints);
+            }
             monthlyChart.timeScale().fitContent();
         }
 
