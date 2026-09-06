@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, UTC
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from pydantic import BaseModel
@@ -515,5 +515,15 @@ async def sim_chat_history_clear():
 async def sim_reset():
     """Wipe all sim tables and restart with start cash."""
     return await sim.reset_sim()
+
+@app.get('/', include_in_schema=False)
+async def index() -> FileResponse:
+    """Serve the SPA entry with no-cache so browsers revalidate on each
+    deploy. Starlette's StaticFiles only sets ETag/Last-Modified; without
+    Cache-Control the browser heuristically caches index.html and keeps
+    running the previous JS after a redeploy."""
+    resp = FileResponse(_STATIC_DIR / "index.html")
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 app.mount('/', StaticFiles(directory=str(_STATIC_DIR), html=True), name='static')
