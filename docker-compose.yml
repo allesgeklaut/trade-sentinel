@@ -6,8 +6,12 @@ services:
     ports: ["8002:8000"]
     env_file:
       - .env
-      - /opt/secrets/trade-sentinel.env
-    volumes: ["trade_sentinel_data:/data"]
+    volumes:
+      - trade_sentinel_data:/data
+      # Single source of truth for the LiteLLM API key. Mounted read-only and
+      # read by the app via LITELLM_API_KEY_FILE (below) — the key is NOT
+      # copied into any env file.
+      - /opt/secrets/litellm.key:/run/secrets/litellm.key:ro
     security_opt: ["no-new-privileges:true"]
     cap_drop: [ALL]
     read_only: true
@@ -20,5 +24,6 @@ services:
       start_period: 30s
     environment:
       - TZ=Europe/Vienna
+      - LITELLM_API_KEY_FILE=/run/secrets/litellm.key
 volumes:
   trade_sentinel_data:
