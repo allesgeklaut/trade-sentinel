@@ -39,14 +39,38 @@ logger = logging.getLogger("trade_sentinel.llm")
 
 _DEFAULT_STATE_FILE = Path(settings.llm_state_file)
 
+# API key sources, in priority order: the backend's own ``api_key`` (set in
+# LLM_BACKENDS), then a dedicated key file (LITELLM_API_KEY_FILE — single
+# source of truth, e.g. /opt/secrets/litellm.key), then the legacy
+# LITELLM_API_KEY env var.  Preferring the file means the key is not
+# duplicated into per-service env files.
+_LLM_API_KEY_FILE = os.environ.get("LITELLM_API_KEY_FILE", "")
+
+
+def _api_key_from_file() -> str:
+    """Read the bare API key from ``LITELLM_API_KEY_FILE`` (or ``""``)."""
+    path = _LLM_API_KEY_FILE.strip()
+    if not path:
+        return ""
+    try:
+        return Path(path).read_text().strip()
+    except OSError as e:
+        logger.warning("Could not read LLM API key file %s: %s", path, e)
+        return ""
+
 
 def _auth_headers(backend: dict[str, Any]) -> dict[str, str]:
     """Authorization headers for an OpenAI-compatible backend.
 
-    Uses the backend's own ``api_key`` if set, otherwise falls back to the
-    shared ``LITELLM_API_KEY`` env var (loaded from /opt/secrets/ by compose).
+    Uses the backend's own ``api_key`` if set, otherwise the key from
+    ``LITELLM_API_KEY_FILE``, otherwise the legacy ``LITELLM_API_KEY`` env var.
     """
-    key = (backend.get("api_key") or os.environ.get("LITELLM_API_KEY") or "").strip()
+    key = (
+        backend.get("api_key")
+        or _api_key_from_file()
+        or os.environ.get("LITELLM_API_KEY")
+        or ""
+    ).strip()
     if key:
         return {"Authorization": f"Bearer {key}"}
     return {}
