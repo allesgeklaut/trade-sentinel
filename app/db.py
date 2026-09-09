@@ -369,6 +369,73 @@ class MonthlyRebalance(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
+# =====================================================================
+# Daily-core paper portfolio (qv-mom core + daily cash deployment)
+# =====================================================================
+
+class DailyCoreAccount(Base):
+    """Singleton row (id=1) tracking the daily-core portfolio cash balance."""
+
+    __tablename__ = "daily_core_account"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cash: Mapped[float] = mapped_column(Float, default=0)
+    last_allowance_month: Mapped[str | None] = mapped_column(String(7), nullable=True)  # YYYY-MM
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class DailyCorePosition(Base):
+    """Current open positions in the daily-core portfolio."""
+
+    __tablename__ = "daily_core_positions"
+    __table_args__ = (UniqueConstraint("ticker"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(32), unique=True)
+    shares: Mapped[float] = mapped_column(Float)
+    avg_cost: Mapped[float] = mapped_column(Float)
+    opened_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class DailyCoreTrade(Base):
+    """Executed trade log for the daily-core portfolio."""
+
+    __tablename__ = "daily_core_trades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(32), index=True)
+    side: Mapped[str] = mapped_column(String(4))  # BUY | SELL
+    shares: Mapped[float] = mapped_column(Float)
+    price: Mapped[float] = mapped_column(Float)
+    cash_after: Mapped[float] = mapped_column(Float)
+    reason: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class DailyCoreAllowance(Base):
+    """Monthly imaginary deposit log for the daily-core portfolio."""
+
+    __tablename__ = "daily_core_allowances"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    amount: Mapped[float] = mapped_column(Float)
+    month: Mapped[str] = mapped_column(String(7), unique=True)  # YYYY-MM
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class DailyCoreSnapshot(Base):
+    """Equity-curve point for the daily-core portfolio (one mark per day)."""
+
+    __tablename__ = "daily_core_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    cash: Mapped[float] = mapped_column(Float)
+    positions_value: Mapped[float] = mapped_column(Float)
+    total_equity: Mapped[float] = mapped_column(Float)
+    allowance_total: Mapped[float] = mapped_column(Float, default=0)
+
+
 
 def _configure_sqlite_pragmas(dbapi_conn, _record) -> None:
     """Set durability/concurrency pragmas on every new SQLite connection."""

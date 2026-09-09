@@ -105,6 +105,13 @@ class Settings(BaseSettings):
     sim_monthly_cost_oneway: float = 0.0010  # paper friction, one-way bps on notional swapped
     sim_monthly_fundamentals_source: str = "edgar"  # edgar (US filers) + yfinance fallback | yfinance-only
 
+    # --- Daily-core portfolio (qv-mom core + daily cash deployment) ---------
+    # §10 A/B winner: monthly qv-mom ranking decides WHAT to own (same
+    # top-N hysteresis, no stops); candles only deploy cash daily into the
+    # top-ranked names toward equal weight. Measured +3..+5.5pp IRR over
+    # the monthly sim on 2020-2026 windows (cash-drag elimination).
+    sim_daily_core_enabled: bool = True
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

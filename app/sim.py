@@ -2366,6 +2366,21 @@ async def _scheduler_loop():
         except Exception as e:
             logger.error("Sim cycle failed: %s", e, exc_info=True)
 
+        # Daily-core portfolio last: it depends on the freshly refreshed
+        # candles above (fundamental ranking + daily deployment) and must
+        # not race the monthly rebalance. Runs every trading day the
+        # scheduler fires — that's the whole point (daily cash deployment).
+        try:
+            from .daily_core import run_daily_cycle
+            dc_result = await run_daily_cycle()
+            if dc_result.get("skipped"):
+                logger.info("Daily-core scheduler: skipped — %s", dc_result.get("reason"))
+            else:
+                logger.info("Daily-core cycle complete: %d trades",
+                            len(dc_result.get("deployment", {}).get("trades", [])))
+        except Exception as e:
+            logger.error("Daily-core cycle failed: %s", e, exc_info=True)
+
 
 async def _daily_monthly_snapshot_loop():
     # Imported here (not at module top) to avoid a circular import:
