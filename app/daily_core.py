@@ -483,8 +483,13 @@ async def backfill(start: str | None = None) -> dict:
                 m = (pd.Timestamp(months[0]) + pd.DateOffset(months=i)).strftime("%Y-%m")
                 s.add(Al(amount=settings.sim_monthly_contribution, month=m))
             for sd, eq in snaps:
+                # created_at = the replay day: the UI groups snapshots by
+                # this column's date, so synthetic history must carry the
+                # historical day, not the write time (otherwise all points
+                # collapse into "today" and the curve shows one day).
                 s.add(Sn(cash=0.0, positions_value=eq, total_equity=eq,
-                         allowance_total=round(contributed, 2)))
+                         allowance_total=round(contributed, 2),
+                         created_at=pd.Timestamp(f"{sd} 16:00:00+00:00").to_pydatetime()))
             await s.commit()
 
         return {"ok": True, "days": len(idx), "start": str(first_day.date()),
