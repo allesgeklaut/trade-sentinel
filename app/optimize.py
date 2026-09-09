@@ -2296,7 +2296,11 @@ async def _prune_candles(before: str, dry_run: bool) -> None:
 
 
 async def _monthly_backtest(start: str | None, end: str | None, universe: str,
-                            contribution: float, verbose: bool) -> BacktestSummary | None:
+                            contribution: float, verbose: bool,
+                            frame_cache: dict[pd.Timestamp, pd.DataFrame | None] | None = None,
+                            close_preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
+                            fund_preloaded: dict[str, dict[str, list[dict]]] | None = None,
+                            ) -> BacktestSummary | None:
     """DCA backtest of the monthly qv-mom-v1 strategy on stored candles.
 
     Mirrors stockstrat's run_dca: at the last trading day of each month,
@@ -2310,11 +2314,15 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
     tickers = universe_tickers(universe)
     logger.info("Monthly backtest universe: %d tickers", len(tickers))
 
-    close, vol = await monthly_mod.load_frames(tickers, None)
+    if close_preloaded is not None and fund_preloaded is not None:
+        close, vol = close_preloaded
+        fund = fund_preloaded
+    else:
+        close, vol = await monthly_mod.load_frames(tickers, None)
+        fund = await fundamentals_mod.load_fundamentals(tickers)
     if close.empty:
         print("No candle data found. Run the monthly rebalance (or a data refresh) first.")
         return
-    fund = await fundamentals_mod.load_fundamentals(tickers)
     logger.info("Frames: %d days x %d tickers; fundamentals for %d tickers",
                 len(close), close.shape[1], len(fund))
 
@@ -2345,13 +2353,15 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
               f"for momentum warmup).")
         return
 
-    # eligibility frame per rebalance date is the expensive part — cache by month
-    frame_cache: dict[pd.Timestamp, pd.DataFrame | None] = {}
-    for i, d in enumerate(months):
-        frame_cache[d] = await asyncio.to_thread(
-            monthly_mod.eligible_frame, d, close, vol, fund)
-        if (i + 1) % 12 == 0:
-            logger.info("eligibility %d/%d", i + 1, len(months))
+    # eligibility frame per rebalance date is the expensive part — cache by
+    # month (a prebuilt cache can be passed in by the parameter sweep)
+    if frame_cache is None:
+        frame_cache = {}
+        for i, d in enumerate(months):
+            frame_cache[d] = await asyncio.to_thread(
+                monthly_mod.eligible_frame, d, close, vol, fund)
+            if (i + 1) % 12 == 0:
+                logger.info("eligibility %d/%d", i + 1, len(months))
 
     # Drop dead months: yfinance fundamentals only cover ~4-5 years, so early
     # rebalances have zero eligible names (the strategy would hold cash at 0%
@@ -2470,6 +2480,9 @@ async def _daily_core_backtest(
     exit_cadence: str,
     crash_pause: bool,
     dca: str,
+    frame_cache: dict[pd.Timestamp, pd.DataFrame | None] | None = None,
+    close_preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
+    fund_preloaded: dict[str, dict[str, list[dict]]] | None = None,
 ) -> BacktestSummary | None:
     """Deterministic "daily-core" backtest: the monthly qv-mom portfolio as the
     FUNDAMENTAL core, with minor candle-driven daily adjustments on top.
@@ -2501,11 +2514,15 @@ async def _daily_core_backtest(
     tickers = universe_tickers(universe)
     logger.info("Daily-core backtest universe: %d tickers", len(tickers))
 
-    close, vol = await monthly_mod.load_frames(tickers, None)
+    if close_preloaded is not None and fund_preloaded is not None:
+        close, vol = close_preloaded
+        fund = fund_preloaded
+    else:
+        close, vol = await monthly_mod.load_frames(tickers, None)
+        fund = await fundamentals_mod.load_fundamentals(tickers)
     if close.empty:
         print("No candle data found. Run the monthly rebalance (or a data refresh) first.")
         return
-    fund = await fundamentals_mod.load_fundamentals(tickers)
     logger.info("Frames: %d days x %d tickers; fundamentals for %d tickers",
                 len(close), close.shape[1], len(fund))
 
@@ -2536,12 +2553,15 @@ async def _daily_core_backtest(
 
     # Eligibility frames per MONTH (fundamentals move quarterly; daily
     # overlays reuse the current month's frame — no per-day TTM recompute).
-    frame_cache: dict[pd.Timestamp, pd.DataFrame | None] = {}
-    for i, d in enumerate(months):
-        frame_cache[d] = await asyncio.to_thread(
-            monthly_mod.eligible_frame, d, close, vol, fund)
-        if (i + 1) % 12 == 0:
-            logger.info("eligibility %d/%d", i + 1, len(months))
+    # A prebuilt cache can be passed in (parameter sweep: frames built once,
+    # reused across every config).
+    if frame_cache is None:
+        frame_cache = {}
+        for i, d in enumerate(months):
+            frame_cache[d] = await asyncio.to_thread(
+                monthly_mod.eligible_frame, d, close, vol, fund)
+            if (i + 1) % 12 == 0:
+                logger.info("eligibility %d/%d", i + 1, len(months))
 
     def _live(d: pd.Timestamp) -> bool:
         f = frame_cache[d]
@@ -2598,8 +2618,16 @@ async def _daily_core_backtest(
     equity_month_start = 0.0
     cur_month: int | None = None
 
+    # Valuation closes: each ticker valued at its last valid close <= day
+    # (same rule as eligible_frame). A raw close.at[d, t] treats a ticker
+    # with no candle that day (market not closed yet, holiday) as worthless,
+    # which valued whole positions at $0 when the window ended on a
+    # partial/intraday day — final equity collapsed to leftover cash and
+    # IRR to -100%.
+    close_val = close.ffill()
+
     def px_of(t: str, d: pd.Timestamp) -> float | None:
-        return monthly_mod.px_at(close, d, t)
+        return monthly_mod.px_at(close_val, d, t)
 
     def trade(d: pd.Timestamp, t: str, side: str, delta_value: float) -> None:
         """Execute one fill at d's close with one-way cost on the notional."""
