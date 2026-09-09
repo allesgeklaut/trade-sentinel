@@ -17,6 +17,7 @@ import logging
 import math
 from datetime import datetime, timedelta, UTC
 from zoneinfo import ZoneInfo
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import delete, func, select
@@ -393,7 +394,7 @@ async def _quality_map(tickers: list[str]) -> dict[str, dict[str, float | None]]
 async def _deterministic_propose(
     valuation: dict[str, Any],
     signals: dict[str, dict] | None = None,
-    quality_of: callable | None = None,
+    quality_of: Callable[[str], dict[str, float | None] | None] | None = None,
 ) -> list[dict]:
     """Propose deterministic trades WITHOUT executing them.
 
@@ -484,7 +485,8 @@ async def _execute_proposed(proposals: list[dict]) -> list[dict]:
         # BUY: re-check the max-positions cap against the live DB state, so
         # a SELL earlier in this same list frees a slot for the next BUY.
         async with Session() as s:
-            open_count = await s.scalar(select(func.count()).select_from(SimPosition))
+            open_count = await s.scalar(
+                select(func.count()).select_from(SimPosition)) or 0
             held = await s.scalar(select(SimPosition).where(SimPosition.ticker == p["ticker"]))
         if open_count >= settings.sim_max_positions and held is None:
             continue  # at cap and this is a new position — skip
@@ -495,7 +497,7 @@ async def _execute_proposed(proposals: list[dict]) -> list[dict]:
 
 
 async def _deterministic_decide(valuation: dict[str, Any],
-                                quality_of: callable | None = None) -> list[dict]:
+                                quality_of: Callable[[str], dict[str, float | None] | None] | None = None) -> list[dict]:
     """Rule-based strategy: propose + execute deterministic trades.
 
     Thin wrapper over ``_deterministic_propose`` + ``_execute_proposed`` so
@@ -509,7 +511,7 @@ async def _deterministic_decide(valuation: dict[str, Any],
 
 def _quality_lookup(
     quality: dict[str, dict[str, float | None]] | None,
-) -> callable | None:
+) -> Callable[[str], dict[str, float | None] | None] | None:
     """Turn a quality map into the ``quality_of(ticker)`` callable that
     ``strategy.propose_trades`` expects. None map -> None (feature off)."""
     if quality is None:
@@ -1348,9 +1350,10 @@ async def _llm_review_proposals(
         content = out["text"]
     except Exception as e:
         err_detail = f"{type(e).__name__}: {e}"
-        if hasattr(e, 'response'):
+        resp = getattr(e, 'response', None)
+        if resp is not None:
             try:
-                err_detail += f" | status={e.response.status_code} body={e.response.text[:300]}"
+                err_detail += f" | status={resp.status_code} body={resp.text[:300]}"
             except Exception:
                 pass
         logger.warning("LLM review failed [%s] (backend=%s, model=%s); executing all proposals",
@@ -1516,9 +1519,10 @@ async def _llm_decide(
         content = out["text"]
     except Exception as e:
         err_detail = f"{type(e).__name__}: {e}"
-        if hasattr(e, 'response'):
+        resp = getattr(e, 'response', None)
+        if resp is not None:
             try:
-                err_detail += f" | status={e.response.status_code} body={e.response.text[:300]}"
+                err_detail += f" | status={resp.status_code} body={resp.text[:300]}"
             except Exception:
                 pass
         mode = "pure-LLM" if pure_llm else "hybrid"

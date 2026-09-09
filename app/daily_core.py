@@ -446,8 +446,10 @@ async def backfill(start: str | None = None) -> dict:
         for m in months:
             frame_cache[m] = await asyncio.to_thread(
                 monthly_mod.eligible_frame, m, close, vol, fund)
-        months = [m for m in months
-                  if frame_cache[m] is not None and bool(frame_cache[m]["eligible"].any())]
+        def _has_eligible(m: pd.Timestamp) -> bool:
+            f = frame_cache[m]
+            return f is not None and bool(f["eligible"].any())
+        months = [m for m in months if _has_eligible(m)]
         if not months:
             return {"ok": False, "error": "no month with eligible names"}
         idx = idx[idx >= months[0]]
@@ -495,11 +497,7 @@ async def backfill(start: str | None = None) -> dict:
         snaps: list[tuple[str, float, float]] = []
 
         def px_of(t: str, d: pd.Timestamp) -> float | None:
-            try:
-                p = close_val.at[d, t]
-            except KeyError:
-                return None
-            return float(p) if pd.notna(p) else None
+            return monthly_mod.px_at(close_val, d, t)
 
         cur_month: int | None = None
         for d in idx:

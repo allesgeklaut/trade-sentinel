@@ -19,6 +19,7 @@ PaymentsToAcquirePropertyPlantAndEquipment.
 """
 import asyncio
 import logging
+from collections.abc import Sequence
 from datetime import datetime, UTC
 
 import pandas as pd
@@ -186,7 +187,7 @@ async def _fx_rates_from_candles(pairs: list[str]) -> dict[str, pd.Series]:
         out[pair] = pd.Series(dtype=float)
     for r in rows:
         out.setdefault(r.ticker, pd.Series(dtype=float))
-        out[r.ticker][pd.Timestamp(r.timestamp)] = r.close
+        out[r.ticker].at[pd.Timestamp(r.timestamp)] = r.close
     return {k: v.dropna() for k, v in out.items()}
 
 
@@ -251,7 +252,7 @@ async def refresh_universe(universe: str | None = None, tickers: list[str] | Non
     return statuses
 
 
-def _load_fundamentals_rows(tickers: list[str], rows: list) -> dict[str, dict[str, list[dict]]]:
+def _load_fundamentals_rows(tickers: list[str], rows: Sequence[Fundamental]) -> dict[str, dict[str, list[dict]]]:
     """Build {ticker: {tag: [fact, ...]}} from Fundamental ORM rows.
 
     When a ticker has facts from both sources (edgar + yfinance), EDGAR wins:

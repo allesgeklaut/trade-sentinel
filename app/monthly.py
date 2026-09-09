@@ -199,6 +199,19 @@ def load_frames_sync(tickers: list[str], rows: list, asof: datetime | None = Non
     return close, vol
 
 
+def px_at(frame: pd.DataFrame, d: pd.Timestamp, ticker: str) -> float | None:
+    """Scalar close lookup: frame.at[d, ticker] as a float, None when the
+    cell is missing or NaN. Shared by the live engines and the backtests so
+    the pandas scalar typing quirk is handled in exactly one place."""
+    try:
+        p = frame.at[d, ticker]
+    except KeyError:
+        return None
+    if pd.isna(p):
+        return None
+    return float(np.asarray(p).reshape(-1)[0])
+
+
 async def load_frames(tickers: list[str], asof: datetime | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """(close, volume) DataFrames {date: {ticker: value}} from the candles
     cache, loaded in a thread. Foreign-listing closes are converted to USD at
@@ -251,7 +264,7 @@ def eligible_frame(rebal_date: pd.Timestamp, close: pd.DataFrame, vol: pd.DataFr
         # of that market from the ranking — it did: on 2026-09-09 the frame
         # contained only the 11 European names that had already closed,
         # flipping the top-10 from US to European names overnight.
-        vpos = valid[t].values
+        vpos = valid[t].to_numpy(dtype=bool)
         last_valid = int(np.max(np.nonzero(vpos))) if vpos.any() else -1
         if last_valid < 0:
             continue
@@ -493,14 +506,16 @@ async def monthly_valuate() -> dict[str, Any]:
 
 def _fx_close_series(rows: list, asof: pd.Timestamp | None = None) -> pd.Series:
     """FX pair closes from candle rows as a naive-UTC-indexed Series."""
-    s = pd.Series(dtype=float)
+    pairs: dict[pd.Timestamp, float] = {}
     for r in rows:
         ts = pd.Timestamp(r.timestamp)
         if ts.tzinfo is not None:
             ts = ts.tz_localize(None)
         if asof is None or ts <= asof:
-            s[ts] = r.close
-    return s.sort_index() if len(s) else s
+            pairs[ts] = float(r.close)
+    if not pairs:
+        return pd.Series(dtype=float)
+    return pd.Series(pairs, dtype=float).sort_index()
 
 
 def _convert_usd(price: float, ts: pd.Timestamp, fx: pd.Series, mode: str) -> float:
@@ -513,9 +528,12 @@ def _convert_usd(price: float, ts: pd.Timestamp, fx: pd.Series, mode: str) -> fl
         rate = rate.copy()
         rate.index = idx.tz_localize(None)
     r = rate.asof(ts)
-    if r is None or pd.isna(r) or r == 0:
+    if r is None:
         return price
-    return price * float(r) if mode == "mul" else price / float(r)
+    rf = float(np.asarray(r).reshape(-1)[0])
+    if np.isnan(rf) or rf == 0:
+        return price
+    return price * rf if mode == "mul" else price / rf
 
 
 async def _price_usd_map(tickers: list[str]) -> dict[str, float | None]:

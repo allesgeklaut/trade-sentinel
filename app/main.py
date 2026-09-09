@@ -91,8 +91,8 @@ async def symbols(q:str=Query(min_length=2,max_length=80)):
     except ValueError as e: raise HTTPException(400,str(e)) from e
     except Exception as e: raise HTTPException(502,f"{provider()} symbol search failed: {e}") from e
 @app.post('/api/refresh/{ticker}')
-async def fetch(ticker:str, period:str=None):
-    try: await refresh(ticker.upper(), period); return {"ok":True}
+async def fetch(ticker:str, period:str|None=None):
+    try: await refresh(ticker.upper(), period or "2y"); return {"ok":True}
     except Exception as e: raise HTTPException(400,str(e)) from e
 
 @app.post('/api/refresh-watchlist')
@@ -110,7 +110,7 @@ async def sim_refresh(period: str = "2y"):
     refreshed, errors = await refresh_many(tickers, period)
     return {"refreshed": refreshed, "errors": errors, "total": len(tickers)}
 @app.get('/api/dashboard/{ticker}')
-async def dashboard(ticker:str, period:str=None):
+async def dashboard(ticker:str, period:str|None=None):
     # Always fetch the full cached dataset — indicators need >=206 candles
     all_rows = await candles(ticker.upper())
     candles_for_chart = list(all_rows)
