@@ -23,9 +23,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import json
 import logging
 import math
+import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from collections.abc import Callable
@@ -2922,6 +2925,10 @@ async def _main(args: argparse.Namespace) -> None:
         )
         return
 
+    if args.command == "daily-core-sweep":
+        await _sweep_daily_core(args)
+        return
+
     tickers = _candidate_tickers()
     logger.info("Loading series for %d tickers...", len(tickers))
     series = await _load_series(tickers)
@@ -3181,6 +3188,198 @@ async def _main(args: argparse.Namespace) -> None:
                           f"{t['shares']:>9.4f} @ {t['price']:>10.2f} — {t['reason']}")
 
 
+# ---------------------------------------------------------------------------
+# Daily-core parameter sweep + walk-forward
+# ---------------------------------------------------------------------------
+
+_SWEEP_WINDOWS = [("2017-01-01", "2019-12-31"), ("2020-01-01", "2021-12-31"),
+                  ("2022-01-01", "2023-12-31"), ("2024-01-01", "2026-12-31")]
+
+
+def _sweep_months(idx, start: str) -> list[pd.Timestamp]:
+    """Last trading day of each month at/after `start`."""
+    idx = pd.DatetimeIndex(idx)
+    idx = idx[idx >= pd.Timestamp(start)]
+    months: list[pd.Timestamp] = []
+    for ym in sorted({(d.year, d.month) for d in idx}):
+        sub = idx[(idx.year == ym[0]) & (idx.month == ym[1])]
+        if len(sub):
+            months.append(sub[-1])
+    return months
+
+
+async def _sweep_load_market(universe: str):
+    from . import monthly as monthly_mod
+    from . import fundamentals as fundamentals_mod
+
+    tickers = universe_tickers(universe)
+    fund = await fundamentals_mod.load_fundamentals(tickers)
+    close, vol = await monthly_mod.load_frames(tickers, None)
+    return tickers, close, vol, fund
+
+
+def _sweep_grid() -> list[tuple[str, str, str, bool, float]]:
+    """The knob grid: dca x entry-gate x exit-cadence x crash-pause x boost."""
+    grid = []
+    for dca, gate, exit_c, pause in itertools.product(
+            ["monthly", "daily", "rank"], ["none", "not-crash", "above-sma50"],
+            ["monthly", "daily"], [False, True]):
+        for boost in ([0.0, 0.25, 0.5] if dca == "rank" else [0.0]):
+            grid.append((dca, gate, exit_c, pause, boost))
+    return grid
+
+
+# Fork-inherited worker state (set by the pool initializer before the
+# workers fork — copy-on-write, no pickling, no duplication).
+_SWEEP_WORKER_STATE: dict = {}
+
+
+def _sweep_worker_init(close: pd.DataFrame, vol: pd.DataFrame,
+                       fund: dict[str, dict[str, list[dict]]],
+                       fc: dict[pd.Timestamp, pd.DataFrame | None]) -> None:
+    _SWEEP_WORKER_STATE["close"] = close
+    _SWEEP_WORKER_STATE["vol"] = vol
+    _SWEEP_WORKER_STATE["fund"] = fund
+    _SWEEP_WORKER_STATE["fc"] = fc
+
+
+def _sweep_run_config(task: tuple[str, str, str, bool, float]) -> dict:
+    """One config in one worker process. Pure compute: the backtest with
+    preloaded frames never touches the DB; boost is process-local state."""
+    import asyncio
+
+    dca, gate, exit_c, pause, boost = task
+    settings.sim_monthly_rank_boost = boost
+
+    async def go() -> BacktestSummary | None:
+        return await _daily_core_backtest(
+            "2017-01-01", None, settings.sim_monthly_universe,
+            settings.sim_monthly_contribution, False,
+            gate, exit_c, pause, dca,
+            frame_cache=_SWEEP_WORKER_STATE["fc"],
+            close_preloaded=(_SWEEP_WORKER_STATE["close"], _SWEEP_WORKER_STATE["vol"]),
+            fund_preloaded=_SWEEP_WORKER_STATE["fund"],
+            with_baseline=False)
+
+    r = asyncio.run(go())
+    return {
+        "dca": dca, "gate": gate, "exit": exit_c, "pause": pause, "boost": boost,
+        "irr": r.irr if r else None, "value": r.final_value if r else 0.0,
+        "turnover": r.avg_turnover if r else 0.0, "trades": r.n_trades if r else 0,
+    }
+
+
+async def _sweep_stage1(fc, close, vol, fund, baseline_irr: float,
+                        out_path: str, workers: int) -> list[dict]:
+    from concurrent.futures import ProcessPoolExecutor
+
+    grid = _sweep_grid()
+    print(f"stage1: {len(grid)} configs on {workers} workers", flush=True)
+    t0 = time.time()
+    results: list[dict] = []
+    with ProcessPoolExecutor(max_workers=workers, initializer=_sweep_worker_init,
+                             initargs=(close, vol, fund, fc)) as ex:
+        for res in ex.map(_sweep_run_config, grid, chunksize=1):
+            if res["irr"] is not None:
+                results.append(res)
+            n = len(results)
+            if n % 10 == 0:
+                print(f"  {n} done ({time.time() - t0:.0f}s)", flush=True)
+
+    results.sort(key=lambda r: -(r["irr"] or -1))
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=1)
+    print(f"\n=== stage1 top 15 ({time.time() - t0:.0f}s) — baseline {baseline_irr:.2%} ===")
+    for r in results[:15]:
+        print(f"  dca={r['dca']:<7} gate={r['gate']:<11} exit={r['exit']:<7} "
+              f"pause={int(r['pause'])} boost={r['boost']:<4} "
+              f"IRR {r['irr']:7.2%}  turn {r['turnover']:.1%}  trades {r['trades']}")
+    return results
+
+
+async def _sweep_stage2(fc, close, vol, fund, results: list[dict],
+                        top_n: int, out_path: str) -> None:
+    seen: set = set()
+    configs = []
+    for r in results:
+        key = (r["dca"], r["gate"], r["exit"], r["pause"], r["boost"])
+        if key in seen:
+            continue
+        seen.add(key)
+        configs.append(r)
+        if len(configs) >= top_n:
+            break
+
+    print(f"\nstage2: top {len(configs)} configs x {len(_SWEEP_WINDOWS)} "
+          f"walk-forward windows + monthly baseline", flush=True)
+    report = []
+    for w_start, w_end in _SWEEP_WINDOWS:
+        base = await _monthly_backtest(w_start, w_end, settings.sim_monthly_universe,
+                                       settings.sim_monthly_contribution, False,
+                                       frame_cache=fc, close_preloaded=(close, vol),
+                                       fund_preloaded=fund)
+        assert base is not None, "monthly backtest returned no summary"
+        row = {"window": f"{w_start[:4]}-{w_end[:4]}", "baseline_irr": base.irr,
+               "configs": []}
+        for c in configs:
+            settings.sim_monthly_rank_boost = c["boost"]
+            r = await _daily_core_backtest(
+                w_start, w_end, settings.sim_monthly_universe,
+                settings.sim_monthly_contribution, False,
+                c["gate"], c["exit"], c["pause"], c["dca"],
+                frame_cache=fc, close_preloaded=(close, vol), fund_preloaded=fund,
+                with_baseline=False)
+            row["configs"].append({
+                "cfg": f"{c['dca']}/{c['gate']}/{c['exit']}/p{int(c['pause'])}/b{c['boost']}",
+                "irr": r.irr if r else None})
+        report.append(row)
+        wins = sum(1 for x in row["configs"] if x["irr"] is not None and x["irr"] > row["baseline_irr"])
+        print(f"\n=== {row['window']}: baseline {row['baseline_irr']:.2%} | "
+              f"configs beating it: {wins}/{len(configs)}")
+        for x in sorted(row["configs"], key=lambda x: -(x["irr"] or -99)):
+            if x["irr"] is not None:
+                print(f"  {x['cfg']:<40} {x['irr']:7.2%} "
+                      f"{'>' if x['irr'] > row['baseline_irr'] else '<'} baseline")
+
+    with open(out_path, "w") as f:
+        json.dump(report, f, indent=1)
+
+
+async def _sweep_daily_core(args: argparse.Namespace) -> None:
+    """`daily-core-sweep` CLI: grid-search the daily-core knobs in parallel,
+    then walk-forward the top configs."""
+    universe = args.universe or settings.sim_monthly_universe
+    workers = args.workers
+    out_dir = args.out or "/data/sweeps"
+    os.makedirs(out_dir, exist_ok=True)
+    stage1_path = os.path.join(out_dir, "daily_core_stage1.json")
+    stage2_path = os.path.join(out_dir, "daily_core_walkforward.json")
+
+    from . import monthly as monthly_mod
+
+    print("loading market frames...", flush=True)
+    _tickers, close, vol, fund = await _sweep_load_market(universe)
+    print(f"frames: {close.shape[0]} days x {close.shape[1]} tickers", flush=True)
+
+    fc: dict[pd.Timestamp, pd.DataFrame | None] = {}
+    t0 = time.time()
+    for d in _sweep_months(close.index, "2016-06-01"):
+        fc[d] = await asyncio.to_thread(monthly_mod.eligible_frame, d, close, vol, fund)
+    print(f"frame cache: {len(fc)} months ({time.time() - t0:.0f}s)", flush=True)
+
+    base = await _monthly_backtest("2017-01-01", None, universe,
+                                   settings.sim_monthly_contribution, False,
+                                   frame_cache=fc, close_preloaded=(close, vol),
+                                   fund_preloaded=fund)
+    assert base is not None, "monthly backtest returned no summary"
+    print(f"baseline IRR full window: {base.irr:.2%}", flush=True)
+
+    results = await _sweep_stage1(fc, close, vol, fund, base.irr, stage1_path, workers)
+    if args.stage in ("2", "all"):
+        await _sweep_stage2(fc, close, vol, fund, results,
+                            top_n=args.top, out_path=stage2_path)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Walk-forward optimization for the deterministic strategy")
     sub = p.add_subparsers(dest="command", required=True)
@@ -3360,6 +3559,20 @@ def _build_parser() -> argparse.ArgumentParser:
     dc.add_argument("--crash-pause", action="store_true",
                     help="Pause NEW entries when the universe is in a pullback regime")
     dc.add_argument("--verbose", action="store_true", help="Print the last trades")
+
+    sw = sub.add_parser("daily-core-sweep",
+                        help="Grid-search the daily-core knobs in parallel, then "
+                             "walk-forward the top configs against the monthly baseline")
+    sw.add_argument("--stage", default="all", choices=["1", "2", "all"],
+                    help="1 = in-sample grid, 2 = walk-forward of the top configs")
+    sw.add_argument("--workers", type=int, default=6,
+                    help="Worker processes for stage1 (default 6)")
+    sw.add_argument("--universe", default=None,
+                    help="Universe name (default: sim_monthly_universe)")
+    sw.add_argument("--top", type=int, default=8,
+                    help="Configs carried into the walk-forward (default 8)")
+    sw.add_argument("--out", default="/data/sweeps",
+                    help="Directory for the results JSONs (default /data/sweeps)")
 
     pc = sub.add_parser("prune-candles",
                         help="Delete candle rows before a cutoff date (frees DB space, "
