@@ -366,8 +366,17 @@ async def backfill(start: str | None = None) -> dict:
         first_day = idx[0]
 
         # --- wipe + reset ---
+        # Preserve the CURRENT month's live allowance (the real deposit the
+        # engine already made): the replay re-creates allowance rows for its
+        # own month sequence, which may not include the current month, and
+        # the status endpoint's deposit_allowance() would then hit the
+        # UNIQUE(month) constraint.
         from sqlalchemy import delete as sa_delete
+        live_allowance_month: str | None = None
         async with Session() as s:
+            acc0 = await s.get(Acc, 1)
+            if acc0 is not None:
+                live_allowance_month = acc0.last_allowance_month
             for tbl in (Tr, Pos, Al, Sn):
                 await s.execute(sa_delete(tbl))
             acc = await _account(s)
@@ -378,6 +387,15 @@ async def backfill(start: str | None = None) -> dict:
         cost = settings.sim_monthly_cost_oneway
         target_n = settings.sim_monthly_target_n
         hold_band = settings.sim_monthly_hold_band
+
+        # Valuation prices: forward-filled closes so a ticker without a
+        # candle on a given day (holiday, partial today, stale feed) is
+        # valued at its LAST known close instead of 0. Without this the
+        # replay's equity collapses on days when held names lack candles —
+        # the snapshot then records near-zero equity and the UI curve
+        # cliffs. Fills also use the carried price, the same convention as
+        # the monthly sim's USD-converted valuation.
+        close_val = close.ffill()
 
         # --- in-memory replay state ---
         shares: dict[str, float] = {}
@@ -390,7 +408,7 @@ async def backfill(start: str | None = None) -> dict:
 
         def px_of(t: str, d: pd.Timestamp) -> float | None:
             try:
-                p = close.at[d, t]
+                p = close_val.at[d, t]
             except KeyError:
                 return None
             return float(p) if pd.notna(p) else None
@@ -425,7 +443,7 @@ async def backfill(start: str | None = None) -> dict:
                 p = px_of(t, d)
                 if p is None or p <= 0:
                     return
-                notional = min(budget, cash)
+                notional = min(budget, max(cash, 0.0))
                 if notional < 1:
                     return
                 sh = notional / p
@@ -474,6 +492,10 @@ async def backfill(start: str | None = None) -> dict:
             snaps.append((d.strftime("%Y-%m-%d"), equity_close))
 
         # --- persist the end state ---
+        # Allowance rows: one per month the replay actually deposited,
+        # derived from the replay's own month sequence (safer than a
+        # DateOffset sweep, which can drift across the trimmed start).
+        replay_months = sorted({d.strftime("%Y-%m") for d in idx})
         async with Session() as s:
             acc = await _account(s)
             acc.cash = cash
@@ -485,9 +507,14 @@ async def backfill(start: str | None = None) -> dict:
             for td, side, t, notional in trades:
                 s.add(Tr(ticker=t, side=side, shares=0.0, price=0.0,
                          cash_after=0.0, reason=f"backfill {side.lower()} ${notional:,.0f}"))
-            for i in range(n_contribs):
-                m = (pd.Timestamp(months[0]) + pd.DateOffset(months=i)).strftime("%Y-%m")
+            for m in replay_months:
                 s.add(Al(amount=settings.sim_monthly_contribution, month=m))
+            # The current month's LIVE deposit happened before the wipe and
+            # is part of the replay's own sequence only if that month had
+            # trading days here — it does (idx ends today), but keep the
+            # account marker consistent so deposit_allowance() stays a no-op
+            # for the live month.
+            acc.last_allowance_month = live_allowance_month or replay_months[-1]
             for sd, eq in snaps:
                 # created_at = the replay day: the UI groups snapshots by
                 # this column's date, so synthetic history must carry the
