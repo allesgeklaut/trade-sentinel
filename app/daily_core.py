@@ -443,7 +443,9 @@ async def backfill(start: str | None = None) -> dict:
                 p = px_of(t, d)
                 if p is None or p <= 0:
                     return
-                notional = min(budget, max(cash, 0.0))
+                # Reserve the one-way fee inside the spend so cash can never
+                # go negative (a full-cash spend plus fee would).
+                notional = min(budget, max(cash, 0.0) / (1.0 + cost))
                 if notional < 1:
                     return
                 sh = notional / p
