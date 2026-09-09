@@ -419,6 +419,8 @@ async def backfill(start: str | None = None) -> dict:
 
         if start is None:
             start = await _sync_start_date()
+        elif start == "all":
+            start = None  # full stored history
         start_note = start or "first eligible month"
 
         tickers = universe_tickers(settings.sim_monthly_universe)
@@ -441,9 +443,19 @@ async def backfill(start: str | None = None) -> dict:
             if len(sub):
                 months.append(sub[-1])
 
-        # Eligibility frames per month (same caching as the backtest).
+        # Eligibility frames per month (same caching as the backtest), plus
+        # the month-end BEFORE the window: a start like 2026-06-01 should
+        # replay June 1-29 against May's month-end ranking (facts public by
+        # then), not sit idle until June's month-end. Point-in-time safe:
+        # the prior frame only uses facts public by its own date.
+        prior_month_ends: list[pd.Timestamp] = []
+        if months:
+            prev = months[0] - pd.offsets.MonthEnd(1)
+            prev_idx = close.index[close.index <= prev]
+            if len(prev_idx):
+                prior_month_ends.append(prev_idx[-1])
         frame_cache: dict[pd.Timestamp, pd.DataFrame | None] = {}
-        for m in months:
+        for m in prior_month_ends + months:
             frame_cache[m] = await asyncio.to_thread(
                 monthly_mod.eligible_frame, m, close, vol, fund)
         def _has_eligible(m: pd.Timestamp) -> bool:
@@ -452,7 +464,9 @@ async def backfill(start: str | None = None) -> dict:
         months = [m for m in months if _has_eligible(m)]
         if not months:
             return {"ok": False, "error": "no month with eligible names"}
-        idx = idx[idx >= months[0]]
+        # No idx clamp to months[0]: days before the first eligible
+        # month-end in the window replay against the PRIOR month-end's
+        # frame (built above), so start=YYYY-06-01 really starts June 1.
         first_day = idx[0]
 
         # --- wipe + reset ---
