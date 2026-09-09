@@ -2693,8 +2693,14 @@ async def _daily_core_backtest(
         # --- monthly turnover bookkeeping ---
         if cur_month is None or d.month != cur_month:
             if cur_month is not None and equity_month_start > 0:
-                # (buys + sells) / 2 / equity at month start = one-way turnover
-                churns.append(((month_buys + month_sells) / 2.0) / equity_month_start)
+                # One-way turnover = ((buys - contribution) + sells) / 2 /
+                # equity at month start. Deploying the fresh contribution is
+                # not churn (same convention as the monthly baseline, where
+                # slot swaps exclude it); buys beyond the contribution are.
+                # Buys can exceed the contribution within a month (sell
+                # proceeds recycled into rebalancing) — the excess is churn.
+                churns.append(((max(month_buys - contribution, 0.0)
+                                + month_sells) / 2.0) / equity_month_start)
             month_buys, month_sells = 0.0, 0.0
             cur_month = d.month
             equity_month_start = cash + pending_cash + sum(
