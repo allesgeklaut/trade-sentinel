@@ -242,11 +242,22 @@ def eligible_frame(rebal_date: pd.Timestamp, close: pd.DataFrame, vol: pd.DataFr
 
     rows: dict[str, dict[str, float | None]] = {}
     for t in hist.columns:
-        if not valid[t].iloc[-1]:
+        # Value each ticker at its last VALID close <= asof, not strictly at
+        # the asof day's close. The month-end rebalance runs after the US
+        # close so behavior there is unchanged (the last valid close IS the
+        # asof-day close). But an asof day where a market simply hasn't
+        # closed yet (daily-core runs intraday, holidays where one market
+        # trades and the other doesn't) must not silently drop every ticker
+        # of that market from the ranking — it did: on 2026-09-09 the frame
+        # contained only the 11 European names that had already closed,
+        # flipping the top-10 from US to European names overnight.
+        vpos = valid[t].values
+        last_valid = int(np.max(np.nonzero(vpos))) if vpos.any() else -1
+        if last_valid < 0:
             continue
         if int(n_valid[t]) < settings.sim_monthly_min_history_days:
             continue
-        price = float(hist[t].iloc[-1])
+        price = float(c[t].iloc[last_valid])
         rec = fundamentals.get(t)
         if not rec:
             continue
