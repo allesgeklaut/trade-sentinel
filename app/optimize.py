@@ -2483,6 +2483,7 @@ async def _daily_core_backtest(
     frame_cache: dict[pd.Timestamp, pd.DataFrame | None] | None = None,
     close_preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
     fund_preloaded: dict[str, dict[str, list[dict]]] | None = None,
+    with_baseline: bool = True,
 ) -> BacktestSummary | None:
     """Deterministic "daily-core" backtest: the monthly qv-mom portfolio as the
     FUNDAMENTAL core, with minor candle-driven daily adjustments on top.
@@ -2655,12 +2656,25 @@ async def _daily_core_backtest(
             month_sells += notional
         trades_log.append((d.strftime("%Y-%m-%d"), side, t, notional))
 
+    # Ranking memo: the eligibility frame is per-month, so the qv-mom
+    # order is identical for every trading day within that month —
+    # recomputing it per day (a ~4ms _ttm_as_of walk per eligible
+    # ticker) dominated the profile. Keyed by the frame object id since
+    # distinct months have distinct frames.
+    order_memo: dict[int, tuple[list[str], pd.DataFrame | None]] = {}
+
     def current_order(d: pd.Timestamp, month_td: pd.Timestamp) -> tuple[list[str], pd.DataFrame | None]:
         frame = frame_cache.get(month_td)
         if frame is None or not frame["eligible"].any():
             return [], frame
+        key = id(frame)
+        hit = order_memo.get(key)
+        if hit is not None:
+            return hit
         _elig, order = monthly_mod._qv_order(frame)
-        return order, frame
+        result = (order, frame)
+        order_memo[key] = result
+        return result
 
     def month_for(d: pd.Timestamp) -> pd.Timestamp:
         # the most recent month-end at or before d
@@ -2861,12 +2875,17 @@ async def _daily_core_backtest(
             print(f"  {td} {side:<4} {t:<10} ${notional:,.0f}")
 
     # --- Monthly baseline over the same window (for comparison) ---
-    print("\n--- Monthly qv-mom baseline over the same window ---")
-    await _monthly_backtest(
-        start or (days_all[0].strftime("%Y-%m-%d")),
-        end or (last_day.strftime("%Y-%m-%d")),
-        universe, contribution, False,
-    )
+    # Skippable: the sweep computes the (config-independent) baseline once
+    # per window instead of once per config.
+    if with_baseline:
+        print("\n--- Monthly qv-mom baseline over the same window ---")
+        await _monthly_backtest(
+            start or (days_all[0].strftime("%Y-%m-%d")),
+            end or (last_day.strftime("%Y-%m-%d")),
+            universe, contribution, False,
+            frame_cache=frame_cache, close_preloaded=close_preloaded,
+            fund_preloaded=fund_preloaded,
+        )
 
     return BacktestSummary(
         irr=irr,
