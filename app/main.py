@@ -437,6 +437,37 @@ async def monthly_refresh():
     refreshed, errors = await refresh_many(held + pairs, "2y")
     return {"refreshed": refreshed, "errors": errors}
 
+@app.get('/api/dailycore/status')
+async def daily_core_status():
+    """Daily-core portfolio status: valuation + config + today's ranking."""
+    from . import daily_core
+    if settings.sim_daily_core_enabled:
+        await daily_core.deposit_allowance()
+    val = await daily_core.valuate()
+    band, picks, _frame = await daily_core.compute_targets()
+    return {
+        "valuation": val,
+        "sim_daily_core_enabled": settings.sim_daily_core_enabled,
+        "band": band,
+        "picks": picks,
+    }
+
+@app.get('/api/dailycore/trades')
+async def daily_core_trades(limit: int = Query(default=100, ge=1, le=500)):
+    from . import daily_core
+    return await daily_core.get_trades(limit)
+
+@app.get('/api/dailycore/equity')
+async def daily_core_equity(limit: int = Query(default=365, ge=1, le=1000)):
+    from . import daily_core
+    return await daily_core.get_equity_curve(limit)
+
+@app.post('/api/dailycore/run')
+async def daily_core_run():
+    """Manually trigger one daily-core cycle (idempotent; lock-guarded)."""
+    from . import daily_core
+    return await daily_core.run_daily_cycle()
+
 @app.post('/api/sim/chat')
 async def sim_chat_endpoint(req: ChatRequest):
     """Interactive chat with the sim portfolio manager LLM.

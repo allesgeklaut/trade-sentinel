@@ -1288,7 +1288,8 @@
     <header><b>TRADE SENTINEL // PAPER-ONLY RESEARCH TERMINAL</b>
         <div class="nav-toggle"><button id="nav-dashboard" class="nav-active"
                 onclick="showView('dashboard')">Dashboard</button><button id="nav-sim" onclick="showView('sim')">Daily
-                Sim</button><button id="nav-monthly" onclick="showView('monthly')">Monthly Sim</button></div><span
+                Sim</button><button id="nav-monthly" onclick="showView('monthly')">Monthly Sim</button><button
+                id="nav-dailycore" onclick="showView('dailycore')">Daily-Core</button></div><span
             id="status">loading</span>
         <select id="llm-model" title="Active LLM backend / model" onchange="switchLLMModel()">
             <option value="">loading models…</option>
@@ -1473,6 +1474,49 @@
                 <button id="monthly-run-btn" onclick="runMonthly()">Rebalance Now</button>
             </div>
             <div id="monthly-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
+        </div>
+    </section>
+    <section id="dailycore-view" style="display:none">
+        <div class="sim-section">
+            <div id="dailycore-summary"></div>
+        </div>
+        <div class="sim-grid2">
+            <div class="sim-section">
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">POSITIONS</h3>
+                <div id="dailycore-positions"></div>
+            </div>
+            <div class="sim-section">
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">TODAY'S RANKING (hold band)</h3>
+                <div id="dailycore-band"></div>
+            </div>
+        </div>
+        <div class="sim-section">
+            <div class="sim-section-title">Equity Curve (vs contributed)</div>
+            <div id="dailycore-chart"></div>
+        </div>
+        <div class="sim-grid2">
+            <div class="sim-section">
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">TRADE LOG</h3>
+                <div id="dailycore-trades"></div>
+            </div>
+            <div class="sim-section">
+                <div class="bench-label">STRATEGY</div>
+                <div id="dailycore-info" class="sim-empty" style="text-align:left;padding:8px 0">
+                    <b>daily-core (qv-mom + daily deployment)</b> — the Monthly sim's qv-mom ranking decides
+                    WHAT to own (top-10 equal-weight, top-20 hysteresis band, no stops). Candles only adjust
+                    WHEN: every trading day free cash deploys into the top-ranked names toward their
+                    equal-weight target — no month-end parking, no pro-rata spread into laggards. Measured
+                    +3..+5.5pp IRR over the Monthly sim on 2020-2026 windows (experiment doc §10). Funded by
+                    the same monthly allowance as the other portfolios.
+                </div>
+            </div>
+        </div>
+        <div class="sim-section">
+            <div class="bench-label">ACTIONS</div>
+            <div class="sim-actions">
+                <button id="dailycore-run-btn" onclick="runDailyCore()">Run Cycle Now</button>
+            </div>
+            <div id="dailycore-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
         </div>
     </section>
     <div id="explain-backdrop-container">
@@ -2489,14 +2533,18 @@
             const dash = document.getElementById('dashboard-view');
             const sim = document.getElementById('sim-view');
             const monthly = document.getElementById('monthly-view');
+            const dailycore = document.getElementById('dailycore-view');
             const navDash = document.getElementById('nav-dashboard');
             const navSim = document.getElementById('nav-sim');
             const navMonthly = document.getElementById('nav-monthly');
+            const navDailyCore = document.getElementById('nav-dailycore');
             navDash.classList.remove('nav-active');
             navSim.classList.remove('nav-active');
             navMonthly.classList.remove('nav-active');
+            navDailyCore.classList.remove('nav-active');
             sim.classList.remove('active');
             monthly.style.display = 'none';
+            dailycore.style.display = 'none';
             if (view === 'sim') {
                 dash.style.display = 'none';
                 sim.classList.add('active');
@@ -2511,10 +2559,101 @@
                 // loadMonthlyAll) and the "Rebalance Now" button, both of
                 // which call loadMonthlyAll() explicitly.
                 if (!monthlyLoaded) { monthlyLoaded = true; loadMonthlyAll(); }
+            } else if (view === 'dailycore') {
+                dash.style.display = 'none';
+                dailycore.style.display = 'block';
+                navDailyCore.classList.add('nav-active');
+                if (!dailyCoreLoaded) { dailyCoreLoaded = true; loadDailyCoreAll(); }
             } else {
                 dash.style.display = 'grid';
                 navDash.classList.add('nav-active');
             }
+        }
+
+        // ===================== Daily-core portfolio =====================
+        let dailyCoreChart = null;
+        let dailyCoreLoaded = false;
+
+        async function loadDailyCoreStatus() {
+            try {
+                const s = await api('dailycore/status');
+                const v = s.valuation || {};
+                const gain = v.allowance_total > 0 ? (v.total_equity / v.allowance_total * 100 - 100) : null;
+                const m = [
+                    ['Total Equity', v.total_equity != null ? '$' + v.total_equity.toFixed(2) : '—'],
+                    ['Contributed', v.allowance_total != null ? '$' + v.allowance_total.toFixed(2) : '—'],
+                    ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(1) + '%' : '—'],
+                    ['Cash', v.cash != null ? '$' + v.cash.toFixed(2) : '—'],
+                    ['Picks', (s.picks || []).length ? s.picks.join(', ') : '—'],
+                ];
+                document.getElementById('dailycore-summary').innerHTML = m.map(([k, x]) => `<span class="metric">${k}<br><b>${x}</b></span>`).join('');
+                const pos = v.positions || [];
+                document.getElementById('dailycore-positions').innerHTML = pos.length ? `<table><tr><th>Ticker</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>P&L%</th></tr>${pos.map(p => {
+                    const pnl = p.pnl_pct;
+                    const cls = pnl > 0 ? 'buy' : pnl < 0 ? 'sell' : '';
+                    return `<tr><td>${escapeHtml(p.ticker)}</td><td>${p.shares.toFixed(4)}</td><td>$${p.avg_cost.toFixed(2)}</td><td>$${p.current_price.toFixed(2)}</td><td>$${p.value.toFixed(2)}</td><td class="${cls}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</td></tr>`;
+                }).join('')}</table>` : '<div class="sim-empty">No open positions — waiting for the first cycle.</div>';
+                const band = s.band || [];
+                document.getElementById('dailycore-band').innerHTML = band.length ? `<table><tr><th>#</th><th>Ticker</th><th>In Top-10</th></tr>${band.map((t, i) => `<tr><td>${i + 1}</td><td>${escapeHtml(t)}</td><td>${i < 10 ? '✓' : ''}</td></tr>`).join('')}</table>` : '<div class="sim-empty">No eligible ranking yet.</div>';
+            } catch (e) { document.getElementById('dailycore-summary').innerHTML = 'Error: ' + escapeHtml(e.message); }
+        }
+
+        async function loadDailyCoreTrades() {
+            try {
+                const t = await api('dailycore/trades?limit=50');
+                document.getElementById('dailycore-trades').innerHTML = t.length ? renderTradeLog(t) : '<div class="sim-empty">No trades yet — the scheduler runs the first cycle tonight.</div>';
+            } catch (e) { document.getElementById('dailycore-trades').innerHTML = 'Error: ' + escapeHtml(e.message); }
+        }
+
+        async function loadDailyCoreEquity() {
+            const snaps = await api('dailycore/equity?limit=365').catch(() => null);
+            if (dailyCoreChart) { dailyCoreChart.remove(); dailyCoreChart = null; }
+            if (!snaps || !snaps.length) {
+                document.getElementById('dailycore-chart').innerHTML = '<div class="sim-empty">No data yet — the equity curve appears after the first cycle.</div>';
+                return;
+            }
+            const byDay = new Map();  // last snapshot per day
+            for (const s of snaps) byDay.set(s.date, { value: s.total_equity, contributed: s.allowance_total });
+            const points = [...byDay.entries()].sort((a, b) => a[0] < b[0] ? -1 : 1);
+            document.getElementById('dailycore-chart').innerHTML = '';
+            dailyCoreChart = LightweightCharts.createChart(document.getElementById('dailycore-chart'), {
+                autoSize: true,
+                height: 280, layout: { background: { color: '#071009' }, textColor: '#b7ffc0' },
+                grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } },
+                timeScale: { timeVisible: false, secondsVisible: false },
+            });
+            dailyCoreChart.addLineSeries({
+                color: '#4d9fff', lineWidth: 2,
+                priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+            }).setData(points.map(([time, p]) => ({ time, value: p.value })));
+            dailyCoreChart.addLineSeries({
+                color: '#7aaa81', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted,
+                priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+            }).setData(points.map(([time, p]) => ({ time, value: p.contributed })));
+            dailyCoreChart.timeScale().fitContent();
+        }
+
+        async function runDailyCore() {
+            const btn = document.getElementById('dailycore-run-btn');
+            const status = document.getElementById('dailycore-run-status');
+            btn.disabled = true;
+            status.textContent = 'Running cycle… (refreshes candles + fundamentals, can take a few minutes)';
+            try {
+                const r = await api('dailycore/run', { method: 'POST' });
+                if (r.skipped) {
+                    status.textContent = 'Skipped: ' + (r.reason || 'unknown');
+                } else {
+                    status.textContent = `Cycle complete: ${(r.deployment?.trades || []).length} trades.`;
+                    loadDailyCoreAll();
+                }
+            } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
+            btn.disabled = false;
+        }
+
+        async function loadDailyCoreAll() {
+            await Promise.all([
+                loadDailyCoreStatus(), loadDailyCoreTrades(), loadDailyCoreEquity(),
+            ]);
         }
 
         // ===================== Monthly qv-mom portfolio =====================
