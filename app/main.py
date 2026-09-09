@@ -475,10 +475,18 @@ async def daily_core_run():
 
 @app.post('/api/dailycore/refresh')
 async def daily_core_refresh():
-    """Refresh candle data (+FX) for the daily-core universe and holdings —
-    the pull-to-refresh / manual-refresh path, mirroring /api/monthly/refresh."""
+    """Refresh candle data for the daily-core portfolio's holdings (+ FX
+    pairs) so valuation/equity use current prices — the pull-to-refresh
+    path, mirroring /api/monthly/refresh. The universe-wide refresh stays
+    in the nightly cycle."""
     from . import daily_core
-    refreshed, errors = await daily_core.refresh_data()
+    from .db import DailyCorePosition
+    from sqlalchemy import select
+    async with Session() as s:
+        held = [p.ticker for p in (await s.scalars(select(DailyCorePosition))).all()]
+    pairs = sorted({pm[0] for t in held
+                    if (pm := daily_core.monthly_mod.fundamentals_mod._suffix_fx(t))})
+    refreshed, errors = await refresh_many(held + pairs, "2y")
     return {"refreshed": refreshed, "errors": errors, "total": len(refreshed) + len(errors)}
 
 @app.post('/api/dailycore/backfill')
