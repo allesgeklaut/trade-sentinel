@@ -1288,3 +1288,115 @@ class TestReviewInterval:
             f"expected 3 LLM calls (once per calendar week) with "
             f"review_interval=1, got {call_count[0]}"
         )
+
+
+class TestDailyCoreMonthlyParity:
+    """The daily-core backtest with all knobs at their defaults
+    (dca="monthly", entry-gate="none", exit-cadence="monthly",
+    crash-pause off) must track the monthly qv-mom baseline over the
+    same window — same ranking brain, similar deployment cadence. This
+    is the automated guard for the class of sim/live parity bugs we
+    found by hand in the backfill (snapshot stamps, month-end ranking,
+    ffill valuation, fee-inside-spend)."""
+
+    @pytest.fixture
+    def synthetic_market(self, monkeypatch):
+        """Patch monthly.load_frames + fundamentals.load_fundamentals with
+        deterministic synthetic frames: 20 tickers, ~3 years of daily
+        closes with one clear cross-sectional momentum spread (some
+        strong uptrenders, some flattish) so the ranking is stable and
+        the hysteresis band actually churns."""
+        import numpy as np
+        import pandas as pd
+        from app import monthly as monthly_mod
+        from app import fundamentals as fundamentals_mod
+
+        rng = np.random.default_rng(123)
+        tickers = [f"T{i:02d}" for i in range(20)]
+        n_days = 900
+        dates = pd.bdate_range("2022-01-03", periods=n_days)
+        # per-ticker drift from +0.10%/day to -0.05%/day: creates a
+        # persistent ranking
+        drifts = np.linspace(0.0010, -0.0004, len(tickers))
+        closes = {}
+        for t, drift in zip(tickers, drifts, strict=False):
+            r = rng.normal(drift, 0.010, n_days)
+            closes[t] = 50.0 * np.exp(np.cumsum(r))
+        close = pd.DataFrame(closes, index=dates)
+        vol = pd.DataFrame(5e6, index=dates, columns=tickers)
+        fund = {
+            t: {
+                "StockholdersEquity": [{"start": None, "end": "2021-12-31",
+                                        "filed": "2022-02-15", "val": 5e9}],
+                "NetIncomeLoss": [{"start": "2021-01-01", "end": "2021-12-31",
+                                   "filed": "2022-02-15", "val": 5e8}],
+                "CommonStockSharesOutstanding": [{"start": None, "end": "2021-12-31",
+                                                  "filed": "2022-02-15", "val": 1e8}],
+                "NetCashProvidedByUsedInOperatingActivities": [
+                    {"start": "2021-01-01", "end": "2021-12-31",
+                     "filed": "2022-02-15", "val": 1e9}],
+                "PaymentsToAcquirePropertyPlantAndEquipment": [
+                    {"start": "2021-01-01", "end": "2021-12-31",
+                     "filed": "2022-02-15", "val": -2e8}],
+            }
+            for t in tickers
+        }
+
+        async def fake_load_frames(_tickers, _asof):
+            return close, vol
+
+        async def fake_load_fundamentals(_tickers):
+            return fund
+
+        monkeypatch.setattr(monthly_mod, "load_frames", fake_load_frames)
+        monkeypatch.setattr(fundamentals_mod, "load_fundamentals", fake_load_fundamentals)
+        return {"tickers": tickers, "close": close}
+
+    async def test_defaults_track_monthly_baseline(self, synthetic_market,
+                                                    monkeypatch, capsys):
+        import app.optimize as opt
+
+        # capture both summaries while keeping the printed report
+        summaries: dict[str, object] = {}
+        real_daily = opt._daily_core_backtest
+        real_monthly = opt._monthly_backtest
+
+        async def daily(*a, **k):
+            r = await real_daily(*a, **k)
+            summaries["daily"] = r
+            return r
+
+        async def monthly(*a, **k):
+            r = await real_monthly(*a, **k)
+            summaries["monthly"] = r
+            return r
+
+        monkeypatch.setattr(opt, "_daily_core_backtest", daily)
+        monkeypatch.setattr(opt, "_monthly_backtest", monthly)
+        await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "monthly")
+        d, m = summaries["daily"], summaries["monthly"]
+        assert d is not None and m is not None
+
+        # Same window (the daily backtest prints the baseline for the
+        # same span), same contributions
+        assert d.contributed == m.contributed
+        # Both must actually be invested and growing: with monthly $200
+        # contributions, the money multiple stays close to 1 (recent
+        # contributions haven't compounded), so assert growth over 1.0
+        # and an IRR that reflects the +0.10%/day drift spread.
+        assert d.final_value / d.contributed > 1.05
+        assert m.final_value / m.contributed > 1.05
+        assert d.irr > 0.05 and m.irr > 0.05
+        # The IRRs must track each other: the deployment semantics
+        # differ slightly (underweight top-up vs pro-rata 1/N), so the
+        # test allows a 5pp/yr tolerance — a real parity bug (ranking
+        # divergence, wrong month-end rule, fee handling) blows far
+        # past that.
+        assert abs(d.irr - m.irr) < 0.05, (
+            f"daily-core defaults IRR {d.irr:.2%} vs monthly baseline "
+            f"{m.irr:.2%} — deployment parity broken?"
+        )
+        # Turnover in the same ballpark (< 2x of baseline)
+        assert d.avg_turnover < m.avg_turnover * 2 + 0.05

@@ -2296,7 +2296,7 @@ async def _prune_candles(before: str, dry_run: bool) -> None:
 
 
 async def _monthly_backtest(start: str | None, end: str | None, universe: str,
-                            contribution: float, verbose: bool) -> None:
+                            contribution: float, verbose: bool) -> BacktestSummary | None:
     """DCA backtest of the monthly qv-mom-v1 strategy on stored candles.
 
     Mirrors stockstrat's run_dca: at the last trading day of each month,
@@ -2435,6 +2435,16 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
         print("\nLast 12 rebalances:")
         for m, picks in picks_hist[-12:]:
             print(f"  {m}: {', '.join(picks)}")
+
+    return BacktestSummary(
+        irr=irr,
+        final_value=value,
+        contributed=contributed,
+        avg_turnover=sum(churns) / len(churns) if churns else 0.0,
+        n_trades=0,
+        window=(pd.Timestamp(months[0]).strftime("%Y-%m-%d"),
+                pd.Timestamp(months[-1]).strftime("%Y-%m-%d")),
+    )
 
 
 @dataclass
@@ -2822,6 +2832,14 @@ async def _daily_core_backtest(
         for td, side, t, notional in trades_log[-15:]:
             print(f"  {td} {side:<4} {t:<10} ${notional:,.0f}")
 
+    # --- Monthly baseline over the same window (for comparison) ---
+    print("\n--- Monthly qv-mom baseline over the same window ---")
+    await _monthly_backtest(
+        start or (days_all[0].strftime("%Y-%m-%d")),
+        end or (last_day.strftime("%Y-%m-%d")),
+        universe, contribution, False,
+    )
+
     return BacktestSummary(
         irr=irr,
         final_value=value,
@@ -2830,14 +2848,6 @@ async def _daily_core_backtest(
         n_trades=len(trades_log),
         window=(pd.Timestamp(days_all[0]).strftime("%Y-%m-%d"),
                 pd.Timestamp(last_day).strftime("%Y-%m-%d")),
-    )
-
-    # --- Monthly baseline over the same window (for comparison) ---
-    print("\n--- Monthly qv-mom baseline over the same window ---")
-    await _monthly_backtest(
-        start or (days_all[0].strftime("%Y-%m-%d")),
-        end or (last_day.strftime("%Y-%m-%d")),
-        universe, contribution, False,
     )
 
 
