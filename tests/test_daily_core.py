@@ -68,7 +68,7 @@ def fake_ranking(monkeypatch):
         },
         index=pd.Index(["AAA", "BBB", "CCC", "DDD"], name="ticker"),
     )
-    async def fake_targets():
+    async def fake_targets(force=False):
         band = ["AAA", "BBB", "CCC", "DDD"]
         async with daily_core.Session() as s:
             held = [p.ticker for p in
