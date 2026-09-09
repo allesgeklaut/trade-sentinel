@@ -188,3 +188,56 @@ numbers from long windows are contaminated and should not be trusted.
   the market shifts back to the 2025-10→2026-08 chop pattern.
 - The walkforward sweep prefers ATR stops (7/17) over the live percent-15
   (6/17); differences were small but worth a dedicated look someday.
+
+## 10. Fundamentals-first daily engine ("daily-core") — 2026-09-09
+
+Owner's design: the monthly qv-mom ranking IS the portfolio (fundamentals
+decide WHAT to own); candles only make minor WHEN adjustments. Deterministic
+only — LLM overlays are a separate experiment (§ earlier: LLM context columns
+and the ROE guard stay flag-gated off; the context arm measured inside noise
+on the chop window, the guard cost right-tail returns).
+
+New tool: `app.optimize daily-core` — monthly qv-mom core with candle-driven
+overlays. All-defaults ≈ the monthly baseline (sanity check built in; the
+report prints both side by side on the same window).
+
+### Review fixes (commit 7a95861)
+- pending_cash stranding: a zero-new-picks month never deployed the
+  contribution; all modes now release it at the month-end rebuild
+- month-end rebuild restores picks to equal weight (baseline semantics)
+- turnover reporting was always 0; now (buys+sells)/2 / equity at month start
+- dead code removal (is_month_end, duplicate run5_frame line)
+
+### Cash-deployment A/B (IRR/yr, diversified-plus, $1k/mo)
+
+| Window | monthly sim | daily-core defaults | rank daily, boost=0 | rank boost=0.3 | boost=0.5 | boost=0.8 |
+|---|---|---|---|---|---|---|
+| 2020-01..2023-01 (bear) | 2.67% | 3.76% | **5.69%** | 5.13% | 4.56% | 1.51% |
+| 2022-01..2026-09 (mixed) | 44.95% | 46.44% | **48.82%** | 48.03% | 46.98% | 47.53% |
+| 2023-01..2026-09 (bull) | 48.58% | 51.41% | **54.06%** | 55.47% | 54.83% | 53.47% |
+
+### Findings
+
+1. **Daily rank deployment beats the monthly sim on every window tested**
+   (boost=0: +3.0pp / +3.9pp / +5.5pp). The edge is cash-drag elimination:
+   the monthly sim parks the contribution ~2 weeks on average; daily
+   deployment into the top-ranked names preserves the momentum
+   concentration instead of diluting it.
+2. **Boosting the top rank (0.3-0.8) does NOT help** — 0.0 (flat targets,
+   deploy daily into top names up to equal weight) is as good or better.
+   The qv-mom score already decides WHICH names; tilting size on top of it
+   adds variance without return. Keep boost=0.
+3. **Equal-weight pro-rata drip loses badly** (-8pp IRR): spreading fresh
+   cash across all holdings rebalances into laggards. Daily cash must go to
+   the TOP of the ranking (or the most underweight), never spread.
+4. **Entry timing destroys returns** — `above-sma50` gate cost 13pp+ (misses
+   the strongest runners, same right-tail lesson as the ROE guard in §7).
+   `not-crash` was a no-op. Crash-pause ≈ neutral (+0.3pp on 2023+).
+5. **Exit cadence is irrelevant** — the hysteresis band is sticky; daily
+   release ≈ monthly release (same final value).
+
+### Config note
+
+`rank boost=0.0` ≈ "deploy daily into the top-ranked names toward equal
+weight". The monthly sim's structural edge survives only its ranking; its
+monthly cadence is a (small, consistent) cost.
