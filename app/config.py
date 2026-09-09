@@ -66,6 +66,15 @@ class Settings(BaseSettings):
     sim_llm_minimal_prompt: bool = False  # use the minimal system prompt (no methodology/regime rules)
     sim_llm_mode_aware_prompt: bool = False  # use the mode-aware minimal prompt (engine owns exits; LLM adds BUYs only)
     sim_llm_failure_marker: bool = False  # hybrid: consult the LLM only on engine failure (stop-out cascade / drawdown)
+    # Fundamentals context (daily sim): show point-in-time ROE % and P/FCF per
+    # candidate in the LLM's signals table. Missing fundamentals render as "-"
+    # (neutral); the table is omitted entirely when off (zero prompt change).
+    sim_llm_fundamentals_context: bool = False
+    # Quality guard (daily sim): block BUY entries for names with KNOWN
+    # non-positive ROE. Missing fundamentals stay neutral (ETFs like GLD,
+    # thin coverage) — only known-bad data blocks. Opt-in until the replay
+    # A/B verdict (bull-window right-tail cost is the known risk class).
+    sim_block_negative_roe: bool = False
     sim_run_hour: int = 22
     sim_run_minute: int = 30
 

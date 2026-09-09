@@ -189,6 +189,11 @@ class ReplayParams:
     # Block BUYs into parabolic extensions: dist_above SMA200 > this %.
     # 0 = disabled.
     max_dist_above: float = 0.0
+    # Quality guard: block BUY entries for names with KNOWN non-positive ROE.
+    # Missing fundamentals stay neutral (ETFs, thin coverage). Requires the
+    # caller to pass a quality lookup (see _QualityLookup). Off by default
+    # until the replay A/B verdict.
+    block_negative_roe: bool = False
 
 
 # Sector groupings for the global-large-cap universe. Used by the sector
@@ -376,13 +381,17 @@ def _row_strength(row: dict, action: str) -> int:
 
 def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
             start: str | None = None, end: str | None = None,
-            regime: dict[str, bool] | None = None) -> ReplayResult:
+            regime: dict[str, bool] | None = None,
+            quality: "_QualityLookup | None" = None) -> ReplayResult:
     """Run the deterministic strategy over the precomputed series.
 
     ``start``/``end`` are inclusive date strings (YYYY-MM-DD) used to bound
     the replay window (e.g. a walk-forward test window). ``regime`` is an
     optional day→uptrend map; when provided and ``params.regime_filter`` is
     set, new BUYs are blocked on days where the market is not in an uptrend.
+    ``quality`` is the optional monthly fundamentals provider; when given
+    together with ``params.block_negative_roe``, BUY entries into names with
+    known non-positive ROE are blocked (missing data stays neutral).
     """
     # Build a global timeline of all trading days across tickers.
     all_days: set[str] = set()
@@ -525,6 +534,7 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
             signals=signals,
             params=sp,
             sector_of=_sector_of if params.max_sector_pct > 0 else None,
+            quality_of=quality.of(day) if quality else None,
         )
         for p in proposals:
             if p["side"] == "SELL":
@@ -545,6 +555,7 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
                 signals=signals,
                 params=sp,
                 sector_of=_sector_of if params.max_sector_pct > 0 else None,
+                quality_of=quality.of(day) if quality else None,
             )
             for p in proposals2:
                 if p["side"] == "BUY":
@@ -655,11 +666,86 @@ def _replay_params_to_strategy(p: ReplayParams) -> StrategyParams:
         max_run_5d=p.max_run_5d,
         min_run_5d=p.min_run_5d,
         max_dist_above=p.max_dist_above,
+        block_negative_roe=p.block_negative_roe,
         relaxed_hold_strength=p.relaxed_hold_strength,
         relaxed_hold_limit=p.relaxed_hold_limit,
         max_sector_pct=p.max_sector_pct,
         risk_pct=p.risk_pct,
     )
+
+
+class _QualityLookup:
+    """Monthly-granularity quality provider for the replay engines.
+
+    Wraps ``{ticker: {"roe", "p_fcf"}}`` maps cached per calendar month: the
+    fundamentals move quarterly, so a fresh quality snapshot per month (keyed
+    by the month of the replay day) matches the monthly fetch cadence and
+    avoids re-running the TTM math for every trading day. ``of(day)`` returns
+    the ``quality_of(ticker)`` callable ``strategy.propose_trades`` expects
+    for that day, or None when no quality data exists at all (feature off /
+    empty fact store).
+    """
+
+    def __init__(self, fund: dict[str, dict[str, list[dict]]],
+                 closes: dict[str, dict[str, float]] | None = None):
+        self._fund = fund
+        # {ticker: {date: close}} — USD-converted replay closes for P/FCF.
+        self._closes = closes or {}
+        self._cache: dict[str, dict[str, dict[str, float | None]]] = {}
+
+    def month_map(self, day: str) -> dict[str, dict[str, float | None]]:
+        """Quality map {ticker: {"roe","p_fcf"}} for `day`'s month (cached)."""
+        month = day[:7]
+        cached = self._cache.get(month)
+        if cached is not None:
+            return cached
+        from .monthly import quality_snapshot
+
+        asof: pd.Timestamp = pd.Timestamp(pd.to_datetime(day).date())  # type: ignore[assignment]
+        out: dict[str, dict[str, float | None]] = {}
+        px_of = self._closes.get(month, {})
+        for t in self._fund:
+            q = quality_snapshot(self._fund, t, asof, px_of.get(t))
+            if q is not None:
+                out[t] = q
+        self._cache[month] = out
+        return out
+
+    def of(self, day: str) -> callable | None:
+        """``quality_of(ticker)`` callable for `day`, or None (feature off)."""
+        mmap = self.month_map(day)
+        if not mmap:
+            return None
+
+        def _lookup(ticker: str) -> dict[str, float | None] | None:
+            return mmap.get(ticker.upper())
+
+        return _lookup
+
+
+async def _load_quality_lookup(tickers: list[str]) -> "_QualityLookup | None":
+    """Build a _QualityLookup from the fundamentals store + candle closes.
+
+    Loads the EDGAR-first fact store once and the monthly frames (for
+    USD-converted period-end closes feeding P/FCF). Returns None when the
+    fact store is empty (feature effectively off).
+    """
+    from . import monthly as monthly_mod
+    from .fundamentals import load_fundamentals
+
+    fund = await load_fundamentals(tickers)
+    if not fund:
+        return None
+    close, _ = await monthly_mod.load_frames(tickers, None)
+    # {month: {ticker: period-end USD close}} — one price per ticker per
+    # month is enough for P/FCF (the quality snapshot only needs a scale).
+    closes: dict[str, dict[str, float]] = {}
+    if not close.empty:
+        for t in close.columns:
+            for ts, px in close[t].dropna().items():
+                m = pd.Timestamp(ts).strftime("%Y-%m")  # type: ignore[arg-type]
+                closes.setdefault(m, {})[t] = float(px)  # type: ignore[call-overload]
+    return _QualityLookup(fund, closes)
 
 
 def _deterministic_propose_replay(
@@ -668,6 +754,7 @@ def _deterministic_propose_replay(
     prices: dict[str, float],
     day: str,
     params: ReplayParams,
+    quality_of: callable | None = None,
 ) -> list[dict]:
     """Propose deterministic trades for one day WITHOUT mutating ``pf``.
 
@@ -684,6 +771,7 @@ def _deterministic_propose_replay(
         prices=prices,
         signals=signals,
         params=sp,
+        quality_of=quality_of,
     )
     # Stamp the day on each proposal (strategy.propose_trades is day-agnostic).
     for p in proposals:
@@ -774,6 +862,8 @@ async def _hybrid_replay(
     failure_marker: bool = False,
     failure_stop_outs: int = 2,
     failure_drawdown: float = 7.0,
+    quality: "_QualityLookup | None" = None,
+    fundamentals_context: bool = False,
 ) -> ReplayResult:
     """Replay the hybrid strategy (deterministic + LLM review).
 
@@ -896,7 +986,8 @@ async def _hybrid_replay(
                 # sizing and engine-driven exits added variance + losses.
                 proposals = []
             else:
-                proposals = _deterministic_propose_replay(pf, by_time, prices, day, params)
+                proposals = _deterministic_propose_replay(pf, by_time, prices, day, params,
+                                                          quality_of=quality.of(day) if quality else None)
                 if proposals:
                     logger.info("  det proposed: %d — %s",
                                 len(proposals),
@@ -966,7 +1057,8 @@ async def _hybrid_replay(
                                             pure_llm=pure_llm,
                                             trade_history=list(reversed(pf.trades[-15:]))[:12],
                                             minimal=minimal_prompt or mode_aware,
-                                            max_positions=llm_max_positions)
+                                            max_positions=llm_max_positions,
+                                            quality=quality.month_map(day) if (fundamentals_context and quality) else None)
                 system_prompt = (
                     _LLM_MODE_AWARE_MINIMAL_PROMPT if mode_aware
                     else _LLM_MINIMAL_SYSTEM_PROMPT if minimal_prompt
@@ -1086,7 +1178,8 @@ async def _hybrid_replay(
                 for p in proposals:
                     if p["side"] == "SELL":
                         _execute_proposal(pf, p)
-                proposals2 = _deterministic_propose_replay(pf, by_time, prices, day, params)
+                proposals2 = _deterministic_propose_replay(pf, by_time, prices, day, params,
+                                                           quality_of=quality.of(day) if quality else None)
                 for p in proposals2:
                     if p["side"] == "BUY":
                         _execute_proposal(pf, p)
@@ -2001,6 +2094,8 @@ async def _llm_walkforward(
     failure_marker: bool = False,
     failure_stop_outs: int = 2,
     failure_drawdown: float = 7.0,
+    quality: "_QualityLookup | None" = None,
+    fundamentals_context: bool = False,
 ) -> list[_WindowResult]:
     """Run N non-overlapping windows, each deterministic vs LLM.
 
@@ -2057,7 +2152,7 @@ async def _llm_walkforward(
     results: list[_WindowResult] = []
     for i, (w_start, w_end) in enumerate(windows, 1):
         print(f"\n--- Window {i}/{len(windows)}: {w_start}..{w_end} ---")
-        det = _replay(series, params, start=w_start, end=w_end)
+        det = _replay(series, params, start=w_start, end=w_end, quality=quality)
         logger.info("window %d/%d %s..%s deterministic: return %.2f%%, dd %.2f%%, %d trades",
                     i, len(windows), w_start, w_end,
                     det.total_return_pct, det.max_drawdown_pct, det.n_trades)
@@ -2072,7 +2167,9 @@ async def _llm_walkforward(
                                    marker_gated=marker_gated,
                                    failure_marker=failure_marker,
                                    failure_stop_outs=failure_stop_outs,
-                                   failure_drawdown=failure_drawdown)
+                                   failure_drawdown=failure_drawdown,
+                                   quality=quality,
+                                   fundamentals_context=fundamentals_context)
         logger.info("window %d/%d %s..%s %s: return %.2f%%, dd %.2f%%, %d trades",
                     i, len(windows), w_start, w_end, mode_label,
                     llm.total_return_pct, llm.max_drawdown_pct, llm.n_trades)
@@ -2428,6 +2525,12 @@ async def _main(args: argparse.Namespace) -> None:
         review_interval = getattr(args, "review_interval", 1)
         veto_only = getattr(args, "veto_only", False)
         minimal_prompt = getattr(args, "minimal_prompt", False)
+        fundamentals_context = getattr(args, "fundamentals_context", False)
+        block_negative_roe = getattr(args, "block_negative_roe", False)
+        quality = None
+        if fundamentals_context or block_negative_roe:
+            params.block_negative_roe = block_negative_roe
+            quality = await _load_quality_lookup(universe_tickers(settings.sim_monthly_universe))
         print(f"\n=== {mode_label} replay ({start}..{end}) — probing LLM "
               f"once per {review_interval} calendar week(s) ===")
         print(f"  Backend: {active.get('name', '?')} · {active.get('model', '?')}")
@@ -2435,7 +2538,9 @@ async def _main(args: argparse.Namespace) -> None:
                                    pure_llm=pure_llm,
                                    review_interval=review_interval,
                                    veto_only=veto_only,
-                                   minimal_prompt=minimal_prompt)
+                                   minimal_prompt=minimal_prompt,
+                                   quality=quality,
+                                   fundamentals_context=fundamentals_context)
         _print_result(hyb, f"{mode_label} (deterministic + LLM review)" if not pure_llm else "Pure LLM")
 
         # Side-by-side comparison
@@ -2485,6 +2590,17 @@ async def _main(args: argparse.Namespace) -> None:
         failure_marker = getattr(args, "failure_marker", False)
         failure_stop_outs = getattr(args, "failure_stop_outs", 2)
         failure_drawdown = getattr(args, "failure_drawdown", 7.0)
+        # Fundamentals features (A/B flags): quality guard in the deterministic
+        # engine, ROE/P-FCF columns in the LLM context. Both share the
+        # monthly-granularity quality provider loaded once from the fact store.
+        fundamentals_context = getattr(args, "fundamentals_context", False)
+        block_negative_roe = getattr(args, "block_negative_roe", False)
+        quality = None
+        if fundamentals_context or block_negative_roe:
+            params.block_negative_roe = block_negative_roe
+            quality = await _load_quality_lookup(universe_tickers(settings.sim_monthly_universe))
+            print(f"Quality data: {len(quality.month_map(all_days[-1]) if all_days else {})} tickers"
+                  if quality else "Quality data: none (empty fundamentals store)")
         if pure_llm and (marker_gated or failure_marker):
             print("Cannot combine --pure-llm with --marker-gated / --failure-marker: "
                   "the markers key off the deterministic engine's proposals and "
@@ -2507,6 +2623,8 @@ async def _main(args: argparse.Namespace) -> None:
                 failure_marker=failure_marker,
                 failure_stop_outs=failure_stop_outs,
                 failure_drawdown=failure_drawdown,
+                quality=quality,
+                fundamentals_context=fundamentals_context,
             )
         except ValueError as e:
             print(f"Cannot run walk-forward: {e}")
@@ -2582,6 +2700,12 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(no LLM-initiated BUY/SELL additions)")
     hr.add_argument("--minimal-prompt", action="store_true",
                     help="Use the minimal system prompt (no methodology / regime / veto rules)")
+    hr.add_argument("--fundamentals-context", action="store_true",
+                    help="Add point-in-time ROE%% / P-FCF columns to the LLM's "
+                         "signal table (monthly qv-mom quality data; missing = '-')")
+    hr.add_argument("--block-negative-roe", action="store_true",
+                    help="Deterministic quality guard: block BUY entries for "
+                         "names with KNOWN non-positive ROE (missing stays neutral)")
 
     lwf = sub.add_parser("llm-walkforward",
                          help="Multi-window LLM vs deterministic benchmark (reliable scoreboard)")
@@ -2637,6 +2761,12 @@ def _build_parser() -> argparse.ArgumentParser:
     lwf.add_argument("--failure-drawdown", type=float, default=7.0,
                      help="With --failure-marker: equity drawdown %% below peak "
                           "that counts as failure (default 7.0)")
+    lwf.add_argument("--fundamentals-context", action="store_true",
+                     help="Add point-in-time ROE%% / P-FCF columns to the LLM's "
+                          "signal table (monthly qv-mom quality data; missing = '-')")
+    lwf.add_argument("--block-negative-roe", action="store_true",
+                     help="Deterministic quality guard: block BUY entries for "
+                          "names with KNOWN non-positive ROE (missing stays neutral)")
     lwf.add_argument("--trades", action="store_true", help="Print every LLM trade per window")
 
     mb = sub.add_parser("monthly-backtest",

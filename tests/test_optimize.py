@@ -1123,11 +1123,11 @@ class TestLlmWalkforwardWindows:
 
         calls = []
 
-        def fake_det(series, params, start=None, end=None):
+        def fake_det(series, params, start=None, end=None, **_):
             calls.append(("det", start, end))
             return ReplayResult(params=params)
 
-        async def fake_llm(series, params, start=None, end=None, pure_llm=False, news=None, review_interval=1, veto_only=False, no_llm_sells=False, minimal_prompt=False, mode_aware=False, llm_max_positions=0, marker_gated=False, failure_marker=False, failure_stop_outs=2, failure_drawdown=7.0):
+        async def fake_llm(series, params, start=None, end=None, pure_llm=False, news=None, review_interval=1, veto_only=False, no_llm_sells=False, minimal_prompt=False, mode_aware=False, llm_max_positions=0, marker_gated=False, failure_marker=False, failure_stop_outs=2, failure_drawdown=7.0, **_):
             calls.append(("llm", start, end))
             return ReplayResult(params=params)
 
@@ -1157,11 +1157,11 @@ class TestLlmWalkforwardWindows:
         # overlaps the 3rd at the front. We get 4 windows total.
         all_days = [f"2025-01-{i:02d}" for i in range(1, 91)]
 
-        def fake_det(series, params, start=None, end=None):
+        def fake_det(series, params, start=None, end=None, **_):
             from app.optimize import ReplayResult
             return ReplayResult(params=params)
 
-        async def fake_llm(series, params, start=None, end=None, pure_llm=False, news=None, review_interval=1, veto_only=False, no_llm_sells=False, minimal_prompt=False, mode_aware=False, llm_max_positions=0, marker_gated=False, failure_marker=False, failure_stop_outs=2, failure_drawdown=7.0):
+        async def fake_llm(series, params, start=None, end=None, pure_llm=False, news=None, review_interval=1, veto_only=False, no_llm_sells=False, minimal_prompt=False, mode_aware=False, llm_max_positions=0, marker_gated=False, failure_marker=False, failure_stop_outs=2, failure_drawdown=7.0, **_):
             from app.optimize import ReplayResult
             return ReplayResult(params=params)
 
