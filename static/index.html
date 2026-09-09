@@ -2725,9 +2725,14 @@
                 .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
                 .sort((a, b) => a.time < b.time ? -1 : 1);
             const last = points[points.length - 1];
+            const today = new Date().toISOString().slice(0, 10);
             if (live && live.valuation && live.valuation.total_equity != null) {
-                const today = new Date().toISOString().slice(0, 10);
+                // Live valuation wins for today: it is fresher than any
+                // same-day snapshot (which may be a stale intraday mark).
+                // Without this, a morning snapshot hides today's real
+                // drop/gain from the chart while the other tabs show live.
                 if (last.time < today) points.push({ time: today, value: live.valuation.total_equity, contributed: live.valuation.allowance_total });
+                else points[points.length - 1] = { time: today, value: live.valuation.total_equity, contributed: live.valuation.allowance_total };
             }
             const toPct = p => p.contributed > 0 ? (p.value / p.contributed * 100) : p.value;
             // Sim + benchmark overlays: same series the Monthly tab plots.
@@ -2901,9 +2906,12 @@
                 .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
                 .sort((a, b) => a.time < b.time ? -1 : 1);
             const last = points[points.length - 1];
+            const today = new Date().toISOString().slice(0, 10);
             if (live && live.total_equity != null) {
-                const today = new Date().toISOString().slice(0, 10);
+                // Live valuation wins for today (fresher than a same-day
+                // snapshot — same rule as the Daily-Core chart).
                 if (last.time < today) points.push({ time: today, value: live.total_equity, contributed: live.allowance_total });
+                else points[points.length - 1] = { time: today, value: live.total_equity, contributed: live.allowance_total };
             }
             const toPct = p => p.contributed > 0 ? (p.value / p.contributed * 100) : p.value;
             // Sim overlay: same data the Simulation tab plots. The sim's
