@@ -2429,12 +2429,20 @@ async def _main(args: argparse.Namespace) -> None:
         if getattr(args, "no_entry_guards", False):
             params.min_run_5d = 0.0
             params.max_dist_above = 0.0
-        res = _replay(series, params, start=args.start, end=args.end, regime=regime)
+        quality = None
+        if getattr(args, "block_negative_roe", False):
+            params.block_negative_roe = True
+            quality = await _load_quality_lookup(universe_tickers(settings.sim_monthly_universe))
+            n_with_fund = len(quality._fund) if quality else 0
+            print(f"Quality guard ON: {n_with_fund} tickers with fundamentals")
+        res = _replay(series, params, start=args.start, end=args.end, regime=regime, quality=quality)
         label = "Backtest (live sim risk config)"
         if params.regime_filter:
             label += " + regime filter"
         if getattr(args, "no_entry_guards", False):
             label += " [guards OFF]"
+        if getattr(args, "block_negative_roe", False):
+            label += " [ROE guard ON]"
         _print_result(res, label)
         print(f"  Risk config: max_positions={params.max_positions}, "
               f"stop={params.stop_type} {params.stop_pct:g}%, "
@@ -2654,6 +2662,9 @@ def _build_parser() -> argparse.ArgumentParser:
     b.add_argument("--no-entry-guards", action="store_true",
                    help="Disable the falling-knife (min_run_5d) and parabolic-extension "
                         "(max_dist_above) BUY blocks — A/B escape hatch for benchmarking")
+    b.add_argument("--block-negative-roe", action="store_true",
+                   help="Deterministic quality guard: block BUY entries for names "
+                        "with KNOWN non-positive ROE (missing stays neutral)")
 
     s = sub.add_parser("sweep", help="Grid-search thresholds")
     s.add_argument("--start", default=None)
