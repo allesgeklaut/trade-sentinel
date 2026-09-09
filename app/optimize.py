@@ -2533,6 +2533,11 @@ async def _main(args: argparse.Namespace) -> None:
         review_interval = getattr(args, "review_interval", 1)
         veto_only = getattr(args, "veto_only", False)
         minimal_prompt = getattr(args, "minimal_prompt", False)
+        mode_aware = getattr(args, "mode_aware_prompt", False)
+        marker_gated = False
+        failure_marker = getattr(args, "failure_marker", False)
+        failure_stop_outs = getattr(args, "failure_stop_outs", 2)
+        failure_drawdown = getattr(args, "failure_drawdown", 7.0)
         fundamentals_context = getattr(args, "fundamentals_context", False)
         block_negative_roe = getattr(args, "block_negative_roe", False)
         quality = None
@@ -2547,6 +2552,11 @@ async def _main(args: argparse.Namespace) -> None:
                                    review_interval=review_interval,
                                    veto_only=veto_only,
                                    minimal_prompt=minimal_prompt,
+                                   mode_aware=mode_aware,
+                                   marker_gated=marker_gated,
+                                   failure_marker=failure_marker,
+                                   failure_stop_outs=failure_stop_outs,
+                                   failure_drawdown=failure_drawdown,
                                    quality=quality,
                                    fundamentals_context=fundamentals_context)
         _print_result(hyb, f"{mode_label} (deterministic + LLM review)" if not pure_llm else "Pure LLM")
@@ -2711,6 +2721,19 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(no LLM-initiated BUY/SELL additions)")
     hr.add_argument("--minimal-prompt", action="store_true",
                     help="Use the minimal system prompt (no methodology / regime / veto rules)")
+    hr.add_argument("--mode-aware-prompt", action="store_true",
+                    help="Use the mode-aware minimal prompt (engine owns exits; "
+                         "LLM adds BUYs only). Implies the minimal context")
+    hr.add_argument("--failure-marker", action="store_true",
+                    help="Consult the LLM only when the engine shows failure "
+                         "(2+ stop-out SELLs in 5 trading days or equity >7%% "
+                         "below its running peak); no cooldown")
+    hr.add_argument("--failure-stop-outs", type=int, default=2,
+                    help="With --failure-marker: stop-out SELLs in 5 days that "
+                         "count as failure (default 2)")
+    hr.add_argument("--failure-drawdown", type=float, default=7.0,
+                    help="With --failure-marker: equity drawdown %% below peak "
+                         "that counts as failure (default 7.0)")
     hr.add_argument("--fundamentals-context", action="store_true",
                     help="Add point-in-time ROE%% / P-FCF columns to the LLM's "
                          "signal table (monthly qv-mom quality data; missing = '-')")
