@@ -66,7 +66,7 @@ async def _aval(value: float | None) -> float | None:
     return value
 
 
-async def _val_of(pf: "PaperPortfolio", t: str, prices: dict[str, float]) -> float:
+async def _val_of(pf: PaperPortfolio, t: str, prices: dict[str, float]) -> float:
     """Value currently held in `t` (0.0 when unheld) as an awaitable."""
     return float(pf.positions.get(t, 0) * prices.get(t, 0))
 
@@ -418,7 +418,7 @@ def _row_strength(row: dict, action: str) -> int:
 def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
             start: str | None = None, end: str | None = None,
             regime: dict[str, bool] | None = None,
-            quality: "_QualityLookup | None" = None) -> ReplayResult:
+            quality: _QualityLookup | None = None) -> ReplayResult:
     """Run the deterministic strategy over the precomputed series.
 
     ``start``/``end`` are inclusive date strings (YYYY-MM-DD) used to bound
@@ -766,7 +766,7 @@ class _QualityLookup:
         return _lookup
 
 
-async def _load_quality_lookup(tickers: list[str]) -> "_QualityLookup | None":
+async def _load_quality_lookup(tickers: list[str]) -> _QualityLookup | None:
     """Build a _QualityLookup from the fundamentals store + candle closes.
 
     Loads the EDGAR-first fact store once and the monthly frames (for
@@ -905,7 +905,7 @@ async def _hybrid_replay(
     failure_marker: bool = False,
     failure_stop_outs: int = 2,
     failure_drawdown: float = 7.0,
-    quality: "_QualityLookup | None" = None,
+    quality: _QualityLookup | None = None,
     fundamentals_context: bool = False,
 ) -> ReplayResult:
     """Replay the hybrid strategy (deterministic + LLM review).
@@ -2146,7 +2146,7 @@ async def _llm_walkforward(
     failure_marker: bool = False,
     failure_stop_outs: int = 2,
     failure_drawdown: float = 7.0,
-    quality: "_QualityLookup | None" = None,
+    quality: _QualityLookup | None = None,
     fundamentals_context: bool = False,
 ) -> list[_WindowResult]:
     """Run N non-overlapping windows, each deterministic vs LLM.

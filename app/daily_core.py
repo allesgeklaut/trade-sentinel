@@ -35,7 +35,7 @@ from sqlalchemy import func, select
 from . import fundamentals as fundamentals_mod
 from . import monthly as monthly_mod
 from .config import settings
-from .db import (Candle, DailyCoreAccount, DailyCoreAllowance, DailyCorePosition,
+from .db import (DailyCoreAccount, DailyCoreAllowance, DailyCorePosition,
                  DailyCoreSnapshot, DailyCoreTrade, Session)
 from .screener import tickers as universe_tickers
 
@@ -492,7 +492,6 @@ async def backfill(start: str | None = None) -> dict:
         cash = 0.0
         contributed = 0.0
         n_contribs = 0
-        last_month_deposited: str | None = None
         trades: list[tuple[str, str, str, float]] = []
         snaps: list[tuple[str, float, float]] = []
 
@@ -522,11 +521,10 @@ async def backfill(start: str | None = None) -> dict:
                 cash += settings.sim_monthly_contribution
                 contributed += settings.sim_monthly_contribution
                 n_contribs += 1
-                last_month_deposited = d.strftime("%Y-%m")
 
-            def do_buy(t: str, budget: float) -> None:
+            def do_buy(t: str, budget: float, day=d) -> None:
                 nonlocal cash
-                p = px_of(t, d)
+                p = px_of(t, day)
                 if p is None or p <= 0:
                     return
                 # Reserve the one-way fee inside the spend so cash can never
@@ -538,18 +536,18 @@ async def backfill(start: str | None = None) -> dict:
                 cash -= notional
                 cash -= notional * cost
                 shares[t] = shares.get(t, 0.0) + sh
-                trades.append((d.strftime("%Y-%m-%d"), "BUY", t, notional))
+                trades.append((day.strftime("%Y-%m-%d"), "BUY", t, notional))
 
-            def do_sell(t: str) -> None:
+            def do_sell(t: str, day=d) -> None:
                 nonlocal cash
-                p = px_of(t, d)
+                p = px_of(t, day)
                 sh = shares.get(t, 0.0)
                 if p is None or p <= 0 or sh <= 0:
                     return
                 notional = sh * p
                 cash += notional * (1.0 - cost)
                 del shares[t]
-                trades.append((d.strftime("%Y-%m-%d"), "SELL", t, notional))
+                trades.append((day.strftime("%Y-%m-%d"), "SELL", t, notional))
 
             # SELL band releases (month-end rebuild only, as in the backtest)
             if d in months:
@@ -595,7 +593,7 @@ async def backfill(start: str | None = None) -> dict:
                 # equity curve); book at the last close so valuation works.
                 p = px_of(t, idx[-1]) or 0.0
                 s.add(Pos(ticker=t, shares=sh, avg_cost=p))
-            for td, side, t, notional in trades:
+            for _td, side, t, notional in trades:
                 s.add(Tr(ticker=t, side=side, shares=0.0, price=0.0,
                          cash_after=0.0, reason=f"backfill {side.lower()} ${notional:,.0f}"))
             for m in replay_months:

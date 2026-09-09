@@ -1308,8 +1308,9 @@ class TestDailyCoreMonthlyParity:
         the hysteresis band actually churns."""
         import numpy as np
         import pandas as pd
-        from app import monthly as monthly_mod
+
         from app import fundamentals as fundamentals_mod
+        from app import monthly as monthly_mod
 
         rng = np.random.default_rng(123)
         tickers = [f"T{i:02d}" for i in range(20)]
