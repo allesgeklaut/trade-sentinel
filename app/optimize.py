@@ -2489,7 +2489,6 @@ async def _daily_core_backtest(
     # Daily-frame variant of the LLM context's regime heuristic: PULLBACK =
     # <60% of eligible names above their SMA50 AND median 5d run < -2.5%.
     sma50_frame = close.rolling(50).mean()
-    run5_frame = close / close.shift(21)  # 1-month proxy is too slow; use 5d below
     run5_frame = close.pct_change(5)
     above50 = (close > sma50_frame)
 
@@ -2512,6 +2511,14 @@ async def _daily_core_backtest(
     pending_pick: dict[str, pd.Timestamp] = {}   # ticker -> first day seen in-band (entry-gate)
     churns: list[float] = []
     trades_log: list[tuple[str, str, str, float]] = []
+    # Monthly turnover bookkeeping: notional traded per calendar month,
+    # relative to the equity at that month's start. Fresh-contribution
+    # deployment is excluded (same convention as the monthly baseline,
+    # where deploying the contribution is not counted as churn).
+    month_buys = 0.0
+    month_sells = 0.0
+    equity_month_start = 0.0
+    cur_month: int | None = None
 
     def px_of(t: str, d: pd.Timestamp) -> float | None:
         try:
@@ -2522,7 +2529,7 @@ async def _daily_core_backtest(
 
     def trade(d: pd.Timestamp, t: str, side: str, delta_value: float) -> None:
         """Execute one fill at d's close with one-way cost on the notional."""
-        nonlocal cash
+        nonlocal cash, month_buys, month_sells
         p = px_of(t, d)
         if p is None or p <= 0:
             return
@@ -2535,6 +2542,7 @@ async def _daily_core_backtest(
             cost_fee = notional * cost
             cash -= cost_fee
             shares[t] = shares.get(t, 0.0) + sh
+            month_buys += notional
         else:
             sh = shares.get(t, 0.0)
             if sh <= 0:
@@ -2542,6 +2550,7 @@ async def _daily_core_backtest(
             notional = sh * p
             cash += notional * (1.0 - cost)
             del shares[t]
+            month_sells += notional
         trades_log.append((d.strftime("%Y-%m-%d"), side, t, notional))
 
     def current_order(d: pd.Timestamp, month_td: pd.Timestamp) -> tuple[list[str], pd.DataFrame | None]:
@@ -2559,18 +2568,31 @@ async def _daily_core_backtest(
     pending_cash = 0.0  # contributions not yet deployed (dca="monthly")
 
     for d in days_all:
-        is_month_end = d in months and d == last_day or (d in months)
         month_td = month_for(d)
         order, frame = current_order(d, month_td)
+
+        # --- monthly turnover bookkeeping ---
+        if cur_month is None or d.month != cur_month:
+            if cur_month is not None and equity_month_start > 0:
+                # (buys + sells) / 2 / equity at month start = one-way turnover
+                churns.append(((month_buys + month_sells) / 2.0) / equity_month_start)
+            month_buys, month_sells = 0.0, 0.0
+            cur_month = d.month
+            equity_month_start = cash + pending_cash + sum(
+                (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0) for t in shares)
 
         # --- contribution ---
         if d in months:
             contributed += contribution
             n_contribs += 1
-            if dca == "daily":
-                cash += contribution
-            else:
-                pending_cash += contribution
+            # All deployment modes release the contribution at the month-end
+            # rebalance: "monthly" spends it via the month-end rebuild + top-up,
+            # "daily"/"rank" have already been spending from cash daily, so
+            # month-end just tops the balance back up. (pending_cash exists
+            # only as an intra-month idle pool for "monthly"; releasing it
+            # here keeps a zero-new-picks month from stranding cash.)
+            cash += contribution + pending_cash
+            pending_cash = 0.0
 
         # --- SELL phase: releases from the hysteresis band ---
         if order:
@@ -2592,13 +2614,59 @@ async def _daily_core_backtest(
             held = list(shares)
             picks = monthly_mod._band_fill(order, held, target_n, hold_band)
 
-        # daily top-up of underweight holdings — but NOT pro-rata: the fresh
-        # cash goes to the most underweight holding (rank-agnostic
-        # equal-weight rebalance dilutes momentum and was measured worse
-        # than the monthly baseline on 2020-2026; see experiment doc).
         paused = crash_pause and pullback_day(d)
-        if order and not paused:
-            # find the single most underweight holding
+
+        # --- Rank-weighted cash deployment (dca="rank") ---
+        # Fresh cash goes where the qv-mom ranking says it belongs: each day,
+        # deploy (a slice of) available cash into the top-ranked names with
+        # target weights ABOVE their current value — i.e. new cash reinforces
+        # the strongest core names instead of equal-weight rebalancing into
+        # laggards. A held name at/above target gets nothing; a not-yet-held
+        # top name is bought to its target. This is the momentum-preserving
+        # variant of "deploy daily": the monthly sim's edge is concentrating
+        # fresh capital into the top of the ranking — rank deployment does
+        # that every day without the ~2-week cash drag.
+        if dca == "rank" and order and not paused:
+            remaining = cash - (0 if d in months else 0)  # spendable cash
+            for rank_i, t in enumerate(order[:target_n]):
+                if remaining < 1:
+                    break
+                p = px_of(t, d)
+                if p is None:
+                    continue
+                # score-weighted target: rank 1 gets up to `weight` * boost,
+                # linearly decaying to the equal weight at the band edge.
+                boost = 1.0 + settings.sim_monthly_rank_boost * (
+                    1.0 - rank_i / max(target_n - 1, 1))
+                tgt = weight * boost
+                cur = shares.get(t, 0.0) * p
+                gap = tgt - cur
+                if gap > 1:
+                    spend = min(gap, remaining)
+                    trade(d, t, "BUY", spend)
+                    remaining -= spend
+
+        # Month-end equal-weight rebuild (dca="monthly" only): the baseline
+        # semantics — spread the FULL portfolio (incl. fresh contribution)
+        # 1/N across the picks. Implemented as: buy each underweight pick up
+        # to weight (releasing cash pro-rata), sell nothing here (releases
+        # happened in the SELL phase). This makes all-defaults ≈ baseline.
+        if dca == "monthly" and d in months and order and not paused:
+            for t in picks:
+                p = px_of(t, d)
+                if p is None:
+                    continue
+                cur = shares.get(t, 0.0) * p
+                gap = weight - cur
+                if gap > 1 and cash > 1:
+                    trade(d, t, "BUY", min(gap, cash))
+
+        # daily top-up of underweight holdings (dca="daily" only; rank mode
+        # and month-end days already allocated). NOT pro-rata: the fresh
+        # cash goes to the single most underweight holding — equal-weight
+        # rebalancing into laggards dilutes momentum and was measured worse
+        # than the monthly baseline on 2020-2026.
+        if dca == "daily" and order and not paused and d not in months:
             worst_t, worst_gap = None, 0.0
             for t in order:
                 if t not in shares:
@@ -2631,12 +2699,8 @@ async def _daily_core_backtest(
                 if not ok:
                     pending_pick[t] = d  # wait for the gate to open
                     continue
-                budget = min(weight, cash + (pending_cash if d in months else 0.0))
-                budget = min(budget, cash + pending_cash)
+                budget = min(weight, cash)
                 if budget > 1:
-                    if dca == "monthly":
-                        cash += pending_cash
-                        pending_cash = 0.0
                     trade(d, t, "BUY", budget)
         elif entry_gate != "none" and order:
             # daily re-check of gated entries once the gate opens
@@ -2655,11 +2719,8 @@ async def _daily_core_backtest(
                     r5 = run5_frame.at[d, t]
                     ok = pd.isna(r5) or float(r5) > -0.10
                 if ok:
-                    budget = min(weight, cash + pending_cash)
+                    budget = min(weight, cash)
                     if budget > 1:
-                        if dca == "monthly":
-                            cash += pending_cash
-                            pending_cash = 0.0
                         trade(d, t, "BUY", budget)
                     pending_pick.pop(t, None)
 
@@ -2683,7 +2744,9 @@ async def _daily_core_backtest(
 
     irr = irr_of(value, n_contribs)
     cfg = (f"dca={dca} entry-gate={entry_gate} exit-cadence={exit_cadence} "
-           f"crash-pause={'on' if crash_pause else 'off'}")
+           f"crash-pause={'on' if crash_pause else 'off'}"
+           + (f" rank-boost={settings.sim_monthly_rank_boost:g}"
+              if dca == "rank" else ""))
     print(f"\n=== Daily-core backtest [{universe}] {days_all[0].date()}..{last_day.date()} ===")
     print(f"  config: {cfg}")
     print(f"  contributions: {n_contribs} x ${contribution:,.0f} = ${contributed:,.0f}")
@@ -3152,8 +3215,10 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Universe name (default: sim_monthly_universe)")
     dc.add_argument("--contribution", type=float, default=None,
                     help="Monthly contribution in USD (default: sim_monthly_contribution)")
-    dc.add_argument("--dca", choices=["monthly", "daily"], default="monthly",
-                    help="Deploy contributions at month-end (monthly sim) or daily")
+    dc.add_argument("--dca", choices=["monthly", "daily", "rank"], default="monthly",
+                    help="Deploy contributions at month-end (monthly sim), daily "
+                         "into the most underweight holding, or daily rank-weighted "
+                         "(fresh cash reinforces the top-ranked core names)")
     dc.add_argument("--entry-gate", choices=["none", "above-sma50", "not-crash"],
                     default="none",
                     help="Candle-driven timing for NEW core-name entries "

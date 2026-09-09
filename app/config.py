@@ -75,6 +75,11 @@ class Settings(BaseSettings):
     # thin coverage) — only known-bad data blocks. Opt-in until the replay
     # A/B verdict (bull-window right-tail cost is the known risk class).
     sim_block_negative_roe: bool = False
+    # Daily-core rank deployment: boost factor for the #1-ranked name's target
+    # weight, decaying linearly to 1.0 at the band edge (rank N gets exactly
+    # the equal weight). 0.5 = top name may hold 1.5x the equal weight while
+    # the 10th holds 1.0x. Only used by the daily-core backtest --dca rank.
+    sim_monthly_rank_boost: float = 0.5
     sim_run_hour: int = 22
     sim_run_minute: int = 30
 
