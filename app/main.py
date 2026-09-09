@@ -473,11 +473,13 @@ async def daily_core_backfill(start: str | None = Query(default=None)):
     """Backfill the daily-core portfolio with synthetic history.
 
     Replays the winning strategy (qv-mom ranking + daily rank deployment)
-    over stored candles/fundamentals from `start` (YYYY-MM-DD, default: the
-    first month with eligible fundamentals) to today, and REPLACES the
-    portfolio state with the replay's end state. Paper-convenience so the
-    equity curve has comparable history to the other tabs — trades are
-    simulated, not a live track record.
+    over stored candles/fundamentals to today and REPLACES the portfolio
+    state with the replay's end state.
+
+    ``start``: "YYYY-MM-DD" to replay from that date, "all" for the full
+    stored history, or omit (default) to synch with the other sims — the
+    replay starts on the earliest snapshot date of the daily sim / monthly
+    portfolios so all three equity curves cover the same window.
     """
     from . import daily_core
     r = await daily_core.backfill(start)

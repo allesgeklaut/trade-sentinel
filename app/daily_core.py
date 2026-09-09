@@ -310,17 +310,45 @@ async def refresh_data() -> tuple[list[str], list[str]]:
 # Backfill (synthetic history)
 # ---------------------------------------------------------------------------
 
+async def _sync_start_date() -> str | None:
+    """Earliest live snapshot date across the other two paper portfolios
+    (daily sim + monthly). Used as the daily-core backfill's default start
+    so all three equity curves cover the SAME window — the user wants them
+    synched, and a 2017 synthetic history next to two 2-week live curves is
+    apples-to-oranges on the charts. Returns None when the other tables are
+    empty (then the replay falls back to the first eligible month).
+    """
+    from .db import MonthlySnapshot, Session as DbSession, SimSnapshot
+
+    earliest: datetime | None = None
+    async with DbSession() as s:
+        d = await s.scalar(select(func.min(SimSnapshot.created_at)))
+        if d is not None and (earliest is None or d < earliest):
+            earliest = d
+    async with DbSession() as s:
+        d = await s.scalar(select(func.min(MonthlySnapshot.created_at)))
+        if d is not None and (earliest is None or d < earliest):
+            earliest = d
+    return earliest.strftime("%Y-%m-%d") if earliest else None
+
+
 async def backfill(start: str | None = None) -> dict:
     """Replay the winning daily-core strategy over historical data and
     REPLACE the portfolio state with the replay's end state.
 
     Wipes account/positions/trades/allowances/snapshots, then walks every
-    stored trading day from `start` (default: first month with an eligible
-    frame) to yesterday, depositing the monthly allowance and applying the
-    rank-deployment rule at each day's close with 10 bps one-way paper
-    costs — the same simulation as `optimize daily-core --dca rank` with
-    boost=0. Snapshots are written per calendar day so the UI equity curve
-    carries as many points as the monthly tab's.
+    stored trading day from `start` to today, depositing the monthly
+    allowance and applying the rank-deployment rule at each day's close
+    with 10 bps one-way paper costs — the same simulation as
+    `optimize daily-core --dca rank` with boost=0.
+
+    ``start`` semantics:
+      - explicit "YYYY-MM-DD": replay from that day (the UI's optional date)
+      - None (default): synched with the other sims — the replay starts on
+        the earliest snapshot date of the daily sim / monthly portfolios so
+        all three equity curves cover the same window
+      - "all": the full stored history (2017+, first month with an
+        eligible frame) — the long-view replay
 
     This is a paper-portfolio convenience, not a live track record: the
     trades never happened in real time. The final state converges to
@@ -332,6 +360,10 @@ async def backfill(start: str | None = None) -> dict:
         from . import optimize  # noqa: F401  (ensures strategy modules load)
         from .db import DailyCoreAccount as Acc, DailyCorePosition as Pos, \
             DailyCoreTrade as Tr, DailyCoreAllowance as Al, DailyCoreSnapshot as Sn
+
+        if start is None:
+            start = await _sync_start_date()
+        start_note = start or "first eligible month"
 
         tickers = universe_tickers(settings.sim_monthly_universe)
         fund = await fundamentals_mod.load_fundamentals(tickers)
@@ -345,7 +377,7 @@ async def backfill(start: str | None = None) -> dict:
         if start:
             idx = idx[idx >= pd.Timestamp(start)]
         if idx.empty:
-            return {"ok": False, "error": "no trading days in window"}
+            return {"ok": False, "error": f"no trading days since {start_note}"}
 
         months: list[pd.Timestamp] = []
         for ym in sorted({(d.year, d.month) for d in idx}):
@@ -528,7 +560,8 @@ async def backfill(start: str | None = None) -> dict:
             await s.commit()
 
         return {"ok": True, "days": len(idx), "start": str(first_day.date()),
-                "end": str(idx[-1].date()), "contributed": round(contributed, 2),
+                "end": str(idx[-1].date()), "requested_start": start_note,
+                "contributed": round(contributed, 2),
                 "final_equity": round(snaps[-1][1], 2), "trades": len(trades),
                 "snapshots": len(snaps)}
 
