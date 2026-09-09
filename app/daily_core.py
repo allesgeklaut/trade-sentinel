@@ -306,6 +306,193 @@ async def refresh_data() -> tuple[list[str], list[str]]:
     return refreshed, errors
 
 
+# ---------------------------------------------------------------------------
+# Backfill (synthetic history)
+# ---------------------------------------------------------------------------
+
+async def backfill(start: str | None = None) -> dict:
+    """Replay the winning daily-core strategy over historical data and
+    REPLACE the portfolio state with the replay's end state.
+
+    Wipes account/positions/trades/allowances/snapshots, then walks every
+    stored trading day from `start` (default: first month with an eligible
+    frame) to yesterday, depositing the monthly allowance and applying the
+    rank-deployment rule at each day's close with 10 bps one-way paper
+    costs — the same simulation as `optimize daily-core --dca rank` with
+    boost=0. Snapshots are written per calendar day so the UI equity curve
+    carries as many points as the monthly tab's.
+
+    This is a paper-portfolio convenience, not a live track record: the
+    trades never happened in real time. The final state converges to
+    "what the strategy would hold today", and live cycles continue from
+    there. Point-in-time discipline: each day only sees fundamentals that
+    were public by then (same EDGAR-first fact store as the backtest).
+    """
+    async with _cycle_lock:
+        from . import optimize  # noqa: F401  (ensures strategy modules load)
+        from .db import DailyCoreAccount as Acc, DailyCorePosition as Pos, \
+            DailyCoreTrade as Tr, DailyCoreAllowance as Al, DailyCoreSnapshot as Sn
+
+        tickers = universe_tickers(settings.sim_monthly_universe)
+        fund = await fundamentals_mod.load_fundamentals(tickers)
+        if not fund:
+            return {"ok": False, "error": "no fundamentals loaded"}
+        close, vol = await monthly_mod.load_frames(tickers, None)
+        if close.empty:
+            return {"ok": False, "error": "no candle data"}
+
+        idx = pd.DatetimeIndex(close.index)
+        if start:
+            idx = idx[idx >= pd.Timestamp(start)]
+        if idx.empty:
+            return {"ok": False, "error": "no trading days in window"}
+
+        months: list[pd.Timestamp] = []
+        for ym in sorted({(d.year, d.month) for d in idx}):
+            sub = idx[(idx.year == ym[0]) & (idx.month == ym[1])]
+            if len(sub):
+                months.append(sub[-1])
+
+        # Eligibility frames per month (same caching as the backtest).
+        frame_cache: dict[pd.Timestamp, pd.DataFrame | None] = {}
+        for m in months:
+            frame_cache[m] = await asyncio.to_thread(
+                monthly_mod.eligible_frame, m, close, vol, fund)
+        months = [m for m in months
+                  if frame_cache[m] is not None and bool(frame_cache[m]["eligible"].any())]
+        if not months:
+            return {"ok": False, "error": "no month with eligible names"}
+        idx = idx[idx >= months[0]]
+        first_day = idx[0]
+
+        # --- wipe + reset ---
+        from sqlalchemy import delete as sa_delete
+        async with Session() as s:
+            for tbl in (Tr, Pos, Al, Sn):
+                await s.execute(sa_delete(tbl))
+            acc = await _account(s)
+            acc.cash = 0.0
+            acc.last_allowance_month = None
+            await s.commit()
+
+        cost = settings.sim_monthly_cost_oneway
+        target_n = settings.sim_monthly_target_n
+        hold_band = settings.sim_monthly_hold_band
+
+        # --- in-memory replay state ---
+        shares: dict[str, float] = {}
+        cash = 0.0
+        contributed = 0.0
+        n_contribs = 0
+        last_month_deposited: str | None = None
+        trades: list[tuple[str, str, str, float]] = []
+        snaps: list[tuple[str, float]] = []
+
+        def px_of(t: str, d: pd.Timestamp) -> float | None:
+            try:
+                p = close.at[d, t]
+            except KeyError:
+                return None
+            return float(p) if pd.notna(p) else None
+
+        cur_month: int | None = None
+        for d in idx:
+            month_td = months[-1] if d > months[-1] else next(
+                (m for m in months if m >= d), months[-1])
+            frame = frame_cache.get(month_td)
+            order: list[str] = []
+            if frame is not None and bool(frame["eligible"].any()):
+                _elig, order = await asyncio.to_thread(monthly_mod._qv_order, frame)
+            band = set(order[:hold_band])
+
+            # allowance: deposit on the first trading day of a new month
+            # (same timing as the live deposit_allowance)
+            if cur_month is None or d.month != cur_month:
+                cur_month = d.month
+                cash += settings.sim_monthly_contribution
+                contributed += settings.sim_monthly_contribution
+                n_contribs += 1
+                last_month_deposited = d.strftime("%Y-%m")
+
+            def do_buy(t: str, budget: float) -> None:
+                nonlocal cash
+                p = px_of(t, d)
+                if p is None or p <= 0:
+                    return
+                notional = min(budget, cash)
+                if notional < 1:
+                    return
+                sh = notional / p
+                cash -= notional
+                cash -= notional * cost
+                shares[t] = shares.get(t, 0.0) + sh
+                trades.append((d.strftime("%Y-%m-%d"), "BUY", t, notional))
+
+            def do_sell(t: str) -> None:
+                nonlocal cash
+                p = px_of(t, d)
+                sh = shares.get(t, 0.0)
+                if p is None or p <= 0 or sh <= 0:
+                    return
+                notional = sh * p
+                cash += notional * (1.0 - cost)
+                del shares[t]
+                trades.append((d.strftime("%Y-%m-%d"), "SELL", t, notional))
+
+            # SELL band releases (month-end rebuild only, as in the backtest)
+            if d in months:
+                for t in list(shares):
+                    if t not in band:
+                        do_sell(t)
+
+            equity = cash + sum((shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0)
+                                for t in shares)
+            weight = equity / max(target_n, 1)
+
+            # rank-deployment (boost=0): top up top-ranked names toward the
+            # equal-weight target, best rank first. On month-end days the
+            # full equal-weight rebuild also fills NEW names to weight.
+            if order:
+                for t in order[:target_n]:
+                    p = px_of(t, d)
+                    if p is None:
+                        continue
+                    cur = shares.get(t, 0.0) * p
+                    gap = weight - cur
+                    if gap > 1 and cash > 1:
+                        do_buy(t, gap)
+
+            # daily snapshot (one point per day)
+            equity_close = cash + sum((shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0)
+                                      for t in shares)
+            snaps.append((d.strftime("%Y-%m-%d"), equity_close))
+
+        # --- persist the end state ---
+        async with Session() as s:
+            acc = await _account(s)
+            acc.cash = cash
+            for t, sh in shares.items():
+                # avg_cost is not tracked by the replay (irrelevant for the
+                # equity curve); book at the last close so valuation works.
+                p = px_of(t, idx[-1]) or 0.0
+                s.add(Pos(ticker=t, shares=sh, avg_cost=p))
+            for td, side, t, notional in trades:
+                s.add(Tr(ticker=t, side=side, shares=0.0, price=0.0,
+                         cash_after=0.0, reason=f"backfill {side.lower()} ${notional:,.0f}"))
+            for i in range(n_contribs):
+                m = (pd.Timestamp(months[0]) + pd.DateOffset(months=i)).strftime("%Y-%m")
+                s.add(Al(amount=settings.sim_monthly_contribution, month=m))
+            for sd, eq in snaps:
+                s.add(Sn(cash=0.0, positions_value=eq, total_equity=eq,
+                         allowance_total=round(contributed, 2)))
+            await s.commit()
+
+        return {"ok": True, "days": len(idx), "start": str(first_day.date()),
+                "end": str(idx[-1].date()), "contributed": round(contributed, 2),
+                "final_equity": round(snaps[-1][1], 2), "trades": len(trades),
+                "snapshots": len(snaps)}
+
+
 async def run_daily_cycle(force: bool = False) -> dict:
     """Scheduler entry: one full daily-core cycle.
 

@@ -468,6 +468,23 @@ async def daily_core_run():
     from . import daily_core
     return await daily_core.run_daily_cycle()
 
+@app.post('/api/dailycore/backfill')
+async def daily_core_backfill(start: str | None = Query(default=None)):
+    """Backfill the daily-core portfolio with synthetic history.
+
+    Replays the winning strategy (qv-mom ranking + daily rank deployment)
+    over stored candles/fundamentals from `start` (YYYY-MM-DD, default: the
+    first month with eligible fundamentals) to today, and REPLACES the
+    portfolio state with the replay's end state. Paper-convenience so the
+    equity curve has comparable history to the other tabs — trades are
+    simulated, not a live track record.
+    """
+    from . import daily_core
+    r = await daily_core.backfill(start)
+    if not r.get("ok"):
+        raise HTTPException(400, r.get("error", "backfill failed"))
+    return r
+
 @app.post('/api/sim/chat')
 async def sim_chat_endpoint(req: ChatRequest):
     """Interactive chat with the sim portfolio manager LLM.

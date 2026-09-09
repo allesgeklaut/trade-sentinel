@@ -1061,7 +1061,10 @@
 
         #monthly-trades,
         #monthly-positions,
-        #monthly-rebalances {
+        #monthly-rebalances,
+        #dailycore-trades,
+        #dailycore-positions,
+        #dailycore-band {
             max-height: 320px;
             overflow-y: auto;
             overflow-x: auto
@@ -1073,6 +1076,26 @@
            and not immediately recreated. */
         #monthly-chart {
             height: 320px
+        }
+
+        #dailycore-view {
+            display: none;
+            max-width: 1400px;
+            margin: auto;
+            padding: 18px
+        }
+
+        #dailycore-chart {
+            height: 320px
+        }
+
+        #dailycore-trades table thead th,
+        #dailycore-positions table thead th,
+        #dailycore-band table thead th {
+            position: sticky;
+            top: 0;
+            background: #071009;
+            z-index: 1
         }
 
         .sim-section {
@@ -1196,7 +1219,10 @@
             #sim-allowances table,
             #monthly-trades table,
             #monthly-positions table,
-            #monthly-rebalances table {
+            #monthly-rebalances table,
+            #dailycore-trades table,
+            #dailycore-positions table,
+            #dailycore-band table {
                 font-size: 11px;
                 table-layout: auto
             }
@@ -1212,7 +1238,13 @@
             #monthly-positions td,
             #monthly-positions th,
             #monthly-rebalances td,
-            #monthly-rebalances th {
+            #monthly-rebalances th,
+            #dailycore-trades td,
+            #dailycore-trades th,
+            #dailycore-positions td,
+            #dailycore-positions th,
+            #dailycore-band td,
+            #dailycore-band th {
                 padding: 3px 4px
             }
 
@@ -1222,7 +1254,9 @@
             #sim-trades td,
             #sim-trades th,
             #monthly-trades td,
-            #monthly-trades th {
+            #monthly-trades th,
+            #dailycore-trades td,
+            #dailycore-trades th {
                 padding: 3px 3px
             }
 
@@ -1232,12 +1266,14 @@
                cell may wrap. */
             #sim-positions td,
             #monthly-positions td,
+            #dailycore-positions td,
             #sim-allowances td,
             #sim-allowances th,
             #monthly-rebalances td,
             #monthly-rebalances th,
             #sim-trades td:not(:last-child),
-            #monthly-trades td:not(:last-child) {
+            #monthly-trades td:not(:last-child),
+            #dailycore-trades td:not(:last-child) {
                 white-space: nowrap
             }
 
@@ -1249,7 +1285,9 @@
             #sim-trades th:last-child,
             #sim-trades td:last-child,
             #monthly-trades th:last-child,
-            #monthly-trades td:last-child {
+            #monthly-trades td:last-child,
+            #dailycore-trades th:last-child,
+            #dailycore-trades td:last-child {
                 width: 55%;
                 min-width: 80px;
                 white-space: normal;
@@ -1491,7 +1529,19 @@
             </div>
         </div>
         <div class="sim-section">
-            <div class="sim-section-title">Equity Curve (vs contributed)</div>
+            <div class="sim-section-title">Equity Curve (vs daily sim, contributed &amp; DCA benchmark)</div>
+            <div style="display:flex;gap:16px;margin-bottom:8px;flex-wrap:wrap">
+                <span style="color:#b48cff;font-size:12px">● Daily-Core</span>
+                <span style="color:#42ff72;font-size:12px">● Daily sim (Bot)</span>
+                <span style="color:#7aaa81;font-size:12px">● Contributed</span>
+                <span style="color:#ff9f43;font-size:12px">● DCA benchmark</span>
+                <span style="flex:1"></span>
+                <button id="dc-cmp-pct" class="range-btn range-active" onclick="setDCCompareMode('pct')"
+                    title="Each curve as % of its contributed total — fair comparison even when contributed differs">%
+                    View</button>
+                <button id="dc-cmp-usd" class="range-btn" onclick="setDCCompareMode('usd')" title="Absolute dollars">$
+                    View</button>
+            </div>
             <div id="dailycore-chart"></div>
         </div>
         <div class="sim-grid2">
@@ -1515,8 +1565,14 @@
             <div class="bench-label">ACTIONS</div>
             <div class="sim-actions">
                 <button id="dailycore-run-btn" onclick="runDailyCore()">Run Cycle Now</button>
+                <button id="dailycore-backfill-btn" onclick="backfillDailyCore()">Backfill History</button>
             </div>
             <div id="dailycore-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
+            <div style="margin-top:6px;font-size:11px;color:#7aaa81">
+                Backfill replays the strategy over stored history and replaces this portfolio's state —
+                synthetic trades, not a live track record. Use once to give the equity curve the same
+                depth as the other tabs.
+            </div>
         </div>
     </section>
     <div id="explain-backdrop-container">
@@ -2573,6 +2629,14 @@
         // ===================== Daily-core portfolio =====================
         let dailyCoreChart = null;
         let dailyCoreLoaded = false;
+        let dcCompareMode = 'pct';
+
+        function setDCCompareMode(mode) {
+            dcCompareMode = mode;
+            document.getElementById('dc-cmp-pct').classList.toggle('range-active', mode === 'pct');
+            document.getElementById('dc-cmp-usd').classList.toggle('range-active', mode === 'usd');
+            loadDailyCoreEquity();
+        }
 
         async function loadDailyCoreStatus() {
             try {
@@ -2606,30 +2670,91 @@
         }
 
         async function loadDailyCoreEquity() {
-            const snaps = await api('dailycore/equity?limit=365').catch(() => null);
+            const [snaps, live, simSnaps, bench] = await Promise.all([
+                api('dailycore/equity?limit=365').catch(() => null),
+                api('dailycore/status').catch(() => null),
+                api('sim/equity?limit=365').catch(() => null),
+                api('sim/benchmark').catch(() => null),
+            ]);
             if (dailyCoreChart) { dailyCoreChart.remove(); dailyCoreChart = null; }
             if (!snaps || !snaps.length) {
                 document.getElementById('dailycore-chart').innerHTML = '<div class="sim-empty">No data yet — the equity curve appears after the first cycle.</div>';
                 return;
             }
-            const byDay = new Map();  // last snapshot per day
+            // One point per day, the LAST snapshot winning (a manual cycle
+            // later in the day overwrites the scheduler's morning mark).
+            // Deduping is required: lightweight-charts line series throw on
+            // duplicate timestamps.
+            const byDay = new Map();
             for (const s of snaps) byDay.set(s.date, { value: s.total_equity, contributed: s.allowance_total });
-            const points = [...byDay.entries()].sort((a, b) => a[0] < b[0] ? -1 : 1);
+            const points = [...byDay.entries()]
+                .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                .sort((a, b) => a.time < b.time ? -1 : 1);
+            const last = points[points.length - 1];
+            if (live && live.valuation && live.valuation.total_equity != null) {
+                const today = new Date().toISOString().slice(0, 10);
+                if (last.time < today) points.push({ time: today, value: live.valuation.total_equity, contributed: live.valuation.allowance_total });
+            }
+            const toPct = p => p.contributed > 0 ? (p.value / p.contributed * 100) : p.value;
+            // Sim + benchmark overlays: same series the Monthly tab plots.
+            // In pct mode each series is normalized by ITS OWN contributed
+            // total so all lines share the 100 baseline; in USD mode the
+            // overlays go on a hidden left scale (contributed totals can
+            // differ between portfolios).
+            const simByDay = new Map();
+            for (const s of (simSnaps || [])) {
+                simByDay.set(new Date(s.at).toISOString().slice(0, 10),
+                    { value: s.total_equity, contributed: s.allowance_total });
+            }
+            const simPoints = [...simByDay.entries()].map(([time, p]) => ({
+                time,
+                value: dcCompareMode === 'pct' ? toPct(p) : p.value,
+            })).sort((a, b) => a.time < b.time ? -1 : 1);
+            const benchByDay = new Map();
+            for (const s of ((bench && bench.equity_curve) || [])) {
+                benchByDay.set(new Date(s.at).toISOString().slice(0, 10),
+                    { value: s.total_equity, contributed: s.allowance_total });
+            }
+            const benchPoints = [...benchByDay.entries()].map(([time, p]) => ({
+                time,
+                value: dcCompareMode === 'pct' ? toPct(p) : p.value,
+            })).sort((a, b) => a.time < b.time ? -1 : 1);
             document.getElementById('dailycore-chart').innerHTML = '';
             dailyCoreChart = LightweightCharts.createChart(document.getElementById('dailycore-chart'), {
                 autoSize: true,
-                height: 280, layout: { background: { color: '#071009' }, textColor: '#b7ffc0' },
+                height: 320, layout: { background: { color: '#071009' }, textColor: '#b7ffc0' },
                 grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } },
                 timeScale: { timeVisible: false, secondsVisible: false },
+                localization: dcCompareMode === 'pct' ? { priceFormatter: fmtPct } : {},
             });
-            dailyCoreChart.addLineSeries({
-                color: '#4d9fff', lineWidth: 2,
+            const dcLine = dailyCoreChart.addLineSeries({
+                color: '#b48cff', lineWidth: 2, priceScaleId: 'right',
                 priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
-            }).setData(points.map(([time, p]) => ({ time, value: p.value })));
+            });
+            dcLine.setData(points.map(p => ({ time: p.time, value: dcCompareMode === 'pct' ? toPct(p) : p.value })));
+            if (simPoints.length) {
+                // The Bot is green on its own tab; keep it green here too.
+                const simLine = dailyCoreChart.addLineSeries({
+                    color: '#42ff72', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed,
+                    priceScaleId: dcCompareMode === 'pct' ? 'right' : 'left',
+                    priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+                });
+                simLine.setData(simPoints);
+                if (dcCompareMode !== 'pct') {
+                    dailyCoreChart.priceScale('left').applyOptions({ visible: false });
+                }
+            }
+            // Contributed baseline (grey dotted).
             dailyCoreChart.addLineSeries({
-                color: '#7aaa81', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted,
+                color: '#7aaa81', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, priceScaleId: 'right',
                 priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
-            }).setData(points.map(([time, p]) => ({ time, value: p.contributed })));
+            }).setData(points.map(p => ({ time: p.time, value: dcCompareMode === 'pct' ? 100 : p.contributed })));
+            if (benchPoints.length) {
+                dailyCoreChart.addLineSeries({
+                    color: '#ff9f43', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dotted,
+                    priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+                }).setData(benchPoints);
+            }
             dailyCoreChart.timeScale().fitContent();
         }
 
@@ -2646,6 +2771,20 @@
                     status.textContent = `Cycle complete: ${(r.deployment?.trades || []).length} trades.`;
                     loadDailyCoreAll();
                 }
+            } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
+            btn.disabled = false;
+        }
+
+        async function backfillDailyCore() {
+            const btn = document.getElementById('dailycore-backfill-btn');
+            const status = document.getElementById('dailycore-run-status');
+            btn.disabled = true;
+            status.textContent = 'Backfilling… (replays the strategy over all stored history — can take a few minutes)';
+            try {
+                const r = await api('dailycore/backfill', { method: 'POST' });
+                status.textContent = `Backfilled ${r.days} trading days (${r.start} → ${r.end}): ` +
+                    `${r.snapshots} equity points, ${r.trades} trades, final equity $${r.final_equity.toFixed(2)}.`;
+                loadDailyCoreAll();
             } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
             btn.disabled = false;
         }
