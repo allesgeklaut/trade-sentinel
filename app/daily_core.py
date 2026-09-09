@@ -180,14 +180,35 @@ async def _exec_sell(ticker: str, price: float, reason: str) -> dict | None:
 # The deployment decision
 # ---------------------------------------------------------------------------
 
-async def compute_targets() -> tuple[list[str], list[str], pd.DataFrame | None]:
+# Cache for compute_targets(): the qv-mom ranking needs the full universe's
+# fundamentals + 10y candle frames (multi-second TTM math). The status
+# endpoint calls it on every tab load, so cache the result for a few
+# minutes — the ranking moves at most once a day (fundamentals move
+# quarterly, momentum daily but only at the margin). Invalidated by the
+# deployment cycle computing its own fresh copy.
+_targets_cache: tuple[float, tuple[list[str], list[str], pd.DataFrame | None]] | None = None
+_TARGETS_TTL = 300.0  # seconds
+
+
+async def compute_targets(force: bool = False) -> tuple[list[str], list[str], pd.DataFrame | None]:
     """Compute the daily-core target portfolio.
 
     Returns (band, picks, frame): ``band`` is the full hold-band order
     (top ``sim_monthly_hold_band`` ranked tickers — held names stay while
     inside it), ``picks`` the top ``sim_monthly_target_n`` with hysteresis
     applied. ``frame`` is the eligibility frame (None when no data).
+
+    Cached for _TARGETS_TTL seconds (the status endpoint hits this on every
+    tab load; recomputing the TTM frame each time costs ~7s). ``force``
+    bypasses the cache — the deployment cycle always computes fresh so
+    trades never act on stale rankings.
     """
+    global _targets_cache
+    import time as _time
+    if not force and _targets_cache is not None:
+        ts, cached = _targets_cache
+        if _time.monotonic() - ts < _TARGETS_TTL:
+            return cached
     tickers = universe_tickers(settings.sim_monthly_universe)
     fund = await fundamentals_mod.load_fundamentals(tickers)
     if not fund:
@@ -206,6 +227,7 @@ async def compute_targets() -> tuple[list[str], list[str], pd.DataFrame | None]:
         held = [p.ticker for p in (await s.scalars(select(DailyCorePosition))).all()]
     picks = monthly_mod._band_fill(order, held, settings.sim_monthly_target_n,
                                    settings.sim_monthly_hold_band)
+    _targets_cache = (_time.monotonic(), (band, picks, frame))
     return band, picks, frame
 
 
@@ -221,7 +243,7 @@ async def run_deployment() -> dict:
        boost=0" rule: fresh cash reinforces the top of the ranking, never
        spreads pro-rata, never waits for month-end.
     """
-    band, picks, _frame = await compute_targets()
+    band, picks, _frame = await compute_targets(force=True)
     if not band:
         return {"skipped": True, "reason": "no eligible ranking (fundamentals too thin?)"}
 
@@ -436,7 +458,7 @@ async def backfill(start: str | None = None) -> dict:
         n_contribs = 0
         last_month_deposited: str | None = None
         trades: list[tuple[str, str, str, float]] = []
-        snaps: list[tuple[str, float]] = []
+        snaps: list[tuple[str, float, float]] = []
 
         def px_of(t: str, d: pd.Timestamp) -> float | None:
             try:
@@ -520,10 +542,13 @@ async def backfill(start: str | None = None) -> dict:
                     if gap > 1 and cash > 1:
                         do_buy(t, gap)
 
-            # daily snapshot (one point per day)
+            # daily snapshot (one point per day). The snapshot carries the
+            # contributed total AS OF that day — persisting the final total
+            # for every row would make the % curve halve on early points
+            # (999/2000 on day 1 instead of 999/1000).
             equity_close = cash + sum((shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0)
                                       for t in shares)
-            snaps.append((d.strftime("%Y-%m-%d"), equity_close))
+            snaps.append((d.strftime("%Y-%m-%d"), equity_close, contributed))
 
         # --- persist the end state ---
         # Allowance rows: one per month the replay actually deposited,
@@ -549,13 +574,13 @@ async def backfill(start: str | None = None) -> dict:
             # account marker consistent so deposit_allowance() stays a no-op
             # for the live month.
             acc.last_allowance_month = live_allowance_month or replay_months[-1]
-            for sd, eq in snaps:
+            for sd, eq, contrib_at_day in snaps:
                 # created_at = the replay day: the UI groups snapshots by
                 # this column's date, so synthetic history must carry the
                 # historical day, not the write time (otherwise all points
                 # collapse into "today" and the curve shows one day).
                 s.add(Sn(cash=0.0, positions_value=eq, total_equity=eq,
-                         allowance_total=round(contributed, 2),
+                         allowance_total=round(contrib_at_day, 2),
                          created_at=pd.Timestamp(f"{sd} 16:00:00+00:00").to_pydatetime()))
             await s.commit()
 
