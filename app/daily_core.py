@@ -464,6 +464,10 @@ async def backfill(start: str | None = None) -> dict:
         months = [m for m in months if _has_eligible(m)]
         if not months:
             return {"ok": False, "error": "no month with eligible names"}
+        # Ranking sources: window month-ends PLUS the prior month-end (so
+        # days between `start` and the first window month-end rank against
+        # the last frame before the window instead of sitting idle).
+        ranking_months = sorted(set(prior_month_ends) | set(months))
         # No idx clamp to months[0]: days before the first eligible
         # month-end in the window replay against the PRIOR month-end's
         # frame (built above), so start=YYYY-06-01 really starts June 1.
@@ -518,7 +522,7 @@ async def backfill(start: str | None = None) -> dict:
             # recent month-end AT OR BEFORE d (the frame computed from facts
             # public by then). Using a future month-end's frame would leak
             # look-ahead into the replay.
-            prior = [m for m in months if m <= d]
+            prior = [m for m in ranking_months if m <= d]
             if not prior:
                 continue  # before the first completed month-end — no ranking yet
             month_td = prior[-1]
