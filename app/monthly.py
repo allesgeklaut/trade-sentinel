@@ -294,6 +294,54 @@ def eligible_frame(rebal_date: pd.Timestamp, close: pd.DataFrame, vol: pd.DataFr
     return df
 
 
+def quality_snapshot(fund: dict[str, dict[str, list[dict]]], ticker: str,
+                     asof: pd.Timestamp, close: float | None = None,
+                     ) -> dict[str, float | None] | None:
+    """Point-in-time quality metrics for one ticker, as of `asof`.
+
+    Returns {"roe": float|None, "p_fcf": float|None} or None when the ticker
+    has no fundamentals at all (ETFs, no-CIK listings, thin coverage — the
+    caller treats None as "unknown", NOT as bad quality).
+
+    ROE = TTM net income / latest stockholders' equity (None when equity <= 0
+    or NI missing). P/FCF = market cap / TTM FCF, where market cap uses the
+    `close` price (pass the USD-converted close so foreign listings compare)
+    and TTM FCF = OCF + capex (capex conventionally negative; falls back to
+    OCF alone). None values mean "not computable", never "bad".
+
+    Reuses the same as-of helpers as the monthly qv-mom scoring, so the daily
+    sim sees exactly the numbers the monthly strategy would compute.
+    """
+    rec = fund.get(ticker)
+    if not rec:
+        return None
+
+    roe: float | None = None
+    eq = _latest_as_of(rec.get("StockholdersEquity", []), asof)
+    ni = _ttm_as_of(rec.get("NetIncomeLoss", []), asof)
+    if eq and eq[1] > 0 and ni is not None:
+        roe = ni / eq[1]
+
+    p_fcf: float | None = None
+    ocf = _ttm_as_of(rec.get("NetCashProvidedByUsedInOperatingActivities", []), asof)
+    capex = _ttm_as_of(rec.get("PaymentsToAcquirePropertyPlantAndEquipment", []), asof)
+    fcf = None
+    if ocf is not None and capex is not None:
+        fcf = ocf + capex  # capex is conventionally negative
+    elif ocf is not None:
+        fcf = ocf  # conservative fallback: OCF alone
+    if fcf is not None and fcf > 0 and close is not None and close > 0:
+        sh = _latest_as_of(
+            rec.get("CommonStockSharesOutstanding", [])
+            + rec.get("EntityCommonStockSharesOutstanding", []),
+            asof,
+        )
+        if sh is not None and sh[1] > 0:
+            p_fcf = (close * sh[1]) / fcf
+
+    return {"roe": roe, "p_fcf": p_fcf}
+
+
 def _band_fill(order: list[str], holdings: list[str], target_n: int, hold_band: int) -> list[str]:
     """Hysteresis: held names inside the top `hold_band` of `order` keep their
     slots; remaining slots are filled by the best-ranked names not held. Held

@@ -76,6 +76,10 @@ class StrategyParams:
     # Risk-based position sizing: risk this % of equity per trade, sized by
     # stop distance. 0 = use flat max_position_pct.
     risk_pct: float = 0.0
+    # Block BUY entries for names with KNOWN non-positive ROE (quality guard).
+    # Missing fundamentals are neutral (ETFs like GLD, thin coverage) — only
+    # known-bad data blocks. 0 = disabled (default until the replay A/B).
+    block_negative_roe: bool = False
     relaxed_hold_strength: int = 40
     relaxed_hold_limit: int = 3
 
@@ -123,6 +127,7 @@ def propose_trades(
     signals: dict[str, dict],
     params: StrategyParams,
     sector_of: callable | None = None,
+    quality_of: callable | None = None,
 ) -> list[dict]:
     """Propose deterministic trades WITHOUT executing them.
 
@@ -139,8 +144,11 @@ def propose_trades(
     BUY phase (ranked by strength, strict BUYs first, else relaxed HOLD
     fallback):
       - ``max_run_5d`` blocks BUYs after a short-term spike.
-      - ``max_positions`` cap blocks NEW positions but allows topping up
-        tickers already held.
+      - ``min_run_5d`` blocks BUYs into a 5-day crash.
+      - ``max_dist_above`` blocks BUYs into parabolic extensions.
+      - ``block_negative_roe`` + ``quality_of`` block entries for names with
+        KNOWN non-positive ROE (missing fundamentals stay neutral — ETFs,
+        thin coverage).
       - ``max_position_pct`` ceiling prevents over-concentration.
       - ``min_cash_pct`` floor preserves a cash buffer.
       - Local cash reservation so successive BUY proposals in the same cycle
@@ -207,14 +215,15 @@ def propose_trades(
     min_run_5d = params.min_run_5d
     max_dist_above = params.max_dist_above
 
-    def _entry_ok(sig: dict) -> bool:
+    def _entry_ok(ticker: str, sig: dict) -> bool:
         """Entry-time guards shared by strict BUYs and the relaxed fallback.
 
-        Blocks the two entry shapes the data condemns: chasing a 5-day spike
+        Blocks the entry shapes the data condemns: chasing a 5-day spike
         (max_run_5d), catching a 5-day crash (min_run_5d — bearish-bounce
-        scoring reads falling knives as strong), and buying parabolic
+        scoring reads falling knives as strong), buying parabolic
         extensions (max_dist_above — the score rewards being far above the
-        SMA200, but entries > +100% average -13% forward).
+        SMA200, but entries > +100% average -13% forward), and entries into
+        names with known non-positive ROE (block_negative_roe).
         """
         snap = sig.get("snapshot", {})
         run5 = snap.get("run_5d")
@@ -226,12 +235,20 @@ def propose_trades(
         dist = snap.get("dist_above")
         if max_dist_above > 0 and dist is not None and dist > max_dist_above:
             return False
+        # Quality guard: block entries for names with KNOWN non-positive ROE.
+        # quality_of returns None (or a dict without "roe") for tickers with
+        # no fundamentals — those stay neutral (ETFs, thin coverage).
+        if params.block_negative_roe and quality_of is not None:
+            q = quality_of(ticker)
+            roe = (q or {}).get("roe")
+            if roe is not None and roe <= 0:
+                return False
         return True
 
     buy_candidates = [
         (t, sig) for t, sig in signals.items()
         if sig["action"] == "BUY"
-        and _entry_ok(sig)
+        and _entry_ok(t, sig)
     ]
     buy_candidates.sort(key=lambda x: x[1]["strength"], reverse=True)
 
@@ -241,7 +258,7 @@ def propose_trades(
         hold_candidates = [
             (t, sig) for t, sig in signals.items()
             if sig["action"] == "HOLD" and sig["strength"] >= params.relaxed_hold_strength
-            and _entry_ok(sig)
+            and _entry_ok(t, sig)
         ]
         hold_candidates.sort(key=lambda x: x[1]["strength"], reverse=True)
         buy_candidates = hold_candidates[:params.relaxed_hold_limit]
