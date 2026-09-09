@@ -18,6 +18,7 @@ from app import sim
 from app.monthly import quality_snapshot
 from app.strategy import StrategyParams, propose_trades
 
+
 # pandas-stubs types Timestamp constructors as returning Timestamp | NaTType,
 # which trips pyright against quality_snapshot's `asof: pd.Timestamp` — same
 # pre-existing noise pattern as app/monthly.py. One helper keeps it in one place.
