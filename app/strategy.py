@@ -36,6 +36,7 @@ The output shape (proposals):
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 
@@ -126,8 +127,8 @@ def propose_trades(
     prices: dict[str, float],
     signals: dict[str, dict],
     params: StrategyParams,
-    sector_of: callable | None = None,
-    quality_of: callable | None = None,
+    sector_of: Callable[[str], str] | None = None,
+    quality_of: Callable[[str], dict[str, float | None] | None] | None = None,
 ) -> list[dict]:
     """Propose deterministic trades WITHOUT executing them.
 
@@ -408,8 +409,8 @@ async def plan_llm_buys(
     equity: float,
     params: StrategyParams,
     guarded: bool,
-    price_of: callable,
-    value_of: callable,
+    price_of: Callable[[str], Awaitable[float | None]],
+    value_of: Callable[[str], Awaitable[float]],
     exclude: set[str] | None = None,
 ) -> dict[str, float]:
     """Plan the execution budget for every LLM BUY decision in a batch.

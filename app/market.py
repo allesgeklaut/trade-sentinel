@@ -3,6 +3,7 @@ import asyncio
 import logging
 import httpx
 import numpy as np
+import pandas as pd
 import yfinance as yf
 from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -40,7 +41,16 @@ def yahoo_history(ticker, period="2y"):
     if frame.empty: raise ValueError(f"No Yahoo Finance daily data for {ticker}")
     frame=frame.replace([np.inf,-np.inf],np.nan).dropna(subset=["Open","High","Low","Close"])
     if frame.empty: raise ValueError(f"No valid Yahoo Finance daily data for {ticker}")
-    return [{"timestamp":x.Index.to_pydatetime().replace(tzinfo=None),"open":float(x.Open),"high":float(x.High),"low":float(x.Low),"close":float(x.Close),"volume":float(x.Volume or 0)} for x in frame.itertuples()]
+    out = []
+    for ts, row in frame.iterrows():
+        assert isinstance(ts, pd.Timestamp), f"unexpected index type {type(ts)}"
+        out.append({
+            "timestamp": ts.to_pydatetime().replace(tzinfo=None),
+            "open": float(row["Open"]), "high": float(row["High"]),
+            "low": float(row["Low"]), "close": float(row["Close"]),
+            "volume": float(row.get("Volume", 0) or 0),
+        })
+    return out
 def yahoo_info(ticker):
     """Fetch a human-readable company name for a single ticker."""
     t = yf.Ticker(ticker)

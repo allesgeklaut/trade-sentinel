@@ -28,8 +28,10 @@ import logging
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
+from collections.abc import Callable
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import delete as sa_delete, func, select
 
@@ -59,6 +61,11 @@ logger = logging.getLogger("trade_sentinel.optimize")
 async def _aval(value: float | None) -> float | None:
     """Wrap a sync value as an awaitable for plan_llm_buys' async callbacks."""
     return value
+
+
+async def _val_of(pf: "PaperPortfolio", t: str, prices: dict[str, float]) -> float:
+    """Value currently held in `t` (0.0 when unheld) as an awaitable."""
+    return float(pf.positions.get(t, 0) * prices.get(t, 0))
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +361,33 @@ async def _load_regime(ticker: str) -> dict[str, bool]:
     } for r in rows])
     df["sma200"] = df["close"].rolling(200).mean()
     df["uptrend"] = df["close"] > df["sma200"]
-    return {row.time: bool(row.uptrend) for row in df.itertuples(index=False) if pd.notna(row.sma200)}
+    valid = df["sma200"].notna()
+    return {t: bool(u) for t, u in
+            zip(df.loc[valid, "time"], df.loc[valid, "uptrend"], strict=False)}
+
+
+def _col_f(v) -> float:
+    """pandas scalar -> float via numpy (pyright-stub friendly)."""
+    return float(np.asarray(v).reshape(-1)[0])
+
+
+def _col_opt(v) -> float | None:
+    return None if pd.isna(v) else _col_f(v)
+
+
+def _col_b(v) -> bool:
+    return bool(v)
+
+
+def px_of_col(frame: pd.DataFrame, d: pd.Timestamp, col: str) -> float | None:
+    """frame.at[d, col] as float; None when missing/NaN (pyright-friendly)."""
+    try:
+        v = frame.at[d, col]
+    except KeyError:
+        return None
+    if pd.isna(v):
+        return None
+    return float(np.asarray(v).reshape(-1)[0])
 
 
 def _candidate_tickers() -> list[str]:
@@ -410,26 +443,33 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
     # The raw scoring components are kept so action/strength can be derived
     # per-parameter-set at replay time (the sweep varies the thresholds).
     by_time: dict[str, dict[str, dict]] = {}
+    cols = ("time close net bullish bearish trend_up trend_down dist_above "
+            "dist_below atr_stop atr14 weekly_trend_up run_5d run_20d "
+            "run_60d dist_52w_high").split()
+
     for t, df in series.items():
         by_time[t] = {
-            row.time: {
-                "close": float(row.close),
-                "net": float(row.net),
-                "bullish": float(row.bullish),
-                "bearish": float(row.bearish),
-                "trend_up": bool(row.trend_up),
-                "trend_down": bool(row.trend_down),
-                "dist_above": float(row.dist_above),
-                "dist_below": float(row.dist_below),
-                "atr_stop": None if pd.isna(row.atr_stop) else float(row.atr_stop),
-                "atr14": float(row.atr14) if not pd.isna(row.atr14) else None,
-                "weekly_trend_up": bool(row.weekly_trend_up) if not pd.isna(row.weekly_trend_up) else True,
-                "run_5d": None if pd.isna(row.run_5d) else float(row.run_5d),
-                "run_20d": None if pd.isna(row.run_20d) else float(row.run_20d),
-                "run_60d": None if pd.isna(row.run_60d) else float(row.run_60d),
-                "dist_52w_high": None if pd.isna(row.dist_52w_high) else float(row.dist_52w_high),
+            str(time): {
+                "close": _col_f(close),
+                "net": _col_f(net),
+                "bullish": _col_f(bullish),
+                "bearish": _col_f(bearish),
+                "trend_up": _col_b(trend_up),
+                "trend_down": _col_b(trend_down),
+                "dist_above": _col_f(dist_above),
+                "dist_below": _col_f(dist_below),
+                "atr_stop": _col_opt(atr_stop),
+                "atr14": _col_opt(atr14),
+                "weekly_trend_up": True if pd.isna(weekly_trend_up) else _col_b(weekly_trend_up),
+                "run_5d": _col_opt(run_5d),
+                "run_20d": _col_opt(run_20d),
+                "run_60d": _col_opt(run_60d),
+                "dist_52w_high": _col_opt(dist_52w_high),
             }
-            for row in df.itertuples(index=False)
+            for time, close, net, bullish, bearish, trend_up, trend_down,
+                dist_above, dist_below, atr_stop, atr14, weekly_trend_up,
+                run_5d, run_20d, run_60d, dist_52w_high
+            in zip(*(df[c] for c in cols), strict=True)
         }
 
     pf = PaperPortfolio(cash=params.start_cash)
@@ -711,7 +751,7 @@ class _QualityLookup:
         self._cache[month] = out
         return out
 
-    def of(self, day: str) -> callable | None:
+    def of(self, day: str) -> Callable[[str], dict[str, float | None] | None] | None:
         """``quality_of(ticker)`` callable for `day`, or None (feature off)."""
         mmap = self.month_map(day)
         if not mmap:
@@ -754,7 +794,7 @@ def _deterministic_propose_replay(
     prices: dict[str, float],
     day: str,
     params: ReplayParams,
-    quality_of: callable | None = None,
+    quality_of: Callable[[str], dict[str, float | None] | None] | None = None,
 ) -> list[dict]:
     """Propose deterministic trades for one day WITHOUT mutating ``pf``.
 
@@ -908,26 +948,33 @@ async def _hybrid_replay(
         return ReplayResult(params=params)
 
     by_time: dict[str, dict[str, dict]] = {}
+    cols = ("time close net bullish bearish trend_up trend_down dist_above "
+            "dist_below atr_stop atr14 weekly_trend_up run_5d run_20d "
+            "run_60d dist_52w_high").split()
+
     for t, df in series.items():
         by_time[t] = {
-            row.time: {
-                "close": float(row.close),
-                "net": float(row.net),
-                "bullish": float(row.bullish),
-                "bearish": float(row.bearish),
-                "trend_up": bool(row.trend_up),
-                "trend_down": bool(row.trend_down),
-                "dist_above": float(row.dist_above),
-                "dist_below": float(row.dist_below),
-                "atr_stop": None if pd.isna(row.atr_stop) else float(row.atr_stop),
-                "atr14": float(row.atr14) if not pd.isna(row.atr14) else None,
-                "weekly_trend_up": bool(row.weekly_trend_up) if not pd.isna(row.weekly_trend_up) else True,
-                "run_5d": None if pd.isna(row.run_5d) else float(row.run_5d),
-                "run_20d": None if pd.isna(row.run_20d) else float(row.run_20d),
-                "run_60d": None if pd.isna(row.run_60d) else float(row.run_60d),
-                "dist_52w_high": None if pd.isna(row.dist_52w_high) else float(row.dist_52w_high),
+            str(time): {
+                "close": _col_f(close),
+                "net": _col_f(net),
+                "bullish": _col_f(bullish),
+                "bearish": _col_f(bearish),
+                "trend_up": _col_b(trend_up),
+                "trend_down": _col_b(trend_down),
+                "dist_above": _col_f(dist_above),
+                "dist_below": _col_f(dist_below),
+                "atr_stop": _col_opt(atr_stop),
+                "atr14": _col_opt(atr14),
+                "weekly_trend_up": True if pd.isna(weekly_trend_up) else _col_b(weekly_trend_up),
+                "run_5d": _col_opt(run_5d),
+                "run_20d": _col_opt(run_20d),
+                "run_60d": _col_opt(run_60d),
+                "dist_52w_high": _col_opt(dist_52w_high),
             }
-            for row in df.itertuples(index=False)
+            for time, close, net, bullish, bearish, trend_up, trend_down,
+                dist_above, dist_below, atr_stop, atr14, weekly_trend_up,
+                run_5d, run_20d, run_60d, dist_52w_high
+            in zip(*(df[c] for c in cols), strict=True)
         }
 
     pf = PaperPortfolio(cash=params.start_cash)
@@ -1001,6 +1048,7 @@ async def _hybrid_replay(
             # consulted every trading day (the engine makes no proposals, so
             # there is no weekly-review concept). The weekly cadence below
             # only applies to hybrid mode.
+            week = _current_week_from(day)
             if pure_llm:
                 is_review_day = True
             else:
@@ -1009,7 +1057,7 @@ async def _hybrid_replay(
                 # the LLM is consulted at most once per ISO week, anchored to
                 # the week, not a day counter. review_interval=1 still reviews
                 # every week; larger values skip intermediate weeks.
-                week = _current_week_from(day)
+                week: str = _current_week_from(day)
                 if marker_gated:
                     # Marker-gated mode: the deterministic engine's proposals ARE
                     # the marker — an LLM review is only worthwhile when there is
@@ -1106,7 +1154,7 @@ async def _hybrid_replay(
                             _replay_params_to_strategy(params),
                             guarded=True,
                             price_of=lambda t, _prices=prices: _aval(_prices.get(t)),
-                            value_of=lambda t, _prices=prices: _aval(pf.positions.get(t, 0) * _prices.get(t, 0)),
+                            value_of=lambda t, _prices=prices: _val_of(pf, t, _prices),
                             exclude=proposal_tickers,
                         )
                         held_tickers = set(pf.positions.keys())
@@ -1503,7 +1551,8 @@ def _trade_outcomes(
     """
     closes: dict[str, dict[str, float]] = {}
     for t, df in series.items():
-        closes[t] = {row.time: float(row.close) for row in df.itertuples(index=False)}
+        closes[t] = {str(time): _col_f(c)
+                     for time, c in zip(df["time"], df["close"], strict=False)}
 
     portfolio_states = _reconstruct_portfolio_states(trades)
     cases: list[TradeCase] = []
@@ -2310,8 +2359,11 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
     # meaningless, not conservative). Start at the first month with an
     # eligible frame; the 253d momentum warmup needs no extra headroom because
     # eligibility already requires the price history.
-    first_live = next((d for d in months
-                       if frame_cache[d] is not None and frame_cache[d]["eligible"].any()), None)
+    def _live(d: pd.Timestamp) -> bool:
+        f = frame_cache[d]
+        return f is not None and bool(f["eligible"].any())
+
+    first_live = next((d for d in months if _live(d)), None)
     if first_live is None:
         print("No month has eligible names (fundamentals coverage too thin?). "
               "Run the monthly rebalance once to fetch fundamentals, then retry.")
@@ -2332,7 +2384,7 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
         if not names:
             return 0.0
         r = (close.loc[d1].reindex(names) / close.loc[d0].reindex(names) - 1.0).dropna()
-        return float(r.mean()) if len(r) else 0.0
+        return _col_f(r.mean()) if len(r) else 0.0
 
     for i, d in enumerate(months):
         if i > 0:
@@ -2385,6 +2437,19 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
             print(f"  {m}: {', '.join(picks)}")
 
 
+@dataclass
+class BacktestSummary:
+    """Result summary for a daily-core or monthly backtest run. Returned by
+    the backtests so tests and the parameter sweep can consume them without
+    parsing stdout."""
+    irr: float
+    final_value: float
+    contributed: float
+    avg_turnover: float
+    n_trades: int
+    window: tuple[str, str]
+
+
 async def _daily_core_backtest(
     start: str | None,
     end: str | None,
@@ -2395,7 +2460,7 @@ async def _daily_core_backtest(
     exit_cadence: str,
     crash_pause: bool,
     dca: str,
-) -> None:
+) -> BacktestSummary | None:
     """Deterministic "daily-core" backtest: the monthly qv-mom portfolio as the
     FUNDAMENTAL core, with minor candle-driven daily adjustments on top.
 
@@ -2468,8 +2533,11 @@ async def _daily_core_backtest(
         if (i + 1) % 12 == 0:
             logger.info("eligibility %d/%d", i + 1, len(months))
 
-    first_live = next((d for d in months
-                       if frame_cache[d] is not None and frame_cache[d]["eligible"].any()), None)
+    def _live(d: pd.Timestamp) -> bool:
+        f = frame_cache[d]
+        return f is not None and bool(f["eligible"].any())
+
+    first_live = next((d for d in months if _live(d)), None)
     if first_live is None:
         print("No month has eligible names (fundamentals coverage too thin?). "
               "Run the monthly rebalance once to fetch fundamentals, then retry.")
@@ -2500,7 +2568,7 @@ async def _daily_core_backtest(
             return False
         breadth = row.mean()
         r5 = run5_frame.loc[d].dropna()
-        med5 = float(r5.median()) if len(r5) else 0.0
+        med5 = _col_f(r5.median()) if len(r5) else 0.0
         return bool(breadth < 0.60 and med5 < -0.025)
 
     # --- Portfolio state ---
@@ -2521,11 +2589,7 @@ async def _daily_core_backtest(
     cur_month: int | None = None
 
     def px_of(t: str, d: pd.Timestamp) -> float | None:
-        try:
-            p = close.at[d, t]
-        except KeyError:
-            return None
-        return float(p) if pd.notna(p) else None
+        return monthly_mod.px_at(close, d, t)
 
     def trade(d: pd.Timestamp, t: str, side: str, delta_value: float) -> None:
         """Execute one fill at d's close with one-way cost on the notional."""
@@ -2690,12 +2754,12 @@ async def _daily_core_backtest(
                     continue
                 ok = True
                 if entry_gate != "none":
-                    s = sma50_frame.at[d, t] if t in sma50_frame.columns else None
+                    s = px_of_col(sma50_frame, d, t)
                     if entry_gate == "above-sma50":
-                        ok = s is not None and pd.notna(s) and p > float(s)
+                        ok = s is not None and p > s
                     elif entry_gate == "not-crash":
-                        r5 = run5_frame.at[d, t] if t in run5_frame.columns else None
-                        ok = pd.isna(r5) or float(r5) > -0.10
+                        r5 = px_of_col(run5_frame, d, t)
+                        ok = r5 is None or r5 > -0.10
                 if not ok:
                     pending_pick[t] = d  # wait for the gate to open
                     continue
@@ -2713,11 +2777,11 @@ async def _daily_core_backtest(
                 p = px_of(t, d)
                 if p is None:
                     continue
-                s = sma50_frame.at[d, t] if t in sma50_frame.columns else None
-                ok = s is not None and pd.notna(s) and p > float(s)
+                s = px_of_col(sma50_frame, d, t)
+                ok = s is not None and p > s
                 if entry_gate == "not-crash":
-                    r5 = run5_frame.at[d, t]
-                    ok = pd.isna(r5) or float(r5) > -0.10
+                    r5 = px_of_col(run5_frame, d, t)
+                    ok = r5 is None or r5 > -0.10
                 if ok:
                     budget = min(weight, cash)
                     if budget > 1:
@@ -2757,6 +2821,16 @@ async def _daily_core_backtest(
         print("\nLast 15 trades:")
         for td, side, t, notional in trades_log[-15:]:
             print(f"  {td} {side:<4} {t:<10} ${notional:,.0f}")
+
+    return BacktestSummary(
+        irr=irr,
+        final_value=value,
+        contributed=contributed,
+        avg_turnover=(sum(churns) / len(churns)) if churns else 0.0,
+        n_trades=len(trades_log),
+        window=(pd.Timestamp(days_all[0]).strftime("%Y-%m-%d"),
+                pd.Timestamp(last_day).strftime("%Y-%m-%d")),
+    )
 
     # --- Monthly baseline over the same window (for comparison) ---
     print("\n--- Monthly qv-mom baseline over the same window ---")

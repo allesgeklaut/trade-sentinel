@@ -144,9 +144,10 @@ async def gather_news_for_candidates(
 
     result: dict[str, list[dict]] = {}
     for key, val in zip(keys, values, strict=False):
-        if isinstance(val, Exception):
+        if isinstance(val, BaseException):
             logger.warning("news gather failed for '%s': %s", key, val)
             continue
-        if val:
-            result[key] = val
+        news: list[dict] = list(val) if val else []
+        if news:
+            result[key] = news
     return result
