@@ -27,7 +27,7 @@ deployment pass, and writes the daily equity snapshot.
 import asyncio
 import logging
 import math
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 
 import pandas as pd
 from sqlalchemy import func, select
@@ -180,35 +180,69 @@ async def _exec_sell(ticker: str, price: float, reason: str) -> dict | None:
 # The deployment decision
 # ---------------------------------------------------------------------------
 
-# Cache for compute_targets(): the qv-mom ranking needs the full universe's
-# fundamentals + 10y candle frames (multi-second TTM math). The status
-# endpoint calls it on every tab load, so cache the result for a few
-# minutes — the ranking moves at most once a day (fundamentals move
-# quarterly, momentum daily but only at the margin). Invalidated by the
-# deployment cycle computing its own fresh copy.
-_targets_cache: tuple[float, tuple[list[str], list[str], pd.DataFrame | None]] | None = None
-_TARGETS_TTL = 300.0  # seconds
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def _parse_list(col: str) -> list[str]:
+    return [t for t in (col or "").split(",") if t]
+
+
+async def _load_stored_ranking(max_age_days: float = 1.0) -> tuple[list[str], list[str]] | None:
+    """The stored daily ranking, or None when absent/older than a day.
+
+    The fundamentals math runs once per day in the cycle and persists its
+    output to the DailyCoreRanking row; every other consumer reads that.
+    """
+    from .db import DailyCoreRanking
+    async with Session() as s:
+        row = await s.get(DailyCoreRanking, 1)
+    if row is None:
+        return None
+    age = _utcnow() - row.ranking_date.replace(tzinfo=UTC)
+    if age > timedelta(days=max_age_days):
+        return None
+    return _parse_list(row.band), _parse_list(row.picks)
+
+
+async def _store_ranking(band: list[str], picks: list[str]) -> None:
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+    from .db import DailyCoreRanking
+    stmt = sqlite_insert(DailyCoreRanking).values(
+        id=1, ranking_date=_utcnow().replace(tzinfo=None),
+        band=",".join(band), picks=",".join(picks))
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["id"],
+        set_={"ranking_date": stmt.excluded.ranking_date,
+              "band": stmt.excluded.band,
+              "picks": stmt.excluded.picks,
+              "updated_at": stmt.excluded.updated_at})
+    async with Session() as s:
+        await s.execute(stmt)
+        await s.commit()
 
 
 async def compute_targets(force: bool = False) -> tuple[list[str], list[str], pd.DataFrame | None]:
-    """Compute the daily-core target portfolio.
+    """Compute (or read the stored) daily-core target portfolio.
 
     Returns (band, picks, frame): ``band`` is the full hold-band order
     (top ``sim_monthly_hold_band`` ranked tickers — held names stay while
     inside it), ``picks`` the top ``sim_monthly_target_n`` with hysteresis
-    applied. ``frame`` is the eligibility frame (None when no data).
+    applied. ``frame`` is the eligibility frame (None when no data or when
+    the stored ranking was used).
 
-    Cached for _TARGETS_TTL seconds (the status endpoint hits this on every
-    tab load; recomputing the TTM frame each time costs ~7s). ``force``
-    bypasses the cache — the deployment cycle always computes fresh so
-    trades never act on stale rankings.
+    The full-universe fundamentals math is expensive (~7s), so it runs once
+    per day during the daily cycle, which persists the result to the
+    ``daily_core_ranking`` row. Other consumers (status endpoint / UI) read
+    that stored ranking instead of recomputing. ``force=True`` recomputes
+    regardless — used by the deployment cycle and the manual refresh path
+    so trades always act on today's data.
     """
-    global _targets_cache
-    import time as _time
-    if not force and _targets_cache is not None:
-        ts, cached = _targets_cache
-        if _time.monotonic() - ts < _TARGETS_TTL:
-            return cached
+    if not force:
+        stored = await _load_stored_ranking()
+        if stored is not None:
+            band, picks = stored
+            return band, picks, None
     tickers = universe_tickers(settings.sim_monthly_universe)
     fund = await fundamentals_mod.load_fundamentals(tickers)
     if not fund:
@@ -227,7 +261,7 @@ async def compute_targets(force: bool = False) -> tuple[list[str], list[str], pd
         held = [p.ticker for p in (await s.scalars(select(DailyCorePosition))).all()]
     picks = monthly_mod._band_fill(order, held, settings.sim_monthly_target_n,
                                    settings.sim_monthly_hold_band)
-    _targets_cache = (_time.monotonic(), (band, picks, frame))
+    await _store_ranking(band, picks)
     return band, picks, frame
 
 
