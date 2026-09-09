@@ -436,6 +436,25 @@ class DailyCoreSnapshot(Base):
     allowance_total: Mapped[float] = mapped_column(Float, default=0)
 
 
+class DailyCoreRanking(Base):
+    """Latest qv-mom ranking for the daily-core portfolio (singleton row id=1).
+
+    The fundamentals math (full-universe TTM net income, momentum, scoring)
+    runs ONCE per day during the daily cycle — its output is stored here and
+    every other consumer (status endpoint, UI) just reads this row. Before
+    the first cycle of a day (or before the app ever ran a cycle) the row is
+    absent/stale and the status endpoint may compute it on demand.
+    """
+
+    __tablename__ = "daily_core_ranking"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ranking_date: Mapped[datetime] = mapped_column(DateTime)  # as-of date
+    band: Mapped[str] = mapped_column(Text, default="")       # comma-joined hold band (top-20)
+    picks: Mapped[str] = mapped_column(Text, default="")      # comma-joined top-10 with hysteresis
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
 
 def _configure_sqlite_pragmas(dbapi_conn, _record) -> None:
     """Set durability/concurrency pragmas on every new SQLite connection."""

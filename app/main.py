@@ -439,7 +439,12 @@ async def monthly_refresh():
 
 @app.get('/api/dailycore/status')
 async def daily_core_status():
-    """Daily-core portfolio status: valuation + config + today's ranking."""
+    """Daily-core portfolio status: valuation + config + today's ranking.
+
+    Reads the stored daily ranking (computed once per day by the cycle);
+    recomputes on demand only when no fresh one exists (first run after
+    deploy, or the cycle hasn't fired yet today).
+    """
     from . import daily_core
     if settings.sim_daily_core_enabled:
         await daily_core.deposit_allowance()

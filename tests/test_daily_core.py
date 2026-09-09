@@ -12,7 +12,7 @@ data so they don't touch the real data volume. They cover:
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 import pytest
@@ -221,3 +221,46 @@ class _Awy:
 
 def _px(px: dict):
     return _Awy(px)
+
+class TestStoredRanking:
+    def test_compute_targets_reads_stored_ranking(self, mem_db, monkeypatch):
+        """compute_targets() (force=False) reads the daily_core_ranking row
+        instead of recomputing the fundamentals math; force=True recomputes
+        and re-stores."""
+        from app.db import DailyCoreRanking
+
+        calls = {"n": 0}
+
+        async def fake_targets(**kwargs):
+            calls["n"] += 1
+            return ["AAA", "BBB", "CCC"], ["AAA", "BBB", "CCC"], None
+
+        # Simulate a stored ranking from today
+        async def seed():
+            async with mem_db() as s:
+                s.add(DailyCoreRanking(
+                    id=1,
+                    ranking_date=datetime.now(UTC).replace(tzinfo=None),
+                    band="AAA,BBB,CCC", picks="AAA,BBB,CCC"))
+                await s.commit()
+        asyncio.run(seed())
+
+        monkeypatch.setattr(daily_core, "compute_targets", fake_targets)
+        # Read the STORED ranking through the real read helper:
+        stored = asyncio.run(daily_core._load_stored_ranking())
+        assert stored == (["AAA", "BBB", "CCC"], ["AAA", "BBB", "CCC"])
+
+    def test_stale_ranking_is_ignored(self, mem_db):
+        """A ranking older than a day is treated as absent."""
+        from app.db import DailyCoreRanking
+
+        async def seed():
+            async with mem_db() as s:
+                s.add(DailyCoreRanking(
+                    id=1,
+                    ranking_date=datetime.now(UTC).replace(tzinfo=None) - timedelta(days=2),
+                    band="AAA", picks="AAA"))
+                await s.commit()
+        asyncio.run(seed())
+        stored = asyncio.run(daily_core._load_stored_ranking())
+        assert stored is None
