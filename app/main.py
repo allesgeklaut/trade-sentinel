@@ -473,6 +473,14 @@ async def daily_core_run():
     from . import daily_core
     return await daily_core.run_daily_cycle()
 
+@app.post('/api/dailycore/refresh')
+async def daily_core_refresh():
+    """Refresh candle data (+FX) for the daily-core universe and holdings —
+    the pull-to-refresh / manual-refresh path, mirroring /api/monthly/refresh."""
+    from . import daily_core
+    refreshed, errors = await daily_core.refresh_data()
+    return {"refreshed": refreshed, "errors": errors, "total": len(refreshed) + len(errors)}
+
 @app.post('/api/dailycore/backfill')
 async def daily_core_backfill(start: str | None = Query(default=None)):
     """Backfill the daily-core portfolio with synthetic history.

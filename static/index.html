@@ -2031,6 +2031,14 @@
                     const n = r.refreshed.length, errs = r.errors.length;
                     ptrShowResult(errs === 0,
                         errs ? `${n} updated, ${errs} failed` : `Monthly updated (${n} tickers)`);
+                } else if (document.getElementById('dailycore-view').style.display !== 'none') {
+                    // Daily-core view: refresh candles (+FX) for the universe
+                    // and holdings, then re-read status/positions/equity.
+                    const r = await api('dailycore/refresh', { method: 'POST' });
+                    await loadDailyCoreAll();
+                    const n = r.refreshed.length, errs = r.errors.length;
+                    ptrShowResult(errs === 0,
+                        errs ? `${n} updated, ${errs} failed` : `Daily-core updated (${n} tickers)`);
                 }
                 await new Promise(r => setTimeout(r, 1200));
                 ptrReset();
