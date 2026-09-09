@@ -1565,13 +1565,19 @@
             <div class="bench-label">ACTIONS</div>
             <div class="sim-actions">
                 <button id="dailycore-run-btn" onclick="runDailyCore()">Run Cycle Now</button>
-                <button id="dailycore-backfill-btn" onclick="backfillDailyCore()">Backfill History</button>
+                <button id="dailycore-backfill-btn" onclick="backfillDailyCore()">Backfill (sync with other sims)</button>
+                <input type="date" id="dailycore-backfill-date" title="Optional: replay from this date instead"
+                    onchange="document.getElementById('dailycore-backfill-all').checked = !!this.value">
+                <label style="font-size:12px;color:#7aaa81;display:flex;align-items:center;gap:4px">
+                    <input type="checkbox" id="dailycore-backfill-all"> full history
+                </label>
             </div>
             <div id="dailycore-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
             <div style="margin-top:6px;font-size:11px;color:#7aaa81">
                 Backfill replays the strategy over stored history and replaces this portfolio's state —
-                synthetic trades, not a live track record. Use once to give the equity curve the same
-                depth as the other tabs.
+                synthetic trades, not a live track record. Default: starts where the other sims start so
+                all three equity curves cover the same window. Pick a date or tick "full history" (2017+)
+                for the long-view replay.
             </div>
         </div>
     </section>
@@ -2778,11 +2784,14 @@
         async function backfillDailyCore() {
             const btn = document.getElementById('dailycore-backfill-btn');
             const status = document.getElementById('dailycore-run-status');
+            const dateVal = document.getElementById('dailycore-backfill-date').value;
+            const allHist = document.getElementById('dailycore-backfill-all').checked;
+            const qs = allHist ? '?start=all' : (dateVal ? `?start=${dateVal}` : '');
             btn.disabled = true;
-            status.textContent = 'Backfilling… (replays the strategy over all stored history — can take a few minutes)';
+            status.textContent = 'Backfilling… (replays the strategy over stored history — can take a few minutes)';
             try {
-                const r = await api('dailycore/backfill', { method: 'POST' });
-                status.textContent = `Backfilled ${r.days} trading days (${r.start} → ${r.end}): ` +
+                const r = await api('dailycore/backfill' + qs, { method: 'POST' });
+                status.textContent = `Backfilled ${r.days} trading days (${r.start} → ${r.end}, from ${r.requested_start}): ` +
                     `${r.snapshots} equity points, ${r.trades} trades, final equity $${r.final_equity.toFixed(2)}.`;
                 loadDailyCoreAll();
             } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
