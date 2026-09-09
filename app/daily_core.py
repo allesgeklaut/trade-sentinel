@@ -397,8 +397,14 @@ async def backfill(start: str | None = None) -> dict:
 
         cur_month: int | None = None
         for d in idx:
-            month_td = months[-1] if d > months[-1] else next(
-                (m for m in months if m >= d), months[-1])
+            # Point-in-time discipline: each day uses the ranking of the most
+            # recent month-end AT OR BEFORE d (the frame computed from facts
+            # public by then). Using a future month-end's frame would leak
+            # look-ahead into the replay.
+            prior = [m for m in months if m <= d]
+            if not prior:
+                continue  # before the first completed month-end — no ranking yet
+            month_td = prior[-1]
             frame = frame_cache.get(month_td)
             order: list[str] = []
             if frame is not None and bool(frame["eligible"].any()):
