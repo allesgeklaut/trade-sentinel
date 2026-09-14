@@ -2493,6 +2493,118 @@ async def reset_benchmark() -> None:
     logger.info("Benchmark reset")
 
 
+async def backfill_benchmark(start: str | None = None) -> dict[str, Any]:
+    """Replay the DCA benchmark over historical URTH candles and REPLACE the
+    benchmark state with the replay's end state.
+
+    The benchmark has no decisions to approximate: each month's allowance is
+    deposited on the month's FIRST trading day and fully invested at that
+    day's close (the live _benchmark_deposit_and_buy rule). Fetches the
+    benchmark ticker's full available candle history first (the cache only
+    carries ~2y by default), so the synthetic curve matches the other
+    backfills' window.
+
+    ``start``: "YYYY-MM-DD" to replay from that date, "all" for the full
+    candle history of the ticker, or omit (default) to synch with the other
+    sims (earliest monthly/daily-core snapshot).
+    """
+    from sqlalchemy import delete as sa_delete
+    from .db import Candle, SimBenchmarkAccount as Acc
+    from .market import refresh as market_refresh
+
+    async with _run_cycle_lock:
+        ticker = settings.sim_benchmark_ticker
+        try:
+            await market_refresh(ticker, "max")
+        except Exception as e:
+            logger.warning("Benchmark backfill: could not refresh %s (%s) — using cache", ticker, e)
+
+        async with Session() as s:
+            rows = (await s.scalars(select(Candle).where(Candle.ticker == ticker)
+                                    .order_by(Candle.timestamp))).all()
+        if not rows:
+            return {"ok": False, "error": f"no candles for {ticker}"}
+
+        dates = pd.DatetimeIndex([r.timestamp.replace(tzinfo=None) for r in rows])
+        closes = pd.Series([r.close for r in rows], index=dates)
+
+        if start is None:
+            start = await _sync_start_date()
+        elif start == "all":
+            start = None
+        start_note = start or "first candle"
+        if start:
+            closes = closes[closes.index >= pd.Timestamp(start)]
+        if closes.empty:
+            return {"ok": False, "error": f"no candles since {start_note}"}
+
+        # DCA replay: deposit on each month's first trading day, buy at that
+        # day's close (same rule as the live engine; no fees for the ETF).
+        amount = settings.sim_monthly_allowance
+        shares = 0.0
+        cash = 0.0  # cumulative deposited (the account's contributed total)
+        avg_cost = 0.0
+        snaps: list[tuple[datetime, float, float, float, float]] = []
+        seen_months: set[str] = set()
+        n_buys = 0
+        for ts in closes.index:
+            px = float(closes.loc[ts])
+            day = pd.Timestamp(ts)
+            month = day.strftime("%Y-%m")
+            if month not in seen_months:
+                seen_months.add(month)
+                cash += amount
+                new_shares = amount / px if px > 0 else 0.0
+                avg_cost = (shares * avg_cost + amount) / (shares + new_shares) \
+                    if (shares + new_shares) > 0 else px
+                shares += new_shares
+                n_buys += 1
+            snaps.append((day.to_pydatetime(), shares, px,
+                          round(shares * px, 2), round(cash, 2)))
+
+        if not snaps:
+            return {"ok": False, "error": "no days in window"}
+
+        # The live engine may already have deposited the CURRENT month while
+        # the replay window ends before it (e.g. backfill on the 1st) — the
+        # wipe would destroy that allowance, so preserve the marker and the
+        # deposit (same rule as the other backfills).
+        async with Session() as s:
+            acc0 = await s.get(Acc, 1)
+            live_month = acc0.last_allowance_month if acc0 else None
+            current_month = _current_month()
+            extra = 0.0
+            if live_month == current_month and current_month not in seen_months:
+                # no candle for today's month yet: book the live deposit at
+                # the last close (the live engine's next cycle will buy it)
+                px = float(closes.iloc[-1])
+                if px > 0:
+                    cash += amount
+                    avg_cost = (shares * avg_cost + amount) / (shares + amount / px) \
+                        if (shares + amount / px) > 0 else px
+                    shares += amount / px
+                    extra = amount
+            await s.execute(sa_delete(SimBenchmarkSnapshot))
+            await s.execute(sa_delete(Acc))
+            acc = Acc(id=1, cash=round(cash, 2), shares=round(shares, 6),
+                      avg_cost=round(avg_cost, 6),
+                      last_allowance_month=live_month or current_month)
+            s.add(acc)
+            for d, sh, _px, eq, contrib in snaps:
+                s.add(SimBenchmarkSnapshot(
+                    shares=round(sh, 6), price=0.0, total_equity=eq,
+                    allowance_total=contrib,
+                    created_at=d))
+            await s.commit()
+
+        return {"ok": True, "ticker": ticker, "days": len(snaps),
+                "start": snaps[0][0].strftime("%Y-%m-%d"),
+                "end": snaps[-1][0].strftime("%Y-%m-%d"),
+                "requested_start": start or "first candle",
+                "contributed": round(cash, 2), "final_equity": snaps[-1][3],
+                "n_buys": n_buys, "extra_current_month": round(extra, 2)}
+
+
 # ---------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------

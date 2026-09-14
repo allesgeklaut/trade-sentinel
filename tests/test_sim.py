@@ -2453,3 +2453,57 @@ class TestSimBackfill:
         monkeypatch.setattr(llm_mod, "chat_stream", _explode, raising=False)
         r = await sim.backfill(start="2025-03-01")
         assert r["ok"] is True
+
+    async def test_benchmark_backfill_replaces_state(self, mem_db, monkeypatch):
+        """The DCA replay deposits on each month's first candle, buys at that
+        close, and persists daily snapshots + the end-state account."""
+        from unittest.mock import patch
+
+        import pandas as pd
+        from sqlalchemy import select as sa_select
+
+        from app.db import Candle, SimBenchmarkAccount, SimBenchmarkSnapshot
+
+        dates = pd.bdate_range("2025-03-01", "2025-04-30")
+        candles = [
+            Candle(ticker="URTH", timestamp=ts.to_pydatetime(), open=100.0,
+                   high=101.0, low=99.0, close=float(100 + i * 0.1), volume=1e6)
+            for i, ts in enumerate(dates)
+        ]
+
+        async def fake_refresh(ticker, period):
+            return None
+
+        async def fake_sync_start():
+            return None
+
+        # _load candles come from the mem_db (Candle rows inserted above)
+        async def seed():
+            async with mem_db() as s:
+                for c in candles:
+                    s.add(c)
+                await s.commit()
+        await seed()
+
+        monkeypatch.setattr(sim, "_current_month", lambda: "2025-04")
+        with patch("app.market.refresh", fake_refresh), \
+             patch.object(sim, "_sync_start_date", fake_sync_start):
+            r = await sim.backfill_benchmark(start="2025-03-01")
+        assert r["ok"] is True
+        assert r["n_buys"] == 2  # March + April
+        assert r["contributed"] == 2 * settings.sim_monthly_allowance
+
+        async def check():
+            async with mem_db() as s:
+                acc = await s.get(SimBenchmarkAccount, 1)
+                assert acc is not None
+                # 2 deposits fully invested; price rose -> equity > contributed
+                assert acc.shares > 0
+                assert r["final_equity"] > r["contributed"] * 0.99
+                snaps = (await s.scalars(sa_select(SimBenchmarkSnapshot))).all()
+                assert len(snaps) == r["days"]
+                # contributed steps at the first trading day of each month
+                by_day = {x.created_at.strftime("%Y-%m-%d"): x.allowance_total for x in snaps}
+                assert by_day["2025-03-03"] == settings.sim_monthly_allowance  # first bday
+                assert by_day["2025-04-01"] == 2 * settings.sim_monthly_allowance
+        await check()

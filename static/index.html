@@ -1468,6 +1468,7 @@
             <div class="sim-actions">
                 <button id="sim-run-btn" onclick="runSim()">Run Bot Now</button>
                 <button id="sim-backfill-btn" onclick="backfillSim()">Backfill (deterministic, no LLM)</button>
+                <button id="sim-backfill-bench-btn" onclick="backfillBenchmark()">Backfill DCA Benchmark</button>
                 <button onclick="resetSim()">Reset Sim</button>
             </div>
             <div id="sim-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
@@ -3764,6 +3765,25 @@
             if (!confirm('Reset simulation? This clears all trades, positions, and equity history.')) return;
             try { await api('sim/reset', { method: 'POST' }); } catch (e) { /* ignore */ }
             loadSimAll();
+        }
+
+        async function backfillBenchmark() {
+            // Replaces the DCA benchmark's state with a synthetic replay of
+            // the dead-simple rule ($1000/month into URTH at the first
+            // trading day's close). Destructive for the bench curve only.
+            if (!confirm('Backfill REPLACES the DCA benchmark curve with a synthetic replay ($1000/month into ' + 'the benchmark ETF at each month\'s first close). Continue?'))
+                return;
+            const btn = document.getElementById('sim-backfill-bench-btn');
+            const status = document.getElementById('sim-run-status');
+            btn.disabled = true;
+            status.textContent = 'Backfilling DCA benchmark… (fetches full ETF history first — can take a minute)';
+            try {
+                const r = await api('sim/backfill-benchmark', { method: 'POST' });
+                status.textContent = `Benchmark backfilled: ${r.days} days (${r.start} → ${r.end}), ` +
+                    `${r.n_buys} monthly buys, contributed $${r.contributed.toFixed(2)}, final equity $${r.final_equity.toFixed(2)}.`;
+                await loadSimAll();
+            } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
+            btn.disabled = false;
         }
 
         async function backfillSim() {

@@ -383,6 +383,17 @@ async def sim_backfill(start: str | None = Query(default=None)):
         raise HTTPException(400, r.get("error", "backfill failed"))
     return r
 
+@app.post('/api/sim/backfill-benchmark')
+async def sim_backfill_benchmark(start: str | None = Query(default=None)):
+    """Backfill the DCA benchmark curve (URTH $1000/month) over historical
+    candles. The twin of the other backfills so all four curves can cover
+    the same window. ``start``: date | "all" | default = synced."""
+    from . import sim
+    r = await sim.backfill_benchmark(start)
+    if not r.get("ok"):
+        raise HTTPException(400, r.get("error", "backfill failed"))
+    return r
+
 @app.get('/api/sim/reasoning')
 async def sim_reasoning():
     """Return structured LLM reasoning summary from the most recent sim cycle."""
