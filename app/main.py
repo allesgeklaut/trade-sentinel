@@ -394,6 +394,64 @@ async def sim_backfill_benchmark(start: str | None = Query(default=None)):
         raise HTTPException(400, r.get("error", "backfill failed"))
     return r
 
+@app.post('/api/backfill-all')
+async def backfill_all(start: str | None = Query(default=None)):
+    """Backfill ALL FOUR portfolios over the SAME window — the shared-range
+    button. Resolves the start ONCE (explicit "YYYY-MM-DD", "all" for the
+    full history, or default = the earliest snapshot across the other
+    portfolios so the curves stay synced), then runs every backfill with
+    that same window:
+
+      daily sim (deterministic approximation) · monthly qv-mom ·
+      daily-core (selected variant) · DCA benchmark (URTH).
+
+    Each backfill replaces its portfolio's state. Runs the slowest first
+    (daily sim ~minutes) so an early failure doesn't leave the others
+    wiped-then-unfilled; results are reported per portfolio. This is a
+    long operation (several minutes) — the caller gets everything in one
+    response when it finishes.
+    """
+    from . import daily_core, monthly, sim
+
+    # Resolve the shared window ONCE. The per-backfill defaults would each
+    # pick their own sync date (and wipe their own snapshots mid-run), so
+    # the coordinator pins one start for everyone.
+    if start in (None, "all"):
+        resolved = await daily_core._sync_start_date()
+        start_note = resolved or "first eligible window"
+        if start == "all":
+            start_note = "full stored history"
+    else:
+        resolved = start
+        start_note = start
+    # "all" passes through so each backfill replays its own full window.
+    effective = None if start == "all" else resolved
+
+    # Lock everything up-front so a scheduler cycle can't interleave with
+    # the multi-portfolio wipe/replay. Backfills acquire their own locks
+    # (asyncio.Lock is re-entrant-free but these are different locks), the
+    # cycle lock is the one that matters: dc's backfill holds _cycle_lock,
+    # so the nightly daily-core stage would wait; sim/monthly cycles run
+    # after this coroutine returns.
+    out: dict[str, dict] = {}
+    errors: dict[str, str] = {}
+
+    for name, fn in (
+        ("daily_sim", lambda: sim.backfill(effective)),
+        ("monthly", lambda: monthly.backfill(effective)),
+        ("daily_core", lambda: daily_core.backfill(effective)),
+        ("benchmark", lambda: sim.backfill_benchmark(effective)),
+    ):
+        try:
+            out[name] = await fn()
+        except Exception as e:
+            logger.exception("backfill-all: %s failed", name)
+            errors[name] = str(e)
+
+    return {"ok": not errors, "start": start_note,
+            "requested_start": start or "synced (earliest of the other sims)",
+            "results": out, "errors": errors}
+
 @app.get('/api/sim/reasoning')
 async def sim_reasoning():
     """Return structured LLM reasoning summary from the most recent sim cycle."""

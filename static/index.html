@@ -1634,13 +1634,15 @@
                 <button id="dailycore-run-btn" onclick="runDailyCore()">Run Cycle Now</button>
                 <select id="dailycore-variant" title="Momentum variant used by the ranking — the next cycle and every backfill honor it"
                     onchange="setDCVariant(this.value)" style="max-width:260px"></select>
-                <button id="dailycore-backfill-btn" onclick="backfillDailyCore()">Backfill (sync with other sims)</button>
+                <button id="dailycore-backfill-btn" onclick="backfillDailyCore()">Backfill (daily-core only)</button>
                 <input type="date" id="dailycore-backfill-date" title="Optional: replay from this date instead"
                     onchange="if(this.value) document.getElementById('dailycore-backfill-all').checked = false">
                 <label style="font-size:12px;color:#7aaa81;display:flex;align-items:center;gap:4px">
                     <input type="checkbox" id="dailycore-backfill-all"
                         onchange="if(this.checked) document.getElementById('dailycore-backfill-date').value = ''"> full history
                 </label>
+                <button id="backfill-all-btn" onclick="backfillAll()"
+                    title="Backfill ALL FOUR portfolios (daily sim, monthly, daily-core, DCA benchmark) over the same window — the date/full-history inputs apply to all">Backfill All 4 (synced)</button>
             </div>
             <div id="dailycore-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
             <div style="margin-top:6px;font-size:11px;color:#7aaa81">
@@ -3033,6 +3035,36 @@
                     await loadDailyCoreAll();  // reload BEFORE re-enabling so
                     // the button never becomes clickable on stale data (#22)
                 }
+            } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
+            btn.disabled = false;
+        }
+
+        async function backfillAll() {
+            // One action, four portfolios, ONE shared window: the date /
+            // full-history inputs here apply to every backfill.
+            const dateVal = document.getElementById('dailycore-backfill-date').value;
+            const allHist = document.getElementById('dailycore-backfill-all').checked;
+            const qs = dateVal ? `?start=${dateVal}` : (allHist ? '?start=all' : '');
+            const rangeDesc = dateVal ? `from ${dateVal}` : (allHist ? 'over FULL history' : 'synced (earliest shared window)');
+            if (!confirm(`Backfill ALL FOUR portfolios (daily sim, monthly, daily-core, DCA benchmark) ${rangeDesc}?\n\nEach backfill REPLACES that portfolio's state — this takes several minutes.`))
+                return;
+            const btn = document.getElementById('backfill-all-btn');
+            const status = document.getElementById('dailycore-run-status');
+            btn.disabled = true;
+            status.textContent = `Backfilling ALL portfolios ${rangeDesc}… (several minutes)`;
+            try {
+                const r = await api('backfill-all' + qs, { method: 'POST' });
+                const parts = [];
+                for (const [name, r2] of Object.entries(r.results || {})) {
+                    parts.push(r2.ok ? `${name}: $${(r2.final_equity ?? 0).toFixed(0)}` : `${name}: FAILED`);
+                }
+                const errNames = Object.keys(r.errors || {});
+                status.textContent = `All-backfills done (${r.start}): ` + parts.join(' · ')
+                    + (errNames.length ? ` — ERRORS: ${errNames.join(', ')}` : '');
+                dcRange = 'MAX';
+                for (const b of document.querySelectorAll('#dc-range-bar .range-btn'))
+                    b.classList.toggle('range-active', b.dataset.range === 'MAX');
+                await loadDailyCoreAll();
             } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
             btn.disabled = false;
         }
