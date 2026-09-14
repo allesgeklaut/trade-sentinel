@@ -326,7 +326,7 @@ def strength_for(action: str, bullish: float, bearish: float) -> int:
 
 def snapshot_from_row(x, net: float, bullish: float, bearish: float,
                       strength: int, weekly_trend_up: bool,
-                      vol_surge: bool, atr_stop: float) -> dict:
+                      vol_surge: bool, atr_stop: float | None) -> dict:
     """Build the snapshot dict from a signal_series row + derived values.
 
     Single source of truth for the snapshot shape — used by ``compute``

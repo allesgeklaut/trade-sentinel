@@ -91,8 +91,8 @@ async def symbols(q:str=Query(min_length=2,max_length=80)):
     except ValueError as e: raise HTTPException(400,str(e)) from e
     except Exception as e: raise HTTPException(502,f"{provider()} symbol search failed: {e}") from e
 @app.post('/api/refresh/{ticker}')
-async def fetch(ticker:str, period:str=None):
-    try: await refresh(ticker.upper(), period); return {"ok":True}
+async def fetch(ticker:str, period:str|None=None):
+    try: await refresh(ticker.upper(), period or "2y"); return {"ok":True}
     except Exception as e: raise HTTPException(400,str(e)) from e
 
 @app.post('/api/refresh-watchlist')
@@ -110,7 +110,7 @@ async def sim_refresh(period: str = "2y"):
     refreshed, errors = await refresh_many(tickers, period)
     return {"refreshed": refreshed, "errors": errors, "total": len(tickers)}
 @app.get('/api/dashboard/{ticker}')
-async def dashboard(ticker:str, period:str=None):
+async def dashboard(ticker:str, period:str|None=None):
     # Always fetch the full cached dataset — indicators need >=206 candles
     all_rows = await candles(ticker.upper())
     candles_for_chart = list(all_rows)
@@ -436,6 +436,77 @@ async def monthly_refresh():
     pairs = sorted({pm[0] for t in held if (pm := monthly.fundamentals_mod._suffix_fx(t))})
     refreshed, errors = await refresh_many(held + pairs, "2y")
     return {"refreshed": refreshed, "errors": errors}
+
+@app.get('/api/dailycore/status')
+async def daily_core_status():
+    """Daily-core portfolio status: valuation + config + today's ranking.
+
+    Reads the stored daily ranking (computed once per day by the cycle);
+    recomputes on demand only when no fresh one exists (first run after
+    deploy, or the cycle hasn't fired yet today).
+    """
+    from . import daily_core
+    if settings.sim_daily_core_enabled:
+        await daily_core.deposit_allowance()
+    val = await daily_core.valuate()
+    band, picks, _frame = await daily_core.compute_targets()
+    return {
+        "valuation": val,
+        "sim_daily_core_enabled": settings.sim_daily_core_enabled,
+        "band": band,
+        "picks": picks,
+    }
+
+@app.get('/api/dailycore/trades')
+async def daily_core_trades(limit: int = Query(default=100, ge=1, le=500)):
+    from . import daily_core
+    return await daily_core.get_trades(limit)
+
+@app.get('/api/dailycore/equity')
+async def daily_core_equity(limit: int = Query(default=365, ge=1, le=1000)):
+    from . import daily_core
+    return await daily_core.get_equity_curve(limit)
+
+@app.post('/api/dailycore/run')
+async def daily_core_run():
+    """Manually trigger one daily-core cycle (idempotent; lock-guarded)."""
+    from . import daily_core
+    return await daily_core.run_daily_cycle()
+
+@app.post('/api/dailycore/refresh')
+async def daily_core_refresh():
+    """Refresh candle data for the daily-core portfolio's holdings (+ FX
+    pairs) so valuation/equity use current prices — the pull-to-refresh
+    path, mirroring /api/monthly/refresh. The universe-wide refresh stays
+    in the nightly cycle."""
+    from . import daily_core
+    from .db import DailyCorePosition
+    from sqlalchemy import select
+    async with Session() as s:
+        held = [p.ticker for p in (await s.scalars(select(DailyCorePosition))).all()]
+    pairs = sorted({pm[0] for t in held
+                    if (pm := daily_core.monthly_mod.fundamentals_mod._suffix_fx(t))})
+    refreshed, errors = await refresh_many(held + pairs, "2y")
+    return {"refreshed": refreshed, "errors": errors, "total": len(refreshed) + len(errors)}
+
+@app.post('/api/dailycore/backfill')
+async def daily_core_backfill(start: str | None = Query(default=None)):
+    """Backfill the daily-core portfolio with synthetic history.
+
+    Replays the winning strategy (qv-mom ranking + daily rank deployment)
+    over stored candles/fundamentals to today and REPLACES the portfolio
+    state with the replay's end state.
+
+    ``start``: "YYYY-MM-DD" to replay from that date, "all" for the full
+    stored history, or omit (default) to synch with the other sims — the
+    replay starts on the earliest snapshot date of the daily sim / monthly
+    portfolios so all three equity curves cover the same window.
+    """
+    from . import daily_core
+    r = await daily_core.backfill(start)
+    if not r.get("ok"):
+        raise HTTPException(400, r.get("error", "backfill failed"))
+    return r
 
 @app.post('/api/sim/chat')
 async def sim_chat_endpoint(req: ChatRequest):

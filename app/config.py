@@ -66,6 +66,22 @@ class Settings(BaseSettings):
     sim_llm_minimal_prompt: bool = False  # use the minimal system prompt (no methodology/regime rules)
     sim_llm_mode_aware_prompt: bool = False  # use the mode-aware minimal prompt (engine owns exits; LLM adds BUYs only)
     sim_llm_failure_marker: bool = False  # hybrid: consult the LLM only on engine failure (stop-out cascade / drawdown)
+    # Fundamentals context (daily sim): show point-in-time ROE % and P/FCF per
+    # candidate in the LLM's signals table. Missing fundamentals render as "-"
+    # (neutral); the table is omitted entirely when off (zero prompt change).
+    sim_llm_fundamentals_context: bool = False
+    # Quality guard (daily sim): block BUY entries for names with KNOWN
+    # non-positive ROE. Missing fundamentals stay neutral (ETFs like GLD,
+    # thin coverage) — only known-bad data blocks. Opt-in until the replay
+    # A/B verdict (bull-window right-tail cost is the known risk class).
+    sim_block_negative_roe: bool = False
+    # Daily-core rank deployment: boost factor for the #1-ranked name's target
+    # weight, decaying linearly to 1.0 at the band edge (rank N gets exactly
+    # the equal weight). 0.5 = top name may hold 1.5x the equal weight while
+    # the 10th holds 1.0x. Only used by the daily-core backtest --dca rank.
+    # Default 0.0 = flat equal-weight targets, the measured winner (experiment
+    # doc §10); the live run_deployment is flat too.
+    sim_monthly_rank_boost: float = 0.0
     sim_run_hour: int = 22
     sim_run_minute: int = 30
 
@@ -90,6 +106,14 @@ class Settings(BaseSettings):
     sim_monthly_min_history_days: int = 253  # trading days of valid closes required
     sim_monthly_cost_oneway: float = 0.0010  # paper friction, one-way bps on notional swapped
     sim_monthly_fundamentals_source: str = "edgar"  # edgar (US filers) + yfinance fallback | yfinance-only
+
+    # --- Daily-core portfolio (qv-mom core + daily cash deployment) ---------
+    # §10 A/B winner: monthly qv-mom ranking decides WHAT to own (same
+    # top-N hysteresis, no stops); candles only deploy cash daily into the
+    # top-ranked names toward equal weight. Measured +3.4..+7.5pp IRR over
+    # the monthly sim on 2020-2026 windows (cash-drag elimination); positive
+    # out-of-sample on all four walk-forward windows (see §10).
+    sim_daily_core_enabled: bool = True
 
     model_config = SettingsConfigDict(
         env_file=".env",

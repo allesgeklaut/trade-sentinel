@@ -17,13 +17,17 @@ import logging
 import math
 from datetime import datetime, timedelta, UTC
 from zoneinfo import ZoneInfo
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import delete, func, select
 
+import pandas as pd
+
 from .analysis import compute
 from .config import settings
 from . import llm as llm_mod
+from . import monthly as monthly_mod
 from .db import (
     SimAccount,
     SimAllowance,
@@ -356,9 +360,41 @@ async def _exec_sell(ticker: str, price: float, shares: float | None, reason: st
         }
 
 
+async def _quality_map(tickers: list[str]) -> dict[str, dict[str, float | None]]:
+    """Point-in-time quality snapshot {ticker: {"roe", "p_fcf"}} for candidates.
+
+    Reuses the monthly portfolio's fundamentals (EDGAR-first facts, already
+    refreshed monthly) — no new network calls. Tickers without fundamentals
+    (ETFs, thin coverage) are simply absent. DB-only work.
+    """
+    from .fundamentals import load_fundamentals
+    from .monthly import quality_snapshot
+
+    fund = await load_fundamentals(tickers)
+    if not fund:
+        return {}
+    iso_today = _utcnow().strftime("%Y-%m-%d")
+    today: pd.Timestamp = pd.Timestamp(iso_today)  # type: ignore[assignment]
+    # USD-converted closes so P/FCF market caps are comparable (same
+    # convention as the monthly strategy's decision frames).
+    close, _ = await monthly_mod.load_frames(tickers, None)
+    out: dict[str, dict[str, float | None]] = {}
+    for t in fund:
+        px = None
+        if t in close.columns and len(close):
+            series = close[t].dropna()
+            if len(series):
+                px = float(series.iloc[-1])
+        q = quality_snapshot(fund, t, today, px)
+        if q is not None:
+            out[t] = q
+    return out
+
+
 async def _deterministic_propose(
     valuation: dict[str, Any],
     signals: dict[str, dict] | None = None,
+    quality_of: Callable[[str], dict[str, float | None] | None] | None = None,
 ) -> list[dict]:
     """Propose deterministic trades WITHOUT executing them.
 
@@ -418,10 +454,15 @@ async def _deterministic_propose(
         # rationale. Set the env vars to 0 to disable.
         min_run_5d=settings.sim_min_run_5d,
         max_dist_above=settings.sim_max_dist_above,
+        # Quality guard: block entries into names with KNOWN non-positive
+        # ROE. Missing fundamentals stay neutral (ETFs, thin coverage).
+        # Opt-in via SIM_BLOCK_NEGATIVE_ROE until the replay A/B verdict.
+        block_negative_roe=settings.sim_block_negative_roe,
         relaxed_hold_strength=40,
         relaxed_hold_limit=3,
     )
-    return propose_trades(positions, valuation["cash"], prices, signals, sp)
+    return propose_trades(positions, valuation["cash"], prices, signals, sp,
+                          quality_of=quality_of)
 
 
 async def _execute_proposed(proposals: list[dict]) -> list[dict]:
@@ -444,7 +485,8 @@ async def _execute_proposed(proposals: list[dict]) -> list[dict]:
         # BUY: re-check the max-positions cap against the live DB state, so
         # a SELL earlier in this same list frees a slot for the next BUY.
         async with Session() as s:
-            open_count = await s.scalar(select(func.count()).select_from(SimPosition))
+            open_count = await s.scalar(
+                select(func.count()).select_from(SimPosition)) or 0
             held = await s.scalar(select(SimPosition).where(SimPosition.ticker == p["ticker"]))
         if open_count >= settings.sim_max_positions and held is None:
             continue  # at cap and this is a new position — skip
@@ -454,7 +496,8 @@ async def _execute_proposed(proposals: list[dict]) -> list[dict]:
     return executed
 
 
-async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
+async def _deterministic_decide(valuation: dict[str, Any],
+                                quality_of: Callable[[str], dict[str, float | None] | None] | None = None) -> list[dict]:
     """Rule-based strategy: propose + execute deterministic trades.
 
     Thin wrapper over ``_deterministic_propose`` + ``_execute_proposed`` so
@@ -462,8 +505,22 @@ async def _deterministic_decide(valuation: dict[str, Any]) -> list[dict]:
     strategy calls the two halves separately so the LLM can review proposals
     before they execute.
     """
-    proposals = await _deterministic_propose(valuation)
+    proposals = await _deterministic_propose(valuation, quality_of=quality_of)
     return await _execute_proposed(proposals)
+
+
+def _quality_lookup(
+    quality: dict[str, dict[str, float | None]] | None,
+) -> Callable[[str], dict[str, float | None] | None] | None:
+    """Turn a quality map into the ``quality_of(ticker)`` callable that
+    ``strategy.propose_trades`` expects. None map -> None (feature off)."""
+    if quality is None:
+        return None
+
+    def _lookup(ticker: str) -> dict[str, float | None] | None:
+        return quality.get(ticker.upper())
+
+    return _lookup
 
 
 # ---------------------------------------------------------------------------
@@ -811,6 +868,7 @@ def _build_llm_context(
     trade_history: list[dict] | None = None,
     minimal: bool = False,
     max_positions: int = 0,
+    quality: dict[str, dict[str, float | None]] | None = None,
 ) -> str:
     """Build the compact context string sent to the LLM.
 
@@ -831,6 +889,14 @@ def _build_llm_context(
     ``max_positions`` overrides the reported position cap (0 = use
     ``settings.sim_max_positions``) so the LLM sees the raised cap when the
     caller grants it extra slots above the deterministic engine's limit.
+
+    ``quality`` is an optional ``{ticker: {"roe": float|None, "p_fcf":
+    float|None}}`` map (point-in-time, same math as the monthly qv-mom
+    scoring). When provided (SIM_LLM_FUNDAMENTALS_CONTEXT=true), two columns
+    are added to the signals table: ``roe`` (TTM net income / equity, in %)
+    and ``p/fcf`` (market cap / TTM free cash flow). Missing fundamentals
+    render as ``-`` (neutral: ETFs, thin coverage). When None the table is
+    unchanged (zero prompt delta when the feature is off).
     """
     from .news import format_news_for_context, format_market_news_for_context
 
@@ -954,9 +1020,15 @@ def _build_llm_context(
 
     if shown:
         atr_col = " {'atrStop':>9}" if pure_llm else ""
+        # Fundamentals columns (SIM_LLM_FUNDAMENTALS_CONTEXT=true): ROE in %,
+        # P/FCF as a multiple. "-" = no fundamentals (neutral — ETFs, thin
+        # coverage), NOT bad quality.
+        q_cols = quality is not None
+        roe_hdr = " {'roe%':>7}" if q_cols else ""
+        pfcf_hdr = " {'p/fcf':>7}" if q_cols else ""
         lines.append(
             f"{'ticker':<10} {'action':<6} {'strength':>8} "
-            f"{'close':>10} {'rsi':>6} {'rsiΔ3':>6} {'adx':>5} {'wk':>3} {'macd':>10} {'mhΔ3':>7} {'run5d':>6} {'run20d':>7} {'run60d':>7} {'hi52d':>6}{atr_col}"
+            f"{'close':>10} {'rsi':>6} {'rsiΔ3':>6} {'adx':>5} {'wk':>3} {'macd':>10} {'mhΔ3':>7} {'run5d':>6} {'run20d':>7} {'run60d':>7} {'hi52d':>6}{roe_hdr}{pfcf_hdr}{atr_col}"
         )
         for ticker, sig in shown:
             snap = sig.get("snapshot", {})
@@ -975,12 +1047,19 @@ def _build_llm_context(
             run60_s = f"{run60:+.1f}%" if run60 is not None else "  -  "
             dist52_s = f"{dist52:+.1f}%" if dist52 is not None else "  -  "
             atr_s = f"{atr_stop:>9.2f}" if pure_llm and atr_stop is not None else ""
+            roe_s = pfcf_s = ""
+            if q_cols:
+                q = (quality or {}).get(ticker) or {}
+                roe = q.get("roe")
+                pfcf = q.get("p_fcf")
+                roe_s = f"{roe * 100:>7.1f}" if roe is not None else "      -"
+                pfcf_s = f"{pfcf:>7.1f}" if pfcf is not None else "      -"
             lines.append(
                 f"{ticker:<10} {sig['action']:<6} {sig['strength']:>8} "
                 f"{(snap.get('close') or 0):>10.2f} {(snap.get('rsi') or 0):>6.1f} "
                 f"{rsi_d_s:>6} "
                 f"{(snap.get('adx') or 0):>5.0f} {wk:>3} "
-                f"{(snap.get('macd') or 0):>10.3f} {mh_d_s:>7} {run5_s:>6} {run20_s:>7} {run60_s:>7} {dist52_s:>6}{atr_s}"
+                f"{(snap.get('macd') or 0):>10.3f} {mh_d_s:>7} {run5_s:>6} {run20_s:>7} {run60_s:>7} {dist52_s:>6}{roe_s}{pfcf_s}{atr_s}"
             )
     else:
         lines.append("(no signals available)")
@@ -1228,6 +1307,7 @@ async def _llm_review_proposals(
     proposals: list[dict],
     signals: dict[str, dict],
     news: dict[str, list[dict]] | None = None,
+    quality: dict[str, dict[str, float | None]] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Hybrid flow: let the LLM review deterministic proposals before they execute.
 
@@ -1254,7 +1334,8 @@ async def _llm_review_proposals(
 
     context = _build_llm_context(valuation, proposals, signals, news,
                                 minimal=settings.sim_llm_minimal_prompt
-                                or settings.sim_llm_mode_aware_prompt)
+                                or settings.sim_llm_mode_aware_prompt,
+                                quality=quality)
     backend = await llm_mod.current_backend()
 
     system_prompt = (_LLM_MODE_AWARE_MINIMAL_PROMPT if settings.sim_llm_mode_aware_prompt
@@ -1269,9 +1350,10 @@ async def _llm_review_proposals(
         content = out["text"]
     except Exception as e:
         err_detail = f"{type(e).__name__}: {e}"
-        if hasattr(e, 'response'):
+        resp = getattr(e, 'response', None)
+        if resp is not None:
             try:
-                err_detail += f" | status={e.response.status_code} body={e.response.text[:300]}"
+                err_detail += f" | status={resp.status_code} body={resp.text[:300]}"
             except Exception:
                 pass
         logger.warning("LLM review failed [%s] (backend=%s, model=%s); executing all proposals",
@@ -1383,6 +1465,7 @@ async def _llm_decide(
     signals: dict[str, dict] | None = None,
     news: dict[str, list[dict]] | None = None,
     pure_llm: bool = False,
+    quality: dict[str, dict[str, float | None]] | None = None,
 ) -> list[dict]:
     """LLM strategy: let an LLM decide what to buy/sell.
 
@@ -1424,7 +1507,8 @@ async def _llm_decide(
     context = _build_llm_context(valuation, deterministic_trades, signals, news,
                                 pure_llm=pure_llm, trade_history=recent_trades,
                                 minimal=settings.sim_llm_minimal_prompt
-                                or settings.sim_llm_mode_aware_prompt)
+                                or settings.sim_llm_mode_aware_prompt,
+                                quality=quality)
     backend = await llm_mod.current_backend()
 
     try:
@@ -1435,9 +1519,10 @@ async def _llm_decide(
         content = out["text"]
     except Exception as e:
         err_detail = f"{type(e).__name__}: {e}"
-        if hasattr(e, 'response'):
+        resp = getattr(e, 'response', None)
+        if resp is not None:
             try:
-                err_detail += f" | status={e.response.status_code} body={e.response.text[:300]}"
+                err_detail += f" | status={resp.status_code} body={resp.text[:300]}"
             except Exception:
                 pass
         mode = "pure-LLM" if pure_llm else "hybrid"
@@ -1729,9 +1814,17 @@ async def run_cycle() -> dict[str, Any]:
 
             # 4. Decide & trade
             strategy = settings.sim_strategy.lower()
+            # Fundamentals quality map (SIM_LLM_FUNDAMENTALS_CONTEXT /
+            # SIM_BLOCK_NEGATIVE_ROE): point-in-time ROE + P/FCF per candidate
+            # from the monthly portfolio's EDGAR-first fact store — DB-only,
+            # no new network calls. Empty when both features are off.
+            quality: dict[str, dict[str, float | None]] | None = None
+            if settings.sim_llm_fundamentals_context or settings.sim_block_negative_roe:
+                _set_progress("quality", "Loading fundamentals quality map", started_at=started_at)
+                quality = await _quality_map(tickers)
             if strategy == "deterministic":
                 _set_progress("decide", "Deterministic engine deciding", started_at=started_at)
-                trades = await _deterministic_decide(valuation)
+                trades = await _deterministic_decide(valuation, quality_of=_quality_lookup(quality))
                 _last_deterministic_trades = trades
             elif strategy == "llm":
                 _set_progress("signals", "Gathering signals", started_at=started_at)
@@ -1742,7 +1835,8 @@ async def run_cycle() -> dict[str, Any]:
                 # and the engine's hard sizing limits (min-cash floor,
                 # max-position-%, max-positions cap) size every BUY.
                 _set_progress("decide", "LLM deciding (pure-LLM strategy)", started_at=started_at)
-                trades = await _llm_decide(valuation, [], signals, news, pure_llm=True)
+                trades = await _llm_decide(valuation, [], signals, news, pure_llm=True,
+                                           quality=quality if settings.sim_llm_fundamentals_context else None)
                 _last_deterministic_trades = []
             elif strategy == "hybrid":
                 # Hybrid with a weekly review: the deterministic engine runs
@@ -1802,7 +1896,7 @@ async def run_cycle() -> dict[str, Any]:
                     )
                 if not is_review_cycle:
                     _set_progress("decide", "Deterministic engine deciding (LLM review off-cycle)", started_at=started_at)
-                    trades = await _deterministic_decide(valuation)
+                    trades = await _deterministic_decide(valuation, quality_of=_quality_lookup(quality))
                     _last_deterministic_trades = trades
                     _last_llm_vetoes = []
                 else:
@@ -1810,9 +1904,11 @@ async def run_cycle() -> dict[str, Any]:
                     signals = await _gather_signals(tickers)
                     news = await _gather_news(signals)
                     _set_progress("propose", "Deterministic engine proposing", started_at=started_at)
-                    proposals = await _deterministic_propose(valuation, signals)
+                    proposals = await _deterministic_propose(valuation, signals,
+                                                             quality_of=_quality_lookup(quality))
                     _set_progress("decide", "LLM reviewing proposals (hybrid)", started_at=started_at)
-                    trades, vetoed = await _llm_review_proposals(valuation, proposals, signals, news)
+                    trades, vetoed = await _llm_review_proposals(valuation, proposals, signals, news,
+                                                                 quality=quality if settings.sim_llm_fundamentals_context else None)
                     _last_deterministic_trades = proposals
                     _last_llm_vetoes = vetoed
                     # Mark the week as reviewed — no more LLM calls until the
@@ -2230,6 +2326,62 @@ _scheduler_task: asyncio.Task | None = None
 _daily_snapshot_task: asyncio.Task | None = None
 
 
+async def _scheduler_tick() -> None:
+    """One scheduler wake: monthly rebalance, then the daily sim cycle, then
+    the daily-core cycle.
+
+    Factored out of ``_scheduler_loop`` (which only sleeps between ticks) so
+    the "each stage runs independently" behaviour is unit-testable. A stage
+    that is skipped or fails must not prevent the later stages from running.
+    """
+    # Monthly qv-mom portfolio first: it only acts on the last trading
+    # day of the month, and a missed month has no catch-up — it must run
+    # even when the daily cycle is skipped below (a manual run holding
+    # the lock at wake time), or the whole month is silently missed.
+    try:
+        from .monthly import run_monthly_cycle
+        monthly_result = await run_monthly_cycle()
+        if monthly_result.get("skipped"):
+            logger.info("Monthly scheduler: skipped — %s", monthly_result.get("reason"))
+        else:
+            logger.info("Monthly rebalance complete: %d trades", len(monthly_result.get("trades", [])))
+    except Exception as e:
+        logger.error("Monthly rebalance failed: %s", e, exc_info=True)
+
+    try:
+        # Skip if a manual run is in flight (e.g. the user clicked "Run
+        # Bot Now" shortly before the scheduled time). The lock check in
+        # run_cycle() also guards against this, but checking here too
+        # avoids logging a confusing "skipped — already running" entry
+        # every scheduled night a manual run overlaps. NOTE: this must not
+        # skip the daily-core stage below — it runs regardless.
+        if _run_cycle_lock.locked():
+            logger.info("Sim scheduler: skipping scheduled run — a cycle is already in progress")
+        else:
+            result = await run_cycle()
+            if result.get("skipped"):
+                logger.info("Sim scheduler: run_cycle skipped — %s", result.get("reason"))
+            else:
+                logger.info("Sim cycle complete: %d trades", len(result["trades"]))
+    except Exception as e:
+        logger.error("Sim cycle failed: %s", e, exc_info=True)
+
+    # Daily-core portfolio last: it depends on the freshly refreshed
+    # candles above (fundamental ranking + daily deployment) and must
+    # not race the monthly rebalance. Runs every trading day the
+    # scheduler fires — that's the whole point (daily cash deployment).
+    try:
+        from .daily_core import run_daily_cycle
+        dc_result = await run_daily_cycle()
+        if dc_result.get("skipped"):
+            logger.info("Daily-core scheduler: skipped — %s", dc_result.get("reason"))
+        else:
+            logger.info("Daily-core cycle complete: %d trades",
+                        len(dc_result.get("deployment", {}).get("trades", [])))
+    except Exception as e:
+        logger.error("Daily-core cycle failed: %s", e, exc_info=True)
+
+
 async def _scheduler_loop():
     """Background loop that runs the sim cycle daily at sim_run_hour UTC."""
     while True:
@@ -2243,36 +2395,7 @@ async def _scheduler_loop():
         logger.info("Sim scheduler: next run at %s (in %.0f seconds)", target, wait_seconds)
         await asyncio.sleep(wait_seconds)
 
-        # Monthly qv-mom portfolio first: it only acts on the last trading
-        # day of the month, and a missed month has no catch-up — it must run
-        # even when the daily cycle is skipped below (a manual run holding
-        # the lock at wake time), or the whole month is silently missed.
-        try:
-            from .monthly import run_monthly_cycle
-            monthly_result = await run_monthly_cycle()
-            if monthly_result.get("skipped"):
-                logger.info("Monthly scheduler: skipped — %s", monthly_result.get("reason"))
-            else:
-                logger.info("Monthly rebalance complete: %d trades", len(monthly_result.get("trades", [])))
-        except Exception as e:
-            logger.error("Monthly rebalance failed: %s", e, exc_info=True)
-
-        try:
-            # Skip if a manual run is in flight (e.g. the user clicked "Run
-            # Bot Now" shortly before the scheduled time). The lock check in
-            # run_cycle() also guards against this, but checking here too
-            # avoids logging a confusing "skipped — already running" entry
-            # every scheduled night a manual run overlaps.
-            if _run_cycle_lock.locked():
-                logger.info("Sim scheduler: skipping scheduled run — a cycle is already in progress")
-                continue
-            result = await run_cycle()
-            if result.get("skipped"):
-                logger.info("Sim scheduler: run_cycle skipped — %s", result.get("reason"))
-            else:
-                logger.info("Sim cycle complete: %d trades", len(result["trades"]))
-        except Exception as e:
-            logger.error("Sim cycle failed: %s", e, exc_info=True)
+        await _scheduler_tick()
 
 
 async def _daily_monthly_snapshot_loop():

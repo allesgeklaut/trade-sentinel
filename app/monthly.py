@@ -199,6 +199,19 @@ def load_frames_sync(tickers: list[str], rows: list, asof: datetime | None = Non
     return close, vol
 
 
+def px_at(frame: pd.DataFrame, d: pd.Timestamp, ticker: str) -> float | None:
+    """Scalar close lookup: frame.at[d, ticker] as a float, None when the
+    cell is missing or NaN. Shared by the live engines and the backtests so
+    the pandas scalar typing quirk is handled in exactly one place."""
+    try:
+        p = frame.at[d, ticker]
+    except KeyError:
+        return None
+    if pd.isna(p):
+        return None
+    return float(np.asarray(p).reshape(-1)[0])
+
+
 async def load_frames(tickers: list[str], asof: datetime | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """(close, volume) DataFrames {date: {ticker: value}} from the candles
     cache, loaded in a thread. Foreign-listing closes are converted to USD at
@@ -242,11 +255,22 @@ def eligible_frame(rebal_date: pd.Timestamp, close: pd.DataFrame, vol: pd.DataFr
 
     rows: dict[str, dict[str, float | None]] = {}
     for t in hist.columns:
-        if not valid[t].iloc[-1]:
+        # Value each ticker at its last VALID close <= asof, not strictly at
+        # the asof day's close. The month-end rebalance runs after the US
+        # close so behavior there is unchanged (the last valid close IS the
+        # asof-day close). But an asof day where a market simply hasn't
+        # closed yet (daily-core runs intraday, holidays where one market
+        # trades and the other doesn't) must not silently drop every ticker
+        # of that market from the ranking — it did: on 2026-09-09 the frame
+        # contained only the 11 European names that had already closed,
+        # flipping the top-10 from US to European names overnight.
+        vpos = valid[t].to_numpy(dtype=bool)
+        last_valid = int(np.max(np.nonzero(vpos))) if vpos.any() else -1
+        if last_valid < 0:
             continue
         if int(n_valid[t]) < settings.sim_monthly_min_history_days:
             continue
-        price = float(hist[t].iloc[-1])
+        price = float(c[t].iloc[last_valid])
         rec = fundamentals.get(t)
         if not rec:
             continue
@@ -292,6 +316,54 @@ def eligible_frame(rebal_date: pd.Timestamp, close: pd.DataFrame, vol: pd.DataFr
         & (df["mom"] > -0.99)
     )
     return df
+
+
+def quality_snapshot(fund: dict[str, dict[str, list[dict]]], ticker: str,
+                     asof: pd.Timestamp, close: float | None = None,
+                     ) -> dict[str, float | None] | None:
+    """Point-in-time quality metrics for one ticker, as of `asof`.
+
+    Returns {"roe": float|None, "p_fcf": float|None} or None when the ticker
+    has no fundamentals at all (ETFs, no-CIK listings, thin coverage — the
+    caller treats None as "unknown", NOT as bad quality).
+
+    ROE = TTM net income / latest stockholders' equity (None when equity <= 0
+    or NI missing). P/FCF = market cap / TTM FCF, where market cap uses the
+    `close` price (pass the USD-converted close so foreign listings compare)
+    and TTM FCF = OCF + capex (capex conventionally negative; falls back to
+    OCF alone). None values mean "not computable", never "bad".
+
+    Reuses the same as-of helpers as the monthly qv-mom scoring, so the daily
+    sim sees exactly the numbers the monthly strategy would compute.
+    """
+    rec = fund.get(ticker)
+    if not rec:
+        return None
+
+    roe: float | None = None
+    eq = _latest_as_of(rec.get("StockholdersEquity", []), asof)
+    ni = _ttm_as_of(rec.get("NetIncomeLoss", []), asof)
+    if eq and eq[1] > 0 and ni is not None:
+        roe = ni / eq[1]
+
+    p_fcf: float | None = None
+    ocf = _ttm_as_of(rec.get("NetCashProvidedByUsedInOperatingActivities", []), asof)
+    capex = _ttm_as_of(rec.get("PaymentsToAcquirePropertyPlantAndEquipment", []), asof)
+    fcf = None
+    if ocf is not None and capex is not None:
+        fcf = ocf + capex  # capex is conventionally negative
+    elif ocf is not None:
+        fcf = ocf  # conservative fallback: OCF alone
+    if fcf is not None and fcf > 0 and close is not None and close > 0:
+        sh = _latest_as_of(
+            rec.get("CommonStockSharesOutstanding", [])
+            + rec.get("EntityCommonStockSharesOutstanding", []),
+            asof,
+        )
+        if sh is not None and sh[1] > 0:
+            p_fcf = (close * sh[1]) / fcf
+
+    return {"roe": roe, "p_fcf": p_fcf}
 
 
 def _band_fill(order: list[str], holdings: list[str], target_n: int, hold_band: int) -> list[str]:
@@ -434,14 +506,16 @@ async def monthly_valuate() -> dict[str, Any]:
 
 def _fx_close_series(rows: list, asof: pd.Timestamp | None = None) -> pd.Series:
     """FX pair closes from candle rows as a naive-UTC-indexed Series."""
-    s = pd.Series(dtype=float)
+    pairs: dict[pd.Timestamp, float] = {}
     for r in rows:
         ts = pd.Timestamp(r.timestamp)
         if ts.tzinfo is not None:
             ts = ts.tz_localize(None)
         if asof is None or ts <= asof:
-            s[ts] = r.close
-    return s.sort_index() if len(s) else s
+            pairs[ts] = float(r.close)
+    if not pairs:
+        return pd.Series(dtype=float)
+    return pd.Series(pairs, dtype=float).sort_index()
 
 
 def _convert_usd(price: float, ts: pd.Timestamp, fx: pd.Series, mode: str) -> float:
@@ -454,9 +528,12 @@ def _convert_usd(price: float, ts: pd.Timestamp, fx: pd.Series, mode: str) -> fl
         rate = rate.copy()
         rate.index = idx.tz_localize(None)
     r = rate.asof(ts)
-    if r is None or pd.isna(r) or r == 0:
+    if r is None:
         return price
-    return price * float(r) if mode == "mul" else price / float(r)
+    rf = float(np.asarray(r).reshape(-1)[0])
+    if np.isnan(rf) or rf == 0:
+        return price
+    return price * rf if mode == "mul" else price / rf
 
 
 async def _price_usd_map(tickers: list[str]) -> dict[str, float | None]:

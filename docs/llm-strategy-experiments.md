@@ -188,3 +188,85 @@ numbers from long windows are contaminated and should not be trusted.
   the market shifts back to the 2025-10→2026-08 chop pattern.
 - The walkforward sweep prefers ATR stops (7/17) over the live percent-15
   (6/17); differences were small but worth a dedicated look someday.
+
+## 10. Fundamentals-first daily engine ("daily-core") — 2026-09-09
+
+Owner's design: the monthly qv-mom ranking IS the portfolio (fundamentals
+decide WHAT to own); candles only make minor WHEN adjustments. Deterministic
+only — LLM overlays are a separate experiment (§ earlier: LLM context columns
+and the ROE guard stay flag-gated off; the context arm measured inside noise
+on the chop window, the guard cost right-tail returns).
+
+New tool: `app.optimize daily-core` — monthly qv-mom core with candle-driven
+overlays. All-defaults ≈ the monthly baseline (sanity check built in; the
+report prints both side by side on the same window).
+
+### Review fixes (commit 7a95861)
+- pending_cash stranding: a zero-new-picks month never deployed the
+  contribution; all modes now release it at the month-end rebuild
+- month-end rebuild restores picks to equal weight (baseline semantics)
+- turnover reporting was always 0; now (buys+sells)/2 / equity at month start
+- dead code removal (is_month_end, duplicate run5_frame line)
+
+### Review fixes (commit 2dd5f05) — re-measured A/B
+
+A code review found the backtest deposited contributions only on month-end
+days, so `pending_cash` was dead and `--dca daily/rank` never saw intra-month
+cash — the "cash-drag elimination" premise was not actually being measured.
+The contribution now arrives on the **first trading day of the month** (as the
+live engine and `backfill` already did) and the fee is reserved inside BUY
+spends. The monthly baseline is unchanged; only the daily/rank arms moved.
+The tables below were re-run on 2026-09-14 (data through 2026-09-11), so the
+numbers that stood here before are superseded.
+
+### Cash-deployment A/B (IRR/yr, diversified-plus, $1k/mo, re-run 2026-09-14)
+
+| Window | monthly sim | daily-core defaults | rank daily, boost=0 | rank boost=0.25 |
+|---|---|---|---|---|
+| 2020-01..2023-01 (bear) | 2.67% | 3.81% | **6.10%** | 5.56% |
+| 2022-01..2026-09 (mixed) | 43.44% | 44.66% | 47.43% | **47.59%** |
+| 2023-01..2026-09 (bull) | 46.55% | 49.02% | **54.04%** | 53.16% |
+
+### Walk-forward (non-overlapping OOS windows, boost=0 vs 0.25)
+
+| Window | monthly sim | rank b0 | rank b0.25 |
+|---|---|---|---|
+| 2017-2019 | 13.41% | **17.66%** | 15.35% |
+| 2020-2021 | 37.28% | 49.99% | **50.83%** |
+| 2022-2023 | 26.03% | 26.69% | **29.96%** |
+| 2024-2026 | 41.73% | 49.53% | **50.09%** |
+
+### Findings
+
+1. **Daily rank deployment beats the monthly sim on every window tested** —
+   in-sample +3.4 / +4.0 / +7.5pp on the 2020-2026 windows, and out-of-sample
+   on all four walk-forward windows (+4.3 / +12.7 / +0.7 / +7.8pp at boost=0).
+   The edge is cash-drag elimination: fresh contributions arrive on the first
+   trading day and deploy immediately instead of parking ~2 weeks, so the
+   momentum concentration is preserved instead of diluted.
+2. **Boost is inconclusive — keep flat (boost=0).** boost=0 wins 2 of the 3
+   in-sample windows and the earliest OOS window by 2.3pp; boost=0.25 wins
+   the other three OOS windows but the mean tilt edge is only ~+0.6pp — inside
+   noise. Flat targets are simpler, lower single-name concentration, and match
+   the live `run_deployment`. Revisit only if more OOS windows confirm a tilt.
+3. **Equal-weight pro-rata drip loses badly** (-8pp IRR): spreading fresh
+   cash across all holdings rebalances into laggards. Daily cash must go to
+   the TOP of the ranking (or the most underweight), never spread.
+   (Architectural conclusion; not re-run in the 2dd5f05 sweep.)
+4. **Entry timing is mode-dependent under the corrected model** — in-sample
+   `above-sma50` is a no-op for rank, costs ~6pp for `dca=daily`, and is
+   roughly neutral for `dca=monthly`; `not-crash` is a no-op. Leave gates off.
+5. **Exit cadence is irrelevant** — the hysteresis band is sticky; daily
+   release ≈ monthly release (top configs tie exactly on final value).
+
+### Config note
+
+`rank boost=0.0` ≈ "deploy daily into the top-ranked names toward equal
+weight". The monthly sim's structural edge survives only its ranking; its
+monthly cadence is a (small, consistent) cost.
+
+**Live config (re-measured 2026-09-14):** `run_deployment` already deploys
+flat rank-first targets and deposits the allowance at month start, so the
+corrected backtest now models production. No live config change was required
+— the walk-forward confirms the deployed rule beats the monthly baseline
+out-of-sample in every window.

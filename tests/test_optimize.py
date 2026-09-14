@@ -9,6 +9,7 @@ from __future__ import annotations
 import random
 from datetime import datetime, timedelta
 
+import pandas as pd
 import pytest
 
 from app import optimize
@@ -1123,11 +1124,11 @@ class TestLlmWalkforwardWindows:
 
         calls = []
 
-        def fake_det(series, params, start=None, end=None):
+        def fake_det(series, params, start=None, end=None, **_):
             calls.append(("det", start, end))
             return ReplayResult(params=params)
 
-        async def fake_llm(series, params, start=None, end=None, pure_llm=False, news=None, review_interval=1, veto_only=False, no_llm_sells=False, minimal_prompt=False, mode_aware=False, llm_max_positions=0, marker_gated=False, failure_marker=False, failure_stop_outs=2, failure_drawdown=7.0):
+        async def fake_llm(series, params, start=None, end=None, pure_llm=False, news=None, review_interval=1, veto_only=False, no_llm_sells=False, minimal_prompt=False, mode_aware=False, llm_max_positions=0, marker_gated=False, failure_marker=False, failure_stop_outs=2, failure_drawdown=7.0, **_):
             calls.append(("llm", start, end))
             return ReplayResult(params=params)
 
@@ -1157,11 +1158,11 @@ class TestLlmWalkforwardWindows:
         # overlaps the 3rd at the front. We get 4 windows total.
         all_days = [f"2025-01-{i:02d}" for i in range(1, 91)]
 
-        def fake_det(series, params, start=None, end=None):
+        def fake_det(series, params, start=None, end=None, **_):
             from app.optimize import ReplayResult
             return ReplayResult(params=params)
 
-        async def fake_llm(series, params, start=None, end=None, pure_llm=False, news=None, review_interval=1, veto_only=False, no_llm_sells=False, minimal_prompt=False, mode_aware=False, llm_max_positions=0, marker_gated=False, failure_marker=False, failure_stop_outs=2, failure_drawdown=7.0):
+        async def fake_llm(series, params, start=None, end=None, pure_llm=False, news=None, review_interval=1, veto_only=False, no_llm_sells=False, minimal_prompt=False, mode_aware=False, llm_max_positions=0, marker_gated=False, failure_marker=False, failure_stop_outs=2, failure_drawdown=7.0, **_):
             from app.optimize import ReplayResult
             return ReplayResult(params=params)
 
@@ -1288,3 +1289,204 @@ class TestReviewInterval:
             f"expected 3 LLM calls (once per calendar week) with "
             f"review_interval=1, got {call_count[0]}"
         )
+
+
+class TestDailyCoreMonthlyParity:
+    """The daily-core backtest with all knobs at their defaults
+    (dca="monthly", entry-gate="none", exit-cadence="monthly",
+    crash-pause off) must track the monthly qv-mom baseline over the
+    same window — same ranking brain, similar deployment cadence. This
+    is the automated guard for the class of sim/live parity bugs we
+    found by hand in the backfill (snapshot stamps, month-end ranking,
+    ffill valuation, fee-inside-spend)."""
+
+    @pytest.fixture
+    def synthetic_market(self, monkeypatch):
+        """Patch monthly.load_frames + fundamentals.load_fundamentals with
+        deterministic synthetic frames: 20 tickers, ~3 years of daily
+        closes with one clear cross-sectional momentum spread (some
+        strong uptrenders, some flattish) so the ranking is stable and
+        the hysteresis band actually churns."""
+        import numpy as np
+        import pandas as pd
+
+        from app import fundamentals as fundamentals_mod
+        from app import monthly as monthly_mod
+
+        rng = np.random.default_rng(123)
+        tickers = [f"T{i:02d}" for i in range(20)]
+        n_days = 900
+        dates = pd.bdate_range("2022-01-03", periods=n_days)
+        # per-ticker drift from +0.10%/day to -0.05%/day: creates a
+        # persistent ranking
+        drifts = np.linspace(0.0010, -0.0004, len(tickers))
+        closes = {}
+        for t, drift in zip(tickers, drifts, strict=False):
+            r = rng.normal(drift, 0.010, n_days)
+            closes[t] = 50.0 * np.exp(np.cumsum(r))
+        close = pd.DataFrame(closes, index=dates)
+        vol = pd.DataFrame(5e6, index=dates, columns=tickers)
+        fund = {
+            t: {
+                "StockholdersEquity": [{"start": None, "end": "2021-12-31",
+                                        "filed": "2022-02-15", "val": 5e9}],
+                "NetIncomeLoss": [{"start": "2021-01-01", "end": "2021-12-31",
+                                   "filed": "2022-02-15", "val": 5e8}],
+                "CommonStockSharesOutstanding": [{"start": None, "end": "2021-12-31",
+                                                  "filed": "2022-02-15", "val": 1e8}],
+                "NetCashProvidedByUsedInOperatingActivities": [
+                    {"start": "2021-01-01", "end": "2021-12-31",
+                     "filed": "2022-02-15", "val": 1e9}],
+                "PaymentsToAcquirePropertyPlantAndEquipment": [
+                    {"start": "2021-01-01", "end": "2021-12-31",
+                     "filed": "2022-02-15", "val": -2e8}],
+            }
+            for t in tickers
+        }
+
+        async def fake_load_frames(_tickers, _asof):
+            return close, vol
+
+        async def fake_load_fundamentals(_tickers):
+            return fund
+
+        monkeypatch.setattr(monthly_mod, "load_frames", fake_load_frames)
+        monkeypatch.setattr(fundamentals_mod, "load_fundamentals", fake_load_fundamentals)
+        return {"tickers": tickers, "close": close}
+
+    async def test_defaults_track_monthly_baseline(self, synthetic_market,
+                                                    monkeypatch, capsys):
+        import app.optimize as opt
+
+        # capture both summaries while keeping the printed report
+        summaries: dict[str, object] = {}
+        real_daily = opt._daily_core_backtest
+        real_monthly = opt._monthly_backtest
+
+        async def daily(*a, **k):
+            r = await real_daily(*a, **k)
+            summaries["daily"] = r
+            return r
+
+        async def monthly(*a, **k):
+            r = await real_monthly(*a, **k)
+            summaries["monthly"] = r
+            return r
+
+        monkeypatch.setattr(opt, "_daily_core_backtest", daily)
+        monkeypatch.setattr(opt, "_monthly_backtest", monthly)
+        await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "monthly")
+        d, m = summaries["daily"], summaries["monthly"]
+        assert d is not None and m is not None
+
+        # Same window (the daily backtest prints the baseline for the
+        # same span), same contributions
+        assert d.contributed == m.contributed
+        # Both must actually be invested and growing: with monthly $200
+        # contributions, the money multiple stays close to 1 (recent
+        # contributions haven't compounded), so assert growth over 1.0
+        # and an IRR that reflects the +0.10%/day drift spread.
+        assert d.final_value / d.contributed > 1.05
+        assert m.final_value / m.contributed > 1.05
+        assert d.irr > 0.05 and m.irr > 0.05
+        # The IRRs must track each other: the deployment semantics
+        # differ slightly (underweight top-up vs pro-rata 1/N), so the
+        # test allows a 5pp/yr tolerance — a real parity bug (ranking
+        # divergence, wrong month-end rule, fee handling) blows far
+        # past that.
+        assert abs(d.irr - m.irr) < 0.05, (
+            f"daily-core defaults IRR {d.irr:.2%} vs monthly baseline "
+            f"{m.irr:.2%} — deployment parity broken?"
+        )
+        # Turnover in the same ballpark (< 2x of baseline)
+        assert d.avg_turnover < m.avg_turnover * 2 + 0.05
+
+
+class TestFillBuy:
+    """The daily-core BUY fill must reserve the one-way fee inside the spend
+    so a full-cash buy can never drive cash negative (milestone parity with
+    daily_core.backfill's do_buy)."""
+
+    def test_full_cash_buy_never_negative(self):
+        fill = optimize._fill_buy(cash=1000.0, price=50.0,
+                                  delta_value=5000.0, cost=0.001)
+        assert fill is not None
+        notional, shares, cash_after = fill
+        assert cash_after >= 0.0
+        assert notional == pytest.approx(1000.0 / 1.001)
+        assert shares == pytest.approx(notional / 50.0)
+
+    def test_partial_buy_keeps_cash_positive(self):
+        fill = optimize._fill_buy(cash=1000.0, price=50.0,
+                                  delta_value=300.0, cost=0.001)
+        assert fill is not None
+        notional, _shares, cash_after = fill
+        assert notional == 300.0
+        assert cash_after == pytest.approx(1000.0 - 300.0 - 0.3)
+
+    def test_too_small_returns_none(self):
+        assert optimize._fill_buy(cash=0.5, price=50.0,
+                                  delta_value=10.0, cost=0.001) is None
+
+    def test_zero_cash_returns_none(self):
+        assert optimize._fill_buy(cash=0.0, price=50.0,
+                                  delta_value=10.0, cost=0.001) is None
+
+
+class TestContributionDays:
+    """Contributions must arrive on the first trading day of each month, not
+    only at the month-end rebuild — otherwise the "daily" deployment modes
+    never see intra-month cash and the A/B can't measure the cash-drag
+    elimination it claims."""
+
+    def test_first_trading_day_of_each_month(self):
+        days = pd.DatetimeIndex(["2025-01-15", "2025-01-31",
+                                 "2025-02-03", "2025-02-28"])
+        months = [pd.Timestamp("2025-01-31"), pd.Timestamp("2025-02-28")]
+        got = optimize._contribution_days(days, months)
+        assert got == {pd.Timestamp("2025-01-15"), pd.Timestamp("2025-02-03")}
+
+    def test_starts_mid_month_still_deposits(self):
+        # The window starts mid-month: the month still gets its contribution,
+        # on the first day the window sees (matching the monthly baseline's
+        # one contribution for that month-end).
+        days = pd.DatetimeIndex(["2025-01-15", "2025-01-31"])
+        months = [pd.Timestamp("2025-01-31")]
+        assert optimize._contribution_days(days, months) == {pd.Timestamp("2025-01-15")}
+
+    def test_one_contribution_per_month_key(self):
+        days = pd.DatetimeIndex(["2024-12-30", "2025-01-02", "2025-01-31",
+                                 "2025-02-03", "2025-02-28"])
+        months = [pd.Timestamp("2024-12-31"), pd.Timestamp("2025-01-31"),
+                  pd.Timestamp("2025-02-28")]
+        got = optimize._contribution_days(days, months)
+        assert len(got) == 3
+
+
+class TestMonthPriceMap:
+    """The P/FCF price scale must be the month's FIRST close (point-in-time),
+    not its last — the old last-close map let an early-month decision use a
+    later price."""
+
+    def test_uses_first_close_of_month(self):
+        idx = pd.DatetimeIndex(["2025-01-02", "2025-01-15", "2025-01-31",
+                                "2025-02-03", "2025-02-28"])
+        close = pd.DataFrame({"AAA": [10.0, 11.0, 12.0, 20.0, 25.0]}, index=idx)
+        m = optimize._month_price_map(close)
+        assert m["2025-01"]["AAA"] == 10.0   # first close, not 12.0 (last)
+        assert m["2025-02"]["AAA"] == 20.0   # first close, not 25.0 (last)
+
+    def test_skips_nan(self):
+        idx = pd.DatetimeIndex(["2025-01-02", "2025-01-15"])
+        close = pd.DataFrame({"AAA": [float("nan"), 11.0]}, index=idx)
+        assert optimize._month_price_map(close)["2025-01"]["AAA"] == 11.0
+
+
+class TestRankBoostDefault:
+    def test_default_is_flat(self):
+        # §10 measured boost=0 as the winner and the live deployment is flat;
+        # the default must not silently run the losing 0.5 config.
+        from app.config import settings
+        assert settings.sim_monthly_rank_boost == 0.0

@@ -23,13 +23,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import json
 import logging
 import math
+import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
+from collections.abc import Callable
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import delete as sa_delete, func, select
 
@@ -59,6 +64,11 @@ logger = logging.getLogger("trade_sentinel.optimize")
 async def _aval(value: float | None) -> float | None:
     """Wrap a sync value as an awaitable for plan_llm_buys' async callbacks."""
     return value
+
+
+async def _val_of(pf: PaperPortfolio, t: str, prices: dict[str, float]) -> float:
+    """Value currently held in `t` (0.0 when unheld) as an awaitable."""
+    return float(pf.positions.get(t, 0) * prices.get(t, 0))
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +199,11 @@ class ReplayParams:
     # Block BUYs into parabolic extensions: dist_above SMA200 > this %.
     # 0 = disabled.
     max_dist_above: float = 0.0
+    # Quality guard: block BUY entries for names with KNOWN non-positive ROE.
+    # Missing fundamentals stay neutral (ETFs, thin coverage). Requires the
+    # caller to pass a quality lookup (see _QualityLookup). Off by default
+    # until the replay A/B verdict.
+    block_negative_roe: bool = False
 
 
 # Sector groupings for the global-large-cap universe. Used by the sector
@@ -349,7 +364,33 @@ async def _load_regime(ticker: str) -> dict[str, bool]:
     } for r in rows])
     df["sma200"] = df["close"].rolling(200).mean()
     df["uptrend"] = df["close"] > df["sma200"]
-    return {row.time: bool(row.uptrend) for row in df.itertuples(index=False) if pd.notna(row.sma200)}
+    valid = df["sma200"].notna()
+    return {t: bool(u) for t, u in
+            zip(df.loc[valid, "time"], df.loc[valid, "uptrend"], strict=False)}
+
+
+def _col_f(v) -> float:
+    """pandas scalar -> float via numpy (pyright-stub friendly)."""
+    return float(np.asarray(v).reshape(-1)[0])
+
+
+def _col_opt(v) -> float | None:
+    return None if pd.isna(v) else _col_f(v)
+
+
+def _col_b(v) -> bool:
+    return bool(v)
+
+
+def px_of_col(frame: pd.DataFrame, d: pd.Timestamp, col: str) -> float | None:
+    """frame.at[d, col] as float; None when missing/NaN (pyright-friendly)."""
+    try:
+        v = frame.at[d, col]
+    except KeyError:
+        return None
+    if pd.isna(v):
+        return None
+    return float(np.asarray(v).reshape(-1)[0])
 
 
 def _candidate_tickers() -> list[str]:
@@ -376,13 +417,17 @@ def _row_strength(row: dict, action: str) -> int:
 
 def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
             start: str | None = None, end: str | None = None,
-            regime: dict[str, bool] | None = None) -> ReplayResult:
+            regime: dict[str, bool] | None = None,
+            quality: _QualityLookup | None = None) -> ReplayResult:
     """Run the deterministic strategy over the precomputed series.
 
     ``start``/``end`` are inclusive date strings (YYYY-MM-DD) used to bound
     the replay window (e.g. a walk-forward test window). ``regime`` is an
     optional day→uptrend map; when provided and ``params.regime_filter`` is
     set, new BUYs are blocked on days where the market is not in an uptrend.
+    ``quality`` is the optional monthly fundamentals provider; when given
+    together with ``params.block_negative_roe``, BUY entries into names with
+    known non-positive ROE are blocked (missing data stays neutral).
     """
     # Build a global timeline of all trading days across tickers.
     all_days: set[str] = set()
@@ -401,26 +446,33 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
     # The raw scoring components are kept so action/strength can be derived
     # per-parameter-set at replay time (the sweep varies the thresholds).
     by_time: dict[str, dict[str, dict]] = {}
+    cols = ("time close net bullish bearish trend_up trend_down dist_above "
+            "dist_below atr_stop atr14 weekly_trend_up run_5d run_20d "
+            "run_60d dist_52w_high").split()
+
     for t, df in series.items():
         by_time[t] = {
-            row.time: {
-                "close": float(row.close),
-                "net": float(row.net),
-                "bullish": float(row.bullish),
-                "bearish": float(row.bearish),
-                "trend_up": bool(row.trend_up),
-                "trend_down": bool(row.trend_down),
-                "dist_above": float(row.dist_above),
-                "dist_below": float(row.dist_below),
-                "atr_stop": None if pd.isna(row.atr_stop) else float(row.atr_stop),
-                "atr14": float(row.atr14) if not pd.isna(row.atr14) else None,
-                "weekly_trend_up": bool(row.weekly_trend_up) if not pd.isna(row.weekly_trend_up) else True,
-                "run_5d": None if pd.isna(row.run_5d) else float(row.run_5d),
-                "run_20d": None if pd.isna(row.run_20d) else float(row.run_20d),
-                "run_60d": None if pd.isna(row.run_60d) else float(row.run_60d),
-                "dist_52w_high": None if pd.isna(row.dist_52w_high) else float(row.dist_52w_high),
+            str(time): {
+                "close": _col_f(close),
+                "net": _col_f(net),
+                "bullish": _col_f(bullish),
+                "bearish": _col_f(bearish),
+                "trend_up": _col_b(trend_up),
+                "trend_down": _col_b(trend_down),
+                "dist_above": _col_f(dist_above),
+                "dist_below": _col_f(dist_below),
+                "atr_stop": _col_opt(atr_stop),
+                "atr14": _col_opt(atr14),
+                "weekly_trend_up": True if pd.isna(weekly_trend_up) else _col_b(weekly_trend_up),
+                "run_5d": _col_opt(run_5d),
+                "run_20d": _col_opt(run_20d),
+                "run_60d": _col_opt(run_60d),
+                "dist_52w_high": _col_opt(dist_52w_high),
             }
-            for row in df.itertuples(index=False)
+            for time, close, net, bullish, bearish, trend_up, trend_down,
+                dist_above, dist_below, atr_stop, atr14, weekly_trend_up,
+                run_5d, run_20d, run_60d, dist_52w_high
+            in zip(*(df[c] for c in cols), strict=True)
         }
 
     pf = PaperPortfolio(cash=params.start_cash)
@@ -525,6 +577,7 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
             signals=signals,
             params=sp,
             sector_of=_sector_of if params.max_sector_pct > 0 else None,
+            quality_of=quality.of(day) if quality else None,
         )
         for p in proposals:
             if p["side"] == "SELL":
@@ -545,6 +598,7 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
                 signals=signals,
                 params=sp,
                 sector_of=_sector_of if params.max_sector_pct > 0 else None,
+                quality_of=quality.of(day) if quality else None,
             )
             for p in proposals2:
                 if p["side"] == "BUY":
@@ -655,11 +709,81 @@ def _replay_params_to_strategy(p: ReplayParams) -> StrategyParams:
         max_run_5d=p.max_run_5d,
         min_run_5d=p.min_run_5d,
         max_dist_above=p.max_dist_above,
+        block_negative_roe=p.block_negative_roe,
         relaxed_hold_strength=p.relaxed_hold_strength,
         relaxed_hold_limit=p.relaxed_hold_limit,
         max_sector_pct=p.max_sector_pct,
         risk_pct=p.risk_pct,
     )
+
+
+class _QualityLookup:
+    """Monthly-granularity quality provider for the replay engines.
+
+    Wraps ``{ticker: {"roe", "p_fcf"}}`` maps cached per calendar month: the
+    fundamentals move quarterly, so a fresh quality snapshot per month (keyed
+    by the month of the replay day) matches the monthly fetch cadence and
+    avoids re-running the TTM math for every trading day. ``of(day)`` returns
+    the ``quality_of(ticker)`` callable ``strategy.propose_trades`` expects
+    for that day, or None when no quality data exists at all (feature off /
+    empty fact store).
+    """
+
+    def __init__(self, fund: dict[str, dict[str, list[dict]]],
+                 closes: dict[str, dict[str, float]] | None = None):
+        self._fund = fund
+        # {ticker: {date: close}} — USD-converted replay closes for P/FCF.
+        self._closes = closes or {}
+        self._cache: dict[str, dict[str, dict[str, float | None]]] = {}
+
+    def month_map(self, day: str) -> dict[str, dict[str, float | None]]:
+        """Quality map {ticker: {"roe","p_fcf"}} for `day`'s month (cached)."""
+        month = day[:7]
+        cached = self._cache.get(month)
+        if cached is not None:
+            return cached
+        from .monthly import quality_snapshot
+
+        asof: pd.Timestamp = pd.Timestamp(pd.to_datetime(day).date())  # type: ignore[assignment]
+        out: dict[str, dict[str, float | None]] = {}
+        px_of = self._closes.get(month, {})
+        for t in self._fund:
+            q = quality_snapshot(self._fund, t, asof, px_of.get(t))
+            if q is not None:
+                out[t] = q
+        self._cache[month] = out
+        return out
+
+    def of(self, day: str) -> Callable[[str], dict[str, float | None] | None] | None:
+        """``quality_of(ticker)`` callable for `day`, or None (feature off)."""
+        mmap = self.month_map(day)
+        if not mmap:
+            return None
+
+        def _lookup(ticker: str) -> dict[str, float | None] | None:
+            return mmap.get(ticker.upper())
+
+        return _lookup
+
+
+async def _load_quality_lookup(tickers: list[str]) -> _QualityLookup | None:
+    """Build a _QualityLookup from the fundamentals store + candle closes.
+
+    Loads the EDGAR-first fact store once and the monthly frames (for
+    USD-converted period-end closes feeding P/FCF). Returns None when the
+    fact store is empty (feature effectively off).
+    """
+    from . import monthly as monthly_mod
+    from .fundamentals import load_fundamentals
+
+    fund = await load_fundamentals(tickers)
+    if not fund:
+        return None
+    close, _ = await monthly_mod.load_frames(tickers, None)
+    # {month: {ticker: first USD close of the month}} — one price per ticker
+    # per month is enough for P/FCF (the quality snapshot only needs a scale).
+    # First (not last) close keeps the monthly cache point-in-time.
+    return _QualityLookup(fund, _month_price_map(close))
 
 
 def _deterministic_propose_replay(
@@ -668,6 +792,7 @@ def _deterministic_propose_replay(
     prices: dict[str, float],
     day: str,
     params: ReplayParams,
+    quality_of: Callable[[str], dict[str, float | None] | None] | None = None,
 ) -> list[dict]:
     """Propose deterministic trades for one day WITHOUT mutating ``pf``.
 
@@ -684,6 +809,7 @@ def _deterministic_propose_replay(
         prices=prices,
         signals=signals,
         params=sp,
+        quality_of=quality_of,
     )
     # Stamp the day on each proposal (strategy.propose_trades is day-agnostic).
     for p in proposals:
@@ -774,6 +900,8 @@ async def _hybrid_replay(
     failure_marker: bool = False,
     failure_stop_outs: int = 2,
     failure_drawdown: float = 7.0,
+    quality: _QualityLookup | None = None,
+    fundamentals_context: bool = False,
 ) -> ReplayResult:
     """Replay the hybrid strategy (deterministic + LLM review).
 
@@ -818,26 +946,33 @@ async def _hybrid_replay(
         return ReplayResult(params=params)
 
     by_time: dict[str, dict[str, dict]] = {}
+    cols = ("time close net bullish bearish trend_up trend_down dist_above "
+            "dist_below atr_stop atr14 weekly_trend_up run_5d run_20d "
+            "run_60d dist_52w_high").split()
+
     for t, df in series.items():
         by_time[t] = {
-            row.time: {
-                "close": float(row.close),
-                "net": float(row.net),
-                "bullish": float(row.bullish),
-                "bearish": float(row.bearish),
-                "trend_up": bool(row.trend_up),
-                "trend_down": bool(row.trend_down),
-                "dist_above": float(row.dist_above),
-                "dist_below": float(row.dist_below),
-                "atr_stop": None if pd.isna(row.atr_stop) else float(row.atr_stop),
-                "atr14": float(row.atr14) if not pd.isna(row.atr14) else None,
-                "weekly_trend_up": bool(row.weekly_trend_up) if not pd.isna(row.weekly_trend_up) else True,
-                "run_5d": None if pd.isna(row.run_5d) else float(row.run_5d),
-                "run_20d": None if pd.isna(row.run_20d) else float(row.run_20d),
-                "run_60d": None if pd.isna(row.run_60d) else float(row.run_60d),
-                "dist_52w_high": None if pd.isna(row.dist_52w_high) else float(row.dist_52w_high),
+            str(time): {
+                "close": _col_f(close),
+                "net": _col_f(net),
+                "bullish": _col_f(bullish),
+                "bearish": _col_f(bearish),
+                "trend_up": _col_b(trend_up),
+                "trend_down": _col_b(trend_down),
+                "dist_above": _col_f(dist_above),
+                "dist_below": _col_f(dist_below),
+                "atr_stop": _col_opt(atr_stop),
+                "atr14": _col_opt(atr14),
+                "weekly_trend_up": True if pd.isna(weekly_trend_up) else _col_b(weekly_trend_up),
+                "run_5d": _col_opt(run_5d),
+                "run_20d": _col_opt(run_20d),
+                "run_60d": _col_opt(run_60d),
+                "dist_52w_high": _col_opt(dist_52w_high),
             }
-            for row in df.itertuples(index=False)
+            for time, close, net, bullish, bearish, trend_up, trend_down,
+                dist_above, dist_below, atr_stop, atr14, weekly_trend_up,
+                run_5d, run_20d, run_60d, dist_52w_high
+            in zip(*(df[c] for c in cols), strict=True)
         }
 
     pf = PaperPortfolio(cash=params.start_cash)
@@ -896,7 +1031,8 @@ async def _hybrid_replay(
                 # sizing and engine-driven exits added variance + losses.
                 proposals = []
             else:
-                proposals = _deterministic_propose_replay(pf, by_time, prices, day, params)
+                proposals = _deterministic_propose_replay(pf, by_time, prices, day, params,
+                                                          quality_of=quality.of(day) if quality else None)
                 if proposals:
                     logger.info("  det proposed: %d — %s",
                                 len(proposals),
@@ -910,6 +1046,7 @@ async def _hybrid_replay(
             # consulted every trading day (the engine makes no proposals, so
             # there is no weekly-review concept). The weekly cadence below
             # only applies to hybrid mode.
+            week = _current_week_from(day)
             if pure_llm:
                 is_review_day = True
             else:
@@ -918,7 +1055,7 @@ async def _hybrid_replay(
                 # the LLM is consulted at most once per ISO week, anchored to
                 # the week, not a day counter. review_interval=1 still reviews
                 # every week; larger values skip intermediate weeks.
-                week = _current_week_from(day)
+                week: str = _current_week_from(day)
                 if marker_gated:
                     # Marker-gated mode: the deterministic engine's proposals ARE
                     # the marker — an LLM review is only worthwhile when there is
@@ -966,7 +1103,8 @@ async def _hybrid_replay(
                                             pure_llm=pure_llm,
                                             trade_history=list(reversed(pf.trades[-15:]))[:12],
                                             minimal=minimal_prompt or mode_aware,
-                                            max_positions=llm_max_positions)
+                                            max_positions=llm_max_positions,
+                                            quality=quality.month_map(day) if (fundamentals_context and quality) else None)
                 system_prompt = (
                     _LLM_MODE_AWARE_MINIMAL_PROMPT if mode_aware
                     else _LLM_MINIMAL_SYSTEM_PROMPT if minimal_prompt
@@ -1014,7 +1152,7 @@ async def _hybrid_replay(
                             _replay_params_to_strategy(params),
                             guarded=True,
                             price_of=lambda t, _prices=prices: _aval(_prices.get(t)),
-                            value_of=lambda t, _prices=prices: _aval(pf.positions.get(t, 0) * _prices.get(t, 0)),
+                            value_of=lambda t, _prices=prices: _val_of(pf, t, _prices),
                             exclude=proposal_tickers,
                         )
                         held_tickers = set(pf.positions.keys())
@@ -1086,7 +1224,8 @@ async def _hybrid_replay(
                 for p in proposals:
                     if p["side"] == "SELL":
                         _execute_proposal(pf, p)
-                proposals2 = _deterministic_propose_replay(pf, by_time, prices, day, params)
+                proposals2 = _deterministic_propose_replay(pf, by_time, prices, day, params,
+                                                           quality_of=quality.of(day) if quality else None)
                 for p in proposals2:
                     if p["side"] == "BUY":
                         _execute_proposal(pf, p)
@@ -1410,7 +1549,8 @@ def _trade_outcomes(
     """
     closes: dict[str, dict[str, float]] = {}
     for t, df in series.items():
-        closes[t] = {row.time: float(row.close) for row in df.itertuples(index=False)}
+        closes[t] = {str(time): _col_f(c)
+                     for time, c in zip(df["time"], df["close"], strict=False)}
 
     portfolio_states = _reconstruct_portfolio_states(trades)
     cases: list[TradeCase] = []
@@ -2001,6 +2141,8 @@ async def _llm_walkforward(
     failure_marker: bool = False,
     failure_stop_outs: int = 2,
     failure_drawdown: float = 7.0,
+    quality: _QualityLookup | None = None,
+    fundamentals_context: bool = False,
 ) -> list[_WindowResult]:
     """Run N non-overlapping windows, each deterministic vs LLM.
 
@@ -2057,7 +2199,7 @@ async def _llm_walkforward(
     results: list[_WindowResult] = []
     for i, (w_start, w_end) in enumerate(windows, 1):
         print(f"\n--- Window {i}/{len(windows)}: {w_start}..{w_end} ---")
-        det = _replay(series, params, start=w_start, end=w_end)
+        det = _replay(series, params, start=w_start, end=w_end, quality=quality)
         logger.info("window %d/%d %s..%s deterministic: return %.2f%%, dd %.2f%%, %d trades",
                     i, len(windows), w_start, w_end,
                     det.total_return_pct, det.max_drawdown_pct, det.n_trades)
@@ -2072,7 +2214,9 @@ async def _llm_walkforward(
                                    marker_gated=marker_gated,
                                    failure_marker=failure_marker,
                                    failure_stop_outs=failure_stop_outs,
-                                   failure_drawdown=failure_drawdown)
+                                   failure_drawdown=failure_drawdown,
+                                   quality=quality,
+                                   fundamentals_context=fundamentals_context)
         logger.info("window %d/%d %s..%s %s: return %.2f%%, dd %.2f%%, %d trades",
                     i, len(windows), w_start, w_end, mode_label,
                     llm.total_return_pct, llm.max_drawdown_pct, llm.n_trades)
@@ -2150,7 +2294,11 @@ async def _prune_candles(before: str, dry_run: bool) -> None:
 
 
 async def _monthly_backtest(start: str | None, end: str | None, universe: str,
-                            contribution: float, verbose: bool) -> None:
+                            contribution: float, verbose: bool,
+                            frame_cache: dict[pd.Timestamp, pd.DataFrame | None] | None = None,
+                            close_preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
+                            fund_preloaded: dict[str, dict[str, list[dict]]] | None = None,
+                            ) -> BacktestSummary | None:
     """DCA backtest of the monthly qv-mom-v1 strategy on stored candles.
 
     Mirrors stockstrat's run_dca: at the last trading day of each month,
@@ -2164,11 +2312,15 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
     tickers = universe_tickers(universe)
     logger.info("Monthly backtest universe: %d tickers", len(tickers))
 
-    close, vol = await monthly_mod.load_frames(tickers, None)
+    if close_preloaded is not None and fund_preloaded is not None:
+        close, vol = close_preloaded
+        fund = fund_preloaded
+    else:
+        close, vol = await monthly_mod.load_frames(tickers, None)
+        fund = await fundamentals_mod.load_fundamentals(tickers)
     if close.empty:
         print("No candle data found. Run the monthly rebalance (or a data refresh) first.")
         return
-    fund = await fundamentals_mod.load_fundamentals(tickers)
     logger.info("Frames: %d days x %d tickers; fundamentals for %d tickers",
                 len(close), close.shape[1], len(fund))
 
@@ -2199,13 +2351,15 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
               f"for momentum warmup).")
         return
 
-    # eligibility frame per rebalance date is the expensive part — cache by month
-    frame_cache: dict[pd.Timestamp, pd.DataFrame | None] = {}
-    for i, d in enumerate(months):
-        frame_cache[d] = await asyncio.to_thread(
-            monthly_mod.eligible_frame, d, close, vol, fund)
-        if (i + 1) % 12 == 0:
-            logger.info("eligibility %d/%d", i + 1, len(months))
+    # eligibility frame per rebalance date is the expensive part — cache by
+    # month (a prebuilt cache can be passed in by the parameter sweep)
+    if frame_cache is None:
+        frame_cache = {}
+        for i, d in enumerate(months):
+            frame_cache[d] = await asyncio.to_thread(
+                monthly_mod.eligible_frame, d, close, vol, fund)
+            if (i + 1) % 12 == 0:
+                logger.info("eligibility %d/%d", i + 1, len(months))
 
     # Drop dead months: yfinance fundamentals only cover ~4-5 years, so early
     # rebalances have zero eligible names (the strategy would hold cash at 0%
@@ -2213,8 +2367,11 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
     # meaningless, not conservative). Start at the first month with an
     # eligible frame; the 253d momentum warmup needs no extra headroom because
     # eligibility already requires the price history.
-    first_live = next((d for d in months
-                       if frame_cache[d] is not None and frame_cache[d]["eligible"].any()), None)
+    def _live(d: pd.Timestamp) -> bool:
+        f = frame_cache[d]
+        return f is not None and bool(f["eligible"].any())
+
+    first_live = next((d for d in months if _live(d)), None)
     if first_live is None:
         print("No month has eligible names (fundamentals coverage too thin?). "
               "Run the monthly rebalance once to fetch fundamentals, then retry.")
@@ -2235,7 +2392,7 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
         if not names:
             return 0.0
         r = (close.loc[d1].reindex(names) / close.loc[d0].reindex(names) - 1.0).dropna()
-        return float(r.mean()) if len(r) else 0.0
+        return _col_f(r.mean()) if len(r) else 0.0
 
     for i, d in enumerate(months):
         if i > 0:
@@ -2287,6 +2444,519 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
         for m, picks in picks_hist[-12:]:
             print(f"  {m}: {', '.join(picks)}")
 
+    return BacktestSummary(
+        irr=irr,
+        final_value=value,
+        contributed=contributed,
+        avg_turnover=sum(churns) / len(churns) if churns else 0.0,
+        n_trades=0,
+        window=(pd.Timestamp(months[0]).strftime("%Y-%m-%d"),
+                pd.Timestamp(months[-1]).strftime("%Y-%m-%d")),
+    )
+
+
+@dataclass
+class BacktestSummary:
+    """Result summary for a daily-core or monthly backtest run. Returned by
+    the backtests so tests and the parameter sweep can consume them without
+    parsing stdout."""
+    irr: float
+    final_value: float
+    contributed: float
+    avg_turnover: float
+    n_trades: int
+    window: tuple[str, str]
+
+
+def _fill_buy(cash: float, price: float, delta_value: float,
+              cost: float) -> tuple[float, float, float] | None:
+    """One BUY fill: ``(notional, shares, cash_after)`` or None when the
+    spend would be under $1.
+
+    The one-way fee is reserved INSIDE the spend, so a full-cash buy
+    (``delta_value >= cash``) can never drive cash negative — without this
+    the fee was charged on top and every full-cash buy left the account at
+    ``-cash * cost``, which also blocked follow-on buys until cash
+    recovered. ``daily_core.backfill.do_buy`` uses the same rule."""
+    notional = min(delta_value, max(cash, 0.0) / (1.0 + cost))
+    if notional < 1.0:
+        return None
+    return notional, notional / price, cash - notional * (1.0 + cost)
+
+
+def _contribution_days(days: pd.DatetimeIndex,
+                       months: list[pd.Timestamp]) -> set[pd.Timestamp]:
+    """The days on which a monthly contribution is received.
+
+    One per calendar month that has a month-end rebalance in the window,
+    deposited on that month's FIRST trading day in the window (mirroring
+    the live daily-core engine and ``daily_core.backfill``, which deposit
+    at the start of the month) rather than parking the cash until the
+    month-end rebuild. Every month in ``months`` gets exactly one
+    contribution, so the count still matches the monthly baseline."""
+    keys = {(m.year, m.month) for m in months}
+    out: set[pd.Timestamp] = set()
+    seen: set[tuple[int, int]] = set()
+    for d in days:
+        k = (d.year, d.month)
+        if k in keys and k not in seen:
+            seen.add(k)
+            out.add(d)
+    return out
+
+
+def _month_price_map(close: pd.DataFrame) -> dict[str, dict[str, float]]:
+    """``{month: {ticker: FIRST close of that month}}`` for the P/FCF scale.
+
+    The quality lookup caches one map per month; using the month's first
+    close (known at the month's start) instead of its last removes the
+    look-ahead where an early-month decision was priced with a later
+    close."""
+    out: dict[str, dict[str, float]] = {}
+    if close.empty:
+        return out
+    for t in close.columns:
+        for ts, px in close[t].dropna().items():
+            m = pd.Timestamp(ts).strftime("%Y-%m")  # type: ignore[arg-type]
+            out.setdefault(m, {}).setdefault(t, float(px))
+    return out
+
+
+async def _daily_core_backtest(
+    start: str | None,
+    end: str | None,
+    universe: str,
+    contribution: float,
+    verbose: bool,
+    entry_gate: str,
+    exit_cadence: str,
+    crash_pause: bool,
+    dca: str,
+    frame_cache: dict[pd.Timestamp, pd.DataFrame | None] | None = None,
+    close_preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
+    fund_preloaded: dict[str, dict[str, list[dict]]] | None = None,
+    with_baseline: bool = True,
+) -> BacktestSummary | None:
+    """Deterministic "daily-core" backtest: the monthly qv-mom portfolio as the
+    FUNDAMENTAL core, with minor candle-driven daily adjustments on top.
+
+    Philosophy (per the owner's design): fundamentals decide WHAT to own —
+    the monthly qv-mom ranking (ROE + 12-1 momentum + 1/P-FCF, top-N with
+    hysteresis, no stops) is the portfolio. Candles only adjust WHEN:
+
+      - ``dca`` deployment: "monthly" parks the contribution until month-end
+        (the monthly sim's behaviour), "daily" deploys it immediately into
+        the most underweight holding (kills the average ~2-week cash drag).
+      - ``entry-gate``: candles time the ENTRY of a NEW core name —
+        "above-sma50" waits for the price to be above its SMA50, "not-crash"
+        merely blocks entries into a 5-day crash. "none" buys at once.
+      - ``exit-cadence``: how fast a held name that dropped out of the
+        hysteresis band is released — "monthly" (the sim) waits for the
+        month-end rebalance, "daily" releases it the next day.
+      - ``crash-pause``: pause NEW entries when the universe is in a
+        pullback regime (breadth + median 5d run deeply negative).
+
+    With all knobs at their "monthly/none" defaults the replay reduces to the
+    monthly qv-mom backtest (same eligibility, same hysteresis, same cost
+    model) — that equivalence is the sanity check. The report compares the
+    money-weighted IRR against the monthly baseline over the same window.
+    """
+    from . import monthly as monthly_mod
+    from . import fundamentals as fundamentals_mod
+
+    tickers = universe_tickers(universe)
+    logger.info("Daily-core backtest universe: %d tickers", len(tickers))
+
+    if close_preloaded is not None and fund_preloaded is not None:
+        close, vol = close_preloaded
+        fund = fund_preloaded
+    else:
+        close, vol = await monthly_mod.load_frames(tickers, None)
+        fund = await fundamentals_mod.load_fundamentals(tickers)
+    if close.empty:
+        print("No candle data found. Run the monthly rebalance (or a data refresh) first.")
+        return
+    logger.info("Frames: %d days x %d tickers; fundamentals for %d tickers",
+                len(close), close.shape[1], len(fund))
+
+    idx = pd.DatetimeIndex(close.index)
+    if start:
+        idx = idx[idx >= pd.Timestamp(start)]
+    if end:
+        idx = idx[idx <= pd.Timestamp(end)]
+    if len(idx) == 0:
+        print("No trading days in the requested window.")
+        return
+
+    days_all = idx  # every trading day in the window
+    months: list[pd.Timestamp] = []
+    for ym in sorted({(d.year, d.month) for d in days_all}):
+        sub = days_all[(days_all.year == ym[0]) & (days_all.month == ym[1])]
+        if len(sub):
+            months.append(sub[-1])
+    last_day = days_all[-1]
+
+    # Momentum warmup: same rule as _monthly_backtest.
+    n_days_to_first = int((close.index <= last_day).sum())
+    if n_days_to_first < settings.sim_monthly_min_history_days:
+        print(f"Not enough history ({n_days_to_first} trading days up to "
+              f"{last_day.date()}; need {settings.sim_monthly_min_history_days} "
+              f"for momentum warmup).")
+        return
+
+    # Eligibility frames per MONTH (fundamentals move quarterly; daily
+    # overlays reuse the current month's frame — no per-day TTM recompute).
+    # A prebuilt cache can be passed in (parameter sweep: frames built once,
+    # reused across every config).
+    if frame_cache is None:
+        frame_cache = {}
+        for i, d in enumerate(months):
+            frame_cache[d] = await asyncio.to_thread(
+                monthly_mod.eligible_frame, d, close, vol, fund)
+            if (i + 1) % 12 == 0:
+                logger.info("eligibility %d/%d", i + 1, len(months))
+
+    def _live(d: pd.Timestamp) -> bool:
+        f = frame_cache[d]
+        return f is not None and bool(f["eligible"].any())
+
+    first_live = next((d for d in months if _live(d)), None)
+    if first_live is None:
+        print("No month has eligible names (fundamentals coverage too thin?). "
+              "Run the monthly rebalance once to fetch fundamentals, then retry.")
+        return
+    if first_live != months[0]:
+        skipped = [d for d in months if d < first_live]
+        print(f"Trimming {len(skipped)} months before {first_live.date()}: "
+              f"no eligible names (fundamentals not yet public).")
+        months = [d for d in months if d >= first_live]
+        days_all = days_all[days_all >= first_live]
+
+    cost = settings.sim_monthly_cost_oneway
+    target_n = settings.sim_monthly_target_n
+    hold_band = settings.sim_monthly_hold_band
+
+    # --- Crash-pause regime series (breadth + median 5d run) ---
+    # Daily-frame variant of the LLM context's regime heuristic: PULLBACK =
+    # <60% of eligible names above their SMA50 AND median 5d run < -2.5%.
+    sma50_frame = close.rolling(50).mean()
+    run5_frame = close.pct_change(5)
+    above50 = (close > sma50_frame)
+
+    def pullback_day(d: pd.Timestamp) -> bool:
+        if d not in above50.index:
+            return False
+        row = above50.loc[d].dropna()
+        if row.empty:
+            return False
+        breadth = row.mean()
+        r5 = run5_frame.loc[d].dropna()
+        med5 = _col_f(r5.median()) if len(r5) else 0.0
+        return bool(breadth < 0.60 and med5 < -0.025)
+
+    # --- Portfolio state ---
+    shares: dict[str, float] = {}     # ticker -> shares held
+    cash = 0.0
+    contributed = 0.0
+    n_contribs = 0
+    pending_pick: dict[str, pd.Timestamp] = {}   # ticker -> first day seen in-band (entry-gate)
+    churns: list[float] = []
+    trades_log: list[tuple[str, str, str, float]] = []
+    # Monthly turnover bookkeeping: notional traded per calendar month,
+    # relative to the equity at that month's start. Fresh-contribution
+    # deployment is excluded (same convention as the monthly baseline,
+    # where deploying the contribution is not counted as churn).
+    month_buys = 0.0
+    month_sells = 0.0
+    equity_month_start = 0.0
+    cur_month: int | None = None
+
+    # Valuation closes: each ticker valued at its last valid close <= day
+    # (same rule as eligible_frame). A raw close.at[d, t] treats a ticker
+    # with no candle that day (market not closed yet, holiday) as worthless,
+    # which valued whole positions at $0 when the window ended on a
+    # partial/intraday day — final equity collapsed to leftover cash and
+    # IRR to -100%.
+    close_val = close.ffill()
+
+    def px_of(t: str, d: pd.Timestamp) -> float | None:
+        return monthly_mod.px_at(close_val, d, t)
+
+    def trade(d: pd.Timestamp, t: str, side: str, delta_value: float) -> None:
+        """Execute one fill at d's close with one-way cost on the notional."""
+        nonlocal cash, month_buys, month_sells
+        p = px_of(t, d)
+        if p is None or p <= 0:
+            return
+        if side == "BUY":
+            fill = _fill_buy(cash, p, delta_value, cost)
+            if fill is None:
+                return
+            notional, sh, cash = fill
+            shares[t] = shares.get(t, 0.0) + sh
+            month_buys += notional
+        else:
+            sh = shares.get(t, 0.0)
+            if sh <= 0:
+                return
+            notional = sh * p
+            cash += notional * (1.0 - cost)
+            del shares[t]
+            month_sells += notional
+        trades_log.append((d.strftime("%Y-%m-%d"), side, t, notional))
+
+    # Ranking memo: the eligibility frame is per-month, so the qv-mom
+    # order is identical for every trading day within that month —
+    # recomputing it per day (a ~4ms _ttm_as_of walk per eligible
+    # ticker) dominated the profile. Keyed by the frame object id since
+    # distinct months have distinct frames.
+    order_memo: dict[int, tuple[list[str], pd.DataFrame | None]] = {}
+
+    def current_order(d: pd.Timestamp, month_td: pd.Timestamp) -> tuple[list[str], pd.DataFrame | None]:
+        frame = frame_cache.get(month_td)
+        if frame is None or not frame["eligible"].any():
+            return [], frame
+        key = id(frame)
+        hit = order_memo.get(key)
+        if hit is not None:
+            return hit
+        _elig, order = monthly_mod._qv_order(frame)
+        result = (order, frame)
+        order_memo[key] = result
+        return result
+
+    def month_for(d: pd.Timestamp) -> pd.Timestamp:
+        # the most recent month-end at or before d
+        m = [m for m in months if m <= d]
+        return m[-1] if m else months[0]
+
+    pending_cash = 0.0  # contributions not yet deployed (dca="monthly")
+    contrib_days = _contribution_days(days_all, months)
+
+    for d in days_all:
+        month_td = month_for(d)
+        order, frame = current_order(d, month_td)
+
+        # --- monthly turnover bookkeeping ---
+        if cur_month is None or d.month != cur_month:
+            if cur_month is not None and equity_month_start > 0:
+                # One-way turnover = ((buys - contribution) + sells) / 2 /
+                # equity at month start. Deploying the fresh contribution is
+                # not churn (same convention as the monthly baseline, where
+                # slot swaps exclude it); buys beyond the contribution are.
+                # Buys can exceed the contribution within a month (sell
+                # proceeds recycled into rebalancing) — the excess is churn.
+                churns.append(((max(month_buys - contribution, 0.0)
+                                + month_sells) / 2.0) / equity_month_start)
+            month_buys, month_sells = 0.0, 0.0
+            cur_month = d.month
+            equity_month_start = cash + pending_cash + sum(
+                (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0) for t in shares)
+
+        # --- contribution ---
+        # Received on the first trading day of each month (same timing as the
+        # live engine and daily_core.backfill). "monthly" parks it in
+        # pending_cash until the month-end rebuild; "daily"/"rank" leave it in
+        # cash so the daily deployment puts it to work immediately.
+        if d in contrib_days:
+            contributed += contribution
+            n_contribs += 1
+            if dca == "monthly":
+                pending_cash += contribution
+            else:
+                cash += contribution
+        # month-end rebuild releases the parked "monthly" pool
+        if d in months and pending_cash:
+            cash += pending_cash
+            pending_cash = 0.0
+
+        # --- SELL phase: releases from the hysteresis band ---
+        if order:
+            band = set(order[:hold_band])
+            if exit_cadence == "daily" or d in months:
+                for t in list(shares):
+                    if t not in band:
+                        trade(d, t, "SELL", 0.0)
+                        pending_pick.pop(t, None)
+
+        # --- BUY phase: keep the portfolio at target weights ---
+        equity_now = cash + pending_cash + sum(
+            (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0) for t in shares)
+        weight = equity_now / max(target_n, 1)
+
+        # month-end rebuild: pick the portfolio with hysteresis (monthly cadence)
+        picks: list[str] = []
+        if d in months and order:
+            held = list(shares)
+            picks = monthly_mod._band_fill(order, held, target_n, hold_band)
+
+        paused = crash_pause and pullback_day(d)
+
+        # --- Rank-weighted cash deployment (dca="rank") ---
+        # Fresh cash goes where the qv-mom ranking says it belongs: each day,
+        # deploy (a slice of) available cash into the top-ranked names with
+        # target weights ABOVE their current value — i.e. new cash reinforces
+        # the strongest core names instead of equal-weight rebalancing into
+        # laggards. A held name at/above target gets nothing; a not-yet-held
+        # top name is bought to its target. This is the momentum-preserving
+        # variant of "deploy daily": the monthly sim's edge is concentrating
+        # fresh capital into the top of the ranking — rank deployment does
+        # that every day without the ~2-week cash drag.
+        if dca == "rank" and order and not paused:
+            remaining = cash - (0 if d in months else 0)  # spendable cash
+            for rank_i, t in enumerate(order[:target_n]):
+                if remaining < 1:
+                    break
+                p = px_of(t, d)
+                if p is None:
+                    continue
+                # score-weighted target: rank 1 gets up to `weight` * boost,
+                # linearly decaying to the equal weight at the band edge.
+                boost = 1.0 + settings.sim_monthly_rank_boost * (
+                    1.0 - rank_i / max(target_n - 1, 1))
+                tgt = weight * boost
+                cur = shares.get(t, 0.0) * p
+                gap = tgt - cur
+                if gap > 1:
+                    spend = min(gap, remaining)
+                    trade(d, t, "BUY", spend)
+                    remaining -= spend
+
+        # Month-end equal-weight rebuild (dca="monthly" only): the baseline
+        # semantics — spread the FULL portfolio (incl. fresh contribution)
+        # 1/N across the picks. Implemented as: buy each underweight pick up
+        # to weight (releasing cash pro-rata), sell nothing here (releases
+        # happened in the SELL phase). This makes all-defaults ≈ baseline.
+        if dca == "monthly" and d in months and order and not paused:
+            for t in picks:
+                p = px_of(t, d)
+                if p is None:
+                    continue
+                cur = shares.get(t, 0.0) * p
+                gap = weight - cur
+                if gap > 1 and cash > 1:
+                    trade(d, t, "BUY", min(gap, cash))
+
+        # daily top-up of underweight holdings (dca="daily" only; rank mode
+        # and month-end days already allocated). NOT pro-rata: the fresh
+        # cash goes to the single most underweight holding — equal-weight
+        # rebalancing into laggards dilutes momentum and was measured worse
+        # than the monthly baseline on 2020-2026.
+        if dca == "daily" and order and not paused and d not in months:
+            worst_t, worst_gap = None, 0.0
+            for t in order:
+                if t not in shares:
+                    continue
+                p = px_of(t, d)
+                if p is None:
+                    continue
+                gap = weight - shares[t] * p
+                if gap > worst_gap:
+                    worst_t, worst_gap = t, gap
+            if worst_t is not None and worst_gap > 1.0:
+                trade(d, worst_t, "BUY", worst_gap)
+
+        # --- NEW entries (core names not yet held) ---
+        if d in months and order:
+            for t in picks:
+                if t in shares or paused:
+                    continue
+                p = px_of(t, d)
+                if p is None:
+                    continue
+                ok = True
+                if entry_gate != "none":
+                    s = px_of_col(sma50_frame, d, t)
+                    if entry_gate == "above-sma50":
+                        ok = s is not None and p > s
+                    elif entry_gate == "not-crash":
+                        r5 = px_of_col(run5_frame, d, t)
+                        ok = r5 is None or r5 > -0.10
+                if not ok:
+                    pending_pick[t] = d  # wait for the gate to open
+                    continue
+                budget = min(weight, cash)
+                if budget > 1:
+                    trade(d, t, "BUY", budget)
+        elif entry_gate != "none" and order:
+            # daily re-check of gated entries once the gate opens
+            for t in list(pending_pick):
+                if t in shares or paused:
+                    continue
+                if t not in order:
+                    pending_pick.pop(t, None)
+                    continue
+                p = px_of(t, d)
+                if p is None:
+                    continue
+                s = px_of_col(sma50_frame, d, t)
+                ok = s is not None and p > s
+                if entry_gate == "not-crash":
+                    r5 = px_of_col(run5_frame, d, t)
+                    ok = r5 is None or r5 > -0.10
+                if ok:
+                    budget = min(weight, cash)
+                    if budget > 1:
+                        trade(d, t, "BUY", budget)
+                    pending_pick.pop(t, None)
+
+    # final valuation
+    value = cash + pending_cash + sum(
+        (shares.get(t, 0.0) or 0.0) * (px_of(t, last_day) or 0.0) for t in shares)
+
+    def irr_of(v: float, n: int) -> float:
+        def f(r: float) -> float:
+            return contribution * sum((1.0 + r) ** k for k in range(n)) - v
+        lo, hi = -0.90, 2.0
+        if f(lo) > 0:
+            return -1.0
+        for _ in range(200):
+            mid = (lo + hi) / 2.0
+            if f(mid) < 0:
+                lo = mid
+            else:
+                hi = mid
+        return (1.0 + (lo + hi) / 2.0) ** 12 - 1.0
+
+    irr = irr_of(value, n_contribs)
+    cfg = (f"dca={dca} entry-gate={entry_gate} exit-cadence={exit_cadence} "
+           f"crash-pause={'on' if crash_pause else 'off'}"
+           + (f" rank-boost={settings.sim_monthly_rank_boost:g}"
+              if dca == "rank" else ""))
+    print(f"\n=== Daily-core backtest [{universe}] {days_all[0].date()}..{last_day.date()} ===")
+    print(f"  config: {cfg}")
+    print(f"  contributions: {n_contribs} x ${contribution:,.0f} = ${contributed:,.0f}")
+    print(f"  final value:   ${value:,.0f}  (multiple {value / max(contributed, 1e-9):.2f}x)")
+    print(f"  money-weighted IRR: {irr:.2%}/yr   avg monthly turnover: "
+          f"{(sum(churns) / len(churns)) if churns else 0:.1%}  trades: {len(trades_log)}")
+    if verbose:
+        print("\nLast 15 trades:")
+        for td, side, t, notional in trades_log[-15:]:
+            print(f"  {td} {side:<4} {t:<10} ${notional:,.0f}")
+
+    # --- Monthly baseline over the same window (for comparison) ---
+    # Skippable: the sweep computes the (config-independent) baseline once
+    # per window instead of once per config.
+    if with_baseline:
+        print("\n--- Monthly qv-mom baseline over the same window ---")
+        await _monthly_backtest(
+            start or (days_all[0].strftime("%Y-%m-%d")),
+            end or (last_day.strftime("%Y-%m-%d")),
+            universe, contribution, False,
+            frame_cache=frame_cache, close_preloaded=close_preloaded,
+            fund_preloaded=fund_preloaded,
+        )
+
+    return BacktestSummary(
+        irr=irr,
+        final_value=value,
+        contributed=contributed,
+        avg_turnover=(sum(churns) / len(churns)) if churns else 0.0,
+        n_trades=len(trades_log),
+        window=(pd.Timestamp(days_all[0]).strftime("%Y-%m-%d"),
+                pd.Timestamp(last_day).strftime("%Y-%m-%d")),
+    )
+
 
 async def _main(args: argparse.Namespace) -> None:
     if args.command == "prune-candles":
@@ -2300,6 +2970,20 @@ async def _main(args: argparse.Namespace) -> None:
             args.contribution if args.contribution is not None else settings.sim_monthly_contribution,
             args.picks,
         )
+        return
+
+    if args.command == "daily-core":
+        await _daily_core_backtest(
+            args.start, args.end,
+            args.universe or settings.sim_monthly_universe,
+            args.contribution if args.contribution is not None else settings.sim_monthly_contribution,
+            args.verbose,
+            args.entry_gate, args.exit_cadence, args.crash_pause, args.dca,
+        )
+        return
+
+    if args.command == "daily-core-sweep":
+        await _sweep_daily_core(args)
         return
 
     tickers = _candidate_tickers()
@@ -2332,12 +3016,20 @@ async def _main(args: argparse.Namespace) -> None:
         if getattr(args, "no_entry_guards", False):
             params.min_run_5d = 0.0
             params.max_dist_above = 0.0
-        res = _replay(series, params, start=args.start, end=args.end, regime=regime)
+        quality = None
+        if getattr(args, "block_negative_roe", False):
+            params.block_negative_roe = True
+            quality = await _load_quality_lookup(universe_tickers(settings.sim_monthly_universe))
+            n_with_fund = len(quality._fund) if quality else 0
+            print(f"Quality guard ON: {n_with_fund} tickers with fundamentals")
+        res = _replay(series, params, start=args.start, end=args.end, regime=regime, quality=quality)
         label = "Backtest (live sim risk config)"
         if params.regime_filter:
             label += " + regime filter"
         if getattr(args, "no_entry_guards", False):
             label += " [guards OFF]"
+        if getattr(args, "block_negative_roe", False):
+            label += " [ROE guard ON]"
         _print_result(res, label)
         print(f"  Risk config: max_positions={params.max_positions}, "
               f"stop={params.stop_type} {params.stop_pct:g}%, "
@@ -2428,6 +3120,17 @@ async def _main(args: argparse.Namespace) -> None:
         review_interval = getattr(args, "review_interval", 1)
         veto_only = getattr(args, "veto_only", False)
         minimal_prompt = getattr(args, "minimal_prompt", False)
+        mode_aware = getattr(args, "mode_aware_prompt", False)
+        marker_gated = False
+        failure_marker = getattr(args, "failure_marker", False)
+        failure_stop_outs = getattr(args, "failure_stop_outs", 2)
+        failure_drawdown = getattr(args, "failure_drawdown", 7.0)
+        fundamentals_context = getattr(args, "fundamentals_context", False)
+        block_negative_roe = getattr(args, "block_negative_roe", False)
+        quality = None
+        if fundamentals_context or block_negative_roe:
+            params.block_negative_roe = block_negative_roe
+            quality = await _load_quality_lookup(universe_tickers(settings.sim_monthly_universe))
         print(f"\n=== {mode_label} replay ({start}..{end}) — probing LLM "
               f"once per {review_interval} calendar week(s) ===")
         print(f"  Backend: {active.get('name', '?')} · {active.get('model', '?')}")
@@ -2435,7 +3138,14 @@ async def _main(args: argparse.Namespace) -> None:
                                    pure_llm=pure_llm,
                                    review_interval=review_interval,
                                    veto_only=veto_only,
-                                   minimal_prompt=minimal_prompt)
+                                   minimal_prompt=minimal_prompt,
+                                   mode_aware=mode_aware,
+                                   marker_gated=marker_gated,
+                                   failure_marker=failure_marker,
+                                   failure_stop_outs=failure_stop_outs,
+                                   failure_drawdown=failure_drawdown,
+                                   quality=quality,
+                                   fundamentals_context=fundamentals_context)
         _print_result(hyb, f"{mode_label} (deterministic + LLM review)" if not pure_llm else "Pure LLM")
 
         # Side-by-side comparison
@@ -2485,6 +3195,17 @@ async def _main(args: argparse.Namespace) -> None:
         failure_marker = getattr(args, "failure_marker", False)
         failure_stop_outs = getattr(args, "failure_stop_outs", 2)
         failure_drawdown = getattr(args, "failure_drawdown", 7.0)
+        # Fundamentals features (A/B flags): quality guard in the deterministic
+        # engine, ROE/P-FCF columns in the LLM context. Both share the
+        # monthly-granularity quality provider loaded once from the fact store.
+        fundamentals_context = getattr(args, "fundamentals_context", False)
+        block_negative_roe = getattr(args, "block_negative_roe", False)
+        quality = None
+        if fundamentals_context or block_negative_roe:
+            params.block_negative_roe = block_negative_roe
+            quality = await _load_quality_lookup(universe_tickers(settings.sim_monthly_universe))
+            print(f"Quality data: {len(quality.month_map(all_days[-1]) if all_days else {})} tickers"
+                  if quality else "Quality data: none (empty fundamentals store)")
         if pure_llm and (marker_gated or failure_marker):
             print("Cannot combine --pure-llm with --marker-gated / --failure-marker: "
                   "the markers key off the deterministic engine's proposals and "
@@ -2507,6 +3228,8 @@ async def _main(args: argparse.Namespace) -> None:
                 failure_marker=failure_marker,
                 failure_stop_outs=failure_stop_outs,
                 failure_drawdown=failure_drawdown,
+                quality=quality,
+                fundamentals_context=fundamentals_context,
             )
         except ValueError as e:
             print(f"Cannot run walk-forward: {e}")
@@ -2520,6 +3243,201 @@ async def _main(args: argparse.Namespace) -> None:
                 for t in wr.llm.trades:
                     print(f"    {t['date']} {t['side']:<4} {t['ticker']:<8} "
                           f"{t['shares']:>9.4f} @ {t['price']:>10.2f} — {t['reason']}")
+
+
+# ---------------------------------------------------------------------------
+# Daily-core parameter sweep + walk-forward
+# ---------------------------------------------------------------------------
+
+_SWEEP_WINDOWS = [("2017-01-01", "2019-12-31"), ("2020-01-01", "2021-12-31"),
+                  ("2022-01-01", "2023-12-31"), ("2024-01-01", "2026-12-31")]
+
+
+def _sweep_months(idx, start: str) -> list[pd.Timestamp]:
+    """Last trading day of each month at/after `start`."""
+    idx = pd.DatetimeIndex(idx)
+    idx = idx[idx >= pd.Timestamp(start)]
+    months: list[pd.Timestamp] = []
+    for ym in sorted({(d.year, d.month) for d in idx}):
+        sub = idx[(idx.year == ym[0]) & (idx.month == ym[1])]
+        if len(sub):
+            months.append(sub[-1])
+    return months
+
+
+async def _sweep_load_market(universe: str):
+    from . import monthly as monthly_mod
+    from . import fundamentals as fundamentals_mod
+
+    tickers = universe_tickers(universe)
+    fund = await fundamentals_mod.load_fundamentals(tickers)
+    close, vol = await monthly_mod.load_frames(tickers, None)
+    return tickers, close, vol, fund
+
+
+def _sweep_grid() -> list[tuple[str, str, str, bool, float]]:
+    """The knob grid: dca x entry-gate x exit-cadence x crash-pause x boost."""
+    grid = []
+    for dca, gate, exit_c, pause in itertools.product(
+            ["monthly", "daily", "rank"], ["none", "not-crash", "above-sma50"],
+            ["monthly", "daily"], [False, True]):
+        for boost in ([0.0, 0.25, 0.5] if dca == "rank" else [0.0]):
+            grid.append((dca, gate, exit_c, pause, boost))
+    return grid
+
+
+# Per-worker state, set once by the pool initializer. NOTE: on Python 3.12+
+# the default multiprocessing start method is "forkserver" (the app venv is
+# 3.14), so `initargs` are pickled to each worker rather than inherited via
+# fork copy-on-write — one copy per worker, not per task. Passing the frames
+# through the initializer still avoids re-pickling them for every grid item.
+_SWEEP_WORKER_STATE: dict = {}
+
+
+def _sweep_worker_init(close: pd.DataFrame, vol: pd.DataFrame,
+                       fund: dict[str, dict[str, list[dict]]],
+                       fc: dict[pd.Timestamp, pd.DataFrame | None]) -> None:
+    _SWEEP_WORKER_STATE["close"] = close
+    _SWEEP_WORKER_STATE["vol"] = vol
+    _SWEEP_WORKER_STATE["fund"] = fund
+    _SWEEP_WORKER_STATE["fc"] = fc
+
+
+def _sweep_run_config(task: tuple[str, str, str, bool, float]) -> dict:
+    """One config in one worker process. Pure compute: the backtest with
+    preloaded frames never touches the DB; boost is process-local state."""
+    import asyncio
+
+    dca, gate, exit_c, pause, boost = task
+    settings.sim_monthly_rank_boost = boost
+
+    async def go() -> BacktestSummary | None:
+        return await _daily_core_backtest(
+            "2017-01-01", None, settings.sim_monthly_universe,
+            settings.sim_monthly_contribution, False,
+            gate, exit_c, pause, dca,
+            frame_cache=_SWEEP_WORKER_STATE["fc"],
+            close_preloaded=(_SWEEP_WORKER_STATE["close"], _SWEEP_WORKER_STATE["vol"]),
+            fund_preloaded=_SWEEP_WORKER_STATE["fund"],
+            with_baseline=False)
+
+    r = asyncio.run(go())
+    return {
+        "dca": dca, "gate": gate, "exit": exit_c, "pause": pause, "boost": boost,
+        "irr": r.irr if r else None, "value": r.final_value if r else 0.0,
+        "turnover": r.avg_turnover if r else 0.0, "trades": r.n_trades if r else 0,
+    }
+
+
+async def _sweep_stage1(fc, close, vol, fund, baseline_irr: float,
+                        out_path: str, workers: int) -> list[dict]:
+    from concurrent.futures import ProcessPoolExecutor
+
+    grid = _sweep_grid()
+    print(f"stage1: {len(grid)} configs on {workers} workers", flush=True)
+    t0 = time.time()
+    results: list[dict] = []
+    with ProcessPoolExecutor(max_workers=workers, initializer=_sweep_worker_init,
+                             initargs=(close, vol, fund, fc)) as ex:
+        for res in ex.map(_sweep_run_config, grid, chunksize=1):
+            if res["irr"] is not None:
+                results.append(res)
+            n = len(results)
+            if n % 10 == 0:
+                print(f"  {n} done ({time.time() - t0:.0f}s)", flush=True)
+
+    results.sort(key=lambda r: -(r["irr"] or -1))
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=1)
+    print(f"\n=== stage1 top 15 ({time.time() - t0:.0f}s) — baseline {baseline_irr:.2%} ===")
+    for r in results[:15]:
+        print(f"  dca={r['dca']:<7} gate={r['gate']:<11} exit={r['exit']:<7} "
+              f"pause={int(r['pause'])} boost={r['boost']:<4} "
+              f"IRR {r['irr']:7.2%}  turn {r['turnover']:.1%}  trades {r['trades']}")
+    return results
+
+
+async def _sweep_stage2(fc, close, vol, fund, results: list[dict],
+                        top_n: int, out_path: str) -> None:
+    seen: set = set()
+    configs = []
+    for r in results:
+        key = (r["dca"], r["gate"], r["exit"], r["pause"], r["boost"])
+        if key in seen:
+            continue
+        seen.add(key)
+        configs.append(r)
+        if len(configs) >= top_n:
+            break
+
+    print(f"\nstage2: top {len(configs)} configs x {len(_SWEEP_WINDOWS)} "
+          f"walk-forward windows + monthly baseline", flush=True)
+    report = []
+    for w_start, w_end in _SWEEP_WINDOWS:
+        base = await _monthly_backtest(w_start, w_end, settings.sim_monthly_universe,
+                                       settings.sim_monthly_contribution, False,
+                                       frame_cache=fc, close_preloaded=(close, vol),
+                                       fund_preloaded=fund)
+        assert base is not None, "monthly backtest returned no summary"
+        row = {"window": f"{w_start[:4]}-{w_end[:4]}", "baseline_irr": base.irr,
+               "configs": []}
+        for c in configs:
+            settings.sim_monthly_rank_boost = c["boost"]
+            r = await _daily_core_backtest(
+                w_start, w_end, settings.sim_monthly_universe,
+                settings.sim_monthly_contribution, False,
+                c["gate"], c["exit"], c["pause"], c["dca"],
+                frame_cache=fc, close_preloaded=(close, vol), fund_preloaded=fund,
+                with_baseline=False)
+            row["configs"].append({
+                "cfg": f"{c['dca']}/{c['gate']}/{c['exit']}/p{int(c['pause'])}/b{c['boost']}",
+                "irr": r.irr if r else None})
+        report.append(row)
+        wins = sum(1 for x in row["configs"] if x["irr"] is not None and x["irr"] > row["baseline_irr"])
+        print(f"\n=== {row['window']}: baseline {row['baseline_irr']:.2%} | "
+              f"configs beating it: {wins}/{len(configs)}")
+        for x in sorted(row["configs"], key=lambda x: -(x["irr"] or -99)):
+            if x["irr"] is not None:
+                print(f"  {x['cfg']:<40} {x['irr']:7.2%} "
+                      f"{'>' if x['irr'] > row['baseline_irr'] else '<'} baseline")
+
+    with open(out_path, "w") as f:
+        json.dump(report, f, indent=1)
+
+
+async def _sweep_daily_core(args: argparse.Namespace) -> None:
+    """`daily-core-sweep` CLI: grid-search the daily-core knobs in parallel,
+    then walk-forward the top configs."""
+    universe = args.universe or settings.sim_monthly_universe
+    workers = args.workers
+    out_dir = args.out or "/data/sweeps"
+    os.makedirs(out_dir, exist_ok=True)
+    stage1_path = os.path.join(out_dir, "daily_core_stage1.json")
+    stage2_path = os.path.join(out_dir, "daily_core_walkforward.json")
+
+    from . import monthly as monthly_mod
+
+    print("loading market frames...", flush=True)
+    _tickers, close, vol, fund = await _sweep_load_market(universe)
+    print(f"frames: {close.shape[0]} days x {close.shape[1]} tickers", flush=True)
+
+    fc: dict[pd.Timestamp, pd.DataFrame | None] = {}
+    t0 = time.time()
+    for d in _sweep_months(close.index, "2016-06-01"):
+        fc[d] = await asyncio.to_thread(monthly_mod.eligible_frame, d, close, vol, fund)
+    print(f"frame cache: {len(fc)} months ({time.time() - t0:.0f}s)", flush=True)
+
+    base = await _monthly_backtest("2017-01-01", None, universe,
+                                   settings.sim_monthly_contribution, False,
+                                   frame_cache=fc, close_preloaded=(close, vol),
+                                   fund_preloaded=fund)
+    assert base is not None, "monthly backtest returned no summary"
+    print(f"baseline IRR full window: {base.irr:.2%}", flush=True)
+
+    results = await _sweep_stage1(fc, close, vol, fund, base.irr, stage1_path, workers)
+    if args.stage in ("2", "all"):
+        await _sweep_stage2(fc, close, vol, fund, results,
+                            top_n=args.top, out_path=stage2_path)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -2536,6 +3454,9 @@ def _build_parser() -> argparse.ArgumentParser:
     b.add_argument("--no-entry-guards", action="store_true",
                    help="Disable the falling-knife (min_run_5d) and parabolic-extension "
                         "(max_dist_above) BUY blocks — A/B escape hatch for benchmarking")
+    b.add_argument("--block-negative-roe", action="store_true",
+                   help="Deterministic quality guard: block BUY entries for names "
+                        "with KNOWN non-positive ROE (missing stays neutral)")
 
     s = sub.add_parser("sweep", help="Grid-search thresholds")
     s.add_argument("--start", default=None)
@@ -2582,6 +3503,25 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(no LLM-initiated BUY/SELL additions)")
     hr.add_argument("--minimal-prompt", action="store_true",
                     help="Use the minimal system prompt (no methodology / regime / veto rules)")
+    hr.add_argument("--mode-aware-prompt", action="store_true",
+                    help="Use the mode-aware minimal prompt (engine owns exits; "
+                         "LLM adds BUYs only). Implies the minimal context")
+    hr.add_argument("--failure-marker", action="store_true",
+                    help="Consult the LLM only when the engine shows failure "
+                         "(2+ stop-out SELLs in 5 trading days or equity >7%% "
+                         "below its running peak); no cooldown")
+    hr.add_argument("--failure-stop-outs", type=int, default=2,
+                    help="With --failure-marker: stop-out SELLs in 5 days that "
+                         "count as failure (default 2)")
+    hr.add_argument("--failure-drawdown", type=float, default=7.0,
+                    help="With --failure-marker: equity drawdown %% below peak "
+                         "that counts as failure (default 7.0)")
+    hr.add_argument("--fundamentals-context", action="store_true",
+                    help="Add point-in-time ROE%% / P-FCF columns to the LLM's "
+                         "signal table (monthly qv-mom quality data; missing = '-')")
+    hr.add_argument("--block-negative-roe", action="store_true",
+                    help="Deterministic quality guard: block BUY entries for "
+                         "names with KNOWN non-positive ROE (missing stays neutral)")
 
     lwf = sub.add_parser("llm-walkforward",
                          help="Multi-window LLM vs deterministic benchmark (reliable scoreboard)")
@@ -2637,6 +3577,12 @@ def _build_parser() -> argparse.ArgumentParser:
     lwf.add_argument("--failure-drawdown", type=float, default=7.0,
                      help="With --failure-marker: equity drawdown %% below peak "
                           "that counts as failure (default 7.0)")
+    lwf.add_argument("--fundamentals-context", action="store_true",
+                     help="Add point-in-time ROE%% / P-FCF columns to the LLM's "
+                          "signal table (monthly qv-mom quality data; missing = '-')")
+    lwf.add_argument("--block-negative-roe", action="store_true",
+                     help="Deterministic quality guard: block BUY entries for "
+                          "names with KNOWN non-positive ROE (missing stays neutral)")
     lwf.add_argument("--trades", action="store_true", help="Print every LLM trade per window")
 
     mb = sub.add_parser("monthly-backtest",
@@ -2648,6 +3594,45 @@ def _build_parser() -> argparse.ArgumentParser:
     mb.add_argument("--contribution", type=float, default=None,
                     help="Monthly contribution in USD (default: sim_monthly_contribution)")
     mb.add_argument("--picks", action="store_true", help="Print the last 12 rebalance picks")
+
+    dc = sub.add_parser("daily-core",
+                        help="Daily-core backtest: monthly qv-mom fundamentals as the "
+                             "core portfolio, minor candle-driven daily adjustments on top. "
+                             "Compares IRR against the monthly baseline on the same window")
+    dc.add_argument("--start", default=None, help="YYYY-MM-DD inclusive start")
+    dc.add_argument("--end", default=None, help="YYYY-MM-DD inclusive end")
+    dc.add_argument("--universe", default=None,
+                    help="Universe name (default: sim_monthly_universe)")
+    dc.add_argument("--contribution", type=float, default=None,
+                    help="Monthly contribution in USD (default: sim_monthly_contribution)")
+    dc.add_argument("--dca", choices=["monthly", "daily", "rank"], default="monthly",
+                    help="Deploy contributions at month-end (monthly sim), daily "
+                         "into the most underweight holding, or daily rank-weighted "
+                         "(fresh cash reinforces the top-ranked core names)")
+    dc.add_argument("--entry-gate", choices=["none", "above-sma50", "not-crash"],
+                    default="none",
+                    help="Candle-driven timing for NEW core-name entries "
+                         "(none = buy at once, like the monthly sim)")
+    dc.add_argument("--exit-cadence", choices=["monthly", "daily"], default="monthly",
+                    help="Release held names that left the hysteresis band at "
+                         "month-end (monthly sim) or the next day")
+    dc.add_argument("--crash-pause", action="store_true",
+                    help="Pause NEW entries when the universe is in a pullback regime")
+    dc.add_argument("--verbose", action="store_true", help="Print the last trades")
+
+    sw = sub.add_parser("daily-core-sweep",
+                        help="Grid-search the daily-core knobs in parallel, then "
+                             "walk-forward the top configs against the monthly baseline")
+    sw.add_argument("--stage", default="all", choices=["1", "2", "all"],
+                    help="1 = in-sample grid, 2 = walk-forward of the top configs")
+    sw.add_argument("--workers", type=int, default=6,
+                    help="Worker processes for stage1 (default 6)")
+    sw.add_argument("--universe", default=None,
+                    help="Universe name (default: sim_monthly_universe)")
+    sw.add_argument("--top", type=int, default=8,
+                    help="Configs carried into the walk-forward (default 8)")
+    sw.add_argument("--out", default="/data/sweeps",
+                    help="Directory for the results JSONs (default /data/sweeps)")
 
     pc = sub.add_parser("prune-candles",
                         help="Delete candle rows before a cutoff date (frees DB space, "
