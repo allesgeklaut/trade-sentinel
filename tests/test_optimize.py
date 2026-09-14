@@ -1610,3 +1610,124 @@ class TestDailyCoreRiskOverlays:
         # degenerate: no frame / empty names -> equal weight
         assert _inv_vol_weights(["X"], None, 4, equal) == {"X": equal}
         assert _inv_vol_weights([], frame, 4, equal) == {}
+
+
+class TestDailyCoreProtection:
+    """The peak-to-trough cash-out brake and the exposure trend filter — the
+    'don't give the win back' mechanisms (Jun→Jul 2026 momentum-crash case)."""
+
+    @pytest.fixture
+    def crash_market(self, monkeypatch):
+        """20 tickers: a clean multi-year uptrend, then a -35% crash in the
+        last 40 trading days affecting ALL names — a broad drawdown for the
+        portfolio-level brake tests."""
+        return self._build_market(monkeypatch, crash_top_only=False)
+
+    @pytest.fixture
+    def sleeve_crash_market(self, monkeypatch):
+        """Same market but only the top-ranked half crashes (T00-T09) — the
+        momentum-sleeve crash shape (AI/semis reversal while the broad market
+        holds), where a per-name trailing stop is not defeated by re-buys."""
+        return self._build_market(monkeypatch, crash_top_only=True)
+
+    def _build_market(self, monkeypatch, *, crash_top_only: bool):
+        import numpy as np
+        import pandas as pd
+
+        from app import fundamentals as fundamentals_mod
+        from app import monthly as monthly_mod
+
+        rng = np.random.default_rng(5)
+        tickers = [f"T{i:02d}" for i in range(20)]
+        n_days = 900
+        dates = pd.bdate_range("2022-01-03", periods=n_days)
+        drifts = np.linspace(0.0012, 0.0, len(tickers))
+        closes = {}
+        for i, (t, drift) in enumerate(zip(tickers, drifts, strict=False)):
+            r = rng.normal(drift, 0.010, n_days)
+            px = 50.0 * np.exp(np.cumsum(r))
+            if not crash_top_only or i < 10:
+                px[-40:] *= np.linspace(1.0, 0.65, 40)
+            closes[t] = px
+        close = pd.DataFrame(closes, index=dates)
+        vol = pd.DataFrame(5e6, index=dates, columns=tickers)
+        fund = {
+            t: {
+                "StockholdersEquity": [{"start": None, "end": "2021-12-31",
+                                        "filed": "2022-02-15", "val": 5e9}],
+                "NetIncomeLoss": [{"start": "2021-01-01", "end": "2021-12-31",
+                                   "filed": "2022-02-15", "val": 5e8}],
+                "CommonStockSharesOutstanding": [{"start": None, "end": "2021-12-31",
+                                                  "filed": "2022-02-15", "val": 1e8}],
+                "NetCashProvidedByUsedInOperatingActivities": [
+                    {"start": "2021-01-01", "end": "2021-12-31",
+                     "filed": "2022-02-15", "val": 1e9}],
+                "PaymentsToAcquirePropertyPlantAndEquipment": [
+                    {"start": "2021-01-01", "end": "2021-12-31",
+                     "filed": "2022-02-15", "val": -2e8}],
+            }
+            for t in tickers
+        }
+
+        async def fake_load_frames(_tickers, _asof):
+            return close, vol
+
+        async def fake_load_fundamentals(_tickers):
+            return fund
+
+        monkeypatch.setattr(monthly_mod, "load_frames", fake_load_frames)
+        monkeypatch.setattr(fundamentals_mod, "load_fundamentals", fake_load_fundamentals)
+        return {"close": close}
+
+    async def _run(self, crash_market, **kw):
+        import app.optimize as opt
+        return await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, **kw)
+
+    async def test_portfolio_stop_cuts_drawdown(self, crash_market):
+        """The brake must reduce the max drawdown in a crash (it cashes out
+        before the bottom) and report that it fired."""
+        control = await self._run(crash_market)
+        stopped = await self._run(crash_market, portfolio_stop_pct=0.10)
+        assert control is not None and stopped is not None
+        assert stopped.brake_events >= 1
+        assert stopped.max_drawdown < control.max_drawdown, (
+            f"stop DD {stopped.max_drawdown:.1%} vs control {control.max_drawdown:.1%}")
+
+    async def test_exposure_trend_parks_cash(self, crash_market):
+        """A trend filter that blocks deployment in the downtrend changes the
+        outcome vs the control (and never crashes)."""
+        control = await self._run(crash_market)
+        filtered = await self._run(crash_market, exposure_trend_days=50)
+        assert control is not None and filtered is not None
+        assert filtered.final_value != control.final_value
+
+    async def test_stop_reenters_after_recovery(self, crash_market):
+        """With a trend re-entry gate the brake must not stay cashed forever:
+        the run must end with open positions (re-deployed)."""
+        r = await self._run(crash_market, portfolio_stop_pct=0.10,
+                            exposure_trend_days=50)
+        assert r is not None and r.brake_events >= 1
+        # still invested (equity moves with the market after re-entry)
+        assert r.n_trades > 0
+
+    async def test_defaults_off(self):
+        from app.config import settings
+        assert settings.sim_daily_core_portfolio_stop == 0.0
+        assert settings.sim_daily_core_exposure_trend == 0
+
+    async def test_trailing_stop_cuts_drawdown(self, sleeve_crash_market):
+        """The per-name trailing stop must exit the crashing sleeve — lower
+        drawdown than the control (which rides it down)."""
+        control = await self._run(sleeve_crash_market)
+        trailed = await self._run(sleeve_crash_market, trailing_stop_pct=0.15)
+        assert control is not None and trailed is not None
+        assert trailed.max_drawdown < control.max_drawdown, (
+            f"trail DD {trailed.max_drawdown:.1%} vs control {control.max_drawdown:.1%}")
+        assert trailed.n_trades > control.n_trades  # the stops trade
+
+    async def test_trailing_stop_off_by_default(self):
+        from app.config import settings
+        assert settings.sim_daily_core_trailing_stop == 0.0

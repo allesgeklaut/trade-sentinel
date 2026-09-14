@@ -102,6 +102,20 @@ class Settings(BaseSettings):
     # score. The classic defensive tilt — expect lower vol AND lower return;
     # kept for completeness (the sweep decides).
     sim_daily_core_lowvol_tilt: bool = False
+    # portfolio_stop_pct (0 = off): peak-to-trough circuit breaker — when the
+    # strategy's own equity is this % below its running peak, sell everything
+    # to cash and park contributions until the market trend recovers. The
+    # "don't give the win back" brake. Wired live only if the walk-forward
+    # says the avoided drawdown beats the missed rebound (§12).
+    sim_daily_core_portfolio_stop: float = 0.0
+    # exposure_trend_days (0 = off): deploy cash only while the equal-weight
+    # universe index is above its N-day SMA (Faber-style). Also the re-entry
+    # gate after a portfolio-stop trigger.
+    sim_daily_core_exposure_trend: int = 0
+    # trailing_stop_pct (0 = off): per-name trailing stop — exit a holding when
+    # its price falls this fraction below its own peak since entry. Targets
+    # momentum-sleeve crashes the market-trend brakes cannot see (§12).
+    sim_daily_core_trailing_stop: float = 0.0
     sim_run_hour: int = 22
     sim_run_minute: int = 30
 

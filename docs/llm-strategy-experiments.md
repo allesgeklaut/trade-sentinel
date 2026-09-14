@@ -365,3 +365,89 @@ inside the container; Sharpe is the decision metric here.)
 
 Live daily-core is now: qv-mom ranking with RESIDUAL momentum + daily rank
 deployment (boost=0, no gates, no vol overlay). Everything else unchanged.
+
+## 12. "Cash out the win": protection overlays vs the Jul-2026 giveback — 2026-09-14
+
+Owner observation: every portfolio rode a strong Apr–Jun 2026 run (beating the
+DCA benchmark) then round-tripped it in July. daily-core peaked at **137.1% of
+contributed on 2026-06-30** and fell to **112.5% by 2026-09-14** (−17.9% from
+the peak, trough 111.8% on 07-29). The qv-mom design has no exits except the
+monthly hysteresis band, so a momentum crash hands the run-up back.
+
+Three opt-in protection mechanisms were built into `_daily_core_backtest`
+(CLI: `daily-core --portfolio-stop/--exposure-trend/--trailing-stop`):
+
+- `--portfolio-stop X` — peak-to-trough cash-out brake: when the portfolio's
+  own equity is X% below its running peak, **sell everything to cash** and park
+  contributions until re-entry.
+- `--exposure-trend N` — deploy cash only while the equal-weight universe index
+  is above its N-day SMA (also the re-entry gate after a stop, since a fully
+  cashed book's own drawdown is frozen).
+- `--trailing-stop X` — per-name stop: exit a holding when its price falls X%
+  below its own peak since entry; the factor-level cut that does not need a
+  market downtrend (a re-buy is possible once the name re-ranks).
+
+Measurement note: the daily-core maxDD was also fixed to the
+contributed-normalized convention (equity / invested-to-date) that the live UI
+uses — the raw-equity DD understated the real peak-to-trough loss (11.2% →
+18.9% on the 2026 episode, matching the chart).
+
+### Walk-forward A/B (residual core, rank deploy b0; Sharpe / normalized maxDD / turnover)
+
+| Window | control (live) | stop10 | stop10+trend200 | trend200 | trail15 |
+|---|---|---|---|---|---|
+| 2017-19 | 1.09 / 21.6% / 4.9% | **1.26** / **18.3%** / 16.1% | 1.22 / **13.8%** / 8.4% | 1.13 / 19.7% / 5.2% | 1.13 / 21.7% / 8.7% |
+| 2020-21 | 1.02 / 28.2% / 5.6% | **1.12** / 25.2% / 89.5% | 1.04 / **19.7%** / 57.1% | 0.96 / 28.2% / 5.6% | 1.07 / 28.5% / 15.5% |
+| 2022-23 | 0.24 / 20.2% / 7.7% | **-0.01** / 20.5% / 62.0% | 0.51 / **11.9%** / 9.3% | **0.58** / **12.1%** / 5.6% | 0.19 / 20.4% / 24.3% |
+| 2024-26 | 1.72 / 31.4% / 4.2% | 1.76 / 27.0% / 109.8% | 1.76 / **22.8%** / 71.9% | 1.73 / 30.6% / 4.3% | 1.67 / 31.5% / 11.4% |
+
+- **stop10+trend200** wins Sharpe in all four windows and cuts maxDD to the
+  best-or-near-best in every window — but pays 8–72%/month turnover (each
+  cash-out + re-entry is a full book turn).
+- **The pure stop whipsaws**: in 2022-23 it fired 15× and *destroyed* the
+  Sharpe (0.24 → -0.01) — the trend gate is what makes the brake usable
+  (2 events, 0.51).
+- **trend200 is the cheap win**: no added turnover, big help in the 2022-23
+  bear (Sharpe 0.24 → 0.58, DD 20.2% → 12.1%).
+- **trailing stops don't pay**: neutral-to-worse Sharpe in every window at
+  1.5–3× turnover. The monthly hysteresis band already cuts fallen names at
+  month-end; the daily trailing exit mostly front-runs that, churning.
+
+### The specific 2026 episode (2026-01-01..2026-09-14, in-sample, normalized DD)
+
+| Arm | Final | IRR | Sharpe | maxDD | Turnover |
+|---|---|---|---|---|---|
+| control | $10,050 | 38.25% | **1.14** | **18.9%** | 10.4% |
+| trend200 | $10,050 | 38.25% | 1.14 | 18.9% | — (never fired) |
+| trailing 15% | $10,035 | 37.65% | 1.13 | 19.0% | 31.1% |
+| target-vol 0.25 | $9,986 | 35.73% | 1.08 | 18.9% | 10.6% |
+| stop10+trend200 | **$9,580** | 20.33% | 0.86 | **21.4%** | 37.9% (2 events) |
+
+**Every protection mechanism was neutral or WORSE on the episode that prompted
+the question.** Why:
+
+1. **trend200 never fired** — the equal-weight universe index stayed above its
+   200-day SMA through the July reversal. This was a *momentum-sleeve crash
+   while the broad market held* (AI/semis reversal), not a market downtrend.
+2. **stop10+trend200 round-tripped**: the portfolio's drawdown triggered a
+   full cash-out, but the market still looked "up" so the trend gate re-armed
+   the very next day → sell-all + rebuy into the continuing decline, twice.
+   Ending equity 4.7% lower AND a worse drawdown (21.4% vs 18.9%).
+3. **trailing stop** cut individual names but the strategy kept rotating into
+   other falling names; 3× turnover bought nothing.
+4. **target-vol** throttled deployment into the rebound → slightly lower final.
+
+### Verdict
+
+**Do not "fix" the giveback with a cash-out brake.** The walk-forward says
+stop10+trend200 improves long-run Sharpe/DD, but it earns that on *sustained
+market downtrends* (2022) that the overlay can see — not on a fast,
+market-neutral momentum crash, where it actively hurts and multiplies
+turnover. The one defensible, low-cost overlay is `--exposure-trend 200`
+(helps the bear window, free otherwise) — but it does **not** address the
+July-2026 shape at all.
+
+The giveback is the price of the momentum premium; the factor-level mitigation
+(residual momentum) is already the live core (§11). All new knobs stay opt-in
+(`sim_daily_core_portfolio_stop=0`, `sim_daily_core_exposure_trend=0`,
+`sim_daily_core_trailing_stop=0`); live daily-core is unchanged.

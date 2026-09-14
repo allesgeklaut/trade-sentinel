@@ -2468,6 +2468,7 @@ class BacktestSummary:
     window: tuple[str, str]
     sharpe: float = 0.0       # annualized, contribution-adjusted daily returns
     max_drawdown: float = 0.0  # peak-to-trough, fraction (positive number)
+    brake_events: int = 0      # portfolio-stop cash-outs that fired
 
 
 def _inv_vol_weights(names: list[str], frame: pd.DataFrame | None,
@@ -2569,6 +2570,9 @@ async def _daily_core_backtest(
     with_baseline: bool = True,
     vol_weight: bool | None = None,
     target_vol: float | None = None,
+    portfolio_stop_pct: float | None = None,
+    exposure_trend_days: int | None = None,
+    trailing_stop_pct: float | None = None,
 ) -> BacktestSummary | None:
     """Deterministic "daily-core" backtest: the monthly qv-mom portfolio as the
     FUNDAMENTAL core, with minor candle-driven daily adjustments on top.
@@ -2689,6 +2693,7 @@ async def _daily_core_backtest(
 
     # --- Portfolio state ---
     shares: dict[str, float] = {}     # ticker -> shares held
+    peak_px: dict[str, float] = {}    # ticker -> highest close since entry (trailing stop)
     cash = 0.0
     contributed = 0.0
     n_contribs = 0
@@ -2727,6 +2732,9 @@ async def _daily_core_backtest(
                 return
             notional, sh, cash = fill
             shares[t] = shares.get(t, 0.0) + sh
+            # trailing-stop peak: a fresh position starts at its entry price;
+            # an add to an existing one keeps the higher peak.
+            peak_px[t] = max(peak_px.get(t, p), p)
             month_buys += notional
         else:
             sh = shares.get(t, 0.0)
@@ -2735,6 +2743,7 @@ async def _daily_core_backtest(
             notional = sh * p
             cash += notional * (1.0 - cost)
             del shares[t]
+            peak_px.pop(t, None)
             month_sells += notional
         trades_log.append((d.strftime("%Y-%m-%d"), side, t, notional))
 
@@ -2779,15 +2788,63 @@ async def _daily_core_backtest(
     # DOWN — a calm portfolio never leverages up past fully invested.
     if target_vol is None:
         target_vol = settings.sim_daily_core_target_vol
+    # portfolio_stop_pct (0 = off): peak-to-trough circuit breaker — when the
+    # strategy's own equity is this % below its running peak, CASH OUT (sell
+    # every holding) and park contributions until the market trend recovers.
+    # This is the "don't give the win back" brake: the qv-mom design has no
+    # exits except the monthly hysteresis band, so a momentum crash round-trips
+    # the run-up (e.g. Jun→Jul 2026: peak 137% → 112%).
+    if portfolio_stop_pct is None:
+        portfolio_stop_pct = settings.sim_daily_core_portfolio_stop
+    # exposure_trend_days (0 = off): deploy cash only while the equal-weight
+    # universe index trades above its N-day SMA. Park contributions in cash in
+    # a downtrend (Faber-style time-series momentum on the deployment stream);
+    # also serves as the RE-ENTRY gate after a portfolio-stop trigger, since a
+    # fully-cashed portfolio's own drawdown is frozen and can't recover.
+    if exposure_trend_days is None:
+        exposure_trend_days = settings.sim_daily_core_exposure_trend
+    # trailing_stop_pct (0 = off): per-name trailing stop — exit a holding
+    # when its price falls this % below its own peak since entry. This is the
+    # factor-level protection the portfolio/market brakes can't provide: a
+    # momentum-SLEEVE crash while the broad market holds (Jul 2026). The name
+    # can be re-bought later if the ranking brings it back.
+    if trailing_stop_pct is None:
+        trailing_stop_pct = settings.sim_daily_core_trailing_stop
+
+    # Equal-weight universe price index (closes, forward-filled) and its SMA.
+    # Point-in-time safe: a rolling mean of closes at/ before d only.
+    mkt_index = close_val.mean(axis=1)
+    mkt_sma = (mkt_index.rolling(exposure_trend_days).mean()
+               if exposure_trend_days and exposure_trend_days > 0 else None)
+
+    def market_uptrend(d: pd.Timestamp) -> bool:
+        """True when the universe index is at/above its SMA (always True when
+        the filter is disabled)."""
+        if mkt_sma is None:
+            return True
+        sma = mkt_sma.get(d)
+        idx = mkt_index.get(d)
+        if sma is None or idx is None or not np.isfinite(sma) or not np.isfinite(idx):
+            return True  # warmup / missing -> don't block
+        return bool(float(idx) >= float(sma))
     port_days: list[pd.Timestamp] = []
     port_eq: list[float] = []
+    port_invested: list[float] = []  # cumulative contributions per day (for normalized DD)
     port_rets: list[float] = []
+    peak_eq = 0.0        # running peak of the portfolio's own equity
+    risk_off = False     # portfolio-stop brake is active (all cash)
+    brake_events = 0     # how many times the brake fired (for the report)
 
     def _record_equity(d: pd.Timestamp, equity: float, contrib_today: float) -> None:
         """Append one day of equity; maintain the matching log-return list
-        (contribution-adjusted) that `realized_vol` reads."""
+        (contribution-adjusted) that `realized_vol` reads, plus the running
+        invested total for the contributed-normalized drawdown."""
+        nonlocal peak_eq
         port_days.append(d)
         port_eq.append(equity)
+        prev_inv = port_invested[-1] if port_invested else 0.0
+        port_invested.append(prev_inv + contrib_today)
+        peak_eq = max(peak_eq, equity)
         if len(port_eq) < 2:
             port_rets.append(0.0)
             return
@@ -2849,6 +2906,24 @@ async def _daily_core_backtest(
             cash += pending_cash
             pending_cash = 0.0
 
+        # --- Portfolio-stop brake (peak-to-trough cash-out) ---
+        # Mark the book, measure the drawdown from the running equity peak,
+        # and CASH OUT when it breaches the stop. Re-engage only on a market
+        # uptrend: once fully cashed the portfolio's own drawdown is frozen,
+        # so a drawdown-recovery rule could never fire.
+        if portfolio_stop_pct > 0:
+            eq_mark = cash + pending_cash + sum(
+                (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0) for t in shares)
+            dd = (peak_eq - eq_mark) / peak_eq if peak_eq > 0 else 0.0
+            if not risk_off and dd >= portfolio_stop_pct:
+                for t in list(shares):
+                    trade(d, t, "SELL", 0.0)
+                    pending_pick.pop(t, None)
+                risk_off = True
+                brake_events += 1
+            elif risk_off and market_uptrend(d):
+                risk_off = False
+
         # --- SELL phase: releases from the hysteresis band ---
         if order:
             band = set(order[:hold_band])
@@ -2857,6 +2932,19 @@ async def _daily_core_backtest(
                     if t not in band:
                         trade(d, t, "SELL", 0.0)
                         pending_pick.pop(t, None)
+
+        # --- Per-name trailing stop: exit any holding fallen X% below its
+        # own peak since entry. Runs every day (not just month-end) and cuts
+        # individual reversals regardless of the market regime.
+        if trailing_stop_pct > 0:
+            for t in list(shares):
+                p = px_of(t, d)
+                pk = peak_px.get(t)
+                if p is None or not pk or pk <= 0:
+                    continue
+                if p <= pk * (1.0 - trailing_stop_pct):
+                    trade(d, t, "SELL", 0.0)
+                    pending_pick.pop(t, None)
 
         # --- BUY phase: keep the portfolio at target weights ---
         equity_now = cash + pending_cash + sum(
@@ -2873,7 +2961,8 @@ async def _daily_core_backtest(
             held = list(shares)
             picks = monthly_mod._band_fill(order, held, target_n, hold_band)
 
-        paused = crash_pause and pullback_day(d)
+        paused = (crash_pause and pullback_day(d)) or risk_off \
+            or (exposure_trend_days > 0 and not market_uptrend(d))
 
         # Barroso-Santa-Clara vol management: cap deployment when the
         # portfolio's own recent vol exceeds the target. Only scales DOWN
@@ -3034,25 +3123,27 @@ async def _daily_core_backtest(
               if settings.sim_daily_core_mom_variant != "raw" else "")
            + (" vol-weight" if vol_weight else "")
            + (f" target-vol={target_vol:g}" if target_vol else "")
+           + (f" portfolio-stop={portfolio_stop_pct:g}" if portfolio_stop_pct else "")
+           + (f" exposure-trend={exposure_trend_days}" if exposure_trend_days else "")
+           + (f" trailing-stop={trailing_stop_pct:g}" if trailing_stop_pct else "")
            + (" lowvol-tilt" if settings.sim_daily_core_lowvol_tilt else ""))
     ann_sharpe = 0.0
     if len(port_rets) >= 21:
         mu = float(np.mean(port_rets))
         sd = float(np.std(port_rets))
         ann_sharpe = (mu / sd) * np.sqrt(252.0) if sd > 0 else 0.0
-    mdd = 0.0
-    peak = 0.0
-    for eq in port_eq:
-        peak = max(peak, eq)
-        if peak > 0:
-            mdd = max(mdd, (peak - eq) / peak)
+    # Max drawdown on the CONTRIBUTED-NORMALIZED curve (equity / invested so
+    # far) — the same convention as the live UI and _max_drawdown's DCA mode.
+    # Raw-equity DD understates a DCA portfolio's real peak-to-trough loss.
+    mdd = _max_drawdown(port_eq, port_invested) / 100.0
     print(f"\n=== Daily-core backtest [{universe}] {days_all[0].date()}..{last_day.date()} ===")
     print(f"  config: {cfg}")
     print(f"  contributions: {n_contribs} x ${contribution:,.0f} = ${contributed:,.0f}")
     print(f"  final value:   ${value:,.0f}  (multiple {value / max(contributed, 1e-9):.2f}x)")
     print(f"  money-weighted IRR: {irr:.2%}/yr   Sharpe (ann): {ann_sharpe:.2f}   "
           f"max DD: {mdd:.1%}   avg monthly turnover: "
-          f"{(sum(churns) / len(churns)) if churns else 0:.1%}  trades: {len(trades_log)}")
+          f"{(sum(churns) / len(churns)) if churns else 0:.1%}  trades: {len(trades_log)}"
+          + (f"  brake events: {brake_events}" if portfolio_stop_pct else ""))
     if verbose:
         print("\nLast 15 trades:")
         for td, side, t, notional in trades_log[-15:]:
@@ -3081,6 +3172,7 @@ async def _daily_core_backtest(
                 pd.Timestamp(last_day).strftime("%Y-%m-%d")),
         sharpe=ann_sharpe,
         max_drawdown=mdd,
+        brake_events=brake_events,
     )
 
 
@@ -3111,6 +3203,9 @@ async def _main(args: argparse.Namespace) -> None:
             args.entry_gate, args.exit_cadence, args.crash_pause, args.dca,
             vol_weight=getattr(args, "vol_weight", False) or None,
             target_vol=getattr(args, "target_vol", None) or None,
+            portfolio_stop_pct=getattr(args, "portfolio_stop", None) or None,
+            exposure_trend_days=getattr(args, "exposure_trend", None) or None,
+            trailing_stop_pct=getattr(args, "trailing_stop", None) or None,
         )
         return
 
@@ -3613,12 +3708,22 @@ async def _sweep_stage4(fc, close, vol, fund, out_path: str) -> None:
     # Live config: rank deploy, boost 0, entry-gate none, exit monthly,
     # no crash pause — the overlays sit on top.
     overlays: list[dict] = [
-        {"label": "control (live)"},
-        {"label": "residual", "mom": "residual"},
+        {"label": "control (live=residual)", "mom": "residual"},
+        {"label": "raw (reference)", "mom": "raw"},
         {"label": "residual+tv0.25", "mom": "residual", "target_vol": 0.25},
         {"label": "tv0.25", "target_vol": 0.25},
         {"label": "lowvol-tilt", "lowvol_tilt": True},
         {"label": "vol-weight", "vol_weight": True},
+        # Protection overlays ("don't give the win back"): peak-to-trough
+        # cash-out brake + exposure trend filter, on the residual core.
+        {"label": "res+stop10", "mom": "residual", "portfolio_stop": 0.10},
+        {"label": "res+stop15", "mom": "residual", "portfolio_stop": 0.15},
+        {"label": "res+stop10+t200", "mom": "residual", "portfolio_stop": 0.10,
+         "exposure_trend": 200},
+        {"label": "res+trend200", "mom": "residual", "exposure_trend": 200},
+        {"label": "res+trend100", "mom": "residual", "exposure_trend": 100},
+        {"label": "res+trail15", "mom": "residual", "trailing_stop": 0.15},
+        {"label": "res+trail20", "mom": "residual", "trailing_stop": 0.20},
     ]
     # one frame cache per mom variant
     print("stage4: building residual frame cache...", flush=True)
@@ -3644,11 +3749,15 @@ async def _sweep_stage4(fc, close, vol, fund, out_path: str) -> None:
                 frame_cache=use_fc, close_preloaded=(close, vol), fund_preloaded=fund,
                 with_baseline=False,
                 vol_weight=ov.get("vol_weight") or None,
-                target_vol=ov.get("target_vol") or None)
+                target_vol=ov.get("target_vol") or None,
+                portfolio_stop_pct=ov.get("portfolio_stop") or None,
+                exposure_trend_days=ov.get("exposure_trend") or None,
+                trailing_stop_pct=ov.get("trailing_stop") or None)
             if r is not None:
                 row["arms"].append({"label": ov["label"], "irr": r.irr,
                                     "sharpe": r.sharpe, "max_dd": r.max_drawdown,
-                                    "turnover": r.avg_turnover})
+                                    "turnover": r.avg_turnover,
+                                    "brake_events": r.brake_events})
             settings.sim_daily_core_mom_variant = "raw"
             settings.sim_daily_core_lowvol_tilt = False
         report.append(row)
@@ -3903,6 +4012,15 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(annualized, e.g. 0.25); 0/unset = off")
     dc.add_argument("--lowvol-tilt", action="store_true",
                     help="Add pct_rank(-vol) as a 4th score term (defensive tilt)")
+    dc.add_argument("--portfolio-stop", type=float, default=None,
+                    help="Peak-to-trough cash-out brake: sell everything to cash when the "
+                         "portfolio's equity is this %% below its running peak (0 = off)")
+    dc.add_argument("--exposure-trend", type=int, default=None,
+                    help="Deploy cash only while the equal-weight universe index is above "
+                         "its N-day SMA (0 = off); also the re-entry gate after a stop")
+    dc.add_argument("--trailing-stop", type=float, default=None,
+                    help="Per-name trailing stop: exit a holding when its price falls this "
+                         "fraction (e.g. 0.15) below its own peak since entry (0 = off)")
     dc.add_argument("--verbose", action="store_true", help="Print the last trades")
 
     sw = sub.add_parser("daily-core-sweep",
