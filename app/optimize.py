@@ -2469,6 +2469,7 @@ class BacktestSummary:
     sharpe: float = 0.0       # annualized, contribution-adjusted daily returns
     max_drawdown: float = 0.0  # peak-to-trough, fraction (positive number)
     brake_events: int = 0      # portfolio-stop cash-outs that fired
+    basket_events: int = 0     # gradient-filter cash-outs that fired
 
 
 def _inv_vol_weights(names: list[str], frame: pd.DataFrame | None,
@@ -2575,6 +2576,9 @@ async def _daily_core_backtest(
     trailing_stop_pct: float | None = None,
     basket_trend_days: int | None = None,
     basket_confirm_days: int | None = None,
+    basket_threshold: float | None = None,
+    basket_drawdown: float | None = None,
+    basket_er_min: float | None = None,
 ) -> BacktestSummary | None:
     """Deterministic "daily-core" backtest: the monthly qv-mom portfolio as the
     FUNDAMENTAL core, with minor candle-driven daily adjustments on top.
@@ -2824,6 +2828,21 @@ async def _daily_core_backtest(
         basket_trend_days = settings.sim_daily_core_basket_trend
     if basket_confirm_days is None:
         basket_confirm_days = settings.sim_daily_core_basket_confirm
+    if basket_threshold is None:
+        basket_threshold = settings.sim_daily_core_basket_threshold
+    # basket_drawdown (0 = off): cash out when the SIGNAL BASKET is this far
+    # below its running peak; re-enter when the drawdown halves. Unlike the
+    # portfolio-equity brake, the basket keeps moving while in cash, so the
+    # re-entry rule can actually fire; the halving gives hysteresis so a
+    # single real drawdown is one event, not a slope-driven whipsaw.
+    if basket_drawdown is None:
+        basket_drawdown = settings.sim_daily_core_basket_drawdown
+    # basket_er_min (0 = off): Kaufman efficiency ratio gate. ER = |net move|
+    # over N days / sum of |daily moves| (1 = perfect trend, ~0 = pure chop).
+    # When set, the cash-out triggers are armed ONLY while ER >= the minimum:
+    # trend-following signals pay in efficient moves and whipsaw in chop.
+    if basket_er_min is None:
+        basket_er_min = settings.sim_daily_core_basket_er_min
 
     # Equal-weight universe price index (closes, forward-filled) and its SMA.
     # Point-in-time safe: a rolling mean of closes at/ before d only.
@@ -2856,6 +2875,7 @@ async def _daily_core_backtest(
     basket_events = 0
     neg_streak = 0
     pos_streak = 0
+    basket_peak = 0.0
     prev_day: pd.Timestamp | None = None
 
     def _record_equity(d: pd.Timestamp, equity: float, contrib_today: float) -> None:
@@ -2949,7 +2969,7 @@ async def _daily_core_backtest(
 
         # --- Gradient filter cash-out: when the basket trend confirmed
         # negative, exit the book (the flip was set at yesterday's close).
-        if basket_trend_days > 0 and basket_out and shares:
+        if (basket_trend_days > 0 or basket_drawdown > 0) and basket_out and shares:
             for t in list(shares):
                 trade(d, t, "SELL", 0.0)
                 pending_pick.pop(t, None)
@@ -3131,9 +3151,11 @@ async def _daily_core_backtest(
         # Chain the equal-weight top-N basket from yesterday to today (one
         # day's cross-sectional mean return). The day-over-day log return is
         # the gradient's building block; the N-day ROC over `basket_hist` is
-        # the slope. Out when negative for the confirm streak; back in when
-        # positive for the same streak.
-        if basket_trend_days > 0:
+        # the slope. Cash out when the slope is below -`basket_threshold` (a
+        # real drawdown, not noise) for the confirm streak; re-enter on any
+        # positive slope for the same streak. The threshold is the "on
+        # demand" switch: calm-market dips no longer trigger.
+        if basket_trend_days > 0 or basket_drawdown > 0:
             top = order[:target_n]
             rets = []
             for t in top:
@@ -3145,18 +3167,38 @@ async def _daily_core_backtest(
             if not basket_hist:
                 basket_hist.append(100.0)
             basket_hist.append(basket_hist[-1] * float(np.exp(day_ret)))
-            if len(basket_hist) > basket_trend_days:
+            basket_peak = max(basket_peak, basket_hist[-1])
+            # Efficiency ratio over the last 20 basket prints: |net| / path.
+            er = 1.0
+            er_win = 20
+            if basket_er_min > 0 and len(basket_hist) > er_win:
+                seg = basket_hist[-er_win:]
+                path = sum(abs(seg[i] - seg[i - 1]) for i in range(1, len(seg)))
+                er = (abs(seg[-1] - seg[0]) / path) if path > 0 else 1.0
+            armed = (basket_er_min <= 0) or (er >= basket_er_min)
+            # (a) slope trigger (gradient filter). The ER gate arms the EXIT
+            # only: re-entry stays unconditional so chop can never lock the
+            # portfolio in cash forever.
+            if basket_trend_days > 0 and len(basket_hist) > basket_trend_days:
                 slope = basket_hist[-1] / basket_hist[-1 - basket_trend_days] - 1.0
-                if slope < 0:
+                if slope < -basket_threshold:
                     neg_streak += 1
                     pos_streak = 0
                 elif slope > 0:
                     pos_streak += 1
                     neg_streak = 0
-                if not basket_out and neg_streak >= basket_confirm_days:
+                if not basket_out and armed and neg_streak >= basket_confirm_days:
                     basket_out = True
                     basket_events += 1
                 elif basket_out and pos_streak >= basket_confirm_days:
+                    basket_out = False
+            # (b) drawdown trigger (on-demand, hysteresis via halving)
+            if basket_drawdown > 0 and basket_peak > 0:
+                bdd = (basket_peak - basket_hist[-1]) / basket_peak
+                if not basket_out and armed and bdd >= basket_drawdown:
+                    basket_out = True
+                    basket_events += 1
+                elif basket_out and bdd <= basket_drawdown / 2.0:
                     basket_out = False
         prev_day = d
 
@@ -3191,7 +3233,11 @@ async def _daily_core_backtest(
            + (f" exposure-trend={exposure_trend_days}" if exposure_trend_days else "")
            + (f" trailing-stop={trailing_stop_pct:g}" if trailing_stop_pct else "")
            + (f" basket-trend={basket_trend_days}/{basket_confirm_days}"
+              + (f" threshold={basket_threshold:g}" if basket_threshold else "")
               if basket_trend_days else "")
+           + (f" basket-drawdown={basket_drawdown:g}" if basket_drawdown else "")
+           + (f" basket-er-min={basket_er_min:g}"
+              if basket_er_min else "")
            + (" lowvol-tilt" if settings.sim_daily_core_lowvol_tilt else ""))
     ann_sharpe = 0.0
     if len(port_rets) >= 21:
@@ -3210,7 +3256,8 @@ async def _daily_core_backtest(
           f"max DD: {mdd:.1%}   avg monthly turnover: "
           f"{(sum(churns) / len(churns)) if churns else 0:.1%}  trades: {len(trades_log)}"
           + (f"  brake events: {brake_events}" if portfolio_stop_pct else "")
-          + (f"  basket events: {basket_events}" if basket_trend_days else ""))
+          + (f"  basket events: {basket_events}"
+             if (basket_trend_days or basket_drawdown) else ""))
     if verbose:
         print("\nLast 15 trades:")
         for td, side, t, notional in trades_log[-15:]:
@@ -3240,6 +3287,7 @@ async def _daily_core_backtest(
         sharpe=ann_sharpe,
         max_drawdown=mdd,
         brake_events=brake_events,
+        basket_events=basket_events,
     )
 
 
@@ -3275,6 +3323,9 @@ async def _main(args: argparse.Namespace) -> None:
             trailing_stop_pct=getattr(args, "trailing_stop", None) or None,
             basket_trend_days=getattr(args, "basket_trend", None) or None,
             basket_confirm_days=getattr(args, "basket_confirm", None) or None,
+            basket_threshold=getattr(args, "basket_threshold", None) or None,
+            basket_drawdown=getattr(args, "basket_drawdown", None) or None,
+            basket_er_min=getattr(args, "basket_er_min", None) or None,
         )
         return
 
@@ -3804,6 +3855,10 @@ async def _sweep_stage4(fc, close, vol, fund, out_path: str) -> None:
          "basket_trend": 20, "basket_confirm": 3},
         {"label": "res+basket30c5", "mom": "residual",
          "basket_trend": 30, "basket_confirm": 5},
+        {"label": "res+g10t5", "mom": "residual", "basket_trend": 10,
+         "basket_confirm": 3, "basket_threshold": 0.05},
+        {"label": "res+bdd8", "mom": "residual", "basket_drawdown": 0.08},
+        {"label": "res+bdd12", "mom": "residual", "basket_drawdown": 0.12},
     ]
     # one frame cache per mom variant
     print("stage4: building residual frame cache...", flush=True)
@@ -3834,7 +3889,9 @@ async def _sweep_stage4(fc, close, vol, fund, out_path: str) -> None:
                 exposure_trend_days=ov.get("exposure_trend") or None,
                 trailing_stop_pct=ov.get("trailing_stop") or None,
                 basket_trend_days=ov.get("basket_trend") or None,
-                basket_confirm_days=ov.get("basket_confirm") or None)
+                basket_confirm_days=ov.get("basket_confirm") or None,
+                basket_threshold=ov.get("basket_threshold") or None,
+                basket_drawdown=ov.get("basket_drawdown") or None)
             if r is not None:
                 row["arms"].append({"label": ov["label"], "irr": r.irr,
                                     "sharpe": r.sharpe, "max_dd": r.max_drawdown,
@@ -4109,6 +4166,15 @@ def _build_parser() -> argparse.ArgumentParser:
     dc.add_argument("--basket-confirm", type=int, default=None,
                     help="Consecutive days the basket gradient must stay negative "
                          "(and positive to re-enter) — default 3")
+    dc.add_argument("--basket-threshold", type=float, default=None,
+                    help="Minimum |slope| to count as a negative (e.g. 0.05 = only a "
+                         "real 5% N-day drop triggers; 0 = any negative slope)")
+    dc.add_argument("--basket-drawdown", type=float, default=None,
+                    help="Cash out when the target basket is this far below its peak "
+                         "(e.g. 0.08); re-enter when the drawdown halves (0 = off)")
+    dc.add_argument("--basket-er-min", type=float, default=None,
+                    help="Kaufman efficiency-ratio gate: only arm the trigger while the "
+                         "basket path is efficient (e.g. 0.3; 0 = always armed)")
     dc.add_argument("--verbose", action="store_true", help="Print the last trades")
 
     sw = sub.add_parser("daily-core-sweep",

@@ -505,3 +505,60 @@ Honest bottom line: no simple timing rule converts the momentum premium into a
 free lunch. The giveback in the owner's episode is real and the gradient filter
 caught it, but the same rule loses in chop. All knobs remain opt-in
 (`sim_daily_core_basket_trend=0`, defaults off).
+
+## 14. "On demand" switches for the gradient filter: thresholds, drawdown, efficiency — 2026-09-14
+
+Follow-up to §13: can a signal ARM the gradient filter only in the windows where
+it works? Three candidates were built and walk-forwarded (all opt-in):
+
+- `--basket-threshold X` — only a slope below -X% counts (real drops, not noise).
+- `--basket-drawdown X` — cash out when the SIGNAL BASKET is X% below its own
+  peak (the basket keeps moving in cash, so re-entry on the drawdown halving
+  can fire — unlike the frozen portfolio-equity brake).
+- `--basket-er-min X` — Kaufman efficiency ratio gate: arm the EXIT only while
+  ER = |net move| / path length over the last 20 basket prints is >= X
+  (trend-following pays in efficient trends, whipsaws in chop). Re-entry stays
+  unconditional so chop can never lock the portfolio in cash.
+
+### Walk-forward averages (4 OOS windows, residual core)
+
+| Arm | avg Sharpe | avg maxDD | avg turnover | worst window |
+|---|---|---|---|---|
+| control (live) | 1.02 | 25.4% | 5.6% | 2022-23 (0.24) |
+| **g10t5** (threshold 5%) | **1.07** | **18.9%** | 20.5% | 2022-23 (-0.06) |
+| bdd12 (drawdown 12%) | 0.95 | 17.0% | 12.2% | 2022-23 (-0.02) |
+| g10c3 (threshold-free, §13) | 0.93 | 19.4% | 55.4% | 2022-23 (-0.13) |
+| bdd8 (drawdown 8%) | 0.79 | 17.7% | 20.7% | 2022-23 (-0.30) |
+
+### The 2026 episode under each switch
+
+| Arm | Final | Sharpe | maxDD | events |
+|---|---|---|---|---|
+| control | $10,050 | 1.14 | 18.9% | — |
+| g10c3 (no threshold) | **$10,175** | **1.42** | **13.0%** | 5 |
+| g10t5 (5% threshold) | $9,974 | 1.25 | 18.8% | 2 |
+| g10t5+ER0.3 | $9,915 | 1.11 | 18.9% | 1 |
+| bdd12 / bdd12+ER0.3 | $10,050 | 1.14 | 18.9% | 0 |
+
+### Verdict: no "on demand" switch gets both
+
+The two regimes are **mutually exclusive with these mechanisms**:
+
+- **Threshold-free gradient** wins the episode (it exits on the first serious
+  negative slope) but whipsaws in chop because small dips trigger too.
+- **Threshold / drawdown / ER-gated variants** suppress the chop whipsaw and
+  improve the long-run average (g10t5: Sharpe 1.07 vs 1.02, DD 18.9% vs
+  25.4%) — but they **also suppress the episode win**: the Jul-2026 decline was
+  a slow stepwise erosion (10-day slope -0.5%, -6.5%, -1.7%, -5.5%, ...), not a
+  sharp threshold breach, so the gated filters either never fire or exit into a
+  bounce.
+- **The efficiency-ratio gate does not separate the regimes**: in the July
+  reversal the basket path was efficient enough to arm the exit only after the
+  damage was done; in 2017-19's calm bull the ER armed it on ordinary pullbacks.
+
+The honest conclusion: at the moment of decision, a reversal and a dip look
+alike; every rule that catches the reversal also pays in the chop. The only
+mechanism that improved the long-run average at acceptable cost is the
+5%-threshold gradient (g10t5) at ~20% turnover — but it does not solve the
+owner's Jul-2026 complaint, and it still loses the 2022-23 window. All knobs
+remain opt-in with defaults off; live daily-core is unchanged.

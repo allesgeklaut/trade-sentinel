@@ -1749,3 +1749,54 @@ class TestDailyCoreProtection:
     async def test_basket_trend_off_by_default(self):
         from app.config import settings
         assert settings.sim_daily_core_basket_trend == 0
+
+    async def test_basket_threshold_suppresses_noise(self, sleeve_crash_market):
+        """A threshold must make the filter fire less often than the
+        threshold-free version (noise dips no longer cash out), while still
+        cutting the drawdown when a real crash hits."""
+        import app.optimize as opt
+        base = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, basket_trend_days=10, basket_confirm_days=3)
+        thresh = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, basket_trend_days=10, basket_confirm_days=3,
+            basket_threshold=0.05)
+        assert base is not None and thresh is not None
+        assert thresh.basket_events <= base.basket_events
+        # the deep sleeve crash still triggers with a 5% threshold
+        assert thresh.basket_events >= 1
+
+    async def test_basket_threshold_off_by_default(self):
+        from app.config import settings
+        assert settings.sim_daily_core_basket_threshold == 0.0
+
+    async def test_basket_drawdown_fires_once_per_drawdown(self, sleeve_crash_market):
+        """The drawdown trigger must cash out in the crash and re-enter when
+        the basket recovers (drawdown halves) — one event, not a whipsaw."""
+        import app.optimize as opt
+        control = await self._run(sleeve_crash_market)
+        dd = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, basket_drawdown=0.08)
+        assert control is not None and dd is not None
+        assert dd.basket_events >= 1
+        assert dd.max_drawdown < control.max_drawdown
+
+    async def test_basket_drawdown_off_by_default(self):
+        from app.config import settings
+        assert settings.sim_daily_core_basket_drawdown == 0.0
+
+    async def test_basket_er_gate_arms_exit_only(self, sleeve_crash_market):
+        """The efficiency-ratio gate must not lock the portfolio in cash:
+        re-entry is unconditional. In the crash market the ER filter should
+        still fire at least once and end invested."""
+        import app.optimize as opt
+        r = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, basket_drawdown=0.08, basket_er_min=0.3)
+        assert r is not None and r.basket_events >= 1

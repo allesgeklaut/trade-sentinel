@@ -122,6 +122,23 @@ class Settings(BaseSettings):
     # when it stays positive. §12-13.
     sim_daily_core_basket_trend: int = 0
     sim_daily_core_basket_confirm: int = 3
+    # basket_threshold (fraction, 0 = any negative slope): the gradient must
+    # be BELOW -threshold (a real drawdown, not noise) to count toward the
+    # cash-out streak. Re-entry stays on any positive slope for the same
+    # confirm streak — sell on deep drops, re-enter on the recovery. This is
+    # the "on demand" switch: small dips in calm markets no longer trigger.
+    sim_daily_core_basket_threshold: float = 0.0
+    # basket_drawdown (fraction, 0 = off): cash out when the target basket is
+    # this far below its own running peak; re-enter when the drawdown halves
+    # (built-in hysteresis — one event per real drawdown, no slope whipsaw).
+    # The basket keeps moving in cash, so re-entry can trigger.
+    sim_daily_core_basket_drawdown: float = 0.0
+    # basket_er_min (0 = off): Kaufman efficiency ratio gate — only ARM the
+    # gradient/drawdown cash-out when the basket's recent path is efficient
+    # (|net move| / path length above this). Trend-following pays in
+    # efficient trends and whipsaws in chop; the ER is the classic
+    # distinguisher. §13.
+    sim_daily_core_basket_er_min: float = 0.0
     sim_run_hour: int = 22
     sim_run_minute: int = 30
 
