@@ -327,7 +327,7 @@ async def sim_trades(limit: int = Query(default=100, ge=1, le=500)):
     return await sim.get_trades(limit)
 
 @app.get('/api/sim/equity')
-async def sim_equity(limit: int = Query(default=365, ge=1, le=4000)):
+async def sim_equity(limit: int = Query(default=365, ge=1, le=12000)):
     """Equity-curve snapshots for charting (oldest-first)."""
     return await sim.get_equity_curve(limit)
 
@@ -337,7 +337,7 @@ async def sim_allowances():
     return await sim.get_allowances()
 
 @app.get('/api/sim/benchmark')
-async def sim_benchmark(limit: int = Query(default=365, ge=1, le=4000)):
+async def sim_benchmark(limit: int = Query(default=365, ge=1, le=12000)):
     """DCA benchmark portfolio status + equity curve."""
     val = await sim.benchmark_valuate()
     curve = await sim.get_benchmark_equity_curve(limit)
@@ -405,10 +405,27 @@ async def monthly_trades(limit: int = Query(default=100, ge=1, le=500)):
     return await monthly.get_trades(limit)
 
 @app.get('/api/monthly/equity')
-async def monthly_equity(limit: int = Query(default=365, ge=1, le=4000)):
+async def monthly_equity(limit: int = Query(default=365, ge=1, le=12000)):
     """Monthly portfolio equity-curve snapshots (oldest-first)."""
     from . import monthly
     return await monthly.get_equity_curve(limit)
+
+@app.post('/api/monthly/backfill')
+async def monthly_backfill(start: str | None = Query(default=None)):
+    """Backfill the monthly portfolio with synthetic history.
+
+    Replays the qv-mom strategy over stored candles/fundamentals to today
+    and REPLACES the portfolio state with the replay's end state — the
+    monthly twin of /api/dailycore/backfill, so all three equity curves can
+    cover the same (full) window for comparison.
+
+    ``start``: "YYYY-MM-DD" to replay from that date, "all" for the full
+    stored history, or omit (default) to synch with the daily sim's
+    earliest snapshot.
+    """
+    from . import monthly
+    return await monthly.backfill(start)
+
 
 @app.get('/api/monthly/rebalances')
 async def monthly_rebalances(limit: int = Query(default=24, ge=1, le=120)):
@@ -467,7 +484,7 @@ async def daily_core_trades(limit: int = Query(default=100, ge=1, le=500)):
     return await daily_core.get_trades(limit)
 
 @app.get('/api/dailycore/equity')
-async def daily_core_equity(limit: int = Query(default=365, ge=1, le=4000)):
+async def daily_core_equity(limit: int = Query(default=365, ge=1, le=12000)):
     from . import daily_core
     return await daily_core.get_equity_curve(limit)
 

@@ -1551,6 +1551,13 @@
             <div class="bench-label">ACTIONS</div>
             <div class="sim-actions">
                 <button id="monthly-run-btn" onclick="runMonthly()">Rebalance Now</button>
+                <button id="monthly-backfill-btn" onclick="backfillMonthly()">Backfill (sync with other sims)</button>
+                <input type="date" id="monthly-backfill-date" title="Optional: replay from this date instead"
+                    onchange="if(this.value) document.getElementById('monthly-backfill-all').checked = false">
+                <label style="font-size:12px;color:#7aaa81;display:flex;align-items:center;gap:4px">
+                    <input type="checkbox" id="monthly-backfill-all"
+                        onchange="if(this.checked) document.getElementById('monthly-backfill-date').value = ''"> full history
+                </label>
             </div>
             <div id="monthly-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
         </div>
@@ -2745,7 +2752,7 @@
         let dcCompareMode = 'pct';
         let dcRange = '1Y';
         let dailyCoreChartReq = 0;
-        const DC_RANGE_LIMIT = { '6M': 126, '1Y': 252, '2Y': 504, '5Y': 1260, 'MAX': 4000 };
+        const DC_RANGE_LIMIT = { '6M': 126, '1Y': 252, '2Y': 504, '5Y': 1260, 'MAX': 12000 };
 
         function setDCRange(r) {
             dcRange = r;
@@ -2761,7 +2768,23 @@
             loadDailyCoreEquity();
         }
 
-        async function loadDailyCoreStatus(status, snaps, monthlySnaps, bench) {
+        // Append/overwrite today's live point on an overlay curve so all
+        // tabs agree on "today" (snapshots end at the last nightly cycle;
+        // the live valuation is fresher — same rule as each tab's own line).
+        function withLiveToday(points, live) {
+            if (!live || live.total_equity == null) return points;
+            const today = new Date().toISOString().slice(0, 10);
+            const last = points[points.length - 1];
+            const lastDay = last ? last.time : null;
+            if (!lastDay || lastDay < today) {
+                return points.concat([{ time: today, value: live.total_equity, contributed: live.allowance_total }]);
+            }
+            const copy = points.slice();
+            copy[copy.length - 1] = { time: today, value: live.total_equity, contributed: live.allowance_total };
+            return copy;
+        }
+
+        async function loadDailyCoreStatus(status, snaps, monthlyStatus, bench) {
             try {
                 const s = status || await api('dailycore/status');
                 const v = s.valuation || {};
@@ -2769,15 +2792,19 @@
                 // Risk metrics from the already-fetched curves (no extra
                 // endpoints): max drawdown of the contributed-normalized
                 // curve + live alpha vs the monthly sim and the DCA bench.
+                // The alpha chips compare LIVE valuations on both sides —
+                // snapshot vintages would mix "today" vs "last night".
                 const points = (snaps || []).map(x => ({ value: x.total_equity, contributed: x.allowance_total }));
                 const mdd = points.length ? mddOf(points) : null;
-                const dcGain = gainOf(points);
-                const mGain = (monthlySnaps && monthlySnaps.length)
-                    ? gainOf(monthlySnaps.map(x => ({ value: x.total_equity, contributed: x.allowance_total }))) : null;
-                const bGain = (bench && bench.equity_curve && bench.equity_curve.length)
-                    ? gainOf(bench.equity_curve.map(x => ({ value: x.total_equity, contributed: x.allowance_total }))) : null;
-                const alphaM = (dcGain != null && mGain != null) ? dcGain - mGain : null;
-                const alphaB = (dcGain != null && bGain != null) ? dcGain - bGain : null;
+                const dcGain = gain != null ? gain : null;
+                const mLive = (monthlyStatus && monthlyStatus.total_equity != null)
+                    ? (monthlyStatus.allowance_total > 0
+                        ? monthlyStatus.total_equity / monthlyStatus.allowance_total * 100 - 100 : null)
+                    : null;
+                const bLive = (bench && bench.total_equity != null && bench.allowance_total > 0)
+                    ? bench.total_equity / bench.allowance_total * 100 - 100 : null;
+                const alphaM = (dcGain != null && mLive != null) ? dcGain - mLive : null;
+                const alphaB = (dcGain != null && bLive != null) ? dcGain - bLive : null;
                 const rankingDate = s.ranking_date;
                 const stale = rankingDate && rankingDate < new Date().toISOString().slice(0, 10);
                 const m = [
@@ -2823,12 +2850,14 @@
             const limit = DC_RANGE_LIMIT[dcRange] || 4000;
             const reqId = ++dailyCoreChartReq;  // stale-chart guard (#19):
             // a second toggle while fetches are in flight drops the first.
-            const [snaps, live, simSnaps, bench, monthlySnaps] = await Promise.all([
+            const [snaps, live, simSnaps, bench, monthlySnaps, monthlyLiveStatus, simLiveStatus] = await Promise.all([
                 shared.snaps || api(`dailycore/equity?limit=${limit}`).catch(() => null),
                 shared.status || api('dailycore/status').catch(() => null),
                 api(`sim/equity?limit=${limit}`).catch(() => null),
                 api(`sim/benchmark?limit=${limit}`).catch(() => null),
                 api(`monthly/equity?limit=${limit}`).catch(() => null),
+                shared.monthlyStatus || api('monthly/status').catch(() => null),
+                shared.simStatus || api('sim/status').catch(() => null),
             ]);
             if (reqId !== dailyCoreChartReq) return;  // superseded mid-flight
             if (dailyCoreChart) { dailyCoreChart.remove(); dailyCoreChart = null; }
@@ -2842,19 +2871,12 @@
             // duplicate timestamps.
             const byDay = new Map();
             for (const s of snaps) byDay.set(s.date, { value: s.total_equity, contributed: s.allowance_total });
-            const points = [...byDay.entries()]
-                .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
-                .sort((a, b) => a.time < b.time ? -1 : 1);
-            const last = points[points.length - 1];
-            const today = new Date().toISOString().slice(0, 10);
-            if (live && live.valuation && live.valuation.total_equity != null) {
-                // Live valuation wins for today: it is fresher than any
-                // same-day snapshot (which may be a stale intraday mark).
-                // Without this, a morning snapshot hides today's real
-                // drop/gain from the chart while the other tabs show live.
-                if (last.time < today) points.push({ time: today, value: live.valuation.total_equity, contributed: live.valuation.allowance_total });
-                else points[points.length - 1] = { time: today, value: live.valuation.total_equity, contributed: live.valuation.allowance_total };
-            }
+            const points = withLiveToday(
+                [...byDay.entries()]
+                    .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                    .sort((a, b) => a.time < b.time ? -1 : 1),
+                live && live.valuation && live.valuation.total_equity != null
+                    ? live.valuation : null);
             const toPct = p => p.contributed > 0 ? (p.value / p.contributed * 100) : p.value;
             // Sim + benchmark overlays: same series the Monthly tab plots.
             // In pct mode each series is normalized by ITS OWN contributed
@@ -2866,31 +2888,44 @@
                 simByDay.set(new Date(s.at).toISOString().slice(0, 10),
                     { value: s.total_equity, contributed: s.allowance_total });
             }
-            const simPoints = [...simByDay.entries()].map(([time, p]) => ({
-                time,
-                value: dcCompareMode === 'pct' ? toPct(p) : p.value,
-            })).sort((a, b) => a.time < b.time ? -1 : 1);
+            const simPoints = withLiveToday(
+                [...simByDay.entries()]
+                    .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                    .sort((a, b) => a.time < b.time ? -1 : 1),
+                simLiveStatus && simLiveStatus.total_equity != null ? simLiveStatus : null,
+            ).map(p => ({ time: p.time, value: dcCompareMode === 'pct' ? toPct(p) : p.value }));
             const benchByDay = new Map();
             for (const s of ((bench && bench.equity_curve) || [])) {
                 benchByDay.set(new Date(s.at).toISOString().slice(0, 10),
                     { value: s.total_equity, contributed: s.allowance_total });
             }
-            const benchPoints = [...benchByDay.entries()].map(([time, p]) => ({
-                time,
-                value: dcCompareMode === 'pct' ? toPct(p) : p.value,
-            })).sort((a, b) => a.time < b.time ? -1 : 1);
+            const benchPoints = withLiveToday(
+                [...benchByDay.entries()]
+                    .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                    .sort((a, b) => a.time < b.time ? -1 : 1),
+                bench && bench.total_equity != null
+                    ? { total_equity: bench.total_equity, allowance_total: bench.allowance_total } : null,
+            ).map(p => ({ time: p.time, value: dcCompareMode === 'pct' ? toPct(p) : p.value }));
             // Monthly-sim overlay: the strategy's own parent portfolio, the
             // comparison that matters most for this tab (same universe,
             // monthly cadence). Blue, matching the Monthly tab's line.
+            // Today's live monthly valuation is appended/overwritten so the
+            // overlay's "today" matches the Monthly tab exactly (snapshots
+            // end at last night's cycle; the tab's own line shows live).
             const monthlyByDay = new Map();
             for (const s of (monthlySnaps || [])) {
                 monthlyByDay.set((s.date || new Date(s.at).toISOString().slice(0, 10)),
                     { value: s.total_equity, contributed: s.allowance_total });
             }
-            const monthlyPoints = [...monthlyByDay.entries()].map(([time, p]) => ({
-                time,
-                value: dcCompareMode === 'pct' ? toPct(p) : p.value,
-            })).sort((a, b) => a.time < b.time ? -1 : 1);
+            const monthlyLive = (monthlyLiveStatus && monthlyLiveStatus.total_equity != null)
+                ? { total_equity: monthlyLiveStatus.total_equity, allowance_total: monthlyLiveStatus.allowance_total }
+                : null;
+            const monthlyPoints = withLiveToday(
+                [...monthlyByDay.entries()]
+                    .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                    .sort((a, b) => a.time < b.time ? -1 : 1),
+                monthlyLive,
+            ).map(p => ({ time: p.time, value: dcCompareMode === 'pct' ? toPct(p) : p.value }));
             document.getElementById('dailycore-chart').innerHTML = '';
             dailyCoreChart = LightweightCharts.createChart(document.getElementById('dailycore-chart'), {
                 autoSize: true,
@@ -2993,16 +3028,17 @@
             // ranking math behind it is the expensive one. Share the fetches
             // across the summary, positions/band tables, and the chart.
             const limit = DC_RANGE_LIMIT[dcRange] || 4000;
-            const [status, snaps, monthlySnaps, bench] = await Promise.all([
+            const [status, snaps, monthlyStatus, simStatus, bench] = await Promise.all([
                 api('dailycore/status').catch(() => null),
                 api(`dailycore/equity?limit=${limit}`).catch(() => null),
-                api(`monthly/equity?limit=${limit}`).catch(() => null),
+                api('monthly/status').catch(() => null),
+                api('sim/status').catch(() => null),
                 api(`sim/benchmark?limit=${limit}`).catch(() => null),
             ]);
             await Promise.all([
-                loadDailyCoreStatus(status, snaps, monthlySnaps, bench),
+                loadDailyCoreStatus(status, snaps, monthlyStatus, bench),
                 loadDailyCoreTrades(),
-                loadDailyCoreEquity({ status, snaps }),
+                loadDailyCoreEquity({ status, snaps, monthlyStatus, simStatus }),
             ]);
         }
 
@@ -3019,7 +3055,7 @@
         let compareMode = 'pct';
         let monthlyRange = '1Y';
         let monthlyChartReq = 0;
-        const M_RANGE_LIMIT = { '6M': 126, '1Y': 252, '2Y': 504, '5Y': 1260, 'MAX': 4000 };
+        const M_RANGE_LIMIT = { '6M': 126, '1Y': 252, '2Y': 504, '5Y': 1260, 'MAX': 12000 };
 
         function setMonthlyRange(r) {
             monthlyRange = r;
@@ -3064,11 +3100,12 @@
             shared = shared || {};
             const limit = M_RANGE_LIMIT[monthlyRange] || 4000;
             const reqId = ++monthlyChartReq;
-            const [snaps, live, simSnaps, bench] = await Promise.all([
+            const [snaps, live, simSnaps, bench, simLiveStatus] = await Promise.all([
                 shared.snaps || api(`monthly/equity?limit=${limit}`).catch(() => null),
                 shared.status || api('monthly/status').catch(() => null),
                 api(`sim/equity?limit=${limit}`).catch(() => null),
                 api(`sim/benchmark?limit=${limit}`).catch(() => null),
+                shared.simStatus || api('sim/status').catch(() => null),
             ]);
             if (reqId !== monthlyChartReq) return;
             if (monthlyChart) { monthlyChart.remove(); monthlyChart = null; }
@@ -3076,43 +3113,35 @@
                 document.getElementById('monthly-chart').innerHTML = '<div class="sim-empty">No data yet — equity is tracked after each monthly rebalance.</div>';
                 return;
             }
-            // Live point: today's valuation, so the curve reflects current
-            // prices between snapshots (deduped if today IS a snapshot day).
-            // Each point carries its own contributed total — the allowance
-            // steps $1000 at every month start, and dividing by the WRONG
-            // vintage would spike the pct curve. One point per day, the LAST
-            // snapshot winning — the daily mark overwrites a same-day
-            // rebalance snapshot. Deduping is also required: lightweight-charts
-            // line series throw on duplicate timestamps and never render.
+            // One point per day, the LAST snapshot winning; today's LIVE
+            // valuation appended/overwritten (fresher than a same-day
+            // snapshot — same rule as the Daily-Core chart).
             const monthlyByDay = new Map();
             for (const s of snaps) {
                 monthlyByDay.set(s.date, { value: s.total_equity, contributed: s.allowance_total });
             }
-            const points = [...monthlyByDay.entries()]
-                .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
-                .sort((a, b) => a.time < b.time ? -1 : 1);
-            const last = points[points.length - 1];
-            const today = new Date().toISOString().slice(0, 10);
-            if (live && live.total_equity != null) {
-                // Live valuation wins for today (fresher than a same-day
-                // snapshot — same rule as the Daily-Core chart).
-                if (last.time < today) points.push({ time: today, value: live.total_equity, contributed: live.allowance_total });
-                else points[points.length - 1] = { time: today, value: live.total_equity, contributed: live.allowance_total };
-            }
+            const points = withLiveToday(
+                [...monthlyByDay.entries()]
+                    .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                    .sort((a, b) => a.time < b.time ? -1 : 1),
+                live && live.total_equity != null ? live : null);
             const toPct = p => p.contributed > 0 ? (p.value / p.contributed * 100) : p.value;
             // Sim overlay: same data the Simulation tab plots. The sim's
             // contributed total can differ from the monthly's (deposit timing
             // drift), so each sim point is normalized by ITS OWN
-            // contributed value in pct mode.
+            // contributed value in pct mode. Live-today appended so overlays
+            // agree across tabs.
             const byDay = new Map();  // collapse intraday snapshots -> last per day
             for (const s of (simSnaps || [])) {
                 byDay.set(new Date(s.at).toISOString().slice(0, 10),
                     { value: s.total_equity, contributed: s.allowance_total });
             }
-            const simPoints = [...byDay.entries()].map(([time, p]) => ({
-                time,
-                value: compareMode === 'pct' ? toPct(p) : p.value,
-            })).sort((a, b) => a.time < b.time ? -1 : 1);
+            const simPoints = withLiveToday(
+                [...byDay.entries()]
+                    .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                    .sort((a, b) => a.time < b.time ? -1 : 1),
+                simLiveStatus && simLiveStatus.total_equity != null ? simLiveStatus : null,
+            ).map(p => ({ time: p.time, value: compareMode === 'pct' ? toPct(p) : p.value }));
             // DCA benchmark overlay (orange, same series the Daily Sim chart
             // plots): the URTH control portfolio, normalized by ITS OWN
             // contributed total so pct mode shares the 100 baseline.
@@ -3121,10 +3150,13 @@
                 benchByDay.set(new Date(s.at).toISOString().slice(0, 10),
                     { value: s.total_equity, contributed: s.allowance_total });
             }
-            const benchPoints = [...benchByDay.entries()].map(([time, p]) => ({
-                time,
-                value: compareMode === 'pct' ? toPct(p) : p.value,
-            })).sort((a, b) => a.time < b.time ? -1 : 1);
+            const benchPoints = withLiveToday(
+                [...benchByDay.entries()]
+                    .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                    .sort((a, b) => a.time < b.time ? -1 : 1),
+                bench && bench.total_equity != null
+                    ? { total_equity: bench.total_equity, allowance_total: bench.allowance_total } : null,
+            ).map(p => ({ time: p.time, value: compareMode === 'pct' ? toPct(p) : p.value }));
             document.getElementById('monthly-chart').innerHTML = '';
             monthlyChart = LightweightCharts.createChart(document.getElementById('monthly-chart'), {
                 autoSize: true,
@@ -3205,6 +3237,31 @@
             btn.disabled = false;
         }
 
+        async function backfillMonthly() {
+            // Destructive: replaces the portfolio's state with a synthetic
+            // replay (same contract as the Daily-Core backfill).
+            if (!confirm('Backfill REPLACES the Monthly portfolio state with a synthetic replay of the qv-mom strategy. Continue?'))
+                return;
+            const btn = document.getElementById('monthly-backfill-btn');
+            const status = document.getElementById('monthly-run-status');
+            const dateVal = document.getElementById('monthly-backfill-date').value;
+            const allHist = document.getElementById('monthly-backfill-all').checked;
+            const qs = dateVal ? `?start=${dateVal}` : (allHist ? '?start=all' : '');
+            btn.disabled = true;
+            status.textContent = 'Backfilling… (replays qv-mom over stored history — can take a few minutes)';
+            try {
+                const r = await api('monthly/backfill' + qs, { method: 'POST' });
+                if (!r.ok) throw new Error(r.error || 'backfill failed');
+                status.textContent = `Backfilled ${r.months} months (${r.start} → ${r.end}, from ${r.requested_start}): ` +
+                    `${r.snapshots} equity points, ${r.trades} trades, ${r.rebalances} rebalances, final equity $${r.final_equity.toFixed(2)}.`;
+                monthlyRange = 'MAX';  // show the replayed history in full
+                for (const b of document.querySelectorAll('#m-range-bar .range-btn'))
+                    b.classList.toggle('range-active', b.dataset.range === 'MAX');
+                await loadMonthlyAll();
+            } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
+            btn.disabled = false;
+        }
+
         async function loadMonthlyAll() {
             const limit = M_RANGE_LIMIT[monthlyRange] || 4000;
             const snaps = await api(`monthly/equity?limit=${limit}`).catch(() => null);
@@ -3222,11 +3279,14 @@
                 const benchEquity = bench && bench.total_equity != null ? '$' + bench.total_equity.toFixed(2) : '—';
                 // Normalized gain + max drawdown; alpha vs the DCA bench is
                 // the number that matters for this engine's churn-prone sim.
+                // Both gains compare LIVE valuations (bench contributed total
+                // is acc.cash — total deposited) so the chip matches the
+                // Daily-Core tab's live-vs-live convention.
                 const points = (snaps || []).map(x => ({ value: x.total_equity, contributed: x.allowance_total }));
                 const mdd = points.length ? mddOf(points) : null;
-                const gain = gainOf(points);
-                const bGain = (bench && bench.equity_curve && bench.equity_curve.length)
-                    ? gainOf(bench.equity_curve.map(x => ({ value: x.total_equity, contributed: x.allowance_total }))) : null;
+                const gain = (s.allowance_total > 0) ? (s.total_equity / s.allowance_total * 100 - 100) : null;
+                const bGain = (bench && bench.total_equity != null && bench.allowance_total > 0)
+                    ? bench.total_equity / bench.allowance_total * 100 - 100 : null;
                 const alpha = (gain != null && bGain != null) ? gain - bGain : null;
                 const m = [
                     ['Total Equity', s.total_equity != null ? '$' + s.total_equity.toFixed(2) : '—'],

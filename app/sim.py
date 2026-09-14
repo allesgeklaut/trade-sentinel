@@ -2208,7 +2208,12 @@ async def benchmark_valuate() -> dict[str, Any]:
         "avg_cost": round(acc.avg_cost, 4),
         "current_price": round(price, 4),
         "total_equity": round(value, 2),
-        "allowance_total": 0.0,  # filled below
+        # total deposited: acc.cash tracks the cumulative allowances (see
+        # _benchmark_deposit_and_buy). The old placeholder 0.0 made every
+        # contributed-normalized view of the live bench divide by zero —
+        # the pct conversion fell back to the RAW value and the 1Y chart
+        # showed the bench at 1986% instead of ~99%.
+        "allowance_total": round(acc.cash, 2),
     }
 
 

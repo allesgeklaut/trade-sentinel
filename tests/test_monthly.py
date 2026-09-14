@@ -895,3 +895,107 @@ def test_qv_order_lowvol_tilt():
     # promote the low-vol name from the ticker-asc fallback.
     assert order_plain == ["HIVOL", "LOVOL"]  # tie -> ticker asc
     assert order_tilt == ["LOVOL", "HIVOL"]
+
+
+# ---------------------------------------------------------------------------
+# Backfill (synthetic history)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fake_market(monkeypatch):
+    """Patch monthly's market/fundamentals loaders so backfill replays a tiny
+    deterministic two-ticker market (no network, no real DB rows)."""
+    dates = pd.bdate_range("2026-07-01", "2026-08-28")
+    close = pd.DataFrame({"AAA": 100.0, "BBB": 50.0}, index=dates)
+    vol = pd.DataFrame(1e6, index=dates, columns=["AAA", "BBB"])
+
+    def fake_frame(m, c, v, f):
+        return pd.DataFrame({
+            "roe": [0.1, 0.2], "p_fcf": [20.0, 15.0], "mcap": [1e10, 1e10],
+            "dollar_vol": [5e7, 5e7], "mom": [0.1, 0.2], "price": [100.0, 50.0],
+            "vol": [0.2, 0.25], "eligible": [True, True],
+        }, index=pd.Index(["AAA", "BBB"], name="ticker"))
+
+    async def fake_load_frames(_tickers, _asof):
+        return close, vol
+
+    async def fake_load_fundamentals(_tickers):
+        return {"AAA": {"x": []}, "BBB": {"x": []}}
+
+    monkeypatch.setattr(monthly, "universe_tickers", lambda _u: ["AAA", "BBB"])
+    monkeypatch.setattr(monthly.fundamentals_mod, "load_fundamentals",
+                        fake_load_fundamentals)
+    monkeypatch.setattr(monthly, "load_frames", fake_load_frames)
+    monkeypatch.setattr(monthly, "eligible_frame", fake_frame)
+    return {"close": close}
+
+
+class TestBackfill:
+    def test_replaces_state_and_persists_rows(self, mem_db, fake_market, monkeypatch):
+        """The replay wipes the portfolio and persists allowance/trade/
+        rebalance/snapshot rows with historical stamps, converging to the
+        picks the strategy would hold today."""
+        from app.db import MonthlyAllowance as Al
+        from app.db import MonthlyPosition as Pos
+        from app.db import MonthlyRebalance as Rb
+        from app.db import MonthlySnapshot as Sn
+        from app.db import MonthlyTrade as Tr
+
+        monkeypatch.setattr(monthly, "_current_month", lambda: "2026-08")
+        r = asyncio.run(monthly.backfill(start="2026-07-01"))
+        assert r["ok"] is True
+        assert r["contributed"] == pytest.approx(2 * settings.sim_monthly_contribution)
+
+        async def check():
+            async with mem_db() as s:
+                snaps = (await s.scalars(select(Sn))).all()
+                assert len(snaps) == r["snapshots"] > 0
+                # one snapshot per trading day, dated by the replay day
+                days = sorted(x.created_at.strftime("%Y-%m-%d") for x in snaps)
+                assert days[0] == "2026-07-01" and days[-1] == "2026-08-28"
+                # allowance rows: exactly the deposited months
+                months = sorted(x.month for x in (await s.scalars(select(Al))).all())
+                assert months == ["2026-07", "2026-08"]
+                # the end state holds the strategy's picks
+                pos = (await s.scalars(select(Pos))).all()
+                assert len(pos) == 2
+                for p in pos:
+                    assert p.shares > 0 and p.avg_cost > 0
+                # rebalance audit rows exist with picks
+                rbs = (await s.scalars(select(Rb))).all()
+                assert rbs and all(x.picked for x in rbs)
+                # trades carry the replay day
+                trs = (await s.scalars(select(Tr))).all()
+                for t in trs:
+                    assert t.created_at.strftime("%Y-%m") in ("2026-07", "2026-08")
+                    assert t.shares > 0 and t.price > 0
+        asyncio.run(check())
+
+    def test_uncovered_current_month_keeps_its_contribution(self, mem_db, fake_market,
+                                                            monkeypatch):
+        """A backfill run before the current month has candles must not lose
+        the live deposit (same rule as daily_core.backfill)."""
+        from app.db import MonthlyAllowance as Al
+
+        monkeypatch.setattr(monthly, "_current_month", lambda: "2026-09")
+
+        async def seed():
+            async with mem_db() as s:
+                acc = await s.get(MonthlyAccount, 1)
+                acc.last_allowance_month = "2026-09"
+                await s.commit()
+        asyncio.run(seed())
+
+        r = asyncio.run(monthly.backfill(start="2026-07-01"))
+        assert r["ok"] is True
+        # Jul + Aug replayed + Sep (live, uncovered) = 3 contributions
+        assert r["contributed"] == pytest.approx(3 * settings.sim_monthly_contribution)
+
+        async def check():
+            async with mem_db() as s:
+                acc = await s.get(MonthlyAccount, 1)
+                assert acc.last_allowance_month == "2026-09"
+                rows = (await s.scalars(select(Al))).all()
+                assert sorted(x.month for x in rows) == \
+                    ["2026-07", "2026-08", "2026-09"]
+        asyncio.run(check())

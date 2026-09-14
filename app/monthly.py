@@ -930,6 +930,266 @@ async def run_monthly_cycle() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Backfill (synthetic history, same contract as daily_core.backfill)
+# ---------------------------------------------------------------------------
+
+async def _sync_start_date() -> str | None:
+    """Earliest daily-sim snapshot date — the monthly backfill's default
+    start so the three equity curves cover the same window (same rule as
+    daily_core._sync_start_date; the daily-sim curve is the longest-running
+    live one, so it anchors the shared window)."""
+    from .db import SimSnapshot
+    async with Session() as s:
+        d = await s.scalar(select(func.min(SimSnapshot.created_at)))
+    return d.strftime("%Y-%m-%d") if d else None
+
+
+async def backfill(start: str | None = None) -> dict[str, Any]:
+    """Replay the monthly qv-mom strategy over historical data and REPLACE
+    the portfolio state with the replay's end state.
+
+    Wipes account/positions/trades/allowances/snapshots/rebalances, then
+    walks every stored month-end from `start` to today: deposits the
+    allowance on each month's FIRST trading day (same timing as the live
+    deposit_allowance so the contributed figures step in lockstep with the
+    other portfolios), picks the top-N with hysteresis at the month-end and
+    trades at that day's close with 10 bps one-way paper costs — the same
+    simulation as `optimize monthly-backtest`, but materialized as real
+    trade/rebalance/snapshot rows the UI can render.
+
+    ``start`` semantics (mirrors daily_core.backfill):
+      - explicit "YYYY-MM-DD": replay from that day
+      - None (default): synched with the other sims — starts on the earliest
+        snapshot date of the daily sim / daily-core portfolios so all three
+        equity curves cover the same window
+      - "all": the full stored history (2017+, first month with an eligible
+        frame) — the long-view replay
+
+    Paper-portfolio convenience, not a live track record. Point-in-time
+    discipline: a rebalance on date d only sees fundamentals public by then
+    (same EDGAR-first fact store as the backtest).
+    """
+    from sqlalchemy import delete as sa_delete
+    from .db import (MonthlyAccount as Acc, MonthlyPosition as Pos,
+                     MonthlyTrade as Tr, MonthlyAllowance as Al,
+                     MonthlySnapshot as Sn, MonthlyRebalance as Rb)
+
+    async with _rebalance_lock:
+        if start is None:
+            # synched with the other sims: the earliest daily-sim snapshot
+            start = await _sync_start_date()
+        elif start == "all":
+            start = None  # full stored history
+        start_note = start or "first eligible month"
+
+        tickers = universe_tickers(settings.sim_monthly_universe)
+        fund = await fundamentals_mod.load_fundamentals(tickers)
+        if not fund:
+            return {"ok": False, "error": "no fundamentals loaded"}
+        close, vol = await load_frames(tickers, None)
+        if close.empty:
+            return {"ok": False, "error": "no candle data"}
+
+        idx = pd.DatetimeIndex(close.index)
+        if start:
+            idx = idx[idx >= pd.Timestamp(start)]
+        if idx.empty:
+            return {"ok": False, "error": f"no trading days since {start_note}"}
+
+        # last trading day of each month in the window
+        months: list[pd.Timestamp] = []
+        for ym in sorted({(d.year, d.month) for d in idx}):
+            sub = idx[(idx.year == ym[0]) & (idx.month == ym[1])]
+            if len(sub):
+                months.append(sub[-1])
+
+        # eligibility frames per month-end (plus the month-end before the
+        # window so a mid-month start ranks against the prior frame)
+        prior_month_ends: list[pd.Timestamp] = []
+        if months:
+            prev = months[0] - pd.offsets.MonthEnd(1)
+            prev_idx = close.index[close.index <= prev]
+            if len(prev_idx):
+                prior_month_ends.append(prev_idx[-1])
+        frame_cache: dict[pd.Timestamp, pd.DataFrame | None] = {}
+        for m in sorted(set(prior_month_ends) | set(months)):
+            frame_cache[m] = await asyncio.to_thread(eligible_frame, m, close, vol, fund)
+        live_months = [m for m in months
+                       if (f := frame_cache.get(m)) is not None
+                       and bool(f["eligible"].any())]
+        if not live_months:
+            return {"ok": False, "error": "no month with eligible names"}
+        # Trim the day index to the FIRST eligible month: months before it
+        # would only produce dead flat-zero snapshots (the replay deposits
+        # from the first eligible month), flooding the curve with ~9k empty
+        # points for start=all (1980-2017) and clipping the equity API's
+        # 4000-point cap to 2011. The momentum warmup still uses the full
+        # close frame — only the REPLAYED days start here.
+        idx = idx[idx >= pd.Timestamp(live_months[0].replace(day=1))]
+
+        # contribution timing: first trading day of each window month
+        contrib_days: dict[str, pd.Timestamp] = {}
+        for m in live_months:
+            key = f"{m.year}-{m.month:02d}"
+            month_days = idx[(idx.year == m.year) & (idx.month == m.month)]
+            if len(month_days):
+                contrib_days[key] = month_days[0]
+        # valuation closes: forward-filled so missing candles carry the last
+        # known close (never value a held position at 0)
+        close_val = close.ffill()
+
+        def px_of(t: str, d: pd.Timestamp) -> float | None:
+            return px_at(close_val, d, t)
+
+        cost = settings.sim_monthly_cost_oneway
+
+        # --- wipe + reset (preserve the live month markers like daily-core) ---
+        live_allowance_month: str | None = None
+        live_rebalance_month: str | None = None
+        async with Session() as s:
+            acc0 = await s.get(Acc, 1)
+            if acc0 is not None:
+                live_allowance_month = acc0.last_allowance_month
+                live_rebalance_month = acc0.last_rebalance_month
+            for tbl in (Tr, Pos, Al, Sn, Rb):
+                await s.execute(sa_delete(tbl))
+            acc = await s.get(Acc, 1)
+            if acc is None:
+                acc = Acc(id=1)
+                s.add(acc)
+            acc.cash = 0.0
+            acc.last_allowance_month = None
+            await s.commit()
+
+        # --- in-memory month-by-month replay ---
+        # Real share/cash bookkeeping (not the optimize backtest's
+        # aggregate-value shortcut) so the trade log can carry actual
+        # shares/prices: each month-end, SELL dropped names at that day's
+        # close, then BUY the new picks to equal weight with the proceeds
+        # plus the month's contribution. Between rebalances the portfolio
+        # is untouched (the monthly engine trades once a month).
+        shares: dict[str, float] = {}
+        cash = 0.0
+        contributed = 0.0
+        rebalance_rows: list[tuple[str, str, str, str, int]] = []
+        trade_rows: list[tuple[str, str, str, float, float, float]] = []
+        snaps: list[tuple[str, float, float]] = []
+
+        def month_first_day(m: pd.Timestamp) -> pd.Timestamp | None:
+            key = f"{m.year}-{m.month:02d}"
+            return contrib_days.get(key)
+
+        # replay from the first eligible month only (earlier months have no
+        # ranking — the trimmed idx already excludes their days, so iterate
+        # the live months directly with their index in the full month list)
+        first_live_set = {m for m in live_months}
+        replay_seq = [m for m in months if m in first_live_set]
+        for i, m in enumerate(replay_seq):
+            frame = frame_cache.get(m)
+            has_frame = frame is not None and bool(frame["eligible"].any())
+            picks, _ = (await asyncio.to_thread(
+                pick_portfolio, m, close, vol, fund, list(shares), frame)) \
+                if has_frame else (list(shares), None)
+            prev_td = replay_seq[i - 1] if i > 0 else None
+            month_days = [d for d in idx if (prev_td is None or d > prev_td) and d <= m]
+
+            # contribution on the month's first trading day
+            cf = 0.0
+            first_day = month_first_day(m)
+            if first_day is not None and any(d == first_day for d in month_days):
+                cf = settings.sim_monthly_contribution
+                cash += cf
+                contributed += cf
+
+            # month-end rebuild: SELL dropped names at the close, then BUY
+            # the picks to equal weight with proceeds + contribution
+            adds = len(set(picks) - set(shares))
+            if picks != list(shares):
+                rebalance_rows.append((f"{m.year}-{m.month:02d}", m.strftime("%Y-%m-%d"),
+                                       ",".join(sorted(shares)), ",".join(sorted(picks)),
+                                       adds))
+                for t in list(shares):
+                    if t in picks:
+                        continue
+                    p = px_of(t, m)
+                    sh = shares.get(t, 0.0)
+                    if p is None or p <= 0 or sh <= 0:
+                        continue
+                    notional = sh * p
+                    cash += notional * (1.0 - cost)
+                    del shares[t]
+                    trade_rows.append((m.strftime("%Y-%m-%d"), "SELL", t, notional, sh, p))
+                equity_now = cash + sum(sh * (px_of(t, m) or 0.0)
+                                        for t, sh in shares.items())
+                weight = equity_now / max(len(picks), 1)
+                for t in picks:
+                    p = px_of(t, m)
+                    if p is None or p <= 0:
+                        continue
+                    gap = weight - shares.get(t, 0.0) * p
+                    if gap > 1 and cash > 1:
+                        notional = min(gap, max(cash, 0.0) / (1.0 + cost))
+                        if notional < 1:
+                            continue
+                        sh = notional / p
+                        cash -= notional
+                        cash -= notional * cost
+                        shares[t] = shares.get(t, 0.0) + sh
+                        trade_rows.append((m.strftime("%Y-%m-%d"), "BUY", t, notional, sh, p))
+
+            # daily snapshots across the month (contribution lands on day 1)
+            for d in month_days:
+                eq = cash + sum(sh * (px_of(t, d) or 0.0) for t, sh in shares.items())
+                snaps.append((d.strftime("%Y-%m-%d"), eq, contributed))
+
+        # --- persist the end state ---
+        replay_months = sorted({f"{m.year}-{m.month:02d}" for m in live_months})
+        # The live engine may already have deposited the CURRENT month while
+        # the replay window has no candle for it yet — the wipe destroyed the
+        # allowance row, so re-create it (same rule as daily_core.backfill).
+        current_month = datetime.now(UTC).strftime("%Y-%m")
+        if live_allowance_month == current_month and current_month not in replay_months:
+            cash += settings.sim_monthly_contribution
+            contributed += settings.sim_monthly_contribution
+            replay_months = sorted(set(replay_months) | {current_month})
+        async with Session() as s:
+            acc = await s.get(Acc, 1)
+            assert acc is not None  # created in the wipe step above
+            # converge to the live engine's state shape: cash = replay cash,
+            # positions booked at their last close (avg_cost not tracked by
+            # the replay; the equity curve is what matters)
+            acc.cash = cash
+            for t, sh in shares.items():
+                p = px_of(t, idx[-1]) or 0.0
+                s.add(Pos(ticker=t, shares=sh, avg_cost=p))
+            for td, side, t, notional, sh, pr in trade_rows:
+                s.add(Tr(ticker=t, side=side, shares=round(sh, 6), price=round(pr, 6),
+                         cash_after=0.0,
+                         reason=f"backfill {side.lower()} ${notional:,.0f}",
+                         created_at=pd.Timestamp(f"{td} 16:00:00+00:00").to_pydatetime()))
+            for m_key in replay_months:
+                s.add(Al(amount=settings.sim_monthly_contribution, month=m_key))
+            for m_key, td, held, picked, n_new in rebalance_rows:
+                s.add(Rb(rebal_month=m_key, rebal_date=pd.Timestamp(f"{td} 16:00:00+00:00").to_pydatetime(),
+                         held_before=held, picked=picked, n_new=n_new,
+                         snapshot=""))
+            acc.last_allowance_month = live_allowance_month or replay_months[-1]
+            acc.last_rebalance_month = live_rebalance_month
+            for sd, eq, contrib_at_day in snaps:
+                s.add(Sn(cash=0.0, positions_value=eq, total_equity=eq,
+                         allowance_total=round(contrib_at_day, 2),
+                         created_at=pd.Timestamp(f"{sd} 16:00:00+00:00").to_pydatetime()))
+            await s.commit()
+
+        return {"ok": True, "months": len(live_months), "start": str(idx[0].date()),
+                "end": str(idx[-1].date()), "requested_start": start_note,
+                "contributed": round(contributed, 2),
+                "final_equity": round(snaps[-1][1], 2) if snaps else 0.0,
+                "trades": len(trade_rows), "rebalances": len(rebalance_rows),
+                "snapshots": len(snaps)}
+
+
+# ---------------------------------------------------------------------------
 # Read APIs
 # ---------------------------------------------------------------------------
 
