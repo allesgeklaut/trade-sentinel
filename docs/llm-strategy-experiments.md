@@ -562,3 +562,52 @@ mechanism that improved the long-run average at acceptable cost is the
 5%-threshold gradient (g10t5) at ~20% turnover — but it does not solve the
 owner's Jul-2026 complaint, and it still loses the 2022-23 window. All knobs
 remain opt-in with defaults off; live daily-core is unchanged.
+
+## 15. Owner's composite: gradient filter in GOOD TIMES + market-trend gate — 2026-09-14
+
+Owner's design after §12-14: *don't* gate everything on one regime rule. Keep the
+engine's normal buying in charge; use the **market-trend gate for bad times**
+(park cash in downtrends, §12) and arm the **gradient cash-out only in good
+times** (market > SMA200) to catch momentum-sleeve crashes inside healthy bull
+markets — no cooldown, the engine re-enters whenever it decides. Implemented as
+`--basket-good-times` (arms the §13 slope trigger only above the market's
+200-day SMA; re-entry unconditional).
+
+### 2026 episode (2026-01-01..2026-09-14)
+
+| Arm | Final | IRR | Sharpe | maxDD | Turnover |
+|---|---|---|---|---|---|
+| control | $10,050 | 38.25% | 1.14 | 18.9% | 10.4% |
+| g10c3 (ungated) | **$10,175** | **43.23%** | **1.42** | **13.0%** | 89.3% |
+| g10c3gt (good-times) | **$10,175** | **43.23%** | **1.42** | **13.0%** | 89.3% |
+| **g10c3gt+t200** | **$10,175** | **43.23%** | **1.42** | **13.0%** | 89.3% |
+
+(Identical: the market stayed above its SMA200 through the July sleeve crash —
+the good-times arm never disarmed, and the trend gate never blocked.)
+
+### Walk-forward (Sharpe / normalized maxDD / turnover)
+
+| Window | control | g10c3gt | g15c3gt | **g10c3gt+t200** |
+|---|---|---|---|---|
+| 2017-19 | **1.09** / 21.6% / 4.9% | 0.86 / 25.0% / 58.0% | 0.85 / 23.1% / 40.9% | **1.14** / **15.5%** / 57.7% |
+| 2020-21 | 1.02 / 28.2% / 5.6% | 1.27 / 14.8% / 51.2% | **1.32** / **12.4%** / 36.5% | 1.01 / 14.6% / 51.3% |
+| 2022-23 | **0.24** / 20.2% / 7.7% | -0.08 / 20.2% / 37.6% | 0.00 / 20.2% / 33.9% | 0.11 / **12.2%** / 35.5% |
+| 2024-26 | 1.72 / 31.4% / 4.2% | 1.72 / 18.5% / 56.2% | 1.65 / 14.2% / 49.1% | **1.78** / **14.5%** / 55.9% |
+| **avg** | **1.02** / 25.4% | 0.94 / 19.6% | 0.96 / 17.5% | 1.01 / **14.2%** |
+
+### Verdict
+
+**This is the first composite that addresses the owner's episode without
+degrading the long-run average.** `g10c3gt+t200`:
+
+- wins the 2026 episode on every metric (Sharpe 1.42 vs 1.14, DD 13.0% vs 18.9%);
+- **halves the average walk-forward drawdown** (14.2% vs 25.4%);
+- keeps average Sharpe neutral (1.01 vs 1.02) — the "not too volatile" goal;
+- costs 35-58%/month turnover (the price of the churn).
+
+Compared with §12's stop10+trend200 (avg Sharpe 1.13, avg DD 17.0%) the owner's
+composite trades a little long-run Sharpe for the episode win and a lower DD —
+and it is the only configuration tested that does both. Good-times arming alone
+does **not** fix 2022-23 (bear rallies re-arm it), so the market-trend gate is
+what handles the bad regime; the two gates are complementary, exactly as the
+owner described. Opt-in (`sim_daily_core_basket_good_times`), live wiring TBD.

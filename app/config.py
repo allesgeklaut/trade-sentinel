@@ -139,6 +139,12 @@ class Settings(BaseSettings):
     # efficient trends and whipsaws in chop; the ER is the classic
     # distinguisher. §13.
     sim_daily_core_basket_er_min: float = 0.0
+    # basket_good_times (bool): arm the gradient cash-out ONLY while the
+    # market is above its 200-day SMA — "gradient filter only in good times".
+    # Catches momentum-sleeve crashes in healthy bull markets (Jul 2026) while
+    # the §12 market-trend gate handles bad times; no cooldown, the normal
+    # deployment re-enters as soon as the signal allows. §15.
+    sim_daily_core_basket_good_times: bool = False
     sim_run_hour: int = 22
     sim_run_minute: int = 30
 

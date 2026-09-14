@@ -1800,3 +1800,25 @@ class TestDailyCoreProtection:
             200.0, False, "none", "monthly", False, "rank",
             with_baseline=False, basket_drawdown=0.08, basket_er_min=0.3)
         assert r is not None and r.basket_events >= 1
+
+    async def test_basket_good_times_arms_only_above_sma(self, sleeve_crash_market):
+        """'Good times' arming: the gradient filter fires while the market is
+        above its 200d SMA; a version with good_times on must fire no more
+        than the always-armed one, and still fire on the sleeve crash."""
+        import app.optimize as opt
+        always = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, basket_trend_days=10, basket_confirm_days=3)
+        good = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, basket_trend_days=10, basket_confirm_days=3,
+            basket_good_times=True)
+        assert always is not None and good is not None
+        assert good.basket_events <= always.basket_events
+        assert good.basket_events >= 1
+
+    async def test_basket_good_times_off_by_default(self):
+        from app.config import settings
+        assert settings.sim_daily_core_basket_good_times is False
