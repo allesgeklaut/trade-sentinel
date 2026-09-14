@@ -79,7 +79,9 @@ class Settings(BaseSettings):
     # weight, decaying linearly to 1.0 at the band edge (rank N gets exactly
     # the equal weight). 0.5 = top name may hold 1.5x the equal weight while
     # the 10th holds 1.0x. Only used by the daily-core backtest --dca rank.
-    sim_monthly_rank_boost: float = 0.5
+    # Default 0.0 = flat equal-weight targets, the measured winner (experiment
+    # doc §10); the live run_deployment is flat too.
+    sim_monthly_rank_boost: float = 0.0
     sim_run_hour: int = 22
     sim_run_minute: int = 30
 

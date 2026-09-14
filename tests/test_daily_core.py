@@ -105,6 +105,32 @@ class TestAllowance:
         r = asyncio.run(daily_core.deposit_allowance())
         assert r["deposited"] is True
 
+    def test_duplicate_month_row_does_not_500_or_double_deposit(self, mem_db, monkeypatch):
+        """The status endpoint calls deposit_allowance() unlocked and the UI
+        fires two concurrent status requests on tab load. At a month rollover
+        both can read the stale marker; the UNIQUE(month) constraint makes
+        the loser's insert fail. It must be handled as "already deposited",
+        not surfaced as a 500 or a second cash deposit."""
+        async def seed():
+            async with mem_db() as s:
+                acc = await daily_core._account(s)
+                acc.cash = 500.0
+                acc.last_allowance_month = "2026-08"
+                s.add(DailyCoreAllowance(amount=settings.sim_monthly_contribution,
+                                         month="2026-09"))
+                await s.commit()
+        asyncio.run(seed())
+        monkeypatch.setattr(daily_core, "_current_month", lambda: "2026-09")
+        r = asyncio.run(daily_core.deposit_allowance())
+        assert r["deposited"] is False
+        async def check():
+            async with mem_db() as s:
+                acc = await daily_core._account(s)
+                assert acc.cash == pytest.approx(500.0)
+                rows = (await s.scalars(select(DailyCoreAllowance))).all()
+                assert len(rows) == 1
+        asyncio.run(check())
+
 
 # ---------------------------------------------------------------------------
 # Deployment
@@ -264,3 +290,181 @@ class TestStoredRanking:
         asyncio.run(seed())
         stored = asyncio.run(daily_core._load_stored_ranking())
         assert stored is None
+
+    def test_concurrent_compute_runs_once(self, mem_db, monkeypatch):
+        """The UI fires two status requests on first tab load; both call
+        compute_targets() with no stored ranking. They must not both run the
+        expensive full-universe ranking — the second reads the first's
+        freshly stored result."""
+        import app.monthly as monthly_mod
+
+        calls = {"fund": 0}
+        frame = pd.DataFrame({"eligible": [True]},
+                             index=pd.Index(["AAA"], name="ticker"))
+        day = pd.DatetimeIndex(["2026-09-01"])
+
+        async def fake_fund(_tickers):
+            calls["fund"] += 1
+            await asyncio.sleep(0)  # yield so a racer could interleave
+            return {"AAA": {}}
+
+        async def fake_frames(_tickers, _asof):
+            return pd.DataFrame({"AAA": [1.0]}, index=day), \
+                   pd.DataFrame({"AAA": [1.0]}, index=day)
+
+        monkeypatch.setattr(daily_core, "universe_tickers", lambda _u: ["AAA"])
+        monkeypatch.setattr(daily_core.fundamentals_mod, "load_fundamentals", fake_fund)
+        monkeypatch.setattr(daily_core.monthly_mod, "load_frames", fake_frames)
+        monkeypatch.setattr(monthly_mod, "eligible_frame", lambda *a: frame)
+        monkeypatch.setattr(monthly_mod, "_qv_order", lambda f: (f["eligible"], ["AAA"]))
+        monkeypatch.setattr(monthly_mod, "_band_fill", lambda o, h, n, b: ["AAA"])
+
+        async def scenario():
+            r1, r2 = await asyncio.gather(
+                daily_core.compute_targets(),
+                daily_core.compute_targets(),
+            )
+            assert r1[0] == ["AAA"] and r2[0] == ["AAA"]
+        asyncio.run(scenario())
+        assert calls["fund"] == 1, (
+            f"full-universe ranking computed {calls['fund']} times concurrently"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Backfill
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fake_market(monkeypatch):
+    """Patch daily_core's market/fundamentals loaders + ranking so backfill
+    replays a tiny deterministic two-ticker market (no network, no DB rows)."""
+    import pandas as pd
+
+    dates = pd.bdate_range("2026-07-01", "2026-08-28")
+    close = pd.DataFrame({"AAA": 100.0, "BBB": 50.0}, index=dates)
+    vol = pd.DataFrame(1e6, index=dates, columns=["AAA", "BBB"])
+
+    def fake_frame(m, c, v, f):
+        return pd.DataFrame({"eligible": [True, True]},
+                            index=pd.Index(["AAA", "BBB"], name="ticker"))
+
+    def fake_order(frame):
+        return frame["eligible"], ["AAA", "BBB"]
+
+    async def fake_load_frames(_tickers, _asof):
+        return close, vol
+
+    async def fake_load_fundamentals(_tickers):
+        return {"AAA": {"x": []}, "BBB": {"x": []}}
+
+    monkeypatch.setattr(daily_core, "universe_tickers", lambda _u: ["AAA", "BBB"])
+    monkeypatch.setattr(daily_core.fundamentals_mod, "load_fundamentals",
+                        fake_load_fundamentals)
+    monkeypatch.setattr(daily_core.monthly_mod, "load_frames", fake_load_frames)
+    monkeypatch.setattr(daily_core.monthly_mod, "eligible_frame", fake_frame)
+    monkeypatch.setattr(daily_core.monthly_mod, "_qv_order", fake_order)
+    return {"close": close}
+
+
+class TestBackfill:
+    def test_uncovered_current_month_keeps_its_contribution(self, mem_db, fake_market,
+                                                            monkeypatch):
+        """The live engine deposits at month start; a backfill run before the
+        current month has any candle must not lose that deposit — the replay
+        never re-creates it and the live marker would suppress it forever."""
+        from app.db import DailyCoreAllowance as Al
+
+        monkeypatch.setattr(daily_core, "_current_month", lambda: "2026-09")
+
+        async def seed():
+            async with mem_db() as s:
+                acc = await daily_core._account(s)
+                acc.cash = 1234.0
+                acc.last_allowance_month = "2026-09"
+                await s.commit()
+        asyncio.run(seed())
+
+        r = asyncio.run(daily_core.backfill(start="2026-08-01"))
+        assert r["ok"] is True
+        # Aug (replayed) + Sep (live, uncovered) = two contributions.
+        assert r["contributed"] == pytest.approx(2 * settings.sim_monthly_contribution)
+
+        async def check():
+            async with mem_db() as s:
+                acc = await daily_core._account(s)
+                assert acc.last_allowance_month == "2026-09"
+                rows = (await s.scalars(select(Al))).all()
+                assert sorted(x.month for x in rows) == ["2026-08", "2026-09"]
+        asyncio.run(check())
+
+    def test_trades_carry_replay_day_and_fill_data(self, mem_db, fake_market, monkeypatch):
+        """Synthetic trades must show when they happened and at what
+        price/size, not "now" with 0 shares and $0.00."""
+        from app.db import DailyCoreTrade as Tr
+
+        monkeypatch.setattr(daily_core, "_current_month", lambda: "2026-08")
+        r = asyncio.run(daily_core.backfill(start="2026-08-01"))
+        assert r["trades"] > 0
+
+        async def check():
+            async with mem_db() as s:
+                rows = (await s.scalars(select(Tr))).all()
+                assert rows
+                for tr in rows:
+                    assert tr.shares > 0
+                    assert tr.price > 0
+                    assert tr.created_at.strftime("%Y-%m") == "2026-08"
+        asyncio.run(check())
+
+
+# ---------------------------------------------------------------------------
+# Data refresh
+# ---------------------------------------------------------------------------
+
+class TestRefreshData:
+    @staticmethod
+    def _seed_holding():
+        async def seed():
+            async with daily_core.Session() as s:
+                s.add(daily_core.DailyCorePosition(ticker="HELD", shares=1.0, avg_cost=10.0))
+                await s.commit()
+        asyncio.run(seed())
+
+    def test_weekend_refreshes_only_holdings(self, mem_db, monkeypatch):
+        """The ~176-ticker universe refresh is the heaviest nightly path and
+        its candles cannot change while the market is closed; on weekends
+        only the holdings are refreshed."""
+        from app import market
+        self._seed_holding()
+        monkeypatch.setattr(daily_core, "_local_now",
+                            lambda: datetime(2026, 9, 12, 12, 0))  # Saturday
+        monkeypatch.setattr(daily_core, "universe_tickers",
+                            lambda _u: ["AAA", "BBB", "CCC"])
+        seen = {}
+
+        async def fake_refresh_many(tickers, period):
+            seen["tickers"] = list(tickers)
+            return list(tickers), []
+        monkeypatch.setattr(market, "refresh_many", fake_refresh_many)
+
+        refreshed, errors = asyncio.run(daily_core.refresh_data())
+        assert seen["tickers"] == ["HELD"]
+        assert refreshed == ["HELD"] and errors == []
+
+    def test_weekday_refreshes_universe_plus_holdings(self, mem_db, monkeypatch):
+        from app import market
+        self._seed_holding()
+        monkeypatch.setattr(daily_core, "_local_now",
+                            lambda: datetime(2026, 9, 14, 12, 0))  # Monday
+        monkeypatch.setattr(daily_core, "universe_tickers",
+                            lambda _u: ["AAA", "BBB"])
+        seen = {}
+
+        async def fake_refresh_many(tickers, period):
+            seen["tickers"] = list(tickers)
+            return list(tickers), []
+        monkeypatch.setattr(market, "refresh_many", fake_refresh_many)
+
+        asyncio.run(daily_core.refresh_data())
+        assert seen["tickers"] == ["AAA", "BBB", "HELD"]

@@ -780,15 +780,10 @@ async def _load_quality_lookup(tickers: list[str]) -> _QualityLookup | None:
     if not fund:
         return None
     close, _ = await monthly_mod.load_frames(tickers, None)
-    # {month: {ticker: period-end USD close}} — one price per ticker per
-    # month is enough for P/FCF (the quality snapshot only needs a scale).
-    closes: dict[str, dict[str, float]] = {}
-    if not close.empty:
-        for t in close.columns:
-            for ts, px in close[t].dropna().items():
-                m = pd.Timestamp(ts).strftime("%Y-%m")  # type: ignore[arg-type]
-                closes.setdefault(m, {})[t] = float(px)  # type: ignore[call-overload]
-    return _QualityLookup(fund, closes)
+    # {month: {ticker: first USD close of the month}} — one price per ticker
+    # per month is enough for P/FCF (the quality snapshot only needs a scale).
+    # First (not last) close keeps the monthly cache point-in-time.
+    return _QualityLookup(fund, _month_price_map(close))
 
 
 def _deterministic_propose_replay(
@@ -2473,6 +2468,60 @@ class BacktestSummary:
     window: tuple[str, str]
 
 
+def _fill_buy(cash: float, price: float, delta_value: float,
+              cost: float) -> tuple[float, float, float] | None:
+    """One BUY fill: ``(notional, shares, cash_after)`` or None when the
+    spend would be under $1.
+
+    The one-way fee is reserved INSIDE the spend, so a full-cash buy
+    (``delta_value >= cash``) can never drive cash negative — without this
+    the fee was charged on top and every full-cash buy left the account at
+    ``-cash * cost``, which also blocked follow-on buys until cash
+    recovered. ``daily_core.backfill.do_buy`` uses the same rule."""
+    notional = min(delta_value, max(cash, 0.0) / (1.0 + cost))
+    if notional < 1.0:
+        return None
+    return notional, notional / price, cash - notional * (1.0 + cost)
+
+
+def _contribution_days(days: pd.DatetimeIndex,
+                       months: list[pd.Timestamp]) -> set[pd.Timestamp]:
+    """The days on which a monthly contribution is received.
+
+    One per calendar month that has a month-end rebalance in the window,
+    deposited on that month's FIRST trading day in the window (mirroring
+    the live daily-core engine and ``daily_core.backfill``, which deposit
+    at the start of the month) rather than parking the cash until the
+    month-end rebuild. Every month in ``months`` gets exactly one
+    contribution, so the count still matches the monthly baseline."""
+    keys = {(m.year, m.month) for m in months}
+    out: set[pd.Timestamp] = set()
+    seen: set[tuple[int, int]] = set()
+    for d in days:
+        k = (d.year, d.month)
+        if k in keys and k not in seen:
+            seen.add(k)
+            out.add(d)
+    return out
+
+
+def _month_price_map(close: pd.DataFrame) -> dict[str, dict[str, float]]:
+    """``{month: {ticker: FIRST close of that month}}`` for the P/FCF scale.
+
+    The quality lookup caches one map per month; using the month's first
+    close (known at the month's start) instead of its last removes the
+    look-ahead where an early-month decision was priced with a later
+    close."""
+    out: dict[str, dict[str, float]] = {}
+    if close.empty:
+        return out
+    for t in close.columns:
+        for ts, px in close[t].dropna().items():
+            m = pd.Timestamp(ts).strftime("%Y-%m")  # type: ignore[arg-type]
+            out.setdefault(m, {}).setdefault(t, float(px))
+    return out
+
+
 async def _daily_core_backtest(
     start: str | None,
     end: str | None,
@@ -2640,13 +2689,10 @@ async def _daily_core_backtest(
         if p is None or p <= 0:
             return
         if side == "BUY":
-            notional = min(delta_value, cash)
-            if notional < 1:
+            fill = _fill_buy(cash, p, delta_value, cost)
+            if fill is None:
                 return
-            sh = notional / p
-            cash -= notional
-            cost_fee = notional * cost
-            cash -= cost_fee
+            notional, sh, cash = fill
             shares[t] = shares.get(t, 0.0) + sh
             month_buys += notional
         else:
@@ -2685,6 +2731,7 @@ async def _daily_core_backtest(
         return m[-1] if m else months[0]
 
     pending_cash = 0.0  # contributions not yet deployed (dca="monthly")
+    contrib_days = _contribution_days(days_all, months)
 
     for d in days_all:
         month_td = month_for(d)
@@ -2707,16 +2754,20 @@ async def _daily_core_backtest(
                 (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0) for t in shares)
 
         # --- contribution ---
-        if d in months:
+        # Received on the first trading day of each month (same timing as the
+        # live engine and daily_core.backfill). "monthly" parks it in
+        # pending_cash until the month-end rebuild; "daily"/"rank" leave it in
+        # cash so the daily deployment puts it to work immediately.
+        if d in contrib_days:
             contributed += contribution
             n_contribs += 1
-            # All deployment modes release the contribution at the month-end
-            # rebalance: "monthly" spends it via the month-end rebuild + top-up,
-            # "daily"/"rank" have already been spending from cash daily, so
-            # month-end just tops the balance back up. (pending_cash exists
-            # only as an intra-month idle pool for "monthly"; releasing it
-            # here keeps a zero-new-picks month from stranding cash.)
-            cash += contribution + pending_cash
+            if dca == "monthly":
+                pending_cash += contribution
+            else:
+                cash += contribution
+        # month-end rebuild releases the parked "monthly" pool
+        if d in months and pending_cash:
+            cash += pending_cash
             pending_cash = 0.0
 
         # --- SELL phase: releases from the hysteresis band ---
@@ -3235,8 +3286,11 @@ def _sweep_grid() -> list[tuple[str, str, str, bool, float]]:
     return grid
 
 
-# Fork-inherited worker state (set by the pool initializer before the
-# workers fork — copy-on-write, no pickling, no duplication).
+# Per-worker state, set once by the pool initializer. NOTE: on Python 3.12+
+# the default multiprocessing start method is "forkserver" (the app venv is
+# 3.14), so `initargs` are pickled to each worker rather than inherited via
+# fork copy-on-write — one copy per worker, not per task. Passing the frames
+# through the initializer still avoids re-pickling them for every grid item.
 _SWEEP_WORKER_STATE: dict = {}
 
 

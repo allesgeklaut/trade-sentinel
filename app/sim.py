@@ -2326,6 +2326,62 @@ _scheduler_task: asyncio.Task | None = None
 _daily_snapshot_task: asyncio.Task | None = None
 
 
+async def _scheduler_tick() -> None:
+    """One scheduler wake: monthly rebalance, then the daily sim cycle, then
+    the daily-core cycle.
+
+    Factored out of ``_scheduler_loop`` (which only sleeps between ticks) so
+    the "each stage runs independently" behaviour is unit-testable. A stage
+    that is skipped or fails must not prevent the later stages from running.
+    """
+    # Monthly qv-mom portfolio first: it only acts on the last trading
+    # day of the month, and a missed month has no catch-up — it must run
+    # even when the daily cycle is skipped below (a manual run holding
+    # the lock at wake time), or the whole month is silently missed.
+    try:
+        from .monthly import run_monthly_cycle
+        monthly_result = await run_monthly_cycle()
+        if monthly_result.get("skipped"):
+            logger.info("Monthly scheduler: skipped — %s", monthly_result.get("reason"))
+        else:
+            logger.info("Monthly rebalance complete: %d trades", len(monthly_result.get("trades", [])))
+    except Exception as e:
+        logger.error("Monthly rebalance failed: %s", e, exc_info=True)
+
+    try:
+        # Skip if a manual run is in flight (e.g. the user clicked "Run
+        # Bot Now" shortly before the scheduled time). The lock check in
+        # run_cycle() also guards against this, but checking here too
+        # avoids logging a confusing "skipped — already running" entry
+        # every scheduled night a manual run overlaps. NOTE: this must not
+        # skip the daily-core stage below — it runs regardless.
+        if _run_cycle_lock.locked():
+            logger.info("Sim scheduler: skipping scheduled run — a cycle is already in progress")
+        else:
+            result = await run_cycle()
+            if result.get("skipped"):
+                logger.info("Sim scheduler: run_cycle skipped — %s", result.get("reason"))
+            else:
+                logger.info("Sim cycle complete: %d trades", len(result["trades"]))
+    except Exception as e:
+        logger.error("Sim cycle failed: %s", e, exc_info=True)
+
+    # Daily-core portfolio last: it depends on the freshly refreshed
+    # candles above (fundamental ranking + daily deployment) and must
+    # not race the monthly rebalance. Runs every trading day the
+    # scheduler fires — that's the whole point (daily cash deployment).
+    try:
+        from .daily_core import run_daily_cycle
+        dc_result = await run_daily_cycle()
+        if dc_result.get("skipped"):
+            logger.info("Daily-core scheduler: skipped — %s", dc_result.get("reason"))
+        else:
+            logger.info("Daily-core cycle complete: %d trades",
+                        len(dc_result.get("deployment", {}).get("trades", [])))
+    except Exception as e:
+        logger.error("Daily-core cycle failed: %s", e, exc_info=True)
+
+
 async def _scheduler_loop():
     """Background loop that runs the sim cycle daily at sim_run_hour UTC."""
     while True:
@@ -2339,51 +2395,7 @@ async def _scheduler_loop():
         logger.info("Sim scheduler: next run at %s (in %.0f seconds)", target, wait_seconds)
         await asyncio.sleep(wait_seconds)
 
-        # Monthly qv-mom portfolio first: it only acts on the last trading
-        # day of the month, and a missed month has no catch-up — it must run
-        # even when the daily cycle is skipped below (a manual run holding
-        # the lock at wake time), or the whole month is silently missed.
-        try:
-            from .monthly import run_monthly_cycle
-            monthly_result = await run_monthly_cycle()
-            if monthly_result.get("skipped"):
-                logger.info("Monthly scheduler: skipped — %s", monthly_result.get("reason"))
-            else:
-                logger.info("Monthly rebalance complete: %d trades", len(monthly_result.get("trades", [])))
-        except Exception as e:
-            logger.error("Monthly rebalance failed: %s", e, exc_info=True)
-
-        try:
-            # Skip if a manual run is in flight (e.g. the user clicked "Run
-            # Bot Now" shortly before the scheduled time). The lock check in
-            # run_cycle() also guards against this, but checking here too
-            # avoids logging a confusing "skipped — already running" entry
-            # every scheduled night a manual run overlaps.
-            if _run_cycle_lock.locked():
-                logger.info("Sim scheduler: skipping scheduled run — a cycle is already in progress")
-                continue
-            result = await run_cycle()
-            if result.get("skipped"):
-                logger.info("Sim scheduler: run_cycle skipped — %s", result.get("reason"))
-            else:
-                logger.info("Sim cycle complete: %d trades", len(result["trades"]))
-        except Exception as e:
-            logger.error("Sim cycle failed: %s", e, exc_info=True)
-
-        # Daily-core portfolio last: it depends on the freshly refreshed
-        # candles above (fundamental ranking + daily deployment) and must
-        # not race the monthly rebalance. Runs every trading day the
-        # scheduler fires — that's the whole point (daily cash deployment).
-        try:
-            from .daily_core import run_daily_cycle
-            dc_result = await run_daily_cycle()
-            if dc_result.get("skipped"):
-                logger.info("Daily-core scheduler: skipped — %s", dc_result.get("reason"))
-            else:
-                logger.info("Daily-core cycle complete: %d trades",
-                            len(dc_result.get("deployment", {}).get("trades", [])))
-        except Exception as e:
-            logger.error("Daily-core cycle failed: %s", e, exc_info=True)
+        await _scheduler_tick()
 
 
 async def _daily_monthly_snapshot_loop():

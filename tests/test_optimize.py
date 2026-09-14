@@ -9,6 +9,7 @@ from __future__ import annotations
 import random
 from datetime import datetime, timedelta
 
+import pandas as pd
 import pytest
 
 from app import optimize
@@ -1401,3 +1402,91 @@ class TestDailyCoreMonthlyParity:
         )
         # Turnover in the same ballpark (< 2x of baseline)
         assert d.avg_turnover < m.avg_turnover * 2 + 0.05
+
+
+class TestFillBuy:
+    """The daily-core BUY fill must reserve the one-way fee inside the spend
+    so a full-cash buy can never drive cash negative (milestone parity with
+    daily_core.backfill's do_buy)."""
+
+    def test_full_cash_buy_never_negative(self):
+        fill = optimize._fill_buy(cash=1000.0, price=50.0,
+                                  delta_value=5000.0, cost=0.001)
+        assert fill is not None
+        notional, shares, cash_after = fill
+        assert cash_after >= 0.0
+        assert notional == pytest.approx(1000.0 / 1.001)
+        assert shares == pytest.approx(notional / 50.0)
+
+    def test_partial_buy_keeps_cash_positive(self):
+        fill = optimize._fill_buy(cash=1000.0, price=50.0,
+                                  delta_value=300.0, cost=0.001)
+        assert fill is not None
+        notional, _shares, cash_after = fill
+        assert notional == 300.0
+        assert cash_after == pytest.approx(1000.0 - 300.0 - 0.3)
+
+    def test_too_small_returns_none(self):
+        assert optimize._fill_buy(cash=0.5, price=50.0,
+                                  delta_value=10.0, cost=0.001) is None
+
+    def test_zero_cash_returns_none(self):
+        assert optimize._fill_buy(cash=0.0, price=50.0,
+                                  delta_value=10.0, cost=0.001) is None
+
+
+class TestContributionDays:
+    """Contributions must arrive on the first trading day of each month, not
+    only at the month-end rebuild — otherwise the "daily" deployment modes
+    never see intra-month cash and the A/B can't measure the cash-drag
+    elimination it claims."""
+
+    def test_first_trading_day_of_each_month(self):
+        days = pd.DatetimeIndex(["2025-01-15", "2025-01-31",
+                                 "2025-02-03", "2025-02-28"])
+        months = [pd.Timestamp("2025-01-31"), pd.Timestamp("2025-02-28")]
+        got = optimize._contribution_days(days, months)
+        assert got == {pd.Timestamp("2025-01-15"), pd.Timestamp("2025-02-03")}
+
+    def test_starts_mid_month_still_deposits(self):
+        # The window starts mid-month: the month still gets its contribution,
+        # on the first day the window sees (matching the monthly baseline's
+        # one contribution for that month-end).
+        days = pd.DatetimeIndex(["2025-01-15", "2025-01-31"])
+        months = [pd.Timestamp("2025-01-31")]
+        assert optimize._contribution_days(days, months) == {pd.Timestamp("2025-01-15")}
+
+    def test_one_contribution_per_month_key(self):
+        days = pd.DatetimeIndex(["2024-12-30", "2025-01-02", "2025-01-31",
+                                 "2025-02-03", "2025-02-28"])
+        months = [pd.Timestamp("2024-12-31"), pd.Timestamp("2025-01-31"),
+                  pd.Timestamp("2025-02-28")]
+        got = optimize._contribution_days(days, months)
+        assert len(got) == 3
+
+
+class TestMonthPriceMap:
+    """The P/FCF price scale must be the month's FIRST close (point-in-time),
+    not its last — the old last-close map let an early-month decision use a
+    later price."""
+
+    def test_uses_first_close_of_month(self):
+        idx = pd.DatetimeIndex(["2025-01-02", "2025-01-15", "2025-01-31",
+                                "2025-02-03", "2025-02-28"])
+        close = pd.DataFrame({"AAA": [10.0, 11.0, 12.0, 20.0, 25.0]}, index=idx)
+        m = optimize._month_price_map(close)
+        assert m["2025-01"]["AAA"] == 10.0   # first close, not 12.0 (last)
+        assert m["2025-02"]["AAA"] == 20.0   # first close, not 25.0 (last)
+
+    def test_skips_nan(self):
+        idx = pd.DatetimeIndex(["2025-01-02", "2025-01-15"])
+        close = pd.DataFrame({"AAA": [float("nan"), 11.0]}, index=idx)
+        assert optimize._month_price_map(close)["2025-01"]["AAA"] == 11.0
+
+
+class TestRankBoostDefault:
+    def test_default_is_flat(self):
+        # §10 measured boost=0 as the winner and the live deployment is flat;
+        # the default must not silently run the losing 0.5 config.
+        from app.config import settings
+        assert settings.sim_monthly_rank_boost == 0.0

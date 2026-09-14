@@ -2289,3 +2289,88 @@ class TestSimChatStream:
         assert history[0]["role"] == "user"
         assert history[1]["role"] == "assistant"
         assert "LLM unavailable" in history[1]["content"]
+
+
+class TestSchedulerTick:
+    """The scheduler must run each stage independently: a skipped or failed
+    stage (sim lock held, monthly skip) must not prevent the daily-core
+    deployment from running."""
+
+    async def test_daily_core_runs_when_sim_lock_held(self, monkeypatch):
+        from app import daily_core, monthly
+
+        called = {"sim": 0, "daily_core": 0}
+
+        async def fake_sim_cycle():
+            called["sim"] += 1
+            return {"skipped": False, "trades": []}
+
+        async def fake_daily_core_cycle():
+            called["daily_core"] += 1
+            return {"deployment": {"trades": []}}
+
+        async def fake_monthly_cycle():
+            return {"skipped": True, "reason": "not month end"}
+
+        monkeypatch.setattr(sim, "run_cycle", fake_sim_cycle)
+        monkeypatch.setattr(daily_core, "run_daily_cycle", fake_daily_core_cycle)
+        monkeypatch.setattr(monthly, "run_monthly_cycle", fake_monthly_cycle)
+
+        await sim._run_cycle_lock.acquire()
+        try:
+            await sim._scheduler_tick()
+        finally:
+            sim._run_cycle_lock.release()
+
+        assert called["sim"] == 0, "the sim cycle should be skipped while the lock is held"
+        assert called["daily_core"] == 1, (
+            "daily-core must still run when the sim cycle is skipped for a "
+            "held lock — otherwise that day's deployment is silently lost"
+        )
+
+    async def test_all_stages_run_when_unlocked(self, monkeypatch):
+        from app import daily_core, monthly
+
+        called = {"sim": 0, "daily_core": 0, "monthly": 0}
+
+        async def fake_sim_cycle():
+            called["sim"] += 1
+            return {"skipped": False, "trades": []}
+
+        async def fake_daily_core_cycle():
+            called["daily_core"] += 1
+            return {"deployment": {"trades": []}}
+
+        async def fake_monthly_cycle():
+            called["monthly"] += 1
+            return {"skipped": False, "trades": []}
+
+        monkeypatch.setattr(sim, "run_cycle", fake_sim_cycle)
+        monkeypatch.setattr(daily_core, "run_daily_cycle", fake_daily_core_cycle)
+        monkeypatch.setattr(monthly, "run_monthly_cycle", fake_monthly_cycle)
+
+        await sim._scheduler_tick()
+
+        assert called == {"sim": 1, "daily_core": 1, "monthly": 1}
+
+    async def test_daily_core_runs_even_if_sim_cycle_raises(self, monkeypatch):
+        from app import daily_core, monthly
+
+        called = {"daily_core": 0}
+
+        async def boom():
+            raise RuntimeError("sim exploded")
+
+        async def fake_daily_core_cycle():
+            called["daily_core"] += 1
+            return {"deployment": {"trades": []}}
+
+        async def fake_monthly_cycle():
+            return {"skipped": True, "reason": "x"}
+
+        monkeypatch.setattr(sim, "run_cycle", boom)
+        monkeypatch.setattr(daily_core, "run_daily_cycle", fake_daily_core_cycle)
+        monkeypatch.setattr(monthly, "run_monthly_cycle", fake_monthly_cycle)
+
+        await sim._scheduler_tick()
+        assert called["daily_core"] == 1

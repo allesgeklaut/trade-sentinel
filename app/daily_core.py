@@ -31,6 +31,7 @@ from datetime import datetime, timedelta, UTC
 
 import pandas as pd
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from . import fundamentals as fundamentals_mod
 from . import monthly as monthly_mod
@@ -44,8 +45,12 @@ logger = logging.getLogger("trade_sentinel.daily_core")
 _TZ = monthly_mod._TZ  # same operator-local month anchor as sim/monthly
 
 
+def _local_now() -> datetime:
+    return datetime.now(_TZ)
+
+
 def _current_month() -> str:
-    return datetime.now(_TZ).strftime("%Y-%m")
+    return _local_now().strftime("%Y-%m")
 
 
 # Serialises cycles: the allowance check runs before the (potentially
@@ -53,6 +58,12 @@ def _current_month() -> str:
 # pass the gate and double-deposit / duplicate trades. Mirrors
 # sim._run_cycle_lock and monthly._rebalance_lock.
 _cycle_lock: asyncio.Lock = asyncio.Lock()
+
+# Serialises the (uncached) target computation. The status endpoint calls
+# compute_targets() unlocked and the UI fires two status requests on first
+# tab load, so without this both would run the ~7s full-universe ranking in
+# parallel and race on the stored-ranking write.
+_targets_lock: asyncio.Lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +136,18 @@ async def deposit_allowance() -> dict:
         acc.cash += settings.sim_monthly_contribution
         acc.last_allowance_month = month
         s.add(DailyCoreAllowance(amount=settings.sim_monthly_contribution, month=month))
-        await s.commit()
+        try:
+            await s.commit()
+        except IntegrityError:
+            # The status endpoint calls this unlocked, and the UI fires two
+            # concurrent status requests on tab load — at a month rollover
+            # both can read the stale marker and insert the same month. The
+            # UNIQUE(month) constraint catches the loser here; treat it as
+            # "already deposited" instead of returning a 500.
+            await s.rollback()
+            acc = await _account(s)
+            logger.info("Daily-core allowance for %s already deposited (race)", month)
+            return {"deposited": False, "month": month, "cash": acc.cash}
         logger.info("Daily-core allowance deposited: %.2f for %s -> cash %.2f",
                     settings.sim_monthly_contribution, month, acc.cash)
         return {"deposited": True, "amount": settings.sim_monthly_contribution,
@@ -243,26 +265,36 @@ async def compute_targets(force: bool = False) -> tuple[list[str], list[str], pd
         if stored is not None:
             band, picks = stored
             return band, picks, None
-    tickers = universe_tickers(settings.sim_monthly_universe)
-    fund = await fundamentals_mod.load_fundamentals(tickers)
-    if not fund:
-        return [], [], None
-    close, vol = await monthly_mod.load_frames(tickers, None)
-    if close.empty:
-        return [], [], None
-    iso = datetime.now(UTC).strftime("%Y-%m-%d")
-    d: pd.Timestamp = pd.Timestamp(iso)  # type: ignore[assignment]
-    frame = await asyncio.to_thread(monthly_mod.eligible_frame, d, close, vol, fund)
-    if frame is None or not bool(frame["eligible"].any()):
-        return [], [], frame
-    _elig, order = await asyncio.to_thread(monthly_mod._qv_order, frame)
-    band = order[:settings.sim_monthly_hold_band]
-    async with Session() as s:
-        held = [p.ticker for p in (await s.scalars(select(DailyCorePosition))).all()]
-    picks = monthly_mod._band_fill(order, held, settings.sim_monthly_target_n,
-                                   settings.sim_monthly_hold_band)
-    await _store_ranking(band, picks)
-    return band, picks, frame
+    async with _targets_lock:
+        # Double-check inside the lock: two concurrent callers (the UI's
+        # duplicate status requests on first load) would otherwise both run
+        # the expensive compute. The loser now reads the winner's freshly
+        # stored ranking.
+        if not force:
+            stored = await _load_stored_ranking()
+            if stored is not None:
+                band, picks = stored
+                return band, picks, None
+        tickers = universe_tickers(settings.sim_monthly_universe)
+        fund = await fundamentals_mod.load_fundamentals(tickers)
+        if not fund:
+            return [], [], None
+        close, vol = await monthly_mod.load_frames(tickers, None)
+        if close.empty:
+            return [], [], None
+        iso = datetime.now(UTC).strftime("%Y-%m-%d")
+        d: pd.Timestamp = pd.Timestamp(iso)  # type: ignore[assignment]
+        frame = await asyncio.to_thread(monthly_mod.eligible_frame, d, close, vol, fund)
+        if frame is None or not bool(frame["eligible"].any()):
+            return [], [], frame
+        _elig, order = await asyncio.to_thread(monthly_mod._qv_order, frame)
+        band = order[:settings.sim_monthly_hold_band]
+        async with Session() as s:
+            held = [p.ticker for p in (await s.scalars(select(DailyCorePosition))).all()]
+        picks = monthly_mod._band_fill(order, held, settings.sim_monthly_target_n,
+                                       settings.sim_monthly_hold_band)
+        await _store_ranking(band, picks)
+        return band, picks, frame
 
 
 async def run_deployment() -> dict:
@@ -346,20 +378,21 @@ async def take_snapshot() -> dict:
 
 
 async def refresh_data() -> tuple[list[str], list[str]]:
-    """Refresh candles (+FX) for the universe and the current holdings."""
-    from .market import refresh
+    """Refresh candles (+FX) for the universe and the current holdings.
+
+    Uses the bounded-concurrency ``refresh_many`` batch instead of a
+    sequential per-ticker loop. On weekends the market is closed, so the
+    full ~176-ticker universe (the heaviest nightly path, and its candles
+    cannot change) is skipped and only the holdings are refreshed.
+    """
+    from .market import refresh_many
     async with Session() as s:
         held = [p.ticker for p in (await s.scalars(select(DailyCorePosition))).all()]
-    tickers = universe_tickers(settings.sim_monthly_universe)
-    errors: list[str] = []
-    refreshed: list[str] = []
-    for t in list(dict.fromkeys(tickers + held)):
-        try:
-            await refresh(t, "2y")
-            refreshed.append(t)
-        except Exception as e:
-            errors.append(f"{t}: {e}")
-    return refreshed, errors
+    if _local_now().weekday() >= 5:  # Sat/Sun
+        tickers = held
+    else:
+        tickers = list(dict.fromkeys(universe_tickers(settings.sim_monthly_universe) + held))
+    return await refresh_many(tickers, "2y")
 
 
 # ---------------------------------------------------------------------------
@@ -510,7 +543,7 @@ async def backfill(start: str | None = None) -> dict:
         cash = 0.0
         contributed = 0.0
         n_contribs = 0
-        trades: list[tuple[str, str, str, float]] = []
+        trades: list[tuple[str, str, str, float, float, float]] = []
         snaps: list[tuple[str, float, float]] = []
 
         def px_of(t: str, d: pd.Timestamp) -> float | None:
@@ -554,7 +587,7 @@ async def backfill(start: str | None = None) -> dict:
                 cash -= notional
                 cash -= notional * cost
                 shares[t] = shares.get(t, 0.0) + sh
-                trades.append((day.strftime("%Y-%m-%d"), "BUY", t, notional))
+                trades.append((day.strftime("%Y-%m-%d"), "BUY", t, notional, sh, p))
 
             def do_sell(t: str, day=d) -> None:
                 nonlocal cash
@@ -565,7 +598,7 @@ async def backfill(start: str | None = None) -> dict:
                 notional = sh * p
                 cash += notional * (1.0 - cost)
                 del shares[t]
-                trades.append((day.strftime("%Y-%m-%d"), "SELL", t, notional))
+                trades.append((day.strftime("%Y-%m-%d"), "SELL", t, notional, sh, p))
 
             # SELL band releases (month-end rebuild only, as in the backtest)
             if d in months:
@@ -603,6 +636,17 @@ async def backfill(start: str | None = None) -> dict:
         # derived from the replay's own month sequence (safer than a
         # DateOffset sweep, which can drift across the trimmed start).
         replay_months = sorted({d.strftime("%Y-%m") for d in idx})
+        # The live engine deposits at the START of the month, so it may
+        # already have deposited the CURRENT month while the replay window
+        # has no candle for it yet (e.g. backfill on the 1st before the
+        # market opens). The replay then never re-deposits it, yet the
+        # account marker below suppresses the live deposit forever — the
+        # account ends permanently one contribution short. Add it back.
+        current_month = _current_month()
+        if live_allowance_month == current_month and current_month not in replay_months:
+            cash += settings.sim_monthly_contribution
+            contributed += settings.sim_monthly_contribution
+            replay_months = sorted(set(replay_months) | {current_month})
         async with Session() as s:
             acc = await _account(s)
             acc.cash = cash
@@ -611,16 +655,18 @@ async def backfill(start: str | None = None) -> dict:
                 # equity curve); book at the last close so valuation works.
                 p = px_of(t, idx[-1]) or 0.0
                 s.add(Pos(ticker=t, shares=sh, avg_cost=p))
-            for _td, side, t, notional in trades:
-                s.add(Tr(ticker=t, side=side, shares=0.0, price=0.0,
-                         cash_after=0.0, reason=f"backfill {side.lower()} ${notional:,.0f}"))
+            for td, side, t, notional, sh, pr in trades:
+                # created_at = the replay day (same reason as the snapshots
+                # below): the trade log must show when the synthetic trade
+                # happened, and shares/price must be real, not 0.
+                s.add(Tr(ticker=t, side=side, shares=round(sh, 6), price=round(pr, 6),
+                         cash_after=0.0,
+                         reason=f"backfill {side.lower()} ${notional:,.0f}",
+                         created_at=pd.Timestamp(f"{td} 16:00:00+00:00").to_pydatetime()))
             for m in replay_months:
                 s.add(Al(amount=settings.sim_monthly_contribution, month=m))
-            # The current month's LIVE deposit happened before the wipe and
-            # is part of the replay's own sequence only if that month had
-            # trading days here — it does (idx ends today), but keep the
-            # account marker consistent so deposit_allowance() stays a no-op
-            # for the live month.
+            # Keep the account marker consistent so deposit_allowance() stays
+            # a no-op for the live month.
             acc.last_allowance_month = live_allowance_month or replay_months[-1]
             for sd, eq, contrib_at_day in snaps:
                 # created_at = the replay day: the UI groups snapshots by

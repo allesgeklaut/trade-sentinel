@@ -1587,9 +1587,10 @@
                 <button id="dailycore-run-btn" onclick="runDailyCore()">Run Cycle Now</button>
                 <button id="dailycore-backfill-btn" onclick="backfillDailyCore()">Backfill (sync with other sims)</button>
                 <input type="date" id="dailycore-backfill-date" title="Optional: replay from this date instead"
-                    onchange="document.getElementById('dailycore-backfill-all').checked = !!this.value">
+                    onchange="if(this.value) document.getElementById('dailycore-backfill-all').checked = false">
                 <label style="font-size:12px;color:#7aaa81;display:flex;align-items:center;gap:4px">
-                    <input type="checkbox" id="dailycore-backfill-all"> full history
+                    <input type="checkbox" id="dailycore-backfill-all"
+                        onchange="if(this.checked) document.getElementById('dailycore-backfill-date').value = ''"> full history
                 </label>
             </div>
             <div id="dailycore-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
@@ -2819,7 +2820,9 @@
             const status = document.getElementById('dailycore-run-status');
             const dateVal = document.getElementById('dailycore-backfill-date').value;
             const allHist = document.getElementById('dailycore-backfill-all').checked;
-            const qs = allHist ? '?start=all' : (dateVal ? `?start=${dateVal}` : '');
+            // The date and "full history" are alternatives (the inputs clear
+            // each other); a picked date wins so it is never silently ignored.
+            const qs = dateVal ? `?start=${dateVal}` : (allHist ? '?start=all' : '');
             btn.disabled = true;
             status.textContent = 'Backfilling… (replays the strategy over stored history — can take a few minutes)';
             try {
