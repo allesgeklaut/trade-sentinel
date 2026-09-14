@@ -2580,6 +2580,7 @@ async def _daily_core_backtest(
     basket_drawdown: float | None = None,
     basket_er_min: float | None = None,
     basket_good_times: bool | None = None,
+    basket_arm_sma: int | None = None,
 ) -> BacktestSummary | None:
     """Deterministic "daily-core" backtest: the monthly qv-mom portfolio as the
     FUNDAMENTAL core, with minor candle-driven daily adjustments on top.
@@ -2850,15 +2851,17 @@ async def _daily_core_backtest(
     # sleeve-crash catcher.
     if basket_good_times is None:
         basket_good_times = settings.sim_daily_core_basket_good_times
+    if basket_arm_sma is None:
+        basket_arm_sma = settings.sim_daily_core_basket_arm_sma
 
     # Equal-weight universe price index (closes, forward-filled) and its SMA.
     # Point-in-time safe: a rolling mean of closes at/ before d only.
     mkt_index = close_val.mean(axis=1)
     mkt_sma = (mkt_index.rolling(exposure_trend_days).mean()
                if exposure_trend_days and exposure_trend_days > 0 else None)
-    # 200-day market SMA used to ARM the gradient filter in "good times"
-    # (independent of the deployment gate's window).
-    mkt_sma_arm = mkt_index.rolling(200).mean()
+    # Market SMA used to ARM the gradient filter in "good times"
+    # (independent of the deployment gate's window; window configurable).
+    mkt_sma_arm = mkt_index.rolling(max(basket_arm_sma, 2)).mean()
 
     def market_above_arm_sma(d: pd.Timestamp) -> bool:
         """True while the market index is at/above its 200-day SMA (the
@@ -3259,7 +3262,8 @@ async def _daily_core_backtest(
            + (f" basket-drawdown={basket_drawdown:g}" if basket_drawdown else "")
            + (f" basket-er-min={basket_er_min:g}"
               if basket_er_min else "")
-           + (" basket-good-times" if basket_good_times else "")
+           + (f" basket-good-times(sma{basket_arm_sma})"
+              if basket_good_times else "")
            + (" lowvol-tilt" if settings.sim_daily_core_lowvol_tilt else ""))
     ann_sharpe = 0.0
     if len(port_rets) >= 21:
@@ -3349,6 +3353,7 @@ async def _main(args: argparse.Namespace) -> None:
             basket_drawdown=getattr(args, "basket_drawdown", None) or None,
             basket_er_min=getattr(args, "basket_er_min", None) or None,
             basket_good_times=getattr(args, "basket_good_times", False) or None,
+            basket_arm_sma=getattr(args, "basket_arm_sma", None) or None,
         )
         return
 
@@ -3891,6 +3896,15 @@ async def _sweep_stage4(fc, close, vol, fund, out_path: str) -> None:
          "basket_confirm": 3, "basket_good_times": True},
         {"label": "res+g10c3gt+t200", "mom": "residual", "basket_trend": 10,
          "basket_confirm": 3, "basket_good_times": True, "exposure_trend": 200},
+        # Arming-window study (§15): SMA50 = strong uptrends only.
+        {"label": "res+g10c3gt50+t200", "mom": "residual", "basket_trend": 10,
+         "basket_confirm": 3, "basket_good_times": True, "basket_arm_sma": 50,
+         "exposure_trend": 200},
+        {"label": "res+g10c3gt100+t200", "mom": "residual", "basket_trend": 10,
+         "basket_confirm": 3, "basket_good_times": True, "basket_arm_sma": 100,
+         "exposure_trend": 200},
+        {"label": "res+g10c3gt50", "mom": "residual", "basket_trend": 10,
+         "basket_confirm": 3, "basket_good_times": True, "basket_arm_sma": 50},
         {"label": "res+bdd12", "mom": "residual", "basket_drawdown": 0.12},
     ]
     # one frame cache per mom variant
@@ -3925,7 +3939,8 @@ async def _sweep_stage4(fc, close, vol, fund, out_path: str) -> None:
                 basket_confirm_days=ov.get("basket_confirm") or None,
                 basket_threshold=ov.get("basket_threshold") or None,
                 basket_drawdown=ov.get("basket_drawdown") or None,
-                basket_good_times=ov.get("basket_good_times") or None)
+                basket_good_times=ov.get("basket_good_times") or None,
+                basket_arm_sma=ov.get("basket_arm_sma") or None)
             if r is not None:
                 row["arms"].append({"label": ov["label"], "irr": r.irr,
                                     "sharpe": r.sharpe, "max_dd": r.max_drawdown,
@@ -4211,7 +4226,9 @@ def _build_parser() -> argparse.ArgumentParser:
                          "basket path is efficient (e.g. 0.3; 0 = always armed)")
     dc.add_argument("--basket-good-times", action="store_true",
                     help="Arm the gradient cash-out only while the market is above its "
-                         "200-day SMA (bull-market sleeve-crash catcher)")
+                         "SMA (bull-market sleeve-crash catcher)")
+    dc.add_argument("--basket-arm-sma", type=int, default=None,
+                    help="Window of the good-times arming SMA (default 200; e.g. 50)")
     dc.add_argument("--verbose", action="store_true", help="Print the last trades")
 
     sw = sub.add_parser("daily-core-sweep",

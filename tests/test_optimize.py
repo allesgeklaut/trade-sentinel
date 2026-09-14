@@ -1822,3 +1822,14 @@ class TestDailyCoreProtection:
     async def test_basket_good_times_off_by_default(self):
         from app.config import settings
         assert settings.sim_daily_core_basket_good_times is False
+
+    async def test_basket_arm_sma_configurable(self, sleeve_crash_market):
+        """A shorter arming SMA (50) must be accepted and change behaviour
+        vs the 200 default (fires only in strong uptrends)."""
+        import app.optimize as opt
+        g50 = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, basket_trend_days=10, basket_confirm_days=3,
+            basket_good_times=True, basket_arm_sma=50)
+        assert g50 is not None and g50.basket_events >= 1

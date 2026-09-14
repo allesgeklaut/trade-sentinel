@@ -145,6 +145,10 @@ class Settings(BaseSettings):
     # the §12 market-trend gate handles bad times; no cooldown, the normal
     # deployment re-enters as soon as the signal allows. §15.
     sim_daily_core_basket_good_times: bool = False
+    # basket_arm_sma (default 200): the market SMA window that defines "good
+    # times" for arming the gradient cash-out. 50 = only strong uptrends,
+    # 200 = the classic bull/bear line. §15.
+    sim_daily_core_basket_arm_sma: int = 200
     sim_run_hour: int = 22
     sim_run_minute: int = 30
 

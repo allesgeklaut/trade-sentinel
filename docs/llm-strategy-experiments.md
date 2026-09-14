@@ -611,3 +611,34 @@ and it is the only configuration tested that does both. Good-times arming alone
 does **not** fix 2022-23 (bear rallies re-arm it), so the market-trend gate is
 what handles the bad regime; the two gates are complementary, exactly as the
 owner described. Opt-in (`sim_daily_core_basket_good_times`), live wiring TBD.
+
+### §15 addendum — arming-window study: SMA50 vs 100 vs 200
+
+Owner asked whether the good-times arming line should be SMA50 instead of
+SMA200. The window is now configurable (`--basket-arm-sma N`). Verdict: **the
+differences are inside noise and flip direction across windows** — another
+parameter to distrust.
+
+| Window | control | gt50+t200 | gt100+t200 | gt200+t200 |
+|---|---|---|---|---|
+| 2017-19 | **1.09** / 21.6% | 0.84 / 23.1% | 0.71 / 25.6% | 1.14 / 15.5% |
+| 2020-21 | 1.02 / 28.2% | 0.71 / 28.2% | 1.05 / 14.6% | 1.01 / 14.6% |
+| 2022-23 | 0.24 / 20.2% | **0.50 / 12.1%** | 0.34 / 12.9% | 0.11 / 12.2% |
+| 2024-26 | 1.72 / 31.4% | 1.87 / 22.6% | **2.16 / 14.3%** | 1.78 / 14.5% |
+| **avg Sharpe** | 1.02 | 0.98 | **1.06** | 1.01 |
+| **avg maxDD** | 25.4% | 21.5% | 16.9% | **14.2%** |
+| avg turnover | 5.6% | 36.8% | 45.6% | 50.1% |
+
+- **On the 2026 episode SMA50/100 look spectacular** (gt50: $10,757, Sharpe
+  1.96 vs control 1.14) — the shorter line disarms during the pre-crash dips
+  and re-arms for the crash. But that is one episode.
+- **Across the walk-forward SMA50 loses 2017-19 and 2020-21** (fast disarm
+  misses the whipsaw protection), wins 2022-23, and the averages are
+  indistinguishable from 100/200 (±0.05 Sharpe over 4 windows).
+- SMA100 has the best average Sharpe (1.06) and SMA200 the best average DD
+  (14.2%) — but with four windows, picking between them is curve-fitting.
+
+**Recommendation:** if the composite is ever wired live, keep the classic
+SMA200 arming (fewest parameters, best drawdown, no window choice to overfit)
+— or expose the window to the experiment selector and judge forward, not on
+this table. All variants remain opt-in.
