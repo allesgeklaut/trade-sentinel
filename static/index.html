@@ -1432,6 +1432,13 @@
                     title="Each curve as % of its contributed allowance — fair growth comparison">% View</button>
                 <button id="sim-cmp-usd" class="range-btn" onclick="setSimCompareMode('usd')" title="Absolute dollars">$
                     View</button>
+                <span id="s-range-bar" style="display:inline-flex;gap:4px;margin-left:10px">
+                    <button class="range-btn" data-range="6M" onclick="setSimRange('6M')">6M</button>
+                    <button class="range-btn range-active" data-range="1Y" onclick="setSimRange('1Y')">1Y</button>
+                    <button class="range-btn" data-range="2Y" onclick="setSimRange('2Y')">2Y</button>
+                    <button class="range-btn" data-range="5Y" onclick="setSimRange('5Y')">5Y</button>
+                    <button class="range-btn" data-range="MAX" onclick="setSimRange('MAX')">MAX</button>
+                </span>
             </div>
             <div id="sim-chart"></div>
                 <div id="sim-asof" style="font-size:10px;color:#7aaa81;text-align:right;margin-top:2px"></div>
@@ -1460,6 +1467,7 @@
             <div class="bench-label">ACTIONS</div>
             <div class="sim-actions">
                 <button id="sim-run-btn" onclick="runSim()">Run Bot Now</button>
+                <button id="sim-backfill-btn" onclick="backfillSim()">Backfill (deterministic, no LLM)</button>
                 <button onclick="resetSim()">Reset Sim</button>
             </div>
             <div id="sim-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
@@ -3275,7 +3283,7 @@
             try {
                 const [s, bench, snaps] = await Promise.all([
                     api('sim/status'), api('sim/benchmark').catch(() => null),
-                    api('sim/equity?limit=4000').catch(() => null)]);
+                    api('sim/equity?limit=12000').catch(() => null)]);
                 const benchEquity = bench && bench.total_equity != null ? '$' + bench.total_equity.toFixed(2) : '—';
                 // Normalized gain + max drawdown; alpha vs the DCA bench is
                 // the number that matters for this engine's churn-prone sim.
@@ -3391,6 +3399,16 @@
         // and benchmark can receive deposits at different times, so absolute
         // dollars would compare apples to oranges.
         let simCompareMode = 'pct';
+        let simRange = '1Y';
+        let simChartReq = 0;
+        const S_RANGE_LIMIT = { '6M': 126, '1Y': 252, '2Y': 504, '5Y': 1260, 'MAX': 12000 };
+
+        function setSimRange(r) {
+            simRange = r;
+            for (const b of document.querySelectorAll('#s-range-bar .range-btn'))
+                b.classList.toggle('range-active', b.dataset.range === r);
+            loadSimEquity();
+        }
 
         function setSimCompareMode(mode) {
             simCompareMode = mode;
@@ -3400,29 +3418,32 @@
         }
 
         async function loadSimEquity() {
-            const [snaps, bench] = await Promise.all([
-                api('sim/equity?limit=365').catch(() => null),
-                api('sim/benchmark').catch(() => null),
+            const limit = S_RANGE_LIMIT[simRange] || 12000;
+            const reqId = ++simChartReq;
+            const [snaps, bench, live] = await Promise.all([
+                api(`sim/equity?limit=${limit}`).catch(() => null),
+                api(`sim/benchmark?limit=${limit}`).catch(() => null),
+                api('sim/status').catch(() => null),
             ]);
+            if (reqId !== simChartReq) return;  // superseded mid-flight
             if (simChart) { simChart.remove(); simChart = null; }
             if (!snaps || !snaps.length) {
                 document.getElementById('sim-chart').innerHTML = '<div class="sim-empty">No data yet — run the bot to start tracking.</div>';
                 return;
             }
-            // Live point: today's valuation so the curve reflects current
-            // prices between snapshots. Each point carries its own contributed
-            // total — the allowance steps $1000 at every month start, and
-            // dividing by the WRONG vintage would spike the pct curve.
-            const points = snaps.map(s => ({ time: s.at, value: s.total_equity, contributed: s.allowance_total }));
-            try {
-                const live = await api('sim/status');
-                if (live && live.total_equity != null) {
-                    const last = points[points.length - 1];
-                    const lastDay = new Date(last.time).toISOString().slice(0, 10);
-                    const today = new Date().toISOString().slice(0, 10);
-                    if (lastDay < today) points.push({ time: new Date().toISOString(), value: live.total_equity, contributed: live.allowance_total });
-                }
-            } catch (e) { /* chart falls back to snapshots only */ }
+            // One point per day (the LAST snapshot winning), then today's
+            // LIVE valuation appended/overwritten — same vintage rule as the
+            // other tabs so all charts agree on "today".
+            const byDay = new Map();
+            for (const s of (snaps || [])) {
+                byDay.set(new Date(s.at).toISOString().slice(0, 10),
+                    { value: s.total_equity, contributed: s.allowance_total });
+            }
+            const points = withLiveToday(
+                [...byDay.entries()]
+                    .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                    .sort((a, b) => a.time < b.time ? -1 : 1),
+                live && live.total_equity != null ? live : null);
             const toPct = p => p.contributed > 0 ? (p.value / p.contributed * 100) : p.value;
             const val = p => simCompareMode === 'pct' ? toPct(p) : p.value;
             document.getElementById('sim-chart').innerHTML = '';
@@ -3710,6 +3731,26 @@
             if (!confirm('Reset simulation? This clears all trades, positions, and equity history.')) return;
             try { await api('sim/reset', { method: 'POST' }); } catch (e) { /* ignore */ }
             loadSimAll();
+        }
+
+        async function backfillSim() {
+            // Destructive: replaces the sim's state with a DETERMINISTIC
+            // replay (no LLM calls — the live hybrid overlay can't be
+            // replayed). Same confirm() pattern as resetSim.
+            if (!confirm('Backfill REPLACES the Daily Sim state with a deterministic replay of the engine rules (no LLM calls — an approximation of the live hybrid strategy). Continue?'))
+                return;
+            const btn = document.getElementById('sim-backfill-btn');
+            const status = document.getElementById('sim-run-status');
+            btn.disabled = true;
+            status.textContent = 'Backfilling… (deterministic replay over stored history — can take a few minutes, no LLM calls)';
+            try {
+                const r = await api('sim/backfill', { method: 'POST' });
+                status.textContent = `Backfilled ${r.days} trading days (${r.start} → ${r.end}, from ${r.requested_start}): ` +
+                    `${r.snapshots} equity points, ${r.trades} trades, final equity $${r.final_equity.toFixed(2)}. ` +
+                    '(deterministic approximation — no LLM overlay)';
+                await loadSimAll();
+            } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
+            btn.disabled = false;
         }
 
         // --- Sim portfolio manager chat ---

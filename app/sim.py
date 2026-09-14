@@ -2163,6 +2163,176 @@ async def get_equity_curve(limit: int = 365) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Backfill (deterministic synthetic history, no LLM calls)
+# ---------------------------------------------------------------------------
+
+async def backfill(start: str | None = None) -> dict[str, Any]:
+    """Replay the DETERMINISTIC sim strategy over historical data and REPLACE
+    the portfolio state with the replay's end state.
+
+    The live sim runs ``SIM_STRATEGY=hybrid`` (deterministic engine + LLM
+    review), but the LLM cannot be replayed faithfully (tokens, and its
+    cloud behaviour isn't reproducible), so this backfill is a DETERMINISTIC
+    APPROXIMATION: the engine's own rules only — the same SELL/ATR-stop/BUY
+    logic, the same risk config (max-positions, stops, run-up block, cash
+    floor), zero LLM calls. The curve approximates the engine the hybrid
+    mode overlays; treat it as context for comparison, not a track record.
+
+    Wipes account/positions/trades/allowances/snapshots (NOT the benchmark,
+    NOT chat history), then walks every stored trading day from `start` to
+    today, depositing the allowance on each month's first trading day and
+    applying the engine's decisions at the day's close.
+
+    ``start`` semantics (mirrors monthly.backfill / daily_core.backfill):
+      - explicit "YYYY-MM-DD": replay from that day
+      - "all": the full stored history (candles to 1980; the replay trims to
+        the first day with computed signals)
+      - None (default): synched with the other sims — the earliest snapshot
+        date of the monthly / daily-core portfolios (the sim's own snapshots
+        are wiped by the replay, so the other two anchor the shared window).
+    """
+    from sqlalchemy import delete as sa_delete
+    from .db import (SimAccount as Acc, SimPosition as Pos, SimTrade as Tr,
+                     SimAllowance as Al, SimSnapshot as Sn)
+    from . import optimize as opt
+
+    def opt_load_series(tickers: list[str]):
+        return opt._load_series(tickers)
+
+    def opt_live_sim_params():
+        return opt._live_sim_params()
+
+    def opt_replay(series, params, start):
+        return opt._replay(series, params, start=start)
+
+    if _run_cycle_lock.locked():
+        return {"skipped": True, "reason": "a sim cycle is already running"}
+    async with _run_cycle_lock:
+        if start is None:
+            start = await _sync_start_date()
+        elif start == "all":
+            start = None  # full stored history
+        start_note = start or "first signal day"
+
+        tickers = await _candidate_tickers()
+        series = await opt_load_series(tickers)
+        if not series:
+            return {"ok": False, "error": "no tickers with enough candle history"}
+
+        params = opt_live_sim_params()
+        res = opt_replay(series, params, start=start)
+        if not res.equity_curve:
+            return {"ok": False, "error": "replay produced no days"}
+
+        # The replay's allowance cadence: contribution on the first trading
+        # day of each month (the _replay convention).
+        days = [e["time"] for e in res.equity_curve]
+        replay_months = sorted({d[:7] for d in days})
+        current_month = _current_month()
+        if current_month not in replay_months:
+            # the live engine already deposited this month; the replay's own
+            # deposit sequence doesn't include it (no candles yet) — keep the
+            # live allowance row so deposit_allowance() stays a no-op
+            replay_months = sorted(set(replay_months) | {current_month})
+
+        # --- wipe + persist (keep the live allowance marker like the other
+        # backfills; also keep the current live month's allowance row) ---
+        async with Session() as s:
+            acc0 = await s.get(Acc, 1)
+            live_allowance_month = acc0.last_allowance_month if acc0 else None
+            await s.execute(sa_delete(Tr))
+            await s.execute(sa_delete(Pos))
+            await s.execute(sa_delete(Al))
+            await s.execute(sa_delete(Sn))
+            acc = await s.get(Acc, 1)
+            if acc is None:
+                acc = Acc(id=1, cash=0.0)
+                s.add(acc)
+            acc.cash = 0.0
+            acc.last_allowance_month = None
+            acc.last_review_week = None
+            await s.commit()
+
+        # Replay state comes from the result's curves; shares/cash are not
+        # exported by ReplayResult, so rebuild the end-state holdings from
+        # the trade log (executing it forward from zero). The allowance
+        # deposits are NOT in the trade log (_replay adds them straight to
+        # pf.cash) — add one deposit per replayed month or cash ends ~$100k
+        # negative and the equity curve cliffs on the live point.
+        shares: dict[str, float] = {}
+        cash = params.start_cash
+        deposited_months: set[str] = set()
+        for tr in res.trades:
+            d = tr["date"]
+            deposited_months.add(d[:7])
+            notional = tr["shares"] * tr["price"]
+            if tr["side"] == "BUY":
+                shares[tr["ticker"]] = shares.get(tr["ticker"], 0.0) + tr["shares"]
+                cash -= notional
+            else:
+                shares[tr["ticker"]] = shares.get(tr["ticker"], 0.0) - tr["shares"]
+                if shares[tr["ticker"]] <= 0.0001:
+                    shares.pop(tr["ticker"], None)
+                cash += notional
+        # deposits: _replay deposits on the first trading day of every month
+        # it processes — including months where the portfolio stayed flat
+        # (no trades), so count months from the equity curve, not the trades.
+        deposited_months = {e["time"][:7] for e in res.equity_curve}
+        cash += params.monthly_allowance * len(deposited_months)
+
+        async with Session() as s:
+            acc = await s.get(Acc, 1)
+            assert acc is not None  # created in the wipe step above
+            acc.cash = round(cash, 2)
+            for t, sh in shares.items():
+                # avg_cost not tracked per-fill here — book at the last close
+                # like the other backfills (the equity curve is what matters).
+                last_px = None
+                df = series.get(t)
+                if df is not None and len(df):
+                    last_px = float(df["close"].iloc[-1])
+                s.add(Pos(ticker=t, shares=round(sh, 6), avg_cost=round(last_px or 0.0, 6)))
+            for tr in res.trades:
+                s.add(Tr(ticker=tr["ticker"], side=tr["side"],
+                         shares=round(tr["shares"], 6), price=round(tr["price"], 6),
+                         cash_after=0.0, reason=f"backfill: {tr['reason']}",
+                         created_at=pd.Timestamp(f"{tr['date']} 16:00:00+00:00").to_pydatetime()))
+            for m in replay_months:
+                s.add(Al(amount=settings.sim_monthly_allowance, month=m))
+            # Keep the marker consistent: the live month's allowance exists
+            # again, so deposit_allowance() stays a no-op for this month.
+            acc.last_allowance_month = live_allowance_month or replay_months[-1]
+            allowance_running = 0.0
+            for e in res.equity_curve:
+                d = e["time"]
+                allowance_running = round(
+                    params.start_cash + params.monthly_allowance
+                    * len({x["time"][:7] for x in res.equity_curve if x["time"] <= d}), 2)
+                s.add(Sn(cash=0.0, positions_value=e["equity"],
+                         total_equity=e["equity"],
+                         allowance_total=round(allowance_running, 2),
+                         created_at=pd.Timestamp(f"{d} 16:00:00+00:00").to_pydatetime()))
+            await s.commit()
+
+        return {"ok": True, "days": len(res.equity_curve),
+                "start": res.equity_curve[0]["time"], "end": res.equity_curve[-1]["time"],
+                "requested_start": start_note,
+                "final_equity": round(res.final_equity, 2),
+                "trades": res.n_trades, "snapshots": len(res.equity_curve),
+                "approximation": True}
+
+
+async def _sync_start_date() -> str | None:
+    """Earliest snapshot date across the monthly / daily-core portfolios —
+    the sim backfill's default start so all three curves cover the same
+    window (mirrors daily_core._sync_start_date)."""
+    from .db import MonthlySnapshot
+    async with Session() as s:
+        d = await s.scalar(select(func.min(MonthlySnapshot.created_at)))
+    return d.strftime("%Y-%m-%d") if d else None
+
+
+# ---------------------------------------------------------------------------
 # Reset
 # ---------------------------------------------------------------------------
 

@@ -2374,3 +2374,82 @@ class TestSchedulerTick:
 
         await sim._scheduler_tick()
         assert called["daily_core"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Backfill (deterministic approximation, no LLM calls)
+# ---------------------------------------------------------------------------
+
+class TestSimBackfill:
+    @pytest.fixture
+    def fake_series(self, monkeypatch):
+        """Patch optimize._load_series with a tiny deterministic market:
+        one strong uptrender + one downtrender so the engine has signals."""
+        from app import optimize as opt
+        from app.analysis import signal_series
+        from tests.test_optimize import _gen_candles
+
+        up = signal_series(_gen_candles(100.0, 0.01, n=300, seed=1))
+        dn = signal_series(_gen_candles(100.0, -0.01, n=300, seed=2))
+
+        async def fake_load_series(_tickers):
+            return {"UP": up, "DN": dn}
+
+        monkeypatch.setattr(opt, "_load_series", fake_load_series)
+        return {"UP": up, "DN": dn}
+
+    async def test_backfill_replaces_state(self, mem_db, fake_series, monkeypatch):
+        """The replay persists trade/snapshot rows with historical stamps,
+        converges to the replay's end state, and flags approximation."""
+        from sqlalchemy import select
+
+        from app.db import SimAllowance as Al
+
+        r = await sim.backfill(start="2025-03-01")
+        assert r["ok"] is True
+        assert r["approximation"] is True
+        assert r["days"] > 0 and r["snapshots"] == r["days"]
+
+        async def check():
+            async with mem_db() as s:
+                snaps = (await s.scalars(select(SimSnapshot))).all()
+                assert len(snaps) == r["snapshots"]
+                days = sorted(x.created_at.strftime("%Y-%m-%d") for x in snaps)
+                assert days[0] == "2025-03-01"
+                # allowance rows: one per replayed month (+ current month)
+                months = sorted(x.month for x in (await s.scalars(
+                    select(Al))).all())
+                assert months[0] == "2025-03"
+                # positions converge to the replay's holdings
+                pos = (await s.scalars(select(SimPosition))).all()
+                assert len(pos) >= 1
+                for p in pos:
+                    assert p.shares > 0
+                # trades carry the replay day
+                trs = (await s.scalars(select(SimTrade))).all()
+                for t in trs:
+                    assert t.created_at.strftime("%Y-%m") >= "2025-03"
+                    assert t.shares > 0 and t.price > 0
+                    assert t.reason.startswith("backfill:")
+        await check()
+
+    async def test_backfill_zero_equity_days_not_persisted_negatively(
+            self, mem_db, fake_series):
+        """The replay starts flat (no cash until the first deposit): early
+        snapshots carry 0 equity — the curve must still start at the window
+        start, not the first deposit."""
+        r = await sim.backfill(start="2025-03-01")
+        assert r["ok"] is True
+        assert r["start"] == "2025-03-01"
+
+    async def test_no_llm_calls(self, mem_db, fake_series, monkeypatch):
+        """The deterministic backfill must never touch the LLM client."""
+        from app import llm as llm_mod
+
+        def _explode(*a, **k):
+            raise AssertionError("LLM called during deterministic backfill")
+
+        monkeypatch.setattr(llm_mod, "chat", _explode, raising=False)
+        monkeypatch.setattr(llm_mod, "chat_stream", _explode, raising=False)
+        r = await sim.backfill(start="2025-03-01")
+        assert r["ok"] is True

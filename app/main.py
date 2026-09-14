@@ -366,6 +366,23 @@ async def sim_run_status():
     """
     return sim.get_run_progress()
 
+@app.post('/api/sim/backfill')
+async def sim_backfill(start: str | None = Query(default=None)):
+    """Backfill the daily sim with a DETERMINISTIC synthetic history.
+
+    Replays the engine's own rules (no LLM calls — the hybrid live strategy's
+    LLM overlay cannot be replayed) over stored candles/fundamentals and
+    REPLACES the portfolio state with the replay's end state. An
+    approximation by design; the response carries approximation: true.
+    """
+    from . import sim
+    r = await sim.backfill(start)
+    if r.get("skipped"):
+        raise HTTPException(409, r.get("reason", "skipped"))
+    if not r.get("ok"):
+        raise HTTPException(400, r.get("error", "backfill failed"))
+    return r
+
 @app.get('/api/sim/reasoning')
 async def sim_reasoning():
     """Return structured LLM reasoning summary from the most recent sim cycle."""
