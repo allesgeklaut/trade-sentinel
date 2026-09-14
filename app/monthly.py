@@ -245,12 +245,19 @@ def eligible_frame(rebal_date: pd.Timestamp, close: pd.DataFrame, vol: pd.DataFr
     n_valid = valid.sum()
 
     c = hist.ffill()
-    # 12-1 momentum: close[t-21td] / close[t-252td] - 1
+    # 12-1 momentum: close[t-21td] / close[t-252td] - 1. Default "raw";
+    # settings.sim_daily_core_mom_variant == "residual" swaps in the
+    # Blitz-Huij-Martens residual momentum (mom per unit of idiosyncratic
+    # vol) — same `mom` column semantic downstream (higher = better) so the
+    # rest of the frame logic is untouched.
     if len(hist) <= 252:
         return None
-    mom_start = c.iloc[-21]
-    mom_end = c.iloc[-252]
-    mom = mom_start / mom_end - 1.0
+    if getattr(settings, "sim_daily_core_mom_variant", "raw") == "residual":
+        mom = residual_momentum(hist, d)
+    else:
+        mom_start = c.iloc[-21]
+        mom_end = c.iloc[-252]
+        mom = mom_start / mom_end - 1.0
     vol_ann = hist.tail(121).pct_change().std() * np.sqrt(252.0)
 
     rows: dict[str, dict[str, float | None]] = {}
@@ -309,11 +316,15 @@ def eligible_frame(rebal_date: pd.Timestamp, close: pd.DataFrame, vol: pd.DataFr
     if not rows:
         return None
     df = pd.DataFrame(rows).T
+    # The mom > -0.99 gate is a raw-momentum "went to zero" sanity floor
+    # (close-ratio - 1). Residual momentum is a scaled t-stat; a -2 value is
+    # meaningful signal, not a busted name — apply the floor to raw only.
+    raw_mom = getattr(settings, "sim_daily_core_mom_variant", "raw") != "residual"
     df["eligible"] = (
         (df["mcap"] > settings.sim_monthly_min_mcap)
         & (df["dollar_vol"] > settings.sim_monthly_min_dollar_vol)
         & np.isfinite(df["mom"])
-        & (df["mom"] > -0.99)
+        & ((df["mom"] > -0.99) if raw_mom else True)
     )
     return df
 
@@ -381,10 +392,71 @@ def _band_fill(order: list[str], holdings: list[str], target_n: int, hold_band: 
     return sorted(picked)
 
 
-def _qv_order(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+def residual_momentum(close: pd.DataFrame, asof: pd.Timestamp,
+                      market: pd.Series | None = None,
+                      lookback: int = 252, skip: int = 21) -> pd.Series:
+    """Residual momentum per Blitz-Huij-Martens (2011): for each ticker, run
+    the daily log returns in [asof-lookback+skip .. asof-skip] through a
+    one-factor market regression, then return mean(residuals)/std(residuals)
+    * sqrt(n) — momentum per unit of idiosyncratic risk. Empirically ~2x the
+    Sharpe of raw 12-1 momentum with roughly half the crash exposure.
+
+    `market` defaults to the equal-weight mean of the frame's own returns.
+    Returns a Series indexed by ticker; tickers with <60 valid days are NaN.
+
+    Note: with the default in-frame market on a SMALL universe the common
+    drift absorbs into the market leg and the residuals cluster ~0 — the
+    method separates names on idiosyncratic VOL (its purpose) rather than
+    on raw trend, which is exactly what reduces crash exposure. For the
+    production use the frame spans ~100 names, so the market leg behaves
+    like a true index.
+    """
+    hist = close.loc[:asof]
+    if len(hist) < lookback + skip:
+        return pd.Series({t: float("nan") for t in close.columns}, dtype=float)
+    # Window: [asof - (lookback+skip) .. asof - skip] — ends `skip` days
+    # before asof (the classic 12-1 skip: excludes the most-recent month to
+    # avoid the short-term reversal that contaminates momentum).
+    win: pd.DataFrame = hist.iloc[-(lookback + skip + 1):-(skip + 1) if skip else None]
+    rets = win.apply(lambda s: np.log(s / s.shift(1))).iloc[1:]
+    if market is None:
+        mkt = rets.mean(axis=1)
+    else:
+        m = market.reindex(rets.index).ffill()
+        mkt = pd.Series(np.log(m / m.shift(1)), index=m.index).iloc[1:]
+        mkt = mkt.reindex(rets.index)
+    mv = mkt.to_numpy(dtype=float)
+    out: dict[str, float] = {}
+    for t in rets.columns:
+        r = rets[t].to_numpy(dtype=float)
+        mask = np.isfinite(r) & np.isfinite(mv)
+        if mask.sum() < 60:
+            out[t] = float("nan")
+            continue
+        r_ = r[mask]
+        m_ = mv[mask]
+        # OLS with intercept on the RAW market returns: r = a + b*m + e.
+        # Momentum lives in E[r]; removing a + b*m leaves the idiosyncratic
+        # drift in E[e] = a, so the score is alpha / resid-std * sqrt(n) —
+        # the alpha t-statistic (the Blitz-Huij-Martens ranking).
+        m_var = float(np.dot(m_ - m_.mean(), m_ - m_.mean()))
+        beta = float(np.dot(r_ - r_.mean(), m_ - m_.mean()) / m_var) if m_var > 0 else 0.0
+        alpha = float(r_.mean() - beta * m_.mean())
+        resid = r_ - (alpha + beta * m_)
+        sd = float(resid.std())
+        # Ranking = alpha t-statistic: OLS forces mean(resid)=0, so score
+        # the ALPHA itself per unit of residual vol, annualized by sqrt(n).
+        out[t] = float(alpha / sd * np.sqrt(len(resid))) if sd > 0 else float("nan")
+    return pd.Series(out)
+
+
+def _qv_order(frame: pd.DataFrame, lowvol_tilt: bool | None = None) -> tuple[pd.DataFrame, list[str]]:
     """Score = pct_rank(ROE) + pct_rank(momentum) + pct_rank(1 / P-FCF if
-    available). Explicit total order (unique ranking => unique portfolio):
+    available) [+ pct_rank(-vol) when the low-vol tilt is on]. Explicit total
+    order (unique ranking => unique portfolio):
       score desc -> higher ROE -> lower P/FCF (missing last) -> ticker asc."""
+    if lowvol_tilt is None:
+        lowvol_tilt = settings.sim_daily_core_lowvol_tilt
     elig = frame[frame["eligible"]].copy()
     if elig.empty:
         return elig, []
@@ -405,6 +477,11 @@ def _qv_order(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     else:
         # degenerate: no value data anywhere -> quality+momentum only
         elig["score"] = elig["roe_rank"].fillna(0) + elig["mom_rank"].fillna(0)
+    if lowvol_tilt:
+        # pct_rank(-vol): the LOWEST-vol names rank highest. Finite-missing
+        # vol stays neutral at 0 (can't penalise what we can't measure).
+        vol_rank = (-elig["vol"]).rank(pct=True)
+        elig["score"] = elig["score"] + vol_rank.where(np.isfinite(elig["vol"]), 0.0)
 
     order = (
         elig.assign(_pf=elig["p_fcf"].fillna(np.inf), _tk=elig.index)

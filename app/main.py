@@ -327,7 +327,7 @@ async def sim_trades(limit: int = Query(default=100, ge=1, le=500)):
     return await sim.get_trades(limit)
 
 @app.get('/api/sim/equity')
-async def sim_equity(limit: int = Query(default=365, ge=1, le=1000)):
+async def sim_equity(limit: int = Query(default=365, ge=1, le=4000)):
     """Equity-curve snapshots for charting (oldest-first)."""
     return await sim.get_equity_curve(limit)
 
@@ -337,10 +337,10 @@ async def sim_allowances():
     return await sim.get_allowances()
 
 @app.get('/api/sim/benchmark')
-async def sim_benchmark():
+async def sim_benchmark(limit: int = Query(default=365, ge=1, le=4000)):
     """DCA benchmark portfolio status + equity curve."""
     val = await sim.benchmark_valuate()
-    curve = await sim.get_benchmark_equity_curve(365)
+    curve = await sim.get_benchmark_equity_curve(limit)
     return {**val, "equity_curve": curve}
 
 @app.post('/api/sim/run')
@@ -405,7 +405,7 @@ async def monthly_trades(limit: int = Query(default=100, ge=1, le=500)):
     return await monthly.get_trades(limit)
 
 @app.get('/api/monthly/equity')
-async def monthly_equity(limit: int = Query(default=365, ge=1, le=1000)):
+async def monthly_equity(limit: int = Query(default=365, ge=1, le=4000)):
     """Monthly portfolio equity-curve snapshots (oldest-first)."""
     from . import monthly
     return await monthly.get_equity_curve(limit)
@@ -455,6 +455,10 @@ async def daily_core_status():
         "sim_daily_core_enabled": settings.sim_daily_core_enabled,
         "band": band,
         "picks": picks,
+        "ranking_date": await daily_core.get_ranking_date(),
+        # rank map {ticker: 1-based rank} so the UI can show each holding's
+        # position in the ranking, not just the bare band list.
+        "rank_map": {t: i + 1 for i, t in enumerate(band)},
     }
 
 @app.get('/api/dailycore/trades')
@@ -463,7 +467,7 @@ async def daily_core_trades(limit: int = Query(default=100, ge=1, le=500)):
     return await daily_core.get_trades(limit)
 
 @app.get('/api/dailycore/equity')
-async def daily_core_equity(limit: int = Query(default=365, ge=1, le=1000)):
+async def daily_core_equity(limit: int = Query(default=365, ge=1, le=4000)):
     from . import daily_core
     return await daily_core.get_equity_curve(limit)
 

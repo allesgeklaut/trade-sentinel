@@ -551,6 +551,7 @@ async def backfill(start: str | None = None) -> dict:
             return monthly_mod.px_at(close_val, d, t)
 
         cur_month: int | None = None
+        deposited_months: set[str] = set()  # months the replay actually funded
         for d in idx:
             # Point-in-time discipline: each day uses the ranking of the most
             # recent month-end AT OR BEFORE d (the frame computed from facts
@@ -567,12 +568,17 @@ async def backfill(start: str | None = None) -> dict:
             band = set(order[:hold_band])
 
             # allowance: deposit on the first trading day of a new month
-            # (same timing as the live deposit_allowance)
+            # (same timing as the live deposit_allowance). Tracked so the
+            # persisted allowance rows match the deposits exactly — the old
+            # code derived them from ALL window months (1980+ for start=all),
+            # creating ~440 phantom $1k rows that inflated allowance_total
+            # to $550k and broke every contributed-normalized UI metric.
             if cur_month is None or d.month != cur_month:
                 cur_month = d.month
                 cash += settings.sim_monthly_contribution
                 contributed += settings.sim_monthly_contribution
                 n_contribs += 1
+                deposited_months.add(d.strftime("%Y-%m"))
 
             def do_buy(t: str, budget: float, day=d) -> None:
                 nonlocal cash
@@ -633,10 +639,12 @@ async def backfill(start: str | None = None) -> dict:
             snaps.append((d.strftime("%Y-%m-%d"), equity_close, contributed))
 
         # --- persist the end state ---
-        # Allowance rows: one per month the replay actually deposited,
-        # derived from the replay's own month sequence (safer than a
-        # DateOffset sweep, which can drift across the trimmed start).
-        replay_months = sorted({d.strftime("%Y-%m") for d in idx})
+        # Allowance rows: one per month the replay ACTUALLY deposited (the
+        # in-loop tracked set). The old code used every month in the window
+        # — for start=all that included ~440 months before the first
+        # eligible ranking (1980+), creating phantom $1k rows that inflated
+        # allowance_total and broke every contributed-normalized metric.
+        replay_months = sorted(deposited_months)
         # The live engine deposits at the START of the month, so it may
         # already have deposited the CURRENT month while the replay window
         # has no candle for it yet (e.g. backfill on the 1st before the
@@ -723,6 +731,15 @@ async def get_trades(limit: int = 100) -> list[dict]:
     return [{"ticker": r.ticker, "side": r.side, "shares": r.shares, "price": r.price,
              "cash_after": round(r.cash_after, 2), "reason": r.reason,
              "date": r.created_at.isoformat()} for r in rows]
+
+
+async def get_ranking_date() -> str | None:
+    """The stored ranking's date (YYYY-MM-DD), None before the first cycle —
+    lets the UI flag a stale band instead of presenting it as today's."""
+    from .db import DailyCoreRanking
+    async with Session() as s:
+        row = await s.get(DailyCoreRanking, 1)
+    return row.ranking_date.strftime("%Y-%m-%d") if row else None
 
 
 async def get_equity_curve(limit: int = 365) -> list[dict]:

@@ -82,6 +82,26 @@ class Settings(BaseSettings):
     # Default 0.0 = flat equal-weight targets, the measured winner (experiment
     # doc §10); the live run_deployment is flat too.
     sim_monthly_rank_boost: float = 0.0
+
+    # --- Daily-core risk overlays (all opt-in, measured via daily-core-sweep) ---
+    # mom_variant: "raw" = classic 12-1 close/close momentum. "residual" =
+    # Blitz-Huij-Martens residual momentum: rank by the residuals of each
+    # stock's 12-1 daily log returns regressed on the market's, scaled by
+    # their std-dev (momentum per unit of idiosyncratic vol). Literature:
+    # ~2x Sharpe and roughly half the crash risk of raw momentum.
+    sim_daily_core_mom_variant: str = "raw"
+    # target_vol (annualized, 0 = off): when the portfolio's own 21d realized
+    # vol exceeds this, hold (realized/target - 1) of the equity in cash.
+    # Barroso-Santa-Clara vol management, capped so bull markets stay ~fully
+    # invested — it never scales UP past 100%, only down.
+    sim_daily_core_target_vol: float = 0.0
+    # vol_weight: position targets proportional to 1/realized-vol (risk parity)
+    # instead of equal weight. Independent of mom_variant.
+    sim_daily_core_vol_weight: bool = False
+    # lowvol_tilt: adds pct_rank(-vol) as a 4th equal term in the qv-mom
+    # score. The classic defensive tilt — expect lower vol AND lower return;
+    # kept for completeness (the sweep decides).
+    sim_daily_core_lowvol_tilt: bool = False
     sim_run_hour: int = 22
     sim_run_minute: int = 30
 

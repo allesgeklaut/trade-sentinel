@@ -1490,3 +1490,123 @@ class TestRankBoostDefault:
         # the default must not silently run the losing 0.5 config.
         from app.config import settings
         assert settings.sim_monthly_rank_boost == 0.0
+
+
+class TestDailyCoreRiskOverlays:
+    """The opt-in risk overlays on the daily-core backtest (vol_weight,
+    target_vol, mom variant, lowvol tilt) must (a) actually change behaviour
+    vs the control and (b) never break the run. Uses the same synthetic
+    market as the parity test."""
+
+    @pytest.fixture
+    def synthetic_market(self, monkeypatch):
+        import numpy as np
+        import pandas as pd
+
+        from app import fundamentals as fundamentals_mod
+        from app import monthly as monthly_mod
+
+        rng = np.random.default_rng(123)
+        tickers = [f"T{i:02d}" for i in range(20)]
+        n_days = 900
+        dates = pd.bdate_range("2022-01-03", periods=n_days)
+        drifts = np.linspace(0.0010, -0.0004, len(tickers))
+        closes = {}
+        for t, drift in zip(tickers, drifts, strict=False):
+            r = rng.normal(drift, 0.010, n_days)
+            closes[t] = 50.0 * np.exp(np.cumsum(r))
+        close = pd.DataFrame(closes, index=dates)
+        vol = pd.DataFrame(5e6, index=dates, columns=tickers)
+        fund = {
+            t: {
+                "StockholdersEquity": [{"start": None, "end": "2021-12-31",
+                                        "filed": "2022-02-15", "val": 5e9}],
+                "NetIncomeLoss": [{"start": "2021-01-01", "end": "2021-12-31",
+                                   "filed": "2022-02-15", "val": 5e8}],
+                "CommonStockSharesOutstanding": [{"start": None, "end": "2021-12-31",
+                                                  "filed": "2022-02-15", "val": 1e8}],
+                "NetCashProvidedByUsedInOperatingActivities": [
+                    {"start": "2021-01-01", "end": "2021-12-31",
+                     "filed": "2022-02-15", "val": 1e9}],
+                "PaymentsToAcquirePropertyPlantAndEquipment": [
+                    {"start": "2021-01-01", "end": "2021-12-31",
+                     "filed": "2022-02-15", "val": -2e8}],
+            }
+            for t in tickers
+        }
+
+        async def fake_load_frames(_tickers, _asof):
+            return close, vol
+
+        async def fake_load_fundamentals(_tickers):
+            return fund
+
+        monkeypatch.setattr(monthly_mod, "load_frames", fake_load_frames)
+        monkeypatch.setattr(fundamentals_mod, "load_fundamentals", fake_load_fundamentals)
+        return {"tickers": tickers, "close": close}
+
+    async def _run(self, synthetic_market, **kw):
+        import app.optimize as opt
+        return await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, **kw)
+
+    async def test_control_runs_and_reports_risk_metrics(self, synthetic_market):
+        r = await self._run(synthetic_market)
+        assert r is not None
+        assert r.sharpe > 0  # trending synthetic market
+        assert 0.0 <= r.max_drawdown < 1.0
+        assert r.n_trades > 0
+
+    async def test_vol_weight_changes_weights(self, synthetic_market):
+        """vol_weight must shift capital toward the low-vol names: the
+        trace of target weights differs from the flat control. (The
+        synthetic market has equal vol per name, so the effect is ~0 —
+        assert it runs and stays invested; the discriminating behaviour is
+        covered by weight_of() below.)"""
+        r = await self._run(synthetic_market, vol_weight=True)
+        assert r is not None and r.n_trades > 0
+
+    async def test_target_vol_parks_cash_in_high_vol(self, synthetic_market):
+        """A tiny target_vol (every day breaches it) must leave cash
+        undeployed vs the control — final value drops and the vol gate
+        actually binds."""
+        import app.optimize as opt
+        control = await self._run(synthetic_market)
+        capped = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, target_vol=0.0001)
+        assert control is not None and capped is not None
+        # capped run holds cash -> lower equity multiple than fully deployed
+        assert capped.final_value < control.final_value
+
+    async def test_residual_mom_variant_runs(self, synthetic_market, monkeypatch):
+        from app.config import settings
+        monkeypatch.setattr(settings, "sim_daily_core_mom_variant", "residual")
+        r = await self._run(synthetic_market)
+        assert r is not None and r.n_trades > 0
+
+    def test_inv_vol_weights_math(self):
+        """LOW vol gets more than equal weight, HIGH vol less; the weights
+        sum to the same total as equal weight; missing-vol names keep the
+        equal weight (never silently zeroed)."""
+        from app.optimize import _inv_vol_weights
+        frame = pd.DataFrame(
+            {"vol": [0.10, 0.20, 0.40, float("nan")]},
+            index=["LOW", "MID", "HIGH", "NONE"])
+        names = ["LOW", "MID", "HIGH", "NONE"]
+        equal = 100.0 / 4
+        w = _inv_vol_weights(names, frame, 4, equal)
+        assert w["LOW"] > w["MID"] > w["HIGH"]
+        assert w["LOW"] > equal > w["HIGH"]
+        # 4x the vol -> 1/4 the weight of the LOW name
+        assert w["LOW"] == pytest.approx(4 * w["HIGH"])
+        # the missing-vol name keeps equal weight, and the total sums to
+        # the same equity equal-weight deployment would spread
+        assert w["NONE"] == equal
+        assert sum(w.values()) == pytest.approx(4 * equal)
+        # degenerate: no frame / empty names -> equal weight
+        assert _inv_vol_weights(["X"], None, 4, equal) == {"X": equal}
+        assert _inv_vol_weights([], frame, 4, equal) == {}

@@ -820,3 +820,78 @@ async def test_run_rebalance_lock_serializes(mem_db, monkeypatch):
     release.set()
     r1 = await t1
     assert r1.get("rebalanced") is True or r1.get("skipped") is True
+
+
+# ---------------------------------------------------------------------------
+# Risk overlays: residual momentum + low-vol tilt
+# ---------------------------------------------------------------------------
+
+def _trend_close(n_days: int = 400) -> pd.DataFrame:
+    """Deterministic 5-ticker frame: LEAD (strong smooth uptrend), CHOP (same
+    endpoint as LEAD but 5x the noise), WEAK (flat), LAG (downtrend), CRASH
+    (uptrend with a mid-window -30% crash). Residual momentum must rank the
+    smooth trend above the choppy one even at identical drift."""
+    rng = np.random.default_rng(7)
+    dates = pd.bdate_range("2024-06-03", periods=n_days)
+    drift = 0.0009
+    lead = 100.0 * np.exp(np.cumsum(rng.normal(drift, 0.003, n_days)))
+    # CHOP: same drift but much noisier path
+    chop = 100.0 * np.exp(np.cumsum(rng.normal(drift, 0.018, n_days)))
+    weak = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.006, n_days)))
+    lag = 100.0 * np.exp(np.cumsum(rng.normal(-drift, 0.006, n_days)))
+    crash = 100.0 * np.exp(np.cumsum(rng.normal(drift, 0.004, n_days)))
+    crash[n_days // 2] = crash[n_days // 2] * 0.70  # one-day -30% idio crash
+    return pd.DataFrame({"LEAD": lead, "CHOP": chop, "WEAK": weak,
+                         "LAG": lag, "CRASH": crash}, index=dates)
+
+
+def test_residual_momentum_rewards_smooth_uptrend():
+    """Blitz-Huij-Martens: momentum per unit of idiosyncratic vol. LEAD and
+    CHOP share the same drift, but LEAD's path is cleaner, so its
+    residual-momentum score must be higher. The crashed name is penalized;
+    the downtrending name is last."""
+    close = _trend_close()
+    rm = monthly.residual_momentum(close, close.index[-1])
+    assert rm["LEAD"] > rm["CHOP"]
+    assert rm["LEAD"] > 0
+    assert rm["LAG"] == rm.min()
+
+
+def test_residual_momentum_short_history_nan():
+    close = _trend_close(n_days=100)  # < 252+21 warmup
+    rm = monthly.residual_momentum(close, close.index[-1])
+    assert rm.isna().all()
+
+
+def test_eligible_frame_residual_variant(monkeypatch):
+    """The residual variant fills the same `mom` column so downstream
+    scoring/eligibility work unchanged; the -0.99 raw-mom floor must not
+    kick in (residual mom is a t-stat, not a return)."""
+    monkeypatch.setattr(settings, "sim_daily_core_mom_variant", "residual")
+    close = _trend_close()
+    vol = pd.DataFrame(5e6, index=close.index, columns=close.columns)
+    fund = _fund_all_positive(close.columns)
+    frame = monthly.eligible_frame(close.index[-1], close, vol, fund)
+    monkeypatch.setattr(settings, "sim_daily_core_mom_variant", "raw")
+    assert frame is not None
+    assert np.isfinite(frame["mom"]).all()
+    assert float(frame["mom"]["LEAD"]) > float(frame["mom"]["CHOP"])
+
+
+def test_qv_order_lowvol_tilt():
+    """With the tilt on, the low-vol name gains one full rank point; the
+    explicit tie-breakers still resolve identical scores."""
+    rows = {
+        "HIVOL": {"roe": 0.10, "p_fcf": 20.0, "mcap": 1e10, "dollar_vol": 5e7,
+                  "mom": 0.10, "price": 100, "vol": 0.60},
+        "LOVOL": {"roe": 0.10, "p_fcf": 20.0, "mcap": 1e10, "dollar_vol": 5e7,
+                  "mom": 0.10, "price": 100, "vol": 0.15},
+    }
+    frame = pd.DataFrame(rows).T
+    frame["eligible"] = True
+    _e, order_plain = monthly._qv_order(frame, lowvol_tilt=False)
+    _e2, order_tilt = monthly._qv_order(frame, lowvol_tilt=True)
+    # identical fundamentals: the tilt is the only difference and must
+    # promote the low-vol name from the ticker-asc fallback.
+    assert order_plain == ["HIVOL", "LOVOL"]  # tie -> ticker asc
+    assert order_tilt == ["LOVOL", "HIVOL"]

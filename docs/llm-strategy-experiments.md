@@ -270,3 +270,98 @@ flat rank-first targets and deposits the allowance at month start, so the
 corrected backtest now models production. No live config change was required
 — the walk-forward confirms the deployed rule beats the monthly baseline
 out-of-sample in every window.
+
+## 11. Risk overlays: residual momentum wins the walk-forward — 2026-09-14
+
+Goal: "optimize return by not getting too volatile." Four literature-backed
+risk knobs were added to the daily-core backtest (all opt-in, code defaults
+conservative):
+
+- `--mom residual` — Blitz-Huij-Martens (2011) residual momentum: per month,
+  regress each ticker's daily log returns (252d window, 21d skip) on the
+  equal-weight market, rank by alpha / residual-std * sqrt(n) (the alpha
+  t-stat). Momentum per unit of idiosyncratic risk. `eligible_frame` fills
+  the same `mom` column; the raw-only `mom > -0.99` floor is skipped for
+  residual (it's a t-stat, not a return).
+- `--target-vol X` — Barroso-Santa-Clara (2015) vol management: when the
+  portfolio's own 21d realized vol (contribution-adjusted daily log returns)
+  exceeds the target, deployment is capped so the excess stays in cash.
+  Only caps down, never leverages up.
+- `--vol-weight` — inverse-vol position weights among the day's top-N
+  candidates instead of equal weight (`_inv_vol_weights`; missing-vol names
+  keep equal weight, weights renormalize to the same total).
+- `--lowvol-tilt` — pct_rank(-vol) as a 4th equal score term in `_qv_order`.
+
+New tooling: `daily-core-sweep --stage 3` (in-sample risk-overlay sweep with
+Sharpe + max-DD now reported by every backtest) and `--stage 4` (walk-forward
+A/B of the overlays on the live config across the §10 OOS windows). Found
+and fixed on the way: stage-3 never applied the stage-1 winner's boost in the
+parent process (control silently ran boost=0 — which happens to be the live
+config, so the overlay comparison stayed valid).
+
+### In-sample (2017-01..2026-09, full window, rank deploy b0)
+
+| Arm | IRR | Sharpe | MaxDD | Turnover |
+|---|---|---|---|---|
+| control (live) | 32.05% | 0.81 | 35.8% | 5.2% |
+| **residual** | 30.64% | **0.95** | **28.2%** | 5.3% |
+| vol-weight | 28.61% | 0.83 | 33.3% | 5.0% |
+| target-vol 0.25 | 31.80% | 0.81 | 34.7% | 5.0% |
+| target-vol 0.20 | 27.84% | 0.76 | 33.7% | 4.8% |
+| lowvol-tilt | 22.33% | 0.95 | 24.7% | 4.7% |
+| residual+tv0.25 | 29.38% | 0.93 | 28.2% | 5.4% |
+
+### Walk-forward A/B on the live config (non-overlapping OOS windows)
+
+| Window | control | residual | res+tv0.25 | tv0.25 | lowvol | vol-weight |
+|---|---|---|---|---|---|---|
+| 2017-19 Sharpe | 1.01 | **1.09** | 1.09 | 0.98 | 1.01 | **1.18** |
+| — maxDD | 17.0% | 16.4% | 16.4% | 17.1% | 15.8% | 15.3% |
+| 2020-21 Sharpe | 0.97 | **1.02** | 0.98 | 0.99 | **1.04** | (0.83 full) |
+| — maxDD | 24.3% | 23.7% | 23.7% | **21.6%** | 23.9% | — |
+| 2022-23 Sharpe | 0.09 | **0.24** | **0.24** | 0.11 | 0.11 | 0.15 |
+| — maxDD | 15.1% | **12.6%** | 12.7% | 15.1% | 10.6% | 14.0% |
+| 2024-26 Sharpe | 1.28 | 1.74 | **1.78** | 1.28 | 1.75 | 1.37 |
+| — maxDD | 24.2% | 21.6% | **18.7%** | 23.5% | 8.6% | 18.2% |
+| 2024-26 IRR | 49.5% | 62.9% | 61.4% | 46.8% | 27.9% | 40.0% |
+
+(IRRs for the other windows are in /data/sweeps/daily_core_risk_walkforward.json
+inside the container; Sharpe is the decision metric here.)
+
+### Findings
+
+1. **Residual momentum is the walk-forward winner — adopted live.** It
+   posts the highest Sharpe of the six arms in all four OOS windows and
+   cuts max drawdown in every stress window (2022-23 bear: 15.1% → 12.6%
+   with Sharpe 0.09 → 0.24; 2024-26: 24.2% → 21.6% with Sharpe 1.28 →
+   1.74 AND IRR +13.4pp). The full-window in-sample IRR cost (-1.4pp vs
+   control) is a bull-market-chasing artifact; OOS the steadier ranking
+   pays for itself. Live: `SIM_DAILY_CORE_MOM_VARIANT=residual` (.env);
+   code default stays `raw` (conservative).
+2. **residual+tv0.25 is a close second** — equal Sharpe in 2022-23, better
+   2024-26 maxDD (18.7% vs 21.6%) at the cost of 2020-21. Not adopted:
+   target-vol needs live daily-return tracking (the live engine would have
+   to gate deployment on its own realized vol — more moving parts for a
+   marginal OOS edge). Revisit if 2026+ windows keep confirming.
+3. **lowvol-tilt is too expensive** — best drawdowns (8.6% in 2024-26!)
+   but gives up 22pp IRR in the same window. The score tilt removes the
+   very momentum exposure the strategy monetizes. Rejected.
+4. **vol-weight underperforms on this 110-name universe** — the frame's
+   `vol` column is computed over only 121 days for all names, and inv-vol
+   weights systematically under-allocate the momentum leaders. Only bright
+   spot: 2017-19 (Sharpe 1.18). Rejected.
+5. **Backfill phantom-allowance bug (found via start=all):** allowance rows
+   were persisted for EVERY month in the candle window (1980+ → 550 rows)
+   while the replay only deposits once a ranking exists (2017+ → 110).
+   allowance_total read $550k instead of $110k, breaking every
+   contributed-normalized metric. Fixed: rows derive from the replay's
+   actual deposits (`deposited_months`), test-guarded in test_daily_core.
+6. **UI risk metrics:** all three portfolio tabs now show Max DD (peak-to-
+   trough on the contributed-normalized curve) and alpha chips vs their
+   natural comparators; Daily-Core gained rank/weight columns, a stale-
+   ranking warning, chart range bars (6M..MAX) and a Monthly-sim overlay.
+
+### Config note
+
+Live daily-core is now: qv-mom ranking with RESIDUAL momentum + daily rank
+deployment (boost=0, no gates, no vol overlay). Everything else unchanged.

@@ -417,6 +417,42 @@ class TestBackfill:
                     assert tr.created_at.strftime("%Y-%m") == "2026-08"
         asyncio.run(check())
 
+    def test_allowance_rows_match_deposited_months_only(self, mem_db, fake_market,
+                                                        monkeypatch):
+        """Found 2026-09-14 with start=all: the persisted allowance rows were
+        derived from EVERY month in the candle window (1980+ → ~550 rows)
+        while the replay only deposits once a ranking exists (2017+ → 110).
+        The phantom rows inflated allowance_total to $550k and broke every
+        contributed-normalized UI metric. Rows must match the months the
+        replay actually funded — in this fixture July 1 has no prior
+        month-end ranking yet, so only August deposits (plus the live
+        current-month add-back)."""
+        from app.db import DailyCoreAllowance as Al
+
+        monkeypatch.setattr(daily_core, "_current_month", lambda: "2026-09")
+        # Seed the live marker to 2026-09 (deposit already made live): the
+        # replay wipes it and the add-back must restore it.
+        async def seed():
+            async with mem_db() as s:
+                acc = await daily_core._account(s)
+                acc.cash = 0.0
+                acc.last_allowance_month = "2026-09"
+                await s.commit()
+        asyncio.run(seed())
+
+        r = asyncio.run(daily_core.backfill(start="2026-08-01"))
+        assert r["ok"] is True
+        # One replayed deposit (August) + the live current-month add-back.
+        assert r["contributed"] == pytest.approx(2 * settings.sim_monthly_contribution)
+
+        async def check():
+            async with mem_db() as s:
+                rows = (await s.scalars(select(Al))).all()
+                # August (replayed) + September (live add-back). No phantom
+                # rows for months outside what the replay actually funded.
+                assert sorted(x.month for x in rows) == ["2026-08", "2026-09"]
+        asyncio.run(check())
+
 
 # ---------------------------------------------------------------------------
 # Data refresh

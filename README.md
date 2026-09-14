@@ -88,6 +88,28 @@ Common flags: `--start`/`--end` (YYYY-MM-DD, inclusive) bound the window; `backt
 
 **Caveats:** this is a no-fees, no-slippage, fractional-share paper backtest — treat absolute returns/drawdowns skeptically. The walk-forward *relative* comparison across windows is the more meaningful signal.
 
+### Daily-core backtest + risk-overlay sweep
+
+`app.optimize daily-core` replays the fundamentals-first daily engine (§10-11 of `docs/llm-strategy-experiments.md`): the monthly qv-mom ranking as the core, candles only deploy cash. Beyond the deployment knobs it accepts risk-overlay flags, each backed by a measured walk-forward verdict:
+
+```bash
+# Momentum variant: raw 12-1 (default) vs residual momentum (Blitz-Huij-Martens;
+# walk-forward winner — see the doc's §11)
+docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize daily-core --start 2022-01-01 --dca rank --mom residual
+
+# Volatility overlays: target-vol cap, inverse-vol weights, low-vol score tilt
+docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize daily-core --dca rank --target-vol 0.25
+docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize daily-core --dca rank --vol-weight
+docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize daily-core --dca rank --lowvol-tilt
+
+# Stage 3: in-sample risk-overlay sweep on the stage-1 winner (reports IRR + Sharpe + max-DD)
+# Stage 4: walk-forward A/B of the risk overlays on the live config
+docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize daily-core-sweep --stage 3
+docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize daily-core-sweep --stage 4
+```
+
+Every backtest now reports an annualized Sharpe (contribution-adjusted daily returns) and max drawdown alongside the money-weighted IRR, so arms can be compared on risk-adjusted return — not just return.
+
 ### LLM benchmark (`llm-benchmark`)
 
 Probes whether the configured LLM would have turned the deterministic model's worst decisions. It replays the deterministic strategy over stored history, scores every trade by its 20-trading-day forward outcome (a BUY is bad when the price then fell; a SELL/stop-out is bad when the price then rallied), picks the 8 worst mistakes plus 2 control cases where the model was clearly right, reconstructs the exact indicator snapshot and portfolio state at each decision point, and sends each to the LLM using the *same* hybrid-sim system prompt and JSON format — then reports whether the LLM agreed, turned to HOLD, or flipped the call.
@@ -118,4 +140,14 @@ LLM_BACKENDS=[{"name":"llama-server","type":"openai","url":"http://your-server-i
 
 ## Timezone convention
 
-All `created_at` / `updated_at` timestamps are stored as tz-aware UTC in SQLite. The autonomous paper-trading scheduler runs at `SIM_RUN_HOUR`:`SIM_RUN_MINUTE` **UTC** (set `22 30` to run at 22:30 UTC). The monthly allowance deposits for BOTH paper portfolios (sim + monthly qv-mom) are anchored to the operator's local timezone (`ALLOWANCE_TZ`, `Europe/Vienna` by default) so the deposits land on the local calendar month boundary — and at the *start* of the month, so the two portfolios' cumulative "contributed" figures step in lockstep and their equity curves are directly comparable. The monthly qv-mom portfolio additionally takes a daily equity snapshot (right before the main nightly cycle), so its curve moves every day instead of only at month-end rebalances. The frontend displays the sim chart axis labels and trade log times in the operator's local timezone (`Europe/Vienna`), converting the stored UTC ISO strings on the client.
+All `created_at` / `updated_at` timestamps are stored as tz-aware UTC in SQLite. The autonomous paper-trading scheduler runs at `SIM_RUN_HOUR`:`SIM_RUN_MINUTE` **UTC** (set `22 30` to run at 22:30 UTC). The monthly allowance deposits for the three paper portfolios (sim + monthly qv-mom + daily-core) are anchored to the operator's local timezone (`ALLOWANCE_TZ`, `Europe/Vienna` by default) so the deposits land on the local calendar month boundary — and at the *start* of the month, so the portfolios' cumulative "contributed" figures step in lockstep and their equity curves are directly comparable. The monthly qv-mom portfolio additionally takes a daily equity snapshot (right before the main nightly cycle), so its curve moves every day instead of only at month-end rebalances. The frontend displays the sim chart axis labels and trade log times in the operator's local timezone (`Europe/Vienna`), converting the stored UTC ISO strings on the client.
+
+## Paper portfolios
+
+Three paper portfolios run side by side on the same $1000/month allowance:
+
+- **Daily Sim** — the technical engine (trend/RSI/MACD signals, stops, optional LLM review; §1-9 of the experiments doc).
+- **Monthly Sim** — qv-mom (quality-value-momentum) top-10, monthly rebalance with hysteresis.
+- **Daily-Core** — the strongest of the three: the Monthly sim's qv-mom ranking decides WHAT to own, but fresh cash deploys EVERY day into the top-ranked names (no month-end parking, no cash drag). Since 2026-09-14 the ranking uses **residual momentum** (Blitz-Huij-Martens alpha t-stat instead of raw 12-1 return), which won the walk-forward on Sharpe in all four OOS windows while cutting max drawdown in every stress regime (doc §11). Live switch via `SIM_DAILY_CORE_MOM_VARIANT=residual`.
+
+The Daily-Core tab shows Max DD, live alpha vs the Monthly sim and the DCA benchmark, per-position rank + weight, the full hold-band with held-name markers, and chart range controls (6M/1Y/2Y/5Y/MAX) over the backfilled 2017+ history.
