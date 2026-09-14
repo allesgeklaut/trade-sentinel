@@ -1631,6 +1631,8 @@
             <div class="bench-label">ACTIONS</div>
             <div class="sim-actions">
                 <button id="dailycore-run-btn" onclick="runDailyCore()">Run Cycle Now</button>
+                <select id="dailycore-variant" title="Momentum variant used by the ranking — the next cycle and every backfill honor it"
+                    onchange="setDCVariant(this.value)" style="max-width:260px"></select>
                 <button id="dailycore-backfill-btn" onclick="backfillDailyCore()">Backfill (sync with other sims)</button>
                 <input type="date" id="dailycore-backfill-date" title="Optional: replay from this date instead"
                     onchange="if(this.value) document.getElementById('dailycore-backfill-all').checked = false">
@@ -2827,6 +2829,17 @@
                     ['Ranking', rankingDate ? (stale ? rankingDate + ' ⚠' : rankingDate) : '—'],
                 ];
                 document.getElementById('dailycore-summary').innerHTML = m.map(([k, x]) => `<span class="metric">${k}<br><b>${x}</b></span>`).join('');
+                // Strategy dropdown: keep the options static, sync the
+                // selection with the server's effective variant.
+                const sel = document.getElementById('dailycore-variant');
+                if (sel && !sel.options.length) {
+                    for (const [key, label] of Object.entries(s.mom_variants || {})) {
+                        const opt = document.createElement('option');
+                        opt.value = key; opt.textContent = label;
+                        sel.appendChild(opt);
+                    }
+                }
+                if (sel && s.mom_variant) sel.value = s.mom_variant;
                 const rankMap = s.rank_map || {};
                 const pos = v.positions || [];
                 document.getElementById('dailycore-positions').innerHTML = pos.length ? `<table><tr><th>Ticker</th><th>Rank</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>Weight</th><th>P&L%</th></tr>${pos.map(p => {
@@ -2985,6 +2998,25 @@
             updateAsOf('dailycore', points.length ? points[points.length - 1].time : null);
         }
 
+        async function setDCVariant(variant) {
+            const status = document.getElementById('dailycore-run-status');
+            const label = (document.getElementById('dailycore-variant')?.selectedOptions || [])[0]?.textContent || variant;
+            if (!confirm(`Switch the daily-core ranking to "${label}"?\n\nThe next cycle will trade the new ranking, and every future backfill replays it. Re-run the backfill to see the new variant's full-history track record.`))
+                return;
+            try {
+                await api('dailycore/strategy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ variant }),
+                });
+                status.textContent = `Strategy switched to ${label} — the next cycle recomputes the ranking.`;
+                await loadDailyCoreAll();
+            } catch (e) {
+                status.textContent = 'Error: ' + escapeHtml(e.message);
+                await loadDailyCoreStatus();  // restore the actual selection
+            }
+        }
+
         async function runDailyCore() {
             const btn = document.getElementById('dailycore-run-btn');
             const status = document.getElementById('dailycore-run-status');
@@ -3020,7 +3052,8 @@
             status.textContent = 'Backfilling… (replays the strategy over stored history — can take a few minutes)';
             try {
                 const r = await api('dailycore/backfill' + qs, { method: 'POST' });
-                status.textContent = `Backfilled ${r.days} trading days (${r.start} → ${r.end}, from ${r.requested_start}): ` +
+                status.textContent = `Backfilled ${r.days} trading days (${r.start} → ${r.end}, from ${r.requested_start}` +
+                    (r.mom_variant ? `, ${r.mom_variant} momentum` : '') + `): ` +
                     `${r.snapshots} equity points, ${r.trades} trades, final equity $${r.final_equity.toFixed(2)}.`;
                 dcRange = 'MAX';  // show the replayed history in full
                 for (const b of document.querySelectorAll('#dc-range-bar .range-btn'))

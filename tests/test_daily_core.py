@@ -504,3 +504,33 @@ class TestRefreshData:
 
         asyncio.run(daily_core.refresh_data())
         assert seen["tickers"] == ["AAA", "BBB", "HELD"]
+
+
+# ---------------------------------------------------------------------------
+# Strategy selection (runtime variant dropdown)
+# ---------------------------------------------------------------------------
+
+class TestVariantSelection:
+    def test_default_falls_back_to_config(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        assert daily_core.current_variant() == settings.sim_daily_core_mom_variant
+
+    def test_set_and_persist(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core.set_variant("raw")
+        assert daily_core.current_variant() == "raw"
+        daily_core.set_variant("residual")
+        # persisted across "restarts" (a fresh read from the file)
+        assert daily_core.current_variant() == "residual"
+
+    def test_set_variant_rejects_unknown(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        with pytest.raises(ValueError):
+            daily_core.set_variant("turbo-momentum")
+
+    def test_invalid_state_file_falls_back(self, monkeypatch, tmp_path):
+        state_file = tmp_path / "state.json"
+        state_file.write_text('{"mom_variant": "bogus"}')
+        monkeypatch.setattr(daily_core, "_STATE_FILE", state_file)
+        # the stored variant is unknown -> config default wins
+        assert daily_core.current_variant() == settings.sim_daily_core_mom_variant

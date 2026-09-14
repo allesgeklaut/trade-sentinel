@@ -26,9 +26,11 @@ portfolios' "contributed" figures stay comparable), refreshes data, runs one
 deployment pass, and writes the daily equity snapshot.
 """
 import asyncio
+import json
 import logging
 import math
 from datetime import datetime, timedelta, UTC
+from pathlib import Path
 
 import pandas as pd
 from sqlalchemy import func, select
@@ -44,6 +46,53 @@ from .screener import tickers as universe_tickers
 logger = logging.getLogger("trade_sentinel.daily_core")
 
 _TZ = monthly_mod._TZ  # same operator-local month anchor as sim/monthly
+
+# ---------------------------------------------------------------------------
+# Strategy selection (runtime, persisted — the LLM-backend pattern)
+# ---------------------------------------------------------------------------
+
+# The selectable momentum variants. `raw` = classic 12-1 close/close return;
+# `residual` = Blitz-Huij-Martens alpha t-stat (§11 walk-forward winner).
+STRATEGY_VARIANTS: dict[str, str] = {
+    "raw": "Raw 12-1 momentum (classic qv-mom)",
+    "residual": "Residual momentum (Blitz-Huij-Martens, §11 winner)",
+}
+
+_STATE_FILE = Path("/data/daily_core_state.json")
+
+
+def _load_state() -> dict:
+    try:
+        return json.loads(_STATE_FILE.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning("Could not read daily-core state file: %s", e)
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    try:
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _STATE_FILE.write_text(json.dumps(state, indent=2))
+    except Exception as e:
+        logger.warning("Could not write daily-core state file %s: %s", _STATE_FILE, e)
+
+
+def current_variant() -> str:
+    """The effective momentum variant: the persisted runtime choice if valid,
+    else the env/config default. Reads the file per call (tiny JSON, called
+    from the scheduler path once per day and the status endpoint) so a
+    hand-edited state file takes effect immediately."""
+    state = _load_state()
+    v = state.get("mom_variant")
+    return v if v in STRATEGY_VARIANTS else settings.sim_daily_core_mom_variant
+
+
+def set_variant(variant: str) -> None:
+    if variant not in STRATEGY_VARIANTS:
+        raise ValueError(f"unknown mom variant: {variant!r}")
+    _save_state({"mom_variant": variant})
 
 
 def _local_now() -> datetime:
@@ -285,6 +334,9 @@ async def compute_targets(force: bool = False) -> tuple[list[str], list[str], pd
             return [], [], None
         iso = datetime.now(UTC).strftime("%Y-%m-%d")
         d: pd.Timestamp = pd.Timestamp(iso)  # type: ignore[assignment]
+        # The runtime-selected momentum variant (UI dropdown, persisted)
+        # drives the frame math — eligible_frame reads this setting.
+        settings.sim_daily_core_mom_variant = current_variant()
         frame = await asyncio.to_thread(monthly_mod.eligible_frame, d, close, vol, fund)
         if frame is None or not bool(frame["eligible"].any()):
             return [], [], frame
@@ -482,6 +534,9 @@ async def backfill(start: str | None = None) -> dict:
         # replay June 1-29 against May's month-end ranking (facts public by
         # then), not sit idle until June's month-end. Point-in-time safe:
         # the prior frame only uses facts public by its own date.
+        # The frames honor the runtime-selected momentum variant (the UI
+        # dropdown) — the replay always models the strategy as configured.
+        settings.sim_daily_core_mom_variant = current_variant()
         prior_month_ends: list[pd.Timestamp] = []
         if months:
             prev = months[0] - pd.offsets.MonthEnd(1)
@@ -691,7 +746,7 @@ async def backfill(start: str | None = None) -> dict:
                 "end": str(idx[-1].date()), "requested_start": start_note,
                 "contributed": round(contributed, 2),
                 "final_equity": round(snaps[-1][1], 2), "trades": len(trades),
-                "snapshots": len(snaps)}
+                "snapshots": len(snaps), "mom_variant": current_variant()}
 
 
 async def run_daily_cycle(force: bool = False) -> dict:

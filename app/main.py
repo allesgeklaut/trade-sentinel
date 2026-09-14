@@ -493,7 +493,36 @@ async def daily_core_status():
         # rank map {ticker: 1-based rank} so the UI can show each holding's
         # position in the ranking, not just the bare band list.
         "rank_map": {t: i + 1 for i, t in enumerate(band)},
+        # runtime-selectable momentum variant + the options (UI dropdown)
+        "mom_variant": daily_core.current_variant(),
+        "mom_variants": daily_core.STRATEGY_VARIANTS,
     }
+
+@app.post('/api/dailycore/strategy')
+async def daily_core_strategy(req: dict):
+    """Select the daily-core momentum variant at runtime (persisted across
+    restarts). Body: {"variant": "raw" | "residual"}.
+
+    The choice drives the NEXT ranking recompute (nightly cycle or a manual
+    "Run Cycle Now") and every future backfill. It does NOT rewrite stored
+    history: re-run the backfill after switching to see the new variant's
+    synthetic track record.
+    """
+    from . import daily_core
+    variant = (req or {}).get("variant", "")
+    try:
+        daily_core.set_variant(variant)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    # Invalidate the stored ranking: it was computed under the previous
+    # variant, and the next cycle must recompute under the new one.
+    from .db import DailyCoreRanking
+    from sqlalchemy import delete as sa_delete
+    async with Session() as s:
+        await s.execute(sa_delete(DailyCoreRanking))
+        await s.commit()
+    return {"ok": True, "variant": variant,
+            "label": daily_core.STRATEGY_VARIANTS[variant]}
 
 @app.get('/api/dailycore/trades')
 async def daily_core_trades(limit: int = Query(default=100, ge=1, le=500)):
