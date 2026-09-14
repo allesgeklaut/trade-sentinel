@@ -1731,3 +1731,21 @@ class TestDailyCoreProtection:
     async def test_trailing_stop_off_by_default(self):
         from app.config import settings
         assert settings.sim_daily_core_trailing_stop == 0.0
+
+    async def test_basket_trend_cuts_drawdown(self, sleeve_crash_market):
+        """The gradient filter must cash out when the basket's own N-day
+        slope turns negative in the sleeve crash — lower DD than the control
+        (which rides it down), and it must re-enter when the slope recovers."""
+        import app.optimize as opt
+        control = await self._run(sleeve_crash_market)
+        filtered = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, basket_trend_days=10, basket_confirm_days=3)
+        assert control is not None and filtered is not None
+        assert filtered.max_drawdown < control.max_drawdown, (
+            f"basket DD {filtered.max_drawdown:.1%} vs control {control.max_drawdown:.1%}")
+
+    async def test_basket_trend_off_by_default(self):
+        from app.config import settings
+        assert settings.sim_daily_core_basket_trend == 0

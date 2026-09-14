@@ -451,3 +451,57 @@ The giveback is the price of the momentum premium; the factor-level mitigation
 (residual momentum) is already the live core (§11). All new knobs stay opt-in
 (`sim_daily_core_portfolio_stop=0`, `sim_daily_core_exposure_trend=0`,
 `sim_daily_core_trailing_stop=0`); live daily-core is unchanged.
+
+## 13. Gradient filter ("basket trend") — owner's idea, walk-forward verdict — 2026-09-14
+
+Owner's proposal after §12: instead of the *market* trend, watch the **gradient
+(N-day rate-of-change) of the strategy's own basket** — cash out when it turns
+negative for some days, re-enter when positive. Not stupid: it is trend-following
+on the strategy's own signal, which sees a momenton-sleeve reversal the market
+index cannot.
+
+Implemented (`--basket-trend N --basket-confirm K`): chain the equal-weight
+top-N target basket day by day; when its N-day slope is negative for K
+consecutive closes, sell everything and park contributions; re-enter when the
+slope is positive for K closes. The basket keeps moving while in cash, so
+re-entry can trigger (unlike a frozen equity-curve gate).
+
+### The Jul-2026 episode (2026-01-01..2026-09-14, in-sample)
+
+| Arm | Final | IRR | Sharpe | maxDD | Turnover |
+|---|---|---|---|---|---|
+| control | $10,050 | 38.25% | 1.14 | 18.9% | 10.4% |
+| **basket10c3** | **$10,175** | **43.23%** | **1.42** | **13.0%** | 89.3% (5 events) |
+| basket15c3 | $9,986 | 35.72% | 1.41 | 14.7% | 45.0% |
+| basket20c3 | $9,709 | 25.11% | 1.20 | 18.3% | 38.5% |
+| basket5c3 | $9,165 | 5.58% | 0.54 | 14.3% | 112.0% |
+
+basket10c3 beats control on **every** metric on the episode — higher final
+value, higher IRR, Sharpe 1.42 vs 1.14, DD 13.0% vs 18.9% — the only mechanism
+tested that does (§12's stop/trend/trailing all failed there).
+
+### Walk-forward A/B (Sharpe / normalized maxDD / turnover)
+
+| Window | control | basket10c3 | basket15c3 | basket30c5 |
+|---|---|---|---|---|
+| 2017-19 | **1.09** / 21.6% / 4.9% | 0.65 / 24.8% / 65.1% | 0.83 / 20.0% / 48.0% | 1.06 / 16.5% / 30.1% |
+| 2020-21 | 1.02 / 28.2% / 5.6% | 1.27 / 14.8% / 51.2% | **1.32** / **12.4%** / 36.5% | 1.07 / 14.2% / 22.4% |
+| 2022-23 | **0.24** / 20.2% / 7.7% | **-0.13** / 14.5% / 66.2% | -0.10 / 14.7% / 65.2% | 0.08 / 13.6% / 37.3% |
+| 2024-26 | 1.72 / 31.4% / 4.2% | **1.92** / **14.5%** / 59.0% | 1.65 / 14.2% / 49.1% | 1.48 / 19.0% / 23.6% |
+| **avg** | **1.02** | 0.93 | 0.93 | 0.92 |
+
+### Verdict
+
+**The idea works in the episode and in 2 of 4 windows, but does not survive the
+walk-forward.** The gradient filter is trend-following on your own signal: it
+whipsaws in range-bound markets (2022-23 Sharpe -0.13 vs +0.24 control; 11.7%
+IRR vs 28.7%) and pays 30-66%/month turnover everywhere. Its one consistent
+virtue is drawdown: it cuts maxDD in 3 of 4 windows (31.4% → 14.5% recent),
+i.e. it does deliver "not too volatile" — at a real, regime-dependent return
+cost. The only overlay whose walk-forward *average* beat control remains
+stop10+trend200 (§12, avg 1.13 vs 1.02) — and that one failed the episode.
+
+Honest bottom line: no simple timing rule converts the momentum premium into a
+free lunch. The giveback in the owner's episode is real and the gradient filter
+caught it, but the same rule loses in chop. All knobs remain opt-in
+(`sim_daily_core_basket_trend=0`, defaults off).

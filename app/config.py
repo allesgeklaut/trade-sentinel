@@ -116,6 +116,12 @@ class Settings(BaseSettings):
     # its price falls this fraction below its own peak since entry. Targets
     # momentum-sleeve crashes the market-trend brakes cannot see (§12).
     sim_daily_core_trailing_stop: float = 0.0
+    # basket_trend_days (0 = off): "gradient filter" — N-day rate-of-change of
+    # the strategy's own target basket (equal-weight top-N candidates). Cash
+    # out when the gradient stays negative for basket_confirm_days, re-enter
+    # when it stays positive. §12-13.
+    sim_daily_core_basket_trend: int = 0
+    sim_daily_core_basket_confirm: int = 3
     sim_run_hour: int = 22
     sim_run_minute: int = 30
 

@@ -2573,6 +2573,8 @@ async def _daily_core_backtest(
     portfolio_stop_pct: float | None = None,
     exposure_trend_days: int | None = None,
     trailing_stop_pct: float | None = None,
+    basket_trend_days: int | None = None,
+    basket_confirm_days: int | None = None,
 ) -> BacktestSummary | None:
     """Deterministic "daily-core" backtest: the monthly qv-mom portfolio as the
     FUNDAMENTAL core, with minor candle-driven daily adjustments on top.
@@ -2810,6 +2812,18 @@ async def _daily_core_backtest(
     # can be re-bought later if the ranking brings it back.
     if trailing_stop_pct is None:
         trailing_stop_pct = settings.sim_daily_core_trailing_stop
+    # basket_trend_days (0 = off): the "gradient filter" — the N-day
+    # rate-of-change (the slope) of the strategy's OWN target basket
+    # (equal-weight top-N candidates). When it is negative for
+    # `basket_confirm_days` consecutive days, cash out and park
+    # contributions; re-enter when it is positive for the same streak.
+    # Unlike the market-trend gate this sees a momentum-SLEEVE reversal
+    # (the basket's own trend), and unlike a frozen equity curve the
+    # basket index keeps moving while in cash so re-entry can trigger.
+    if basket_trend_days is None:
+        basket_trend_days = settings.sim_daily_core_basket_trend
+    if basket_confirm_days is None:
+        basket_confirm_days = settings.sim_daily_core_basket_confirm
 
     # Equal-weight universe price index (closes, forward-filled) and its SMA.
     # Point-in-time safe: a rolling mean of closes at/ before d only.
@@ -2834,6 +2848,15 @@ async def _daily_core_backtest(
     peak_eq = 0.0        # running peak of the portfolio's own equity
     risk_off = False     # portfolio-stop brake is active (all cash)
     brake_events = 0     # how many times the brake fired (for the report)
+    # gradient filter ("basket trend") state: chained equal-weight index of
+    # the current month's top-N target basket, its N-day ROC, and the
+    # consecutive-day streaks that arm the cash-out / re-entry.
+    basket_hist: list[float] = []
+    basket_out = False
+    basket_events = 0
+    neg_streak = 0
+    pos_streak = 0
+    prev_day: pd.Timestamp | None = None
 
     def _record_equity(d: pd.Timestamp, equity: float, contrib_today: float) -> None:
         """Append one day of equity; maintain the matching log-return list
@@ -2924,6 +2947,13 @@ async def _daily_core_backtest(
             elif risk_off and market_uptrend(d):
                 risk_off = False
 
+        # --- Gradient filter cash-out: when the basket trend confirmed
+        # negative, exit the book (the flip was set at yesterday's close).
+        if basket_trend_days > 0 and basket_out and shares:
+            for t in list(shares):
+                trade(d, t, "SELL", 0.0)
+                pending_pick.pop(t, None)
+
         # --- SELL phase: releases from the hysteresis band ---
         if order:
             band = set(order[:hold_band])
@@ -2961,8 +2991,9 @@ async def _daily_core_backtest(
             held = list(shares)
             picks = monthly_mod._band_fill(order, held, target_n, hold_band)
 
-        paused = (crash_pause and pullback_day(d)) or risk_off \
-            or (exposure_trend_days > 0 and not market_uptrend(d))
+        paused = ((crash_pause and pullback_day(d)) or risk_off
+                  or basket_out
+                  or (exposure_trend_days > 0 and not market_uptrend(d)))
 
         # Barroso-Santa-Clara vol management: cap deployment when the
         # portfolio's own recent vol exceeds the target. Only scales DOWN
@@ -3096,6 +3127,39 @@ async def _daily_core_backtest(
         contrib_today = contribution if d in contrib_days else 0.0
         _record_equity(d, equity_close, contrib_today)
 
+        # --- Gradient filter: the N-day slope of the target basket ---
+        # Chain the equal-weight top-N basket from yesterday to today (one
+        # day's cross-sectional mean return). The day-over-day log return is
+        # the gradient's building block; the N-day ROC over `basket_hist` is
+        # the slope. Out when negative for the confirm streak; back in when
+        # positive for the same streak.
+        if basket_trend_days > 0:
+            top = order[:target_n]
+            rets = []
+            for t in top:
+                p0 = px_of(t, prev_day) if prev_day is not None else None
+                p1 = px_of(t, d)
+                if p0 and p1 and p0 > 0 and p1 > 0:
+                    rets.append(float(np.log(p1 / p0)))
+            day_ret = float(np.mean(rets)) if rets else 0.0
+            if not basket_hist:
+                basket_hist.append(100.0)
+            basket_hist.append(basket_hist[-1] * float(np.exp(day_ret)))
+            if len(basket_hist) > basket_trend_days:
+                slope = basket_hist[-1] / basket_hist[-1 - basket_trend_days] - 1.0
+                if slope < 0:
+                    neg_streak += 1
+                    pos_streak = 0
+                elif slope > 0:
+                    pos_streak += 1
+                    neg_streak = 0
+                if not basket_out and neg_streak >= basket_confirm_days:
+                    basket_out = True
+                    basket_events += 1
+                elif basket_out and pos_streak >= basket_confirm_days:
+                    basket_out = False
+        prev_day = d
+
     # final valuation
     value = cash + pending_cash + sum(
         (shares.get(t, 0.0) or 0.0) * (px_of(t, last_day) or 0.0) for t in shares)
@@ -3126,6 +3190,8 @@ async def _daily_core_backtest(
            + (f" portfolio-stop={portfolio_stop_pct:g}" if portfolio_stop_pct else "")
            + (f" exposure-trend={exposure_trend_days}" if exposure_trend_days else "")
            + (f" trailing-stop={trailing_stop_pct:g}" if trailing_stop_pct else "")
+           + (f" basket-trend={basket_trend_days}/{basket_confirm_days}"
+              if basket_trend_days else "")
            + (" lowvol-tilt" if settings.sim_daily_core_lowvol_tilt else ""))
     ann_sharpe = 0.0
     if len(port_rets) >= 21:
@@ -3143,7 +3209,8 @@ async def _daily_core_backtest(
     print(f"  money-weighted IRR: {irr:.2%}/yr   Sharpe (ann): {ann_sharpe:.2f}   "
           f"max DD: {mdd:.1%}   avg monthly turnover: "
           f"{(sum(churns) / len(churns)) if churns else 0:.1%}  trades: {len(trades_log)}"
-          + (f"  brake events: {brake_events}" if portfolio_stop_pct else ""))
+          + (f"  brake events: {brake_events}" if portfolio_stop_pct else "")
+          + (f"  basket events: {basket_events}" if basket_trend_days else ""))
     if verbose:
         print("\nLast 15 trades:")
         for td, side, t, notional in trades_log[-15:]:
@@ -3206,6 +3273,8 @@ async def _main(args: argparse.Namespace) -> None:
             portfolio_stop_pct=getattr(args, "portfolio_stop", None) or None,
             exposure_trend_days=getattr(args, "exposure_trend", None) or None,
             trailing_stop_pct=getattr(args, "trailing_stop", None) or None,
+            basket_trend_days=getattr(args, "basket_trend", None) or None,
+            basket_confirm_days=getattr(args, "basket_confirm", None) or None,
         )
         return
 
@@ -3724,6 +3793,17 @@ async def _sweep_stage4(fc, close, vol, fund, out_path: str) -> None:
         {"label": "res+trend100", "mom": "residual", "exposure_trend": 100},
         {"label": "res+trail15", "mom": "residual", "trailing_stop": 0.15},
         {"label": "res+trail20", "mom": "residual", "trailing_stop": 0.20},
+        # Gradient filter ("basket trend"): cash out when the N-day slope of
+        # the strategy's own target basket stays negative for the confirm
+        # streak. The candidate that beat everything on the Jul-2026 episode.
+        {"label": "res+basket10c3", "mom": "residual",
+         "basket_trend": 10, "basket_confirm": 3},
+        {"label": "res+basket15c3", "mom": "residual",
+         "basket_trend": 15, "basket_confirm": 3},
+        {"label": "res+basket20c3", "mom": "residual",
+         "basket_trend": 20, "basket_confirm": 3},
+        {"label": "res+basket30c5", "mom": "residual",
+         "basket_trend": 30, "basket_confirm": 5},
     ]
     # one frame cache per mom variant
     print("stage4: building residual frame cache...", flush=True)
@@ -3752,7 +3832,9 @@ async def _sweep_stage4(fc, close, vol, fund, out_path: str) -> None:
                 target_vol=ov.get("target_vol") or None,
                 portfolio_stop_pct=ov.get("portfolio_stop") or None,
                 exposure_trend_days=ov.get("exposure_trend") or None,
-                trailing_stop_pct=ov.get("trailing_stop") or None)
+                trailing_stop_pct=ov.get("trailing_stop") or None,
+                basket_trend_days=ov.get("basket_trend") or None,
+                basket_confirm_days=ov.get("basket_confirm") or None)
             if r is not None:
                 row["arms"].append({"label": ov["label"], "irr": r.irr,
                                     "sharpe": r.sharpe, "max_dd": r.max_drawdown,
@@ -4021,6 +4103,12 @@ def _build_parser() -> argparse.ArgumentParser:
     dc.add_argument("--trailing-stop", type=float, default=None,
                     help="Per-name trailing stop: exit a holding when its price falls this "
                          "fraction (e.g. 0.15) below its own peak since entry (0 = off)")
+    dc.add_argument("--basket-trend", type=int, default=None,
+                    help="Gradient filter: N-day rate-of-change of the target basket; "
+                         "cash out when negative for --basket-confirm days (0 = off)")
+    dc.add_argument("--basket-confirm", type=int, default=None,
+                    help="Consecutive days the basket gradient must stay negative "
+                         "(and positive to re-enter) — default 3")
     dc.add_argument("--verbose", action="store_true", help="Print the last trades")
 
     sw = sub.add_parser("daily-core-sweep",
