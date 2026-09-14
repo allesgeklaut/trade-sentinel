@@ -565,6 +565,8 @@ async def daily_core_status():
         # runtime-selectable momentum variant + the options (UI dropdown)
         "mom_variant": daily_core.current_variant(),
         "mom_variants": daily_core.STRATEGY_VARIANTS,
+        "protection": daily_core.current_protection(),
+        "protections": daily_core.PROTECTION_MODES,
     }
 
 @app.post('/api/dailycore/strategy')
@@ -592,6 +594,23 @@ async def daily_core_strategy(req: dict):
         await s.commit()
     return {"ok": True, "variant": variant,
             "label": daily_core.STRATEGY_VARIANTS[variant]}
+
+@app.post('/api/dailycore/protection')
+async def daily_core_protection(req: dict):
+    """Select the daily-core protection overlay at runtime (persisted).
+    Body: {"mode": "none" | "trend200" | "gradient200" | "gradient100" | "gradient50"}.
+
+    The mode drives the NEXT deployment pass and every future backfill. With a
+    gradient mode a confirmed negative basket slope (armed only in good times)
+    cashes out the book; the engine re-enters on its own rule, no cooldown.
+    """
+    from . import daily_core
+    mode = (req or {}).get("mode", "")
+    try:
+        daily_core.set_protection(mode)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    return {"ok": True, "mode": mode, "label": daily_core.PROTECTION_MODES[mode]}
 
 @app.get('/api/dailycore/trades')
 async def daily_core_trades(limit: int = Query(default=100, ge=1, le=500)):

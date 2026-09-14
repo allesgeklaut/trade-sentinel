@@ -29,6 +29,8 @@ import asyncio
 import json
 import logging
 import math
+
+import numpy as np
 from datetime import datetime, timedelta, UTC
 from pathlib import Path
 
@@ -92,7 +94,51 @@ def current_variant() -> str:
 def set_variant(variant: str) -> None:
     if variant not in STRATEGY_VARIANTS:
         raise ValueError(f"unknown mom variant: {variant!r}")
-    _save_state({"mom_variant": variant})
+    state = _load_state()
+    state["mom_variant"] = variant
+    _save_state(state)
+
+
+# ---------------------------------------------------------------------------
+# Protection selection (runtime, persisted, same pattern as the variant)
+# ---------------------------------------------------------------------------
+
+# Selectable protection modes for the live engine. Each maps to the §12-15
+# backtest mechanisms; defaults are OFF (the live engine is unchanged unless
+# the operator picks one).
+#   none            — the live rule (no overlay)
+#   trend200        — deploy only while the market index is above its SMA200
+#   gradient        — trend200 + the gradient cash-out armed only in good
+#                     times (market above its SMA); the "composite" from §15
+#   gradient50/100  — same, with a 50/100-day arming SMA (the window study)
+PROTECTION_MODES: dict[str, str] = {
+    "none": "None (live default — no overlay)",
+    "trend200": "Market trend gate (deploy only above SMA200)",
+    "gradient200": "Gradient cash-out in good times + SMA200 gate (§15)",
+    "gradient100": "Gradient cash-out in good times + SMA100 gate",
+    "gradient50": "Gradient cash-out in good times + SMA50 gate",
+}
+
+_ARM_SMA = {"gradient200": 200, "gradient100": 100, "gradient50": 50}
+
+# Gradient window/confirmation for the live signal (the §15 backtest values:
+# 10-day slope, 3 consecutive closes).
+_GRADIENT_DAYS = 10
+_GRADIENT_CONFIRM = 3
+
+
+def current_protection() -> str:
+    state = _load_state()
+    p = state.get("protection")
+    return p if p in PROTECTION_MODES else "none"
+
+
+def set_protection(mode: str) -> None:
+    if mode not in PROTECTION_MODES:
+        raise ValueError(f"unknown protection mode: {mode!r}")
+    state = _load_state()
+    state["protection"] = mode
+    _save_state(state)
 
 
 def _local_now() -> datetime:
@@ -101,6 +147,90 @@ def _local_now() -> datetime:
 
 def _current_month() -> str:
     return _local_now().strftime("%Y-%m")
+
+
+# ---------------------------------------------------------------------------
+# Protection overlay: live market gate + target-basket gradient
+# ---------------------------------------------------------------------------
+
+async def _protection_decision(band: list[str], frame: pd.DataFrame | None,
+                               arm_sma: int | None) -> tuple[bool, bool]:
+    """Evaluate the live protection signal: ``(market_ok, basket_out)``.
+
+    Market gate: the equal-weight universe index vs its `arm_sma`-day SMA
+    (200 for `trend200`/`gradient200`): ``market_ok`` is False below it, so
+    contributions park.
+
+    Gradient: the target basket (the day's top-N band names) is chained one
+    day at a time from stored closes; a confirmed negative N-day slope
+    (`_GRADIENT_DAYS`, `_GRADIENT_CONFIRM`) sets ``basket_out`` — armed only
+    when ``arm_sma`` is None (always) or the market is above its SMA. Streaks
+    and the basket history persist in the daily-core state file so the signal
+    is stable across cycles (the scheduler runs once a day).
+    """
+    tickers = universe_tickers(settings.sim_monthly_universe)
+    close, _vol = await monthly_mod.load_frames(tickers, None)
+    if close.empty or not band:
+        return True, False
+
+    mkt = close.ffill().mean(axis=1)
+    # Market gate.
+    if arm_sma is not None and arm_sma > 1:
+        sma = mkt.rolling(arm_sma).mean()
+        cur, s = mkt.iloc[-1], sma.iloc[-1]
+        market_ok = not (np.isfinite(s) and np.isfinite(cur) and float(cur) < float(s))
+    else:
+        market_ok = True
+
+    # Basket chain: day-over-day mean log return of the band's top-N names.
+    cv = close.ffill()
+    hist = _load_state().get("basket_hist") or []
+    if not isinstance(hist, list) or not hist:
+        hist = [100.0]
+    last_day = _load_state().get("basket_day")
+    idx = cv.index
+    start_i = 0
+    if last_day:
+        after = idx[idx > pd.Timestamp(last_day)]
+        start_i = len(idx) - len(after) - 1 if len(after) else len(idx) - 1
+    top = band[:settings.sim_monthly_target_n]
+    for i in range(max(start_i, 1), len(idx)):
+        d_prev, d_cur = idx[i - 1], idx[i]
+        rets = []
+        for t in top:
+            p0, p1 = monthly_mod.px_at(cv, d_prev, t), monthly_mod.px_at(cv, d_cur, t)
+            if p0 and p1 and p0 > 0 and p1 > 0:
+                rets.append(float(np.log(p1 / p0)))
+        if rets:
+            hist.append(hist[-1] * float(np.exp(float(np.mean(rets)))))
+    hist = hist[-260:]  # bounded history
+
+    out = False
+    neg = 0
+    pos = 0
+    if arm_sma is not None and len(hist) > _GRADIENT_DAYS:
+        armed = market_ok  # good times only
+        slope = hist[-1] / hist[-1 - _GRADIENT_DAYS] - 1.0
+        state = _load_state()
+        neg = int(state.get("basket_neg_streak") or 0)
+        pos = int(state.get("basket_pos_streak") or 0)
+        was_out = bool(state.get("basket_out") or False)
+        if slope < 0:
+            neg, pos = neg + 1, 0
+        elif slope > 0:
+            pos, neg = pos + 1, 0
+        if not was_out and armed and neg >= _GRADIENT_CONFIRM:
+            was_out = True
+        elif was_out and pos >= _GRADIENT_CONFIRM:
+            was_out = False
+        out = was_out
+    state = _load_state()
+    state.update({"basket_hist": hist, "basket_day": str(idx[-1].date()),
+                  "basket_neg_streak": neg if arm_sma is not None else 0,
+                  "basket_pos_streak": pos if arm_sma is not None else 0,
+                  "basket_out": out})
+    _save_state(state)
+    return market_ok, out
 
 
 # Serialises cycles: the allowance check runs before the (potentially
@@ -361,18 +491,56 @@ async def run_deployment() -> dict:
        targets are exhausted. This is the backtest-winning "rank deploy,
        boost=0" rule: fresh cash reinforces the top of the ranking, never
        spreads pro-rata, never waits for month-end.
+
+    Optional protection overlay (`protection` in the daily-core state file,
+    the §12-15 mechanisms): with a trend gate, cash deploys only while the
+    market index is above its SMA; with a gradient mode, a confirmed negative
+    slope of the target basket CASHES OUT the book (armed only in good times).
+    The engine re-enters on its own rule — no cooldown.
     """
-    band, picks, _frame = await compute_targets(force=True)
+    band, picks, frame = await compute_targets(force=True)
     if not band:
         return {"skipped": True, "reason": "no eligible ranking (fundamentals too thin?)"}
 
     async with Session() as s:
         held_rows = (await s.scalars(select(DailyCorePosition))).all()
     held_before = sorted(p.ticker for p in held_rows)
-
-    # SELLs first: held names out of the band release their slot.
     trades: list[dict] = []
     px_map = await monthly_mod._price_usd_map(sorted(set(band) | set(held_before)))
+
+    # --- protection overlay (market gate + gradient, §12-15) ---
+    protection = current_protection()
+    arm_sma = _ARM_SMA.get(protection)
+    gate_active = protection in ("trend200", "gradient200", "gradient100", "gradient50")
+    gradient_active = protection in ("gradient200", "gradient100", "gradient50")
+
+    block_buys = False
+    protection_note = None
+    if gate_active and frame is not None:
+        market_ok, basket_out = await _protection_decision(band, frame, arm_sma)
+        if not market_ok:
+            block_buys = True
+            protection_note = "market below SMA — contributions parked"
+        elif gradient_active and basket_out:
+            # Confirmed negative basket slope in good times: CASH OUT the
+            # book at the latest prices and park contributions until the
+            # signal clears (then the normal deployment re-enters — no
+            # separate cooldown; the signal IS the gate).
+            for t in held_before:
+                price = px_map.get(t)
+                if not price:
+                    async with Session() as s:
+                        pos = await s.scalar(select(DailyCorePosition)
+                                             .where(DailyCorePosition.ticker == t))
+                    price = pos.avg_cost if pos else 0.0
+                r = await _exec_sell(t, price, "daily-core: gradient cash-out")
+                if r:
+                    trades.append(r)
+            held_before = []
+            block_buys = True
+            protection_note = "gradient cash-out — book moved to cash"
+
+    # SELLs: held names out of the band release their slot.
     for t in held_before:
         if t not in band:
             price = px_map.get(t) or 0.0
@@ -391,6 +559,11 @@ async def run_deployment() -> dict:
     # boost=0" rule — fresh cash reinforces the top of the ranking, never
     # spreads pro-rata, never waits for month-end).
     valuation = await valuate()
+    if block_buys:
+        return {"deployed": True, "band": band, "picks": picks,
+                "held_before": held_before, "trades": trades,
+                "protection": protection, "blocked": protection_note,
+                "valuation": valuation}
     weight = valuation["total_equity"] / max(settings.sim_monthly_target_n, 1)
     for t in band[:settings.sim_monthly_target_n]:
         price = px_map.get(t)
@@ -410,7 +583,7 @@ async def run_deployment() -> dict:
 
     return {"deployed": True, "band": band, "picks": picks,
             "held_before": held_before, "trades": trades,
-            "valuation": await valuate()}
+            "protection": protection, "valuation": await valuate()}
 
 
 # ---------------------------------------------------------------------------
@@ -605,6 +778,29 @@ async def backfill(start: str | None = None) -> dict:
         def px_of(t: str, d: pd.Timestamp) -> float | None:
             return monthly_mod.px_at(close_val, d, t)
 
+        # Protection replay state (same §12-15 mechanisms as the live engine
+        # and the optimize backtest): market gate + gradient, driven by the
+        # currently selected protection mode.
+        protection = current_protection()
+        arm_sma = _ARM_SMA.get(protection)
+        mkt_index = close_val.mean(axis=1)
+        mkt_sma_map = (mkt_index.rolling(max(arm_sma, 2)).mean()
+                       if arm_sma else None)
+        prev_day_r: pd.Timestamp | None = None
+        grad_hist: list[float] = []
+        grad_neg = 0
+        grad_pos = 0
+        grad_out = False
+
+        def _market_ok_r(d: pd.Timestamp) -> bool:
+            if mkt_sma_map is None:
+                return True
+            sm = mkt_sma_map.get(d)
+            cu = mkt_index.get(d)
+            if sm is None or cu is None or not np.isfinite(sm) or not np.isfinite(cu):
+                return True
+            return bool(float(cu) >= float(sm))
+
         cur_month: int | None = None
         deposited_months: set[str] = set()  # months the replay actually funded
         for d in idx:
@@ -662,11 +858,44 @@ async def backfill(start: str | None = None) -> dict:
                 del shares[t]
                 trades.append((day.strftime("%Y-%m-%d"), "SELL", t, notional, sh, p))
 
+            # --- protection overlay: market gate + gradient (armed in good
+            # times only; no cooldown — the rank deployment re-enters) ---
+            protect_ok = True
+            if arm_sma is not None:
+                protect_ok = _market_ok_r(d)
+                if protect_ok:
+                    rets = []
+                    for t in order[:target_n]:
+                        p0 = px_of(t, prev_day_r) if prev_day_r is not None else None
+                        p1 = px_of(t, d)
+                        if p0 and p1 and p0 > 0 and p1 > 0:
+                            rets.append(float(np.log(p1 / p0)))
+                    day_ret = float(np.mean(rets)) if rets else 0.0
+                    if not grad_hist:
+                        grad_hist.append(100.0)
+                    grad_hist.append(grad_hist[-1] * float(np.exp(day_ret)))
+                    if len(grad_hist) > _GRADIENT_DAYS:
+                        slope = grad_hist[-1] / grad_hist[-1 - _GRADIENT_DAYS] - 1.0
+                        if slope < 0:
+                            grad_neg, grad_pos = grad_neg + 1, 0
+                        elif slope > 0:
+                            grad_pos, grad_neg = grad_pos + 1, 0
+                        if not grad_out and grad_neg >= _GRADIENT_CONFIRM:
+                            grad_out = True
+                        elif grad_out and grad_pos >= _GRADIENT_CONFIRM:
+                            grad_out = False
+                prev_day_r = d
+
             # SELL band releases (month-end rebuild only, as in the backtest)
             if d in months:
                 for t in list(shares):
                     if t not in band:
                         do_sell(t)
+
+            # gradient cash-out (confirmed negative slope in good times)
+            if arm_sma is not None and grad_out and shares:
+                for t in list(shares):
+                    do_sell(t)
 
             equity = cash + sum((shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0)
                                 for t in shares)
@@ -675,7 +904,9 @@ async def backfill(start: str | None = None) -> dict:
             # rank-deployment (boost=0): top up top-ranked names toward the
             # equal-weight target, best rank first. On month-end days the
             # full equal-weight rebuild also fills NEW names to weight.
-            if order:
+            # Blocked while the market gate says "bad times" (contributions
+            # park) — the gradient cash-out already emptied the book.
+            if order and protect_ok and not grad_out:
                 for t in order[:target_n]:
                     p = px_of(t, d)
                     if p is None:

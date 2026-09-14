@@ -534,3 +534,32 @@ class TestVariantSelection:
         monkeypatch.setattr(daily_core, "_STATE_FILE", state_file)
         # the stored variant is unknown -> config default wins
         assert daily_core.current_variant() == settings.sim_daily_core_mom_variant
+
+
+# ---------------------------------------------------------------------------
+# Protection selection (runtime, persisted)
+# ---------------------------------------------------------------------------
+
+class TestProtectionSelection:
+    def test_default_is_none(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        assert daily_core.current_protection() == "none"
+
+    def test_set_and_persist(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core.set_protection("gradient200")
+        assert daily_core.current_protection() == "gradient200"
+        # variant + protection coexist in the same state file
+        daily_core.set_variant("raw")
+        assert daily_core.current_variant() == "raw"
+        assert daily_core.current_protection() == "gradient200"
+
+    def test_rejects_unknown(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        with pytest.raises(ValueError):
+            daily_core.set_protection("turbo")
+
+    def test_all_modes_have_labels(self):
+        for mode in daily_core.PROTECTION_MODES:
+            assert daily_core.PROTECTION_MODES[mode]
+        assert set(daily_core._ARM_SMA) <= set(daily_core.PROTECTION_MODES)
