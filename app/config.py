@@ -110,8 +110,9 @@ class Settings(BaseSettings):
     # --- Daily-core portfolio (qv-mom core + daily cash deployment) ---------
     # §10 A/B winner: monthly qv-mom ranking decides WHAT to own (same
     # top-N hysteresis, no stops); candles only deploy cash daily into the
-    # top-ranked names toward equal weight. Measured +3..+5.5pp IRR over
-    # the monthly sim on 2020-2026 windows (cash-drag elimination).
+    # top-ranked names toward equal weight. Measured +3.4..+7.5pp IRR over
+    # the monthly sim on 2020-2026 windows (cash-drag elimination); positive
+    # out-of-sample on all four walk-forward windows (see §10).
     sim_daily_core_enabled: bool = True
 
     model_config = SettingsConfigDict(

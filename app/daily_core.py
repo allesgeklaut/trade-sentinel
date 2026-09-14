@@ -10,7 +10,8 @@ Design (from the §10 backtest A/B, docs/llm-strategy-experiments.md):
     core names, topping each up toward the equal-weight target. Fresh
     contributions go to work immediately instead of waiting for the
     month-end rebalance — that cash-drag elimination is the measured edge
-    (+3..+5.5pp IRR over the monthly sim on 2020-2026 windows).
+    (+3.4..+7.5pp IRR over the monthly sim on 2020-2026 windows; positive
+    out-of-sample on all four walk-forward windows, see §10).
   * Band releases: same hysteresis as the monthly sim — a held name keeps
     its slot while it stays inside the top ``hold_band`` of the ranking.
     Releases are evaluated at the month-end rebuild (the backtest showed
