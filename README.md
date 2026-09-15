@@ -151,3 +151,21 @@ Three paper portfolios run side by side on the same $1000/month allowance:
 - **Daily-Core** — the strongest of the three: the Monthly sim's qv-mom ranking decides WHAT to own, but fresh cash deploys EVERY day into the top-ranked names (no month-end parking, no cash drag). Since 2026-09-14 the ranking uses **residual momentum** (Blitz-Huij-Martens alpha t-stat instead of raw 12-1 return), which won the walk-forward on Sharpe in all four OOS windows while cutting max drawdown in every stress regime (doc §11). Live switch via `SIM_DAILY_CORE_MOM_VARIANT=residual`.
 
 The Daily-Core tab shows Max DD, live alpha vs the Monthly sim and the DCA benchmark, per-position rank + weight, the full hold-band with held-name markers, and chart range controls (6M/1Y/2Y/5Y/MAX) over the backfilled 2017+ history.
+
+## Disclaimer
+
+This project is for **research and education only**. It is a self-hosted, paper-only
+simulation: it places no real orders and connects to no brokerage.
+
+- **Not investment advice.** Nothing here is a recommendation to buy or sell any
+  security. The backtests, signals and LLM output are experimental and may be
+  wrong, look-ahead-biased, or overfit to the past.
+- **No warranty.** Provided "as is" under the MIT license; there is no liability
+  for any use of, or decisions made with, this software.
+- **Data is not redistributed.** Market data is fetched at runtime from third-party
+  providers (Yahoo Finance via yfinance, Twelve Data, SEC EDGAR) into a local cache
+  that is *not* part of this repository. Your use of those providers is governed by
+  their own terms of service.
+- **Not affiliated.** Not affiliated with, or endorsed by, Yahoo, S&P Dow Jones
+  Indices, MSCI, or any data provider. "S&P 500", "MSCI World" and similar marks
+  belong to their respective owners and are used here descriptively.

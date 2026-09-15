@@ -1,6 +1,9 @@
 # S&P 500 current constituents (503 lines, 500 companies).
-# Source: Wikipedia 'List of S&P 500 companies' current members table,
-# symbols mapped to Yahoo convention (share-class '.' -> '-').
+# Constituent list derived from Wikipedia "List of S&P 500 companies"
+# (https://en.wikipedia.org/wiki/List_of_S%26P_500_companies), which is
+# licensed CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/),
+# via its current-members table; symbols mapped to the Yahoo convention
+# (share-class '.' -> '-'). "S&P 500" is a trademark of S&P Dow Jones Indices.
 # NOTE: current members only -> NOT survivorship-free (see docs).
 # Research universe only: inclusion is not a recommendation.
 
