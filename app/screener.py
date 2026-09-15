@@ -1,14 +1,34 @@
 from datetime import datetime, timedelta, UTC
 from pathlib import Path
+import asyncio
 import logging
 import pandas as pd
 from sqlalchemy import delete, func, select
 from .analysis import compute
 from .db import Candle, ScreenerResult, Session
-from .market import candles, refresh, refresh_many
+from .market import candles, refresh_many, refresh_yfinance
 
 _UNIVERSES_DIR = Path(__file__).resolve().parent.parent / "universes"
 logger = logging.getLogger("trade_sentinel.screener")
+
+
+class ScreenerBusy(RuntimeError):
+    """A bulk screener operation was requested while another is running.
+
+    These ops fetch candles for every ticker in a universe; running two at once
+    doubles the provider load (and blew through the Twelve Data free-tier quota
+    when the Update button was double-fired).
+    """
+
+
+# Serializes the three bulk operations (run / refresh / deep). A second
+# invocation is rejected up-front instead of overlapping.
+_screener_lock: asyncio.Lock = asyncio.Lock()
+
+
+def screener_running() -> bool:
+    """True while a bulk screener operation holds the lock."""
+    return _screener_lock.locked()
 
 
 # In-progress screener operation state for the frontend status poller.
@@ -64,6 +84,15 @@ def score(rows):
     value=(35 if trend=="BULLISH" else 18 if trend=="UPTREND" else 0)+min(max(r20,0),20)+min(max(r60,0),20)/2+min(max((rv-1)*10,0),10)+(10 if 50<=rsi<=70 else 3 if 45<=rsi<75 else 0)
     return dict(score=round(value,2),trend=trend,return_20d=round(r20,2),return_60d=round(r60,2),rsi=round(rsi,2),relative_volume=round(rv,2),close=round(float(c.iloc[-1]),2))
 async def run(name):
+    """Bulk screener update. Rejected with :class:`ScreenerBusy` if another
+    bulk op (run / refresh / deep) is already in flight."""
+    if _screener_lock.locked():
+        raise ScreenerBusy("a screener update is already running — wait for it to finish")
+    async with _screener_lock:
+        return await _run(name)
+
+
+async def _run(name):
     # Preserve order while preventing duplicate symbols from violating the
     # (universe, ticker) database constraint.
     symbols=list(dict.fromkeys(tickers(name))); results=[]
@@ -81,10 +110,11 @@ async def run(name):
     async def _process(symbol):
         """Refresh + score one symbol; append to results or skip with a warning.
 
-        Calls the module-level refresh/candles/score so tests can monkeypatch
-        them (market.refresh_many would bypass those patches).
+        Bulk universe fetches use refresh_yfinance (Yahoo) — ~500 tickers in one
+        pass would blow the Twelve Data free-tier daily quota. The functions are
+        module-level so tests can monkeypatch them.
         """
-        await refresh(symbol)
+        await refresh_yfinance(symbol)
         rows = await candles(symbol)
         out = score(rows)
         if not out: return
@@ -128,8 +158,16 @@ async def refresh_incremental(name: str, max_age_days: int = 3) -> dict:
 
     Only fetches tickers that are missing from the DB or whose latest candle
     is older than *max_age_days*. Already-fresh tickers are skipped to avoid
-    redundant network calls. Does NOT re-run the screener ranking.
+    redundant network calls. Does NOT re-run the screener ranking. Rejected
+    with :class:`ScreenerBusy` if another bulk op is already in flight.
     """
+    if _screener_lock.locked():
+        raise ScreenerBusy("a screener update is already running — wait for it to finish")
+    async with _screener_lock:
+        return await _refresh_incremental(name, max_age_days)
+
+
+async def _refresh_incremental(name: str, max_age_days: int = 3) -> dict:
     symbols = list(dict.fromkeys(tickers(name)))
     refreshed = 0
     skipped = 0
@@ -162,8 +200,9 @@ async def refresh_incremental(name: str, max_age_days: int = 3) -> dict:
                                    current=ticker, started_at=started)
 
         async def _do_refresh(symbol):
-            # Module-level refresh so tests can monkeypatch it.
-            await refresh(symbol, "2y")
+            # Module-level, yfinance-forced so tests can monkeypatch it and the
+            # universe batch never hits the metered provider.
+            await refresh_yfinance(symbol, "2y")
 
         _, batch_errors = await refresh_many(stale, work=_do_refresh, on_result=_on_result)
         errors.extend(batch_errors)
@@ -188,8 +227,16 @@ async def load_deep_history(name: str, period: str = "10y") -> dict:
 
     Used to backfill data for walk-forward optimization and the regime filter.
     Fetches *period* (default 10y) for every ticker, overwriting existing
-    candles via upsert. Does NOT re-run the screener ranking.
+    candles via upsert. Does NOT re-run the screener ranking. Rejected with
+    :class:`ScreenerBusy` if another bulk op is already in flight.
     """
+    if _screener_lock.locked():
+        raise ScreenerBusy("a screener update is already running — wait for it to finish")
+    async with _screener_lock:
+        return await _load_deep_history(name, period)
+
+
+async def _load_deep_history(name: str, period: str = "10y") -> dict:
     symbols = list(dict.fromkeys(tickers(name)))
     errors: list[str] = []
     started = datetime.now(UTC).isoformat()
@@ -207,8 +254,9 @@ async def load_deep_history(name: str, period: str = "10y") -> dict:
                                    total=len(symbols), current=ticker, started_at=started)
 
         async def _do_refresh(symbol):
-            # Module-level refresh so tests can monkeypatch it.
-            await refresh(symbol, period)
+            # Module-level, yfinance-forced so tests can monkeypatch it and the
+            # universe batch never hits the metered provider.
+            await refresh_yfinance(symbol, period)
 
         _, batch_errors = await refresh_many(symbols, work=_do_refresh, on_result=_on_result)
         errors.extend(batch_errors)

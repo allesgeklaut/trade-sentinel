@@ -37,6 +37,25 @@ symbol or unavailable ticker) is served by yfinance for that ticker. Both
 sources are normalized to the same adjusted-close OHLCV cache, so switching
 between them does not change the indicators.
 
+**Bulk vs single-ticker.** Only single-ticker lookups (charts, adding to the
+watchlist, live valuations) use the configured provider. Every **multi-ticker
+batch** — the screener's Update/Refresh/Load-10y, and the sim / monthly /
+daily-core universe refreshes — always uses yfinance. A single S&P 500 pass is
+~500 requests, which would exceed the Twelve Data Basic plan's 800/day cap
+(8/min) on its own; Yahoo is free and unmetered for that. Ticker autocomplete
+also always uses Yahoo symbols (see below), regardless of provider.
+
+**Nightly shared universe prefetch.** All three sims share one universe, so it
+is fetched **once**, `SIM_PREFETCH_LEAD_MINUTES` (default 90) before the
+scheduled run, and the cycles then read the DB and skip anything fetched within
+`MARKET_FRESH_SECONDS`. The prefetch uses the configured provider, so with
+`auto` Twelve Data serves the tickers it has — **paced to
+`TWELVE_DATA_MAX_PER_MIN` (8) and capped at `TWELVE_DATA_DAILY_BUDGET` (750)**
+to stay inside the Basic plan — and every miss (e.g. `IFX.DE`) falls back to
+yfinance per ticker. Once the daily budget is spent, the rest of the day uses
+yfinance. The manual per-portfolio refresh buttons fetch only the held tickers.
+Set `SIM_UNIVERSE_PREFETCH=false` to disable it (cycles then fetch via Yahoo).
+
 `yfinance` uses Yahoo Finance's public endpoints through the `yfinance` library. It enables global ticker search and mixed US/EU screeners without a data key, but it is not an official market-data API: cache aggressively, throttle manual screener runs, and treat it as EOD/best-effort research data. Do not use it for execution.
 
 ## Run

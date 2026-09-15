@@ -11,7 +11,7 @@ from .config import settings
 from .db import Watchlist, Session, init_db
 from .market import refresh, refresh_many, candles, search, info, provider, PERIOD_COUNTS
 from .analysis import compute, persist, history, MIN_CANDLES
-from .screener import universe_names, run, results, refresh_incremental, load_deep_history, get_screener_progress
+from .screener import universe_names, run, results, refresh_incremental, load_deep_history, get_screener_progress, ScreenerBusy
 from . import sim
 from . import news as news_mod
 from . import llm as llm_mod
@@ -111,7 +111,9 @@ async def refresh_watchlist(period: str = "2y"):
 async def sim_refresh(period: str = "2y"):
     """Refresh candle data for all sim holdings + benchmark so valuations use live prices."""
     tickers = await sim.held_tickers()
-    refreshed, errors = await refresh_many(tickers, period)
+    # Held tickers are few (≤10): use the configured provider (Twelve Data),
+    # with its per-ticker yfinance fallback — not the bulk Yahoo path.
+    refreshed, errors = await refresh_many(tickers, period, use_provider=True)
     return {"refreshed": refreshed, "errors": errors, "total": len(tickers)}
 @app.get('/api/dashboard/{ticker}')
 async def dashboard(ticker:str, period:str|None=None):
@@ -143,16 +145,19 @@ async def list_universes(): return universe_names()
 @app.post('/api/screener/run/{universe}')
 async def screen_run(universe:str):
     try: return await run(universe)
+    except ScreenerBusy as e: raise HTTPException(409, str(e)) from e
     except ValueError as e: raise HTTPException(404,str(e)) from e
 @app.post('/api/screener/refresh/{universe}')
 async def screen_refresh(universe: str):
     """Incrementally refresh candle data — only fetches tickers with missing or stale data."""
     try: return await refresh_incremental(universe)
+    except ScreenerBusy as e: raise HTTPException(409, str(e)) from e
     except ValueError as e: raise HTTPException(404, str(e)) from e
 @app.post('/api/screener/load_deep/{universe}')
 async def screen_load_deep(universe: str, period: str = '10y'):
     """Fetch deep history (default 10y) for all tickers — for optimization/backtest."""
     try: return await load_deep_history(universe, period)
+    except ScreenerBusy as e: raise HTTPException(409, str(e)) from e
     except ValueError as e: raise HTTPException(404, str(e)) from e
 @app.get('/api/screener/status')
 async def screener_status():
@@ -565,7 +570,8 @@ async def monthly_refresh():
     async with monthly.Session() as s:
         held = [p.ticker for p in (await s.scalars(select(monthly.MonthlyPosition))).all()]
     pairs = sorted({pm[0] for t in held if (pm := monthly.fundamentals_mod._suffix_fx(t))})
-    refreshed, errors = await refresh_many(held + pairs, "2y")
+    # Held-only pull-to-refresh: configured provider (Twelve Data) with fallback.
+    refreshed, errors = await refresh_many(held + pairs, "2y", use_provider=True)
     return {"refreshed": refreshed, "errors": errors}
 
 @app.get('/api/dailycore/status')
@@ -718,7 +724,8 @@ async def daily_core_refresh():
         held = [p.ticker for p in (await s.scalars(select(DailyCorePosition))).all()]
     pairs = sorted({pm[0] for t in held
                     if (pm := daily_core.monthly_mod.fundamentals_mod._suffix_fx(t))})
-    refreshed, errors = await refresh_many(held + pairs, "2y")
+    # Held-only pull-to-refresh: configured provider (Twelve Data) with fallback.
+    refreshed, errors = await refresh_many(held + pairs, "2y", use_provider=True)
     return {"refreshed": refreshed, "errors": errors, "total": len(refreshed) + len(errors)}
 
 @app.post('/api/dailycore/backfill')

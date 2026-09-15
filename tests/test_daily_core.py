@@ -479,8 +479,9 @@ class TestRefreshData:
                             lambda _u: ["AAA", "BBB", "CCC"])
         seen = {}
 
-        async def fake_refresh_many(tickers, period):
+        async def fake_refresh_many(tickers, period, **kwargs):
             seen["tickers"] = list(tickers)
+            seen["kwargs"] = kwargs
             return list(tickers), []
         monkeypatch.setattr(market, "refresh_many", fake_refresh_many)
 
@@ -497,13 +498,16 @@ class TestRefreshData:
                             lambda _u: ["AAA", "BBB"])
         seen = {}
 
-        async def fake_refresh_many(tickers, period):
+        async def fake_refresh_many(tickers, period, **kwargs):
             seen["tickers"] = list(tickers)
+            seen["kwargs"] = kwargs
             return list(tickers), []
         monkeypatch.setattr(market, "refresh_many", fake_refresh_many)
 
         asyncio.run(daily_core.refresh_data())
         assert seen["tickers"] == ["AAA", "BBB", "HELD"]
+        # The nightly prefetch is reused via the freshness window.
+        assert seen["kwargs"].get("max_age_seconds") == settings.market_fresh_seconds
 
 
 # ---------------------------------------------------------------------------

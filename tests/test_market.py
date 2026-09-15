@@ -12,6 +12,17 @@ import pytest
 
 from app import market
 
+
+@pytest.fixture(autouse=True)
+def _reset_market_state(monkeypatch):
+    """Fresh limiter + fresh map per test; no per-minute sleeps in tests."""
+    monkeypatch.setattr(market.settings, "twelve_data_max_per_min", 100000)
+    monkeypatch.setattr(market.settings, "twelve_data_daily_budget", 100000)
+    monkeypatch.setattr(market, "_twelve_limiter", market._TwelveLimiter())
+    market._fresh_at.clear()
+    yield
+    market._fresh_at.clear()
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -42,7 +53,7 @@ class FakeRefresh:
 class TestRefreshMany:
     async def test_success_returns_input_order(self, monkeypatch):
         fake = FakeRefresh(stagger=True)
-        monkeypatch.setattr(market, "refresh", fake)
+        monkeypatch.setattr(market, "refresh_yfinance", fake)
 
         refreshed, errors = await market.refresh_many(["A", "B", "C"])
 
@@ -52,7 +63,7 @@ class TestRefreshMany:
 
     async def test_isolates_failures(self, monkeypatch):
         fake = FakeRefresh(fail={"BAD"})
-        monkeypatch.setattr(market, "refresh", fake)
+        monkeypatch.setattr(market, "refresh_yfinance", fake)
 
         refreshed, errors = await market.refresh_many(["GOOD1", "BAD", "GOOD2"])
 
@@ -61,7 +72,7 @@ class TestRefreshMany:
 
     async def test_dedupes_input_preserving_order(self, monkeypatch):
         fake = FakeRefresh()
-        monkeypatch.setattr(market, "refresh", fake)
+        monkeypatch.setattr(market, "refresh_yfinance", fake)
 
         refreshed, errors = await market.refresh_many(["A", "A", "B", "A"])
 
@@ -71,7 +82,7 @@ class TestRefreshMany:
 
     async def test_clamps_invalid_concurrency(self, monkeypatch):
         fake = FakeRefresh()
-        monkeypatch.setattr(market, "refresh", fake)
+        monkeypatch.setattr(market, "refresh_yfinance", fake)
 
         for bad in (0, -3):
             refreshed, errors = await market.refresh_many(["A", "B"], concurrency=bad)
@@ -81,7 +92,7 @@ class TestRefreshMany:
 
     async def test_empty_input(self, monkeypatch):
         fake = FakeRefresh()
-        monkeypatch.setattr(market, "refresh", fake)
+        monkeypatch.setattr(market, "refresh_yfinance", fake)
 
         refreshed, errors = await market.refresh_many([])
         assert refreshed == []
@@ -90,7 +101,7 @@ class TestRefreshMany:
 
     async def test_on_result_fires_once_per_ticker(self, monkeypatch):
         fake = FakeRefresh(fail={"BAD"})
-        monkeypatch.setattr(market, "refresh", fake)
+        monkeypatch.setattr(market, "refresh_yfinance", fake)
 
         events: list[tuple[str, bool, str | None]] = []
 
@@ -107,7 +118,7 @@ class TestRefreshMany:
         async def fake_refresh(ticker, period="2y"):
             seen_periods.append(period)
 
-        monkeypatch.setattr(market, "refresh", fake_refresh)
+        monkeypatch.setattr(market, "refresh_yfinance", fake_refresh)
 
         await market.refresh_many(["A", "B"], period="10y")
         assert seen_periods == ["10y", "10y"]
@@ -124,7 +135,7 @@ class TestRefreshMany:
             await asyncio.sleep(0.02)
             running -= 1
 
-        monkeypatch.setattr(market, "refresh", fake_refresh)
+        monkeypatch.setattr(market, "refresh_yfinance", fake_refresh)
 
         await market.refresh_many([f"T{i}" for i in range(10)], concurrency=2)
         assert max_running <= 2
@@ -297,4 +308,128 @@ class TestRefreshFallback:
         monkeypatch.setattr(market, "yahoo_history", lambda t, p: _one_bar(t))
 
         await market.refresh("AAPL", "2y")  # must not raise
+
+
+class TestRefreshYfinance:
+    async def test_forces_yahoo_even_with_twelvedata_provider(self, monkeypatch):
+        monkeypatch.setattr(market, "provider", lambda: "twelvedata")
+        monkeypatch.setattr(market, "Session", lambda: _FakeSession())
+
+        async def boom(*a, **k):
+            raise AssertionError("bulk refresh must not call the metered provider")
+
+        periods: list[str] = []
+
+        def fake_yahoo(ticker, period):
+            periods.append(period)
+            return _one_bar(ticker)
+
+        monkeypatch.setattr(market, "_twelve_history", boom)
+        monkeypatch.setattr(market, "yahoo_history", fake_yahoo)
+
+        await market.refresh_yfinance("AAPL", "10y")
+        assert periods == ["10y"]
+
+    async def test_rejects_unknown_period(self, monkeypatch):
+        with pytest.raises(ValueError):
+            await market.refresh_yfinance("AAPL", "bogus")
+
+
+# ---------------------------------------------------------------------------
+# Twelve Data limiter + budget
+# ---------------------------------------------------------------------------
+
+class TestTwelveLimiter:
+    async def test_budget_is_a_hard_cap(self, monkeypatch):
+        monkeypatch.setattr(market.settings, "twelve_data_daily_budget", 2)
+        monkeypatch.setattr(market.settings, "twelve_data_max_per_min", 100000)
+        lim = market._TwelveLimiter()
+        assert await lim.acquire() is True
+        assert await lim.acquire() is True
+        assert await lim.acquire() is False
+
+
+class TestRefreshBudget:
+    async def _setup(self, monkeypatch, lim):
+        monkeypatch.setattr(market, "_twelve_limiter", lim)
+        monkeypatch.setattr(market, "provider", lambda: "twelvedata")
+        monkeypatch.setattr(market, "Session", lambda: _FakeSession())
+
+    async def test_uses_twelve_when_budget_available(self, monkeypatch):
+        monkeypatch.setattr(market.settings, "twelve_data_daily_budget", 100)
+        monkeypatch.setattr(market.settings, "twelve_data_max_per_min", 100000)
+        await self._setup(monkeypatch, market._TwelveLimiter())
+
+        async def fake_twelve(ticker, outputsize):
+            return _one_bar(ticker)
+
+        def boom(*a, **k):
+            raise AssertionError("yfinance must not be used while budget remains")
+
+        monkeypatch.setattr(market, "_twelve_history", fake_twelve)
+        monkeypatch.setattr(market, "yahoo_history", boom)
+
+        await market.refresh("AAPL", "2y")  # must not raise
+
+    async def test_spent_budget_falls_back_to_yfinance(self, monkeypatch):
+        monkeypatch.setattr(market.settings, "twelve_data_daily_budget", 1)
+        monkeypatch.setattr(market.settings, "twelve_data_max_per_min", 100000)
+        lim = market._TwelveLimiter()
+        assert await lim.acquire() is True  # spend the only credit
+        await self._setup(monkeypatch, lim)
+
+        async def boom(*a, **k):
+            raise AssertionError("Twelve Data must not be called once the budget is spent")
+
+        yahoo_calls: list[str] = []
+        monkeypatch.setattr(market, "_twelve_history", boom)
+        monkeypatch.setattr(market, "yahoo_history",
+                            lambda t, p: yahoo_calls.append(t) or _one_bar(t))
+
+        await market.refresh("AAPL", "2y")
+        assert yahoo_calls == ["AAPL"]
+
+
+# ---------------------------------------------------------------------------
+# refresh_many: freshness skip (reuse the nightly prefetch)
+# ---------------------------------------------------------------------------
+
+class TestRefreshManyFreshSkip:
+    async def test_skips_recently_fetched_tickers(self, monkeypatch):
+        fetched: list[str] = []
+
+        async def fake_yahoo(ticker, period):
+            fetched.append(ticker)
+
+        monkeypatch.setattr(market, "refresh_yfinance", fake_yahoo)
+        market._mark_fresh("A")  # A was already fetched this window
+
+        refreshed, errors = await market.refresh_many(["A", "B"], max_age_seconds=3600)
+
+        assert fetched == ["B"]          # A skipped
+        assert refreshed == ["A", "B"]   # both usable
+        assert errors == []
+
+    async def test_no_skip_without_max_age(self, monkeypatch):
+        fetched: list[str] = []
+
+        async def fake_yahoo(ticker, period):
+            fetched.append(ticker)
+
+        monkeypatch.setattr(market, "refresh_yfinance", fake_yahoo)
+        market._mark_fresh("A")
+
+        await market.refresh_many(["A", "B"])
+        assert fetched == ["A", "B"]
+
+    async def test_use_provider_routes_to_configured_refresh(self, monkeypatch):
+        seen: list[str] = []
+
+        async def fake_refresh(ticker, period):
+            seen.append(ticker)
+
+        monkeypatch.setattr(market, "refresh", fake_refresh)
+        await market.refresh_many(["A", "B"], use_provider=True)
+        assert seen == ["A", "B"]
+
 

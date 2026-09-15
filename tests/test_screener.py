@@ -6,6 +6,7 @@ result persistence can be exercised without touching the real volume.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC
 
 import pytest
@@ -100,7 +101,7 @@ class TestDedup:
                     "return_60d": 0.0, "rsi": 50.0, "relative_volume": 1.0,
                     "close": 100.0}
 
-        monkeypatch.setattr(screener, "refresh", mock_refresh)
+        monkeypatch.setattr(screener, "refresh_yfinance", mock_refresh)
         monkeypatch.setattr(screener, "candles", mock_candles)
         monkeypatch.setattr(screener, "score", mock_score)
 
@@ -177,7 +178,7 @@ class TestRunErrorHandling:
                 for i in range(250)
             ]
 
-        monkeypatch.setattr(screener, "refresh", mock_refresh)
+        monkeypatch.setattr(screener, "refresh_yfinance", mock_refresh)
         monkeypatch.setattr(screener, "candles", mock_candles)
 
         result = await screener.run("mix")
@@ -215,7 +216,7 @@ class TestRunErrorHandling:
                 for i in range(250)
             ]
 
-        monkeypatch.setattr(screener, "refresh", mock_refresh)
+        monkeypatch.setattr(screener, "refresh_yfinance", mock_refresh)
         monkeypatch.setattr(screener, "candles", mock_candles)
 
         # Break the DB session so the final commit raises.
@@ -274,7 +275,7 @@ class TestSignalColumn:
                 for i in range(250)
             ]
 
-        monkeypatch.setattr(screener, "refresh", mock_refresh)
+        monkeypatch.setattr(screener, "refresh_yfinance", mock_refresh)
         monkeypatch.setattr(screener, "candles", mock_candles)
 
         result = await screener.run("full")
@@ -300,7 +301,7 @@ class TestSignalColumn:
             # 100 rows is enough for score() (>=65) but not compute() (>=206)
             return [{"close": 100.0 + 0.1 * i, "volume": 1_000_000.0} for i in range(100)]
 
-        monkeypatch.setattr(screener, "refresh", mock_refresh)
+        monkeypatch.setattr(screener, "refresh_yfinance", mock_refresh)
         monkeypatch.setattr(screener, "candles", mock_candles)
 
         result = await screener.run("ipo")
@@ -336,7 +337,7 @@ class TestSignalColumn:
                 for i in range(250)
             ]
 
-        monkeypatch.setattr(screener, "refresh", mock_refresh)
+        monkeypatch.setattr(screener, "refresh_yfinance", mock_refresh)
         monkeypatch.setattr(screener, "candles", mock_candles)
 
         await screener.run("api")
@@ -376,7 +377,7 @@ class TestRefreshManyWiring:
                 for i in range(250)
             ]
 
-        monkeypatch.setattr(screener, "refresh", mock_refresh)
+        monkeypatch.setattr(screener, "refresh_yfinance", mock_refresh)
         monkeypatch.setattr(screener, "candles", mock_candles)
 
         await screener.run("prog")
@@ -397,7 +398,7 @@ class TestRefreshManyWiring:
         async def mock_refresh(ticker, period="2y"):
             pass
 
-        monkeypatch.setattr(screener, "refresh", mock_refresh)
+        monkeypatch.setattr(screener, "refresh_yfinance", mock_refresh)
 
         # Seed candles: FRESH has a recent latest candle, STALE is old,
         # MISSING has none at all.
@@ -433,7 +434,7 @@ class TestRefreshManyWiring:
                 raise ValueError("no such symbol")
             pass
 
-        monkeypatch.setattr(screener, "refresh", mock_refresh)
+        monkeypatch.setattr(screener, "refresh_yfinance", mock_refresh)
 
         result = await screener.refresh_incremental("err")
 
@@ -485,3 +486,52 @@ class TestMigrationGuard:
             await s.commit()
 
         await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Concurrency guard (a second bulk op must be rejected, not started twice)
+# ---------------------------------------------------------------------------
+
+class TestScreenerBusyGuard:
+    async def test_all_bulk_ops_rejected_while_lock_held(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(screener, "_UNIVERSES_DIR", tmp_path)
+        (tmp_path / "u.txt").write_text("AAPL\n")
+
+        async with screener._screener_lock:
+            assert screener.screener_running() is True
+            with pytest.raises(screener.ScreenerBusy):
+                await screener.run("u")
+            with pytest.raises(screener.ScreenerBusy):
+                await screener.refresh_incremental("u")
+            with pytest.raises(screener.ScreenerBusy):
+                await screener.load_deep_history("u")
+        assert screener.screener_running() is False
+
+    async def test_second_run_rejected_while_first_in_flight(self, tmp_path,
+                                                             monkeypatch, mem_db):
+        monkeypatch.setattr(screener, "_UNIVERSES_DIR", tmp_path)
+        (tmp_path / "busy.txt").write_text("AAPL\n")
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_refresh(ticker, period="2y"):
+            started.set()
+            await release.wait()
+
+        async def empty_candles(ticker, period=None):
+            return []
+
+        monkeypatch.setattr(screener, "refresh_yfinance", slow_refresh)
+        monkeypatch.setattr(screener, "candles", empty_candles)
+
+        task = asyncio.create_task(screener.run("busy"))
+        await started.wait()
+        try:
+            with pytest.raises(screener.ScreenerBusy):
+                await screener.run("busy")
+        finally:
+            release.set()
+        await task
+        assert screener.screener_running() is False
+

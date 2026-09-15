@@ -1805,10 +1805,13 @@ async def run_cycle() -> dict[str, Any]:
             _set_progress("allowance", "Depositing monthly allowance", started_at=started_at)
             allowance_result = await deposit_allowance()
 
-            # 2. Refresh candles for the universe
+            # 2. Refresh candles for the universe (reuse the nightly prefetch:
+            # tickers already fetched within the freshness window are skipped).
             _set_progress("refresh", "Refreshing candle data", started_at=started_at)
             tickers = await _candidate_tickers()
-            _, refresh_errors = await refresh_many(tickers, _SIM_REFRESH_PERIOD)
+            _, refresh_errors = await refresh_many(
+                tickers, _SIM_REFRESH_PERIOD,
+                max_age_seconds=settings.market_fresh_seconds)
             detail = f" ({len(refresh_errors)} failed)" if refresh_errors else ""
             _set_progress("refresh", f"Refreshed {len(tickers)} tickers{detail}", started_at=started_at)
 
@@ -2624,6 +2627,50 @@ async def backfill_benchmark(start: str | None = None) -> dict[str, Any]:
 
 _scheduler_task: asyncio.Task | None = None
 _daily_snapshot_task: asyncio.Task | None = None
+_prefetch_task: asyncio.Task | None = None
+
+
+async def prefetch_universe() -> dict[str, Any]:
+    """Fetch the shared sim universe into the candle cache ONCE.
+
+    All three portfolios share one universe, so fetching it here (before the
+    nightly cycles) means they read the DB instead of each re-pulling it. Uses
+    the configured provider — with ``auto`` Twelve Data serves the tickers it
+    has, paced by the rate limiter and capped by the daily budget, and every
+    miss (``IFX.DE`` etc.) falls back to yfinance per ticker. Marks each fetched
+    ticker fresh so run_cycle()/daily-core skip it.
+    """
+    tickers = await _candidate_tickers()
+    if not tickers:
+        return {"ok": False, "reason": "empty universe"}
+    refreshed, errors = await refresh_many(tickers, _SIM_REFRESH_PERIOD, use_provider=True)
+    logger.info("Universe prefetch %s: %d/%d fetched, %d errors",
+                _universe(), len(refreshed), len(tickers), len(errors))
+    return {"ok": True, "universe": _universe(), "total": len(tickers),
+            "refreshed": len(refreshed), "errors": errors}
+
+
+async def _prefetch_loop() -> None:
+    """Background loop: prefetch the shared universe ``sim_prefetch_lead_minutes``
+    before the scheduled sim run so the cycles can reuse it. Disabled by
+    ``sim_universe_prefetch``; the cycles fall back to a Yahoo fetch when it
+    hasn't run."""
+    while True:
+        now = _utcnow()
+        lead = max(0, settings.sim_prefetch_lead_minutes)
+        target = now.replace(hour=settings.sim_run_hour, minute=settings.sim_run_minute,
+                             second=0, microsecond=0) - timedelta(minutes=lead)
+        if target <= now:
+            target = target + timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        logger.info("Universe prefetch: next run at %s (in %.0f seconds)", target, wait_seconds)
+        await asyncio.sleep(wait_seconds)
+        if not settings.sim_universe_prefetch:
+            continue
+        try:
+            await prefetch_universe()
+        except Exception as e:
+            logger.error("Universe prefetch failed: %s", e, exc_info=True)
 
 
 async def _scheduler_tick() -> None:
@@ -2754,22 +2801,27 @@ async def _daily_monthly_snapshot_loop():
 
 def start_scheduler():
     """Start the background scheduler task (called from main.py lifespan)."""
-    global _scheduler_task, _daily_snapshot_task
+    global _scheduler_task, _daily_snapshot_task, _prefetch_task
     if _scheduler_task is None or _scheduler_task.done():
         _scheduler_task = asyncio.create_task(_scheduler_loop())
     if _daily_snapshot_task is None or _daily_snapshot_task.done():
         _daily_snapshot_task = asyncio.create_task(_daily_monthly_snapshot_loop())
+    if _prefetch_task is None or _prefetch_task.done():
+        _prefetch_task = asyncio.create_task(_prefetch_loop())
 
 
 def stop_scheduler():
     """Stop the background scheduler task."""
-    global _scheduler_task, _daily_snapshot_task
+    global _scheduler_task, _daily_snapshot_task, _prefetch_task
     if _scheduler_task and not _scheduler_task.done():
         _scheduler_task.cancel()
     _scheduler_task = None
     if _daily_snapshot_task and not _daily_snapshot_task.done():
         _daily_snapshot_task.cancel()
     _daily_snapshot_task = None
+    if _prefetch_task and not _prefetch_task.done():
+        _prefetch_task.cancel()
+    _prefetch_task = None
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,9 @@
-from datetime import datetime
+from datetime import datetime, UTC
 import asyncio
 import logging
+from collections import deque
 from pathlib import Path
+import time
 import httpx
 import numpy as np
 import pandas as pd
@@ -33,6 +35,62 @@ def _twelve_headers() -> dict[str, str]:
     <key>`` rather than the query string so it never lands in request logs
     (httpx logs the URL at INFO)."""
     return {"Authorization": f"apikey {_twelve_key()}"}
+
+
+class _TwelveLimiter:
+    """Per-minute rate limiter + daily budget for Twelve Data.
+
+    The Basic plan allows 8 credits/min and 800/day; exceeding either returns
+    429. ``acquire()`` waits for a per-minute slot and returns False once the
+    day's budget is spent, so callers fall back to yfinance instead of
+    hammering a limited endpoint. One instance guards every Twelve Data call.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._calls: deque[float] = deque()
+        self._day = None
+        self._used = 0
+
+    async def acquire(self) -> bool:
+        async with self._lock:
+            now = time.monotonic()
+            today = datetime.now(UTC).date()
+            if self._day != today:
+                self._day, self._used = today, 0
+                self._calls.clear()
+            if self._used >= max(1, settings.twelve_data_daily_budget):
+                return False
+            limit = max(1, settings.twelve_data_max_per_min)
+            while self._calls and now - self._calls[0] >= 60:
+                self._calls.popleft()
+            if len(self._calls) >= limit:
+                await asyncio.sleep(60 - (now - self._calls[0]) + 0.05)
+            self._calls.append(time.monotonic())
+            self._used += 1
+            return True
+
+
+_twelve_limiter = _TwelveLimiter()
+
+# Ticker → time.monotonic() of the last successful candle store. Lets a nightly
+# universe prefetch be reused: the sim/day-core cycles skip tickers fetched
+# within `market_fresh_seconds` instead of pulling them again. Process-local
+# (the scheduler and the cycles share one event loop); a restart just refetches.
+_fresh_at: dict[str, float] = {}
+
+
+def _mark_fresh(ticker: str) -> None:
+    _fresh_at[ticker] = time.monotonic()
+
+
+def fresh_count() -> int:
+    return len(_fresh_at)
+
+
+def _is_fresh(ticker: str, max_age_seconds: float, now: float) -> bool:
+    return (now - _fresh_at.get(ticker, float("-inf"))) < max_age_seconds
+
 
 def provider():
     """Primary market-data source.
@@ -131,11 +189,12 @@ def _twelve_profile(ticker: str) -> str:
 
 async def info(ticker):
     if provider()=="yfinance": return await asyncio.to_thread(yahoo_info,ticker)
-    try:
-        name=await asyncio.to_thread(_twelve_profile,ticker)
-        if name: return name
-    except Exception as e:
-        logger.warning("twelvedata profile failed for %s (%s) — falling back to yfinance",ticker,e)
+    if await _twelve_limiter.acquire():
+        try:
+            name=await asyncio.to_thread(_twelve_profile,ticker)
+            if name: return name
+        except Exception as e:
+            logger.warning("twelvedata profile failed for %s (%s) — falling back to yfinance",ticker,e)
     return await asyncio.to_thread(yahoo_info,ticker)
 
 async def search(q):
@@ -156,12 +215,20 @@ async def refresh(ticker, period="2y"):
     yf_period, td_output = RANGES[period]
     if provider()=="yfinance":
         values=await asyncio.to_thread(yahoo_history,ticker,yf_period)
-    else:
+    elif await _twelve_limiter.acquire():
         try:
             values=await _twelve_history(ticker,td_output)
         except Exception as e:
             logger.warning("twelvedata refresh failed for %s (%s) — falling back to yfinance",ticker,e)
             values=await asyncio.to_thread(yahoo_history,ticker,yf_period)
+    else:
+        # Daily budget spent — yfinance for the rest of the day.
+        values=await asyncio.to_thread(yahoo_history,ticker,yf_period)
+    await _store_candles(ticker, values)
+    _mark_fresh(ticker)
+
+async def _store_candles(ticker, values):
+    """Upsert normalized candles for one ticker."""
     async with Session() as s:
         if values:
             stmt = sqlite_insert(Candle).values(
@@ -179,6 +246,19 @@ async def refresh(ticker, period="2y"):
             )
             await s.execute(stmt)
         await s.commit()
+
+async def refresh_yfinance(ticker, period="2y"):
+    """Always Yahoo Finance, ignoring the configured provider.
+
+    Used by the bulk paths that must NOT touch the metered provider (the
+    screener's universe update/refresh/deep-load, and the daily sim/day-core
+    universe refreshes when they don't reuse the nightly prefetch). One S&P 500
+    pass is ~500 requests; Yahoo is free and unmetered for this.
+    """
+    if period not in RANGES: raise ValueError(f"Unsupported range: {period}")
+    yf_period, _ = RANGES[period]
+    await _store_candles(ticker, await asyncio.to_thread(yahoo_history,ticker,yf_period))
+    _mark_fresh(ticker)
 async def candles(ticker, period=None):
     async with Session() as s:
         rows=(await s.scalars(select(Candle).where(Candle.ticker==ticker).order_by(Candle.timestamp))).all()
@@ -207,19 +287,34 @@ async def latest_close(ticker: str) -> float | None:
     return float(row) if row is not None else None
 
 
-async def refresh_many(tickers, period="2y", *, concurrency: int = 4, on_result=None, work=None):
+async def refresh_many(tickers, period="2y", *, concurrency: int = 4, on_result=None, work=None,
+                       use_provider: bool = False, max_age_seconds: float | None = None):
     """Refresh candle data for many tickers with bounded concurrency.
 
     Input is deduplicated while preserving order. Returns ``(refreshed,
     errors)`` where errors are "TICKER: message" strings and ``refreshed``
-    lists the tickers that completed without error, in input order (not
-    completion order). ``on_result(ticker, ok, error_or_None)`` fires after
-    each ticker completes — success or failure — so callers can update
-    progress UI while the batch is still running. Pass ``work`` to run a
-    custom per-ticker coroutine instead of :func:`refresh` (used by the
-    screener to bundle per-symbol scoring with the fetch).
+    lists the tickers that are usable afterwards (fetched OK, or skipped as
+    fresh), in input order — not completion order. ``on_result(ticker, ok,
+    error_or_None)`` fires after each ticker is handled.
+
+    The default per-ticker fetch is :func:`refresh_yfinance` (Yahoo), NOT the
+    configured provider: this primitive is for universe-sized batches. Pass
+    ``use_provider=True`` to use the configured provider (``refresh``) instead —
+    the nightly prefetch does this so Twelve Data serves where it has data, and
+    the limiter paces/falls back so it can't overrun the quota.
+
+    ``max_age_seconds`` skips tickers already fetched within that window (see
+    the fresh map), so the sim/day-core cycles reuse the nightly prefetch
+    instead of re-pulling the whole universe. Pass ``work`` to run a custom
+    per-ticker coroutine (the screener bundles per-symbol scoring with the
+    fetch).
     """
     ordered = list(dict.fromkeys(tickers))
+    skipped: set[str] = set()
+    if max_age_seconds is not None:
+        now = time.monotonic()
+        skipped = {t for t in ordered if _is_fresh(t, max_age_seconds, now)}
+    pending = [t for t in ordered if t not in skipped]
     semaphore = asyncio.Semaphore(max(1, concurrency))
     errors: list[str] = []
     ok_flags: dict[str, bool] = {}
@@ -230,8 +325,10 @@ async def refresh_many(tickers, period="2y", *, concurrency: int = 4, on_result=
             try:
                 if work is not None:
                     await work(ticker)
-                else:
+                elif use_provider:
                     await refresh(ticker, period)
+                else:
+                    await refresh_yfinance(ticker, period)
             except Exception as e:
                 err = str(e)
                 errors.append(f"{ticker}: {e}")
@@ -240,6 +337,6 @@ async def refresh_many(tickers, period="2y", *, concurrency: int = 4, on_result=
         if on_result is not None:
             on_result(ticker, err is None, err)
 
-    await asyncio.gather(*(_one(t) for t in ordered))
-    refreshed = [t for t in ordered if ok_flags.get(t)]
+    await asyncio.gather(*(_one(t) for t in pending))
+    refreshed = [t for t in ordered if t in skipped or ok_flags.get(t)]
     return refreshed, errors

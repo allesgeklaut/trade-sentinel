@@ -2515,3 +2515,38 @@ class TestSimBackfill:
                 assert by_day["2025-03-03"] == settings.sim_monthly_allowance  # first bday
                 assert by_day["2025-04-01"] == 2 * settings.sim_monthly_allowance
         await check()
+
+
+# ---------------------------------------------------------------------------
+# Nightly shared universe prefetch
+# ---------------------------------------------------------------------------
+
+class TestUniversePrefetch:
+    async def test_prefetch_uses_configured_provider(self, monkeypatch):
+        """The shared prefetch must route through the configured provider
+        (auto → Twelve Data), not the bulk Yahoo path."""
+        async def fake_candidates():
+            return ["AAA", "BBB"]
+
+        captured: dict = {}
+
+        async def fake_refresh_many(tickers, period, **kwargs):
+            captured["tickers"] = list(tickers)
+            captured["kwargs"] = kwargs
+            return list(tickers), []
+
+        monkeypatch.setattr(sim, "_candidate_tickers", fake_candidates)
+        monkeypatch.setattr(sim, "refresh_many", fake_refresh_many)
+
+        r = await sim.prefetch_universe()
+        assert r["ok"] is True and r["total"] == 2 and r["refreshed"] == 2
+        assert captured["tickers"] == ["AAA", "BBB"]
+        assert captured["kwargs"].get("use_provider") is True
+
+    async def test_empty_universe_is_a_noop(self, monkeypatch):
+        async def empty_candidates():
+            return []
+
+        monkeypatch.setattr(sim, "_candidate_tickers", empty_candidates)
+        r = await sim.prefetch_universe()
+        assert r["ok"] is False

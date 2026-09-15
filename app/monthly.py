@@ -894,12 +894,13 @@ async def refresh_data(tickers: list[str]) -> tuple[list[str], dict[str, str]]:
     history to ~2009), yfinance fallback for CIK-less listings (ETFs, European
     exchanges). Same split as the stockstrat research pipeline."""
     from . import edgar
-    from .market import refresh
+    from .market import refresh_yfinance
     refresh_errors: list[str] = []
     wanted = list(tickers) + sorted({pm[0] for t in tickers if (pm := fundamentals_mod._suffix_fx(t))})
     for t in wanted:
         try:
-            await refresh(t, "10y")
+            # Universe-sized batch → Yahoo only (see market.refresh_many).
+            await refresh_yfinance(t, "10y")
         except Exception as e:
             refresh_errors.append(f"{t}: {e}")
     fund_status: dict[str, str]

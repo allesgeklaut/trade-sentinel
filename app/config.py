@@ -10,6 +10,11 @@ class Settings(BaseSettings):
     # read-only /opt/secrets mount). Used when TWELVE_DATA_API_KEY is empty,
     # mirroring LITELLM_API_KEY_FILE for the LLM backends.
     twelve_data_api_key_file: str = ""
+    # Twelve Data Basic plan: 8 credits/min and 800/day. The limiter paces
+    # requests to max_per_min and falls back to yfinance once the day's budget
+    # is spent — so a broad universe prefetch can never trip 429s or overrun.
+    twelve_data_max_per_min: int = 8
+    twelve_data_daily_budget: int = 750
     watchlist: str = "AAPL,MSFT,NVDA,IFX.DE"
 
     ollama_url: str = "http://host.docker.internal:11434"
@@ -157,6 +162,15 @@ class Settings(BaseSettings):
     sim_daily_core_basket_arm_sma: int = 200
     sim_run_hour: int = 22
     sim_run_minute: int = 30
+    # Nightly shared universe prefetch: all sims share one universe, so fetch it
+    # ONCE before the cycles and let them read the DB instead of each pulling it.
+    # Uses the configured provider (auto → Twelve Data, rate-limited/budgeted)
+    # with a yfinance fallback per ticker. Starts `sim_prefetch_lead_minutes`
+    # before sim_run_hour; the cycles skip tickers fetched within
+    # `market_fresh_seconds`.
+    sim_universe_prefetch: bool = True
+    sim_prefetch_lead_minutes: int = 90
+    market_fresh_seconds: int = 21600  # 6h: "already fetched, skip the re-pull"
 
     # --- Benchmark (DCA control portfolio) --------------------------------
     sim_benchmark_enabled: bool = True

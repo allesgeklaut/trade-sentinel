@@ -749,7 +749,10 @@ async def refresh_data() -> tuple[list[str], list[str]]:
         tickers = held
     else:
         tickers = list(dict.fromkeys(universe_tickers(current_universe()) + held))
-    return await refresh_many(tickers, "2y")
+    # Reuse the nightly universe prefetch: tickers fetched within the freshness
+    # window are skipped, so daily-core reads the DB instead of re-pulling.
+    return await refresh_many(tickers, "2y",
+                              max_age_seconds=settings.market_fresh_seconds)
 
 
 # ---------------------------------------------------------------------------
