@@ -121,6 +121,19 @@ async def candles(ticker, period=None):
 PERIOD_COUNTS = {"6m":126,"2y":504,"5y":1260,"10y":2520,"max":5000}
 
 
+async def latest_close(ticker: str) -> float | None:
+    """Most recent cached close for a ticker, or None.
+
+    A single-row query: valuation only needs the last bar, and loading a
+    broad-universe ticker's entire history (decades) to read its final value
+    was what made /api/sim/status slow.
+    """
+    async with Session() as s:
+        row = await s.scalar(select(Candle.close).where(Candle.ticker == ticker)
+                             .order_by(Candle.timestamp.desc()).limit(1))
+    return float(row) if row is not None else None
+
+
 async def refresh_many(tickers, period="2y", *, concurrency: int = 4, on_result=None, work=None):
     """Refresh candle data for many tickers with bounded concurrency.
 

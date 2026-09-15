@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import urllib.error
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -772,7 +772,7 @@ async def test_price_usd_converts_foreign_listings(mem_db):
     raw local-currency close as USD would misstate exposure ~1/FX."""
     from app.db import Candle
 
-    dates = pd.bdate_range("2024-06-03", periods=5)
+    dates = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=5)
     async with mem_db() as s:
         for d in dates[:-1]:  # EURUSD pair stops updating one day before...
             s.add(Candle(ticker="EURUSD=X", timestamp=d.to_pydatetime(),
@@ -999,3 +999,30 @@ class TestBackfill:
                 assert sorted(x.month for x in rows) == \
                     ["2026-07", "2026-08", "2026-09"]
         asyncio.run(check())
+
+
+async def test_load_frames_filters_tickers_and_bounds_history(mem_db):
+    """load_frames must query ONLY the requested tickers (the unfiltered
+    full-table scan made every call O(all candles) once the broad universes
+    were added) and honor the optional history bound."""
+    from app.db import Candle
+
+    old = datetime(2020, 1, 2)
+    recent = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=5)
+    async with mem_db() as s:
+        for i in range(3):
+            s.add(Candle(ticker="AAA", timestamp=old + timedelta(days=i),
+                         open=1, high=1, low=1, close=10, volume=1))
+            s.add(Candle(ticker="UNRELATED", timestamp=old + timedelta(days=i),
+                         open=1, high=1, low=1, close=99, volume=1))
+        s.add(Candle(ticker="AAA", timestamp=recent, open=1, high=1, low=1, close=20, volume=1))
+        await s.commit()
+
+    close, _vol = await monthly.load_frames(["AAA"], None)
+    assert list(close.columns) == ["AAA"]  # UNRELATED never loaded
+    assert len(close) == 4
+
+    # history bound drops the 2020 rows, keeping only the recent bar
+    close2, _ = await monthly.load_frames(["AAA"], None, start=recent - timedelta(days=1))
+    assert len(close2) == 1
+    assert float(close2["AAA"].iloc[-1]) == 20

@@ -1065,6 +1065,14 @@ class TestYearLongSimulation:
 
         monkeypatch.setattr(sim, "candles", mock_candles)
 
+        # _latest_close now reads the last bar via market.latest_close
+        # (single-row query); mock it to the same progressive synthetic series.
+        async def mock_latest_close(ticker):
+            data = synthetic.get(ticker, [])[: reveal["day"]]
+            return float(data[-1]["close"]) if data else None
+
+        monkeypatch.setattr(sim, "latest_close", mock_latest_close)
+
         # --- mock refresh to no-op (no yfinance calls) ---
         async def mock_refresh(ticker, period="2y"):
             pass

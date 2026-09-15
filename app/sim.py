@@ -39,7 +39,7 @@ from .db import (
     SimTrade,
     Session,
 )
-from .market import candles, refresh, refresh_many
+from .market import candles, latest_close, refresh, refresh_many
 from .screener import tickers as universe_tickers
 from .strategy import (
     StrategyParams,
@@ -142,11 +142,11 @@ def _week_diff(current: str, last: str) -> int:
 
 
 async def _latest_close(ticker: str) -> float | None:
-    """Return the most recent cached close price for *ticker*, or None."""
-    rows = await candles(ticker)
-    if not rows:
-        return None
-    return float(rows[-1]["close"])
+    """Return the most recent cached close price for *ticker*, or None.
+
+    Delegates to market.latest_close (single-row query) — the old path loaded
+    the ticker's entire history via candles() just to read the last bar."""
+    return await latest_close(ticker)
 
 
 async def held_tickers() -> list[str]:

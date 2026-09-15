@@ -308,7 +308,7 @@ class TestStoredRanking:
             await asyncio.sleep(0)  # yield so a racer could interleave
             return {"AAA": {}}
 
-        async def fake_frames(_tickers, _asof):
+        async def fake_frames(_tickers, _asof, start=None):
             return pd.DataFrame({"AAA": [1.0]}, index=day), \
                    pd.DataFrame({"AAA": [1.0]}, index=day)
 
@@ -352,7 +352,7 @@ def fake_market(monkeypatch):
     def fake_order(frame):
         return frame["eligible"], ["AAA", "BBB"]
 
-    async def fake_load_frames(_tickers, _asof):
+    async def fake_load_frames(_tickers, _asof, start=None):
         return close, vol
 
     async def fake_load_fundamentals(_tickers):

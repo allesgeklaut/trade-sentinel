@@ -190,6 +190,12 @@ TARGET_VOL_MODES: dict[str, str] = {
 # Realized-vol lookback (trading days), matching the backtest's window.
 _VOL_WINDOW = 21
 
+# Candle-history bounds. The strategy only needs a momentum-warmup window
+# (>=253 trading days) before its decision date; broad universes were fetched
+# with full history, so loading everything made every call slow.
+_BACKFILL_WARMUP_DAYS = 600   # ~400 trading days of warmup before the replay start
+_LIVE_HISTORY_DAYS = 1460     # ~4y: ample for the 253d momentum + 200d market SMA
+
 
 def current_target_vol() -> float:
     """The effective annualized target vol (0.0 = off): the persisted runtime
@@ -255,6 +261,12 @@ def _current_month() -> str:
     return _local_now().strftime("%Y-%m")
 
 
+def _live_history_start() -> datetime:
+    """Naive-UTC lower bound for the live ranking's candle load (~4y). Candle
+    timestamps are stored naive, so the bound must be naive too."""
+    return datetime.now(UTC).replace(tzinfo=None) - timedelta(days=_LIVE_HISTORY_DAYS)
+
+
 # ---------------------------------------------------------------------------
 # Protection overlay: live market gate + target-basket gradient
 # ---------------------------------------------------------------------------
@@ -275,7 +287,8 @@ async def _protection_decision(band: list[str], frame: pd.DataFrame | None,
     is stable across cycles (the scheduler runs once a day).
     """
     tickers = universe_tickers(current_universe())
-    close, _vol = await monthly_mod.load_frames(tickers, None)
+    close, _vol = await monthly_mod.load_frames(
+        tickers, None, start=_live_history_start())
     if close.empty or not band:
         return True, False
 
@@ -565,7 +578,8 @@ async def compute_targets(force: bool = False) -> tuple[list[str], list[str], pd
         fund = await fundamentals_mod.load_fundamentals(tickers)
         if not fund:
             return [], [], None
-        close, vol = await monthly_mod.load_frames(tickers, None)
+        close, vol = await monthly_mod.load_frames(
+            tickers, None, start=_live_history_start())
         if close.empty:
             return [], [], None
         iso = datetime.now(UTC).strftime("%Y-%m-%d")
@@ -803,7 +817,12 @@ async def backfill(start: str | None = None) -> dict:
         fund = await fundamentals_mod.load_fundamentals(tickers)
         if not fund:
             return {"ok": False, "error": "no fundamentals loaded"}
-        close, vol = await monthly_mod.load_frames(tickers, None)
+        # Bound the candle load to the replay window + a momentum warmup.
+        # `start=None` means "full stored history" (start=all or before the
+        # data begins) — only then load everything.
+        load_start = ((pd.Timestamp(start) - timedelta(days=_BACKFILL_WARMUP_DAYS)).to_pydatetime()
+                      if start else None)
+        close, vol = await monthly_mod.load_frames(tickers, None, start=load_start)
         if close.empty:
             return {"ok": False, "error": "no candle data"}
 

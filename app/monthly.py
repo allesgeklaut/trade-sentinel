@@ -55,6 +55,11 @@ def _strategy_universe() -> str:
 # equity curves are directly comparable.
 _TZ = ZoneInfo(settings.allowance_tz)
 
+# Recent-window bound for "latest price" lookups (see _price_usd_map): long
+# enough that a stale feed still resolves, short enough to skip the decades of
+# unused history that broad universes carry.
+_PRICE_LOOKBACK_DAYS = 400
+
 
 def _current_month() -> str:
     """Operator-local calendar month key (YYYY-MM), matching sim._current_month."""
@@ -223,15 +228,31 @@ def px_at(frame: pd.DataFrame, d: pd.Timestamp, ticker: str) -> float | None:
     return float(np.asarray(p).reshape(-1)[0])
 
 
-async def load_frames(tickers: list[str], asof: datetime | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+async def load_frames(tickers: list[str], asof: datetime | None = None,
+                      start: datetime | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """(close, volume) DataFrames {date: {ticker: value}} from the candles
     cache, loaded in a thread. Foreign-listing closes are converted to USD at
-    the historical FX rate from the FX pseudo-tickers in the same cache."""
+    the historical FX rate from the FX pseudo-tickers in the same cache.
+
+    ``start`` optionally bounds the history: the strategy only ever needs a
+    momentum-warmup window before its decision date, and after the broad
+    universes were fetched with full history ~61% of the candle table sits
+    before 2015 — loading it on every call is pure waste. Callers that need
+    the full series (e.g. a ``start=all`` backfill) pass ``None``."""
     async with Session() as s:
-        q = select(Candle).order_by(Candle.timestamp)
+        # Load ONLY the requested tickers (+ the FX pairs their closes need
+        # converting), and only the four columns the frame builder reads —
+        # full-ORM hydration of millions of rows was the other half of the
+        # slowness. Same ticker-filter pattern as _price_usd_map.
+        pairs = sorted({pm[0] for t in tickers if (pm := fundamentals_mod._suffix_fx(t))})
+        q = (select(Candle.ticker, Candle.timestamp, Candle.close, Candle.volume)
+             .where(Candle.ticker.in_(set(tickers) | set(pairs)))
+             .order_by(Candle.timestamp))
+        if start is not None:
+            q = q.where(Candle.timestamp >= start)
         if asof is not None:
             q = q.where(Candle.timestamp <= asof)
-        rows = list((await s.scalars(q)).all())
+        rows = list((await s.execute(q)).all())
     return await asyncio.to_thread(load_frames_sync, tickers, rows, asof)
 
 
@@ -635,9 +656,14 @@ async def _price_usd_map(tickers: list[str]) -> dict[str, float | None]:
 
     wanted = set(tickers)
     pairs = sorted({pm[0] for t in tickers if (pm := fundamentals_mod._suffix_fx(t))})
+    # Only the recent tail is needed for a "latest close": held tickers with
+    # full history (broad universes) otherwise hydrate ~16k rows each on every
+    # valuation, which dominated the status endpoints.
+    since = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=_PRICE_LOOKBACK_DAYS)
     async with Session() as s:
-        rows = (await s.scalars(
-            _select(Candle).where(Candle.ticker.in_(wanted | set(pairs)))
+        rows = (await s.execute(
+            _select(Candle.ticker, Candle.timestamp, Candle.close)
+            .where(Candle.ticker.in_(wanted | set(pairs)), Candle.timestamp >= since)
             .order_by(Candle.timestamp))).all()
     pair_close = {p: _fx_close_series([r for r in rows if r.ticker == p])
                   for p in pairs}
