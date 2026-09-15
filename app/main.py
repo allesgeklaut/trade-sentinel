@@ -470,6 +470,7 @@ async def sim_raw_reasoning():
 async def monthly_status():
     """Monthly portfolio snapshot: cash, positions, equity, config."""
     from . import monthly
+    from . import daily_core
     # Deposit the allowance when a new month has begun (start-of-month, same
     # timing as the sim portfolio) so viewing the tab reflects the deposit
     # immediately instead of waiting for the nightly scheduler pass. Skipped
@@ -479,7 +480,7 @@ async def monthly_status():
     val = await monthly.monthly_valuate()
     return {**val,
             "sim_monthly_enabled": settings.sim_monthly_enabled,
-            "sim_monthly_universe": settings.sim_monthly_universe,
+            "sim_monthly_universe": daily_core.current_universe(),
             "sim_monthly_contribution": settings.sim_monthly_contribution,
             "sim_monthly_target_n": settings.sim_monthly_target_n,
             "next_rebalance": monthly.month_last_trading_day(datetime.now(UTC)).strftime("%Y-%m-%d")}
