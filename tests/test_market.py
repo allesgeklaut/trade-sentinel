@@ -205,6 +205,28 @@ class TestTwelveKeyFile:
 
 
 # ---------------------------------------------------------------------------
+# search: always Yahoo (canonical symbols), regardless of candle provider
+# ---------------------------------------------------------------------------
+
+class TestSearchUsesYahoo:
+    async def test_search_uses_yahoo_even_with_twelvedata(self, monkeypatch):
+        monkeypatch.setattr(market, "provider", lambda: "twelvedata")
+
+        yahoo_calls: list[str] = []
+
+        def fake_yahoo(q):
+            yahoo_calls.append(q)
+            return [{"symbol": "IFX.DE", "name": "Infineon", "exchange": "XETRA",
+                     "country": "Germany", "type": "Equity"}]
+
+        monkeypatch.setattr(market, "yahoo_search", fake_yahoo)
+
+        out = await market.search("ifx.de")
+        assert yahoo_calls == ["ifx.de"]
+        assert out[0]["symbol"] == "IFX.DE"
+
+
+# ---------------------------------------------------------------------------
 # refresh: Twelve Data primary, per-ticker yfinance fallback
 # ---------------------------------------------------------------------------
 

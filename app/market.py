@@ -129,13 +129,6 @@ def _twelve_profile(ticker: str) -> str:
         data=c.get("https://api.twelvedata.com/profile",params={"symbol":ticker},headers=_twelve_headers()).json()
     return data.get("name","") if isinstance(data, dict) and data.get("status")!="error" else ""
 
-def _twelve_search(q: str) -> list[dict]:
-    with httpx.Client(timeout=10) as c:
-        data=c.get("https://api.twelvedata.com/symbol_search",params={"symbol":q,"outputsize":8},headers=_twelve_headers()).json()
-    if not isinstance(data, dict) or data.get("status")=="error":
-        raise ValueError(data.get("message","Symbol search failed") if isinstance(data, dict) else "malformed symbol search response")
-    return [{"symbol":x.get("symbol"),"name":x.get("instrument_name",x.get("symbol")),"exchange":x.get("exchange",""),"country":x.get("country",""),"type":x.get("instrument_type","")} for x in data.get("data",[])]
-
 async def info(ticker):
     if provider()=="yfinance": return await asyncio.to_thread(yahoo_info,ticker)
     try:
@@ -146,12 +139,17 @@ async def info(ticker):
     return await asyncio.to_thread(yahoo_info,ticker)
 
 async def search(q):
-    if provider()=="yfinance": return await asyncio.to_thread(yahoo_search,q)
-    try:
-        return await asyncio.to_thread(_twelve_search,q)
-    except Exception as e:
-        logger.warning("twelvedata symbol search failed for %r (%s) — falling back to yfinance",q,e)
-        return await asyncio.to_thread(yahoo_search,q)
+    """Ticker/company autocomplete.
+
+    Always Yahoo Finance, regardless of the candle provider. Yahoo symbols are
+    this app's canonical ticker form (universes, watchlist, EDGAR, cached
+    candles all use them, e.g. ``IFX.DE``), and yf.Search is fuzzy and returns
+    one row per symbol. Twelve Data's symbol_search returns its OWN
+    exchange-scoped symbols (``IFX`` repeated per exchange, with no match for
+    ``ifx.de``) that would not resolve elsewhere in the app, so it is not used
+    here even when it is the primary candle source.
+    """
+    return await asyncio.to_thread(yahoo_search,q)
 
 async def refresh(ticker, period="2y"):
     if period not in RANGES: raise ValueError(f"Unsupported range: {period}")

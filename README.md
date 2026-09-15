@@ -1,6 +1,6 @@
 # Trade Sentinel MVP
 
-A self-hosted, paper-only stock research dashboard. Market data is switched globally with **one environment variable**; all providers normalize historical daily OHLCV data into the same local SQLite cache, so charts, signals, autocomplete, and screening use the selected backend consistently.
+A self-hosted, paper-only stock research dashboard. Market data is switched globally with **one environment variable**; all providers normalize historical daily OHLCV data into the same local SQLite cache, so charts, signals, and screening use the selected backend consistently (ticker autocomplete always uses Yahoo symbols — see below).
 
 ![Desktop screenshot: AAPL chart with BUY signal, key metric chips and local screener](docs/screenshot-desktop.jpg)
 
@@ -75,7 +75,7 @@ Paste the output into the `integrity="sha384-<hash>"` attribute on the correspon
 
 ## Autocomplete and screener
 
-Autocomplete uses the selected provider. With `yfinance`, it supports fuzzy company/ticker lookup and returns canonical Yahoo symbols such as `IFX.DE`, `ASML.AS`, and `OMV.VI`. The `global-large-cap` universe mixes US, German, Dutch, French, Swiss, and Vienna listings. Press **Update** manually after markets close; it downloads and caches about two years of daily candles for each symbol, then ranks trend alignment, 20/60-day momentum, RSI, and relative volume.
+Autocomplete always uses Yahoo Finance (fuzzy company/ticker lookup, canonical Yahoo symbols such as `IFX.DE`, `ASML.AS`, and `OMV.VI`), regardless of the candle provider — Yahoo symbols are the app's canonical ticker form and are what the universes/watchlist/EDGAR use. Candle data still comes from the selected provider, with a per-ticker yfinance fallback. The `global-large-cap` universe mixes US, German, Dutch, French, Swiss, and Vienna listings. Press **Update** manually after markets close; it downloads and caches about two years of daily candles for each symbol, then ranks trend alignment, 20/60-day momentum, RSI, and relative volume.
 
 No live broker or order API exists. Signals and rankings are research tools, not financial advice.
 
