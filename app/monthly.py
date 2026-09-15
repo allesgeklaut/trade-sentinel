@@ -38,6 +38,17 @@ from .screener import tickers as universe_tickers
 
 logger = logging.getLogger("trade_sentinel.monthly")
 
+
+def _strategy_universe() -> str:
+    """The runtime-selected qv-mom universe (daily-core state file), falling
+    back to the config default. Imported lazily: daily_core imports this module,
+    so a module-level import here would be circular."""
+    try:
+        from . import daily_core
+        return daily_core.current_universe()
+    except Exception:  # noqa: BLE001 — never let selection break a cycle
+        return settings.sim_monthly_universe
+
 # Anchor for the allowance "month" key: the same operator-local timezone the
 # sim portfolio uses (settings.allowance_tz), so both portfolios' cumulative
 # contributed figures step at the same calendar-month boundary and the two
@@ -839,7 +850,7 @@ async def _run_rebalance_locked(force: bool) -> dict[str, Any]:
             return {"skipped": True, "reason": f"already rebalanced {month}"}
 
     allowance = await deposit_allowance()
-    tickers = universe_tickers(settings.sim_monthly_universe)
+    tickers = universe_tickers(_strategy_universe())
     refresh_errors, fund_status = await refresh_data(tickers)
 
     close, vol = await load_frames(tickers, None)
@@ -982,7 +993,7 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
             start = None  # full stored history
         start_note = start or "first eligible month"
 
-        tickers = universe_tickers(settings.sim_monthly_universe)
+        tickers = universe_tickers(_strategy_universe())
         fund = await fundamentals_mod.load_fundamentals(tickers)
         if not fund:
             return {"ok": False, "error": "no fundamentals loaded"}

@@ -563,3 +563,38 @@ class TestProtectionSelection:
         for mode in daily_core.PROTECTION_MODES:
             assert daily_core.PROTECTION_MODES[mode]
         assert set(daily_core._ARM_SMA) <= set(daily_core.PROTECTION_MODES)
+
+
+# ---------------------------------------------------------------------------
+# Strategy universe selection (runtime, persisted)
+# ---------------------------------------------------------------------------
+
+class TestUniverseSelection:
+    def test_default_falls_back_to_config(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        assert daily_core.current_universe() == daily_core.settings.sim_monthly_universe
+
+    def test_set_and_persist(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        avail = daily_core.universe_names()
+        assert avail, "expected at least one universe file"
+        daily_core.set_universe(avail[0])
+        assert daily_core.current_universe() == avail[0]
+
+    def test_rejects_unknown(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        with pytest.raises(ValueError):
+            daily_core.set_universe("does-not-exist")
+
+    def test_stale_state_value_falls_back(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        (tmp_path / "state.json").write_text('{"universe": "gone"}')
+        assert daily_core.current_universe() == daily_core.settings.sim_monthly_universe
+
+    def test_sp500_available(self):
+        assert "sp500" in daily_core.universe_names()
+
+    def test_monthly_helper_resolves(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core.set_universe("sp500")
+        assert monthly._strategy_universe() == "sp500"

@@ -43,7 +43,7 @@ from . import monthly as monthly_mod
 from .config import settings
 from .db import (DailyCoreAccount, DailyCoreAllowance, DailyCorePosition,
                  DailyCoreSnapshot, DailyCoreTrade, Session)
-from .screener import tickers as universe_tickers
+from .screener import tickers as universe_tickers, universe_names
 
 logger = logging.getLogger("trade_sentinel.daily_core")
 
@@ -96,6 +96,28 @@ def set_variant(variant: str) -> None:
         raise ValueError(f"unknown mom variant: {variant!r}")
     state = _load_state()
     state["mom_variant"] = variant
+    _save_state(state)
+
+
+# ---------------------------------------------------------------------------
+# Strategy universe selection (runtime, persisted, same pattern as the variant)
+# ---------------------------------------------------------------------------
+
+def current_universe() -> str:
+    """The effective qv-mom universe: the persisted runtime choice if it names
+    an available universe file, else the env/config default. Validated against
+    ``universes/*.txt`` so a stale/hand-edited state value can never reach the
+    loader. Drives the monthly + daily-core rankings (and thus backfills)."""
+    state = _load_state()
+    u = state.get("universe")
+    return u if u in universe_names() else settings.sim_monthly_universe
+
+
+def set_universe(name: str) -> None:
+    if name not in universe_names():
+        raise ValueError(f"unknown universe: {name!r}")
+    state = _load_state()
+    state["universe"] = name
     _save_state(state)
 
 
@@ -168,7 +190,7 @@ async def _protection_decision(band: list[str], frame: pd.DataFrame | None,
     and the basket history persist in the daily-core state file so the signal
     is stable across cycles (the scheduler runs once a day).
     """
-    tickers = universe_tickers(settings.sim_monthly_universe)
+    tickers = universe_tickers(current_universe())
     close, _vol = await monthly_mod.load_frames(tickers, None)
     if close.empty or not band:
         return True, False
@@ -455,7 +477,7 @@ async def compute_targets(force: bool = False) -> tuple[list[str], list[str], pd
             if stored is not None:
                 band, picks = stored
                 return band, picks, None
-        tickers = universe_tickers(settings.sim_monthly_universe)
+        tickers = universe_tickers(current_universe())
         fund = await fundamentals_mod.load_fundamentals(tickers)
         if not fund:
             return [], [], None
@@ -617,7 +639,7 @@ async def refresh_data() -> tuple[list[str], list[str]]:
     if _local_now().weekday() >= 5:  # Sat/Sun
         tickers = held
     else:
-        tickers = list(dict.fromkeys(universe_tickers(settings.sim_monthly_universe) + held))
+        tickers = list(dict.fromkeys(universe_tickers(current_universe()) + held))
     return await refresh_many(tickers, "2y")
 
 
@@ -682,7 +704,7 @@ async def backfill(start: str | None = None) -> dict:
             start = None  # full stored history
         start_note = start or "first eligible month"
 
-        tickers = universe_tickers(settings.sim_monthly_universe)
+        tickers = universe_tickers(current_universe())
         fund = await fundamentals_mod.load_fundamentals(tickers)
         if not fund:
             return {"ok": False, "error": "no fundamentals loaded"}

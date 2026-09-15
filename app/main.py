@@ -567,6 +567,9 @@ async def daily_core_status():
         "mom_variants": daily_core.STRATEGY_VARIANTS,
         "protection": daily_core.current_protection(),
         "protections": daily_core.PROTECTION_MODES,
+        # runtime-selectable qv-mom universe + the options (UI dropdown)
+        "universe": daily_core.current_universe(),
+        "universes": universe_names(),
     }
 
 @app.post('/api/dailycore/strategy')
@@ -611,6 +614,30 @@ async def daily_core_protection(req: dict):
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
     return {"ok": True, "mode": mode, "label": daily_core.PROTECTION_MODES[mode]}
+
+@app.post('/api/dailycore/universe')
+async def daily_core_universe(req: dict):
+    """Select the qv-mom strategy universe at runtime (persisted).
+    Body: {"universe": "<name from /api/screener/universes>"}.
+
+    Drives the monthly + daily-core rankings and every future backfill (both
+    read the same universe). It does NOT rewrite stored history — re-run the
+    backfill after switching to see the new universe's track record.
+    """
+    from . import daily_core
+    name = (req or {}).get("universe", "")
+    try:
+        daily_core.set_universe(name)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    # The stored ranking was computed on the previous universe; drop it so the
+    # next cycle recomputes on the new one.
+    from .db import DailyCoreRanking
+    from sqlalchemy import delete as sa_delete
+    async with Session() as s:
+        await s.execute(sa_delete(DailyCoreRanking))
+        await s.commit()
+    return {"ok": True, "universe": name}
 
 @app.get('/api/dailycore/trades')
 async def daily_core_trades(limit: int = Query(default=100, ge=1, le=500)):

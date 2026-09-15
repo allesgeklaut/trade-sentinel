@@ -1636,6 +1636,8 @@
                     onchange="setDCVariant(this.value)" style="max-width:260px"></select>
                 <select id="dailycore-protection" title="Protection overlay (§12-15) — the next cycle and every backfill honor it"
                     onchange="setDCProtection(this.value)" style="max-width:300px"></select>
+                <select id="dailycore-universe" title="qv-mom universe (monthly + daily-core) — the next cycle and every backfill honor it"
+                    onchange="setDCUniverse(this.value)" style="max-width:180px"></select>
                 <button id="dailycore-backfill-btn" onclick="backfillDailyCore()">Backfill (daily-core only)</button>
                 <input type="date" id="dailycore-backfill-date" title="Optional: replay from this date instead"
                     onchange="if(this.value) document.getElementById('dailycore-backfill-all').checked = false">
@@ -2855,6 +2857,16 @@
                     }
                 }
                 if (psel && s.protection) psel.value = s.protection;
+                // Universe dropdown (qv-mom universe), same pattern.
+                const usel = document.getElementById('dailycore-universe');
+                if (usel && !usel.options.length) {
+                    for (const u of (s.universes || [])) {
+                        const opt = document.createElement('option');
+                        opt.value = u; opt.textContent = u;
+                        usel.appendChild(opt);
+                    }
+                }
+                if (usel && s.universe) usel.value = s.universe;
                 const rankMap = s.rank_map || {};
                 const pos = v.positions || [];
                 document.getElementById('dailycore-positions').innerHTML = pos.length ? `<table><tr><th>Ticker</th><th>Rank</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>Weight</th><th>P&L%</th></tr>${pos.map(p => {
@@ -3011,6 +3023,24 @@
             }
             dailyCoreChart.timeScale().fitContent();
             updateAsOf('dailycore', points.length ? points[points.length - 1].time : null);
+        }
+
+        async function setDCUniverse(name) {
+            const status = document.getElementById('dailycore-run-status');
+            if (!confirm(`Switch the qv-mom universe to "${name}"?\n\nThe next cycle ranks on it, and every future backfill replays it. Re-run the backfill to see the full-history track record (a broad universe is slower to rank and refresh).`))
+                return;
+            try {
+                await api('dailycore/universe', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ universe: name }),
+                });
+                status.textContent = `Universe switched to ${name} — the next cycle recomputes the ranking.`;
+                await loadDailyCoreAll();
+            } catch (e) {
+                status.textContent = 'Error: ' + escapeHtml(e.message);
+                await loadDailyCoreStatus();
+            }
         }
 
         async function setDCProtection(mode) {
