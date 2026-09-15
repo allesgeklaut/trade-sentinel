@@ -1026,3 +1026,43 @@ async def test_load_frames_filters_tickers_and_bounds_history(mem_db):
     close2, _ = await monthly.load_frames(["AAA"], None, start=recent - timedelta(days=1))
     assert len(close2) == 1
     assert float(close2["AAA"].iloc[-1]) == 20
+
+
+async def test_first_snapshot_is_parked_contribution(mem_db, monkeypatch):
+    """The monthly engine parks the contribution until month-end, so the FIRST
+    snapshot must equal what has been contributed (100%) — not the value of the
+    month-end picks marked at the month's earlier (lower) prices. Regression:
+    the replay used to build the month-end portfolio and then snapshot the
+    whole month, so a 2025 backfill's first point read 91% instead of 100%."""
+    from app.db import MonthlySnapshot as Sn
+
+    dates = pd.bdate_range("2026-07-01", "2026-08-31")
+    rising = [100.0 * (1.01 ** i) for i in range(len(dates))]
+    close = pd.DataFrame({"AAA": rising, "BBB": [x / 2 for x in rising]}, index=dates)
+    vol = pd.DataFrame(1e6, index=dates, columns=["AAA", "BBB"])
+
+    def fake_frame(m, c, v, f):
+        return pd.DataFrame({
+            "roe": [0.1, 0.2], "p_fcf": [20.0, 15.0], "mcap": [1e10, 1e10],
+            "dollar_vol": [5e7, 5e7], "mom": [0.1, 0.2], "price": [100.0, 50.0],
+            "vol": [0.2, 0.25], "eligible": [True, True],
+        }, index=pd.Index(["AAA", "BBB"], name="ticker"))
+
+    async def fake_load_frames(_t, _a, start=None):
+        return close, vol
+
+    async def fake_load_fundamentals(_t):
+        return {"AAA": {"x": []}, "BBB": {"x": []}}
+
+    monkeypatch.setattr(monthly, "universe_tickers", lambda _u: ["AAA", "BBB"])
+    monkeypatch.setattr(monthly, "load_frames", fake_load_frames)
+    monkeypatch.setattr(monthly.fundamentals_mod, "load_fundamentals", fake_load_fundamentals)
+    monkeypatch.setattr(monthly, "eligible_frame", fake_frame)
+
+    await monthly.backfill("2026-07-01")
+
+    async with mem_db() as s:
+        rows = (await s.scalars(select(Sn).order_by(Sn.created_at))).all()
+    assert rows, "backfill produced snapshots"
+    assert rows[0].total_equity == pytest.approx(1000.0)      # parked, 100%
+    assert rows[0].allowance_total == pytest.approx(1000.0)

@@ -1211,6 +1211,16 @@ async def backfill(start: str | None = None,
                 cash += cf
                 contributed += cf
 
+            # daily snapshots FIRST, on the holdings actually owned during
+            # this month — the picks from the PREVIOUS month-end rebalance.
+            # (Snapshotting after the rebuild below valued this month's days
+            # on this month's own month-end purchases: a look-ahead that made
+            # every month start distorted — the first point of a 2025 backfill
+            # read 91% instead of 100%.)
+            for d in month_days:
+                eq = cash + sum(sh * (px_of(t, d) or 0.0) for t, sh in shares.items())
+                snaps.append((d.strftime("%Y-%m-%d"), eq, contributed))
+
             # month-end rebuild: SELL dropped names at the close, then BUY
             # the picks to equal weight with proceeds + contribution
             adds = len(set(picks) - set(shares))
@@ -1246,11 +1256,6 @@ async def backfill(start: str | None = None,
                         cash -= notional * cost
                         shares[t] = shares.get(t, 0.0) + sh
                         trade_rows.append((m.strftime("%Y-%m-%d"), "BUY", t, notional, sh, p))
-
-            # daily snapshots across the month (contribution lands on day 1)
-            for d in month_days:
-                eq = cash + sum(sh * (px_of(t, d) or 0.0) for t, sh in shares.items())
-                snaps.append((d.strftime("%Y-%m-%d"), eq, contributed))
 
         # --- persist the end state ---
         replay_months = sorted({f"{m.year}-{m.month:02d}" for m in live_months})
