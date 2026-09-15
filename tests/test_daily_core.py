@@ -598,3 +598,16 @@ class TestUniverseSelection:
         monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
         daily_core.set_universe("sp500")
         assert monthly._strategy_universe() == "sp500"
+
+    def test_persisted_universe_none_when_unset(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        assert daily_core.persisted_universe() is None
+
+    def test_sim_uses_shared_universe(self, monkeypatch, tmp_path):
+        from app import sim
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core.set_universe("sp500")
+        assert sim._universe() == "sp500"
+        # clearing falls back to the sim's own config default
+        (tmp_path / "state.json").write_text("{}")
+        assert sim._universe() == settings.sim_universe

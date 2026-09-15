@@ -265,16 +265,29 @@ async def valuate() -> dict[str, Any]:
 async def _candidate_tickers() -> list[str]:
     """Return the list of tickers the sim should consider.
 
-    If ``sim_universe`` is ``watchlist``, use the watchlist table; otherwise
-    load from the universe file.
+    If the (runtime or configured) universe is ``watchlist``, use the watchlist
+    table; otherwise load from the universe file. The universe is the shared
+    Dashboard selection, so it applies to every sim.
     """
-    if settings.sim_universe.lower() == "watchlist":
+    name = _universe()
+    if name.lower() == "watchlist":
         from .db import Watchlist
         async with Session() as s:
             rows = (await s.scalars(select(Watchlist).order_by(Watchlist.ticker))).all()
             return [r.ticker for r in rows]
     else:
-        return universe_tickers(settings.sim_universe)
+        return universe_tickers(name)
+
+
+def _universe() -> str:
+    """The runtime-selected sim universe (shared across all sims, persisted in
+    the daily-core state file), else the config default. Lazy import avoids any
+    import cycle with daily_core."""
+    try:
+        from . import daily_core
+        return daily_core.persisted_universe() or settings.sim_universe
+    except Exception:  # noqa: BLE001 — selection must never break a cycle
+        return settings.sim_universe
 
 
 async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str) -> dict | None:

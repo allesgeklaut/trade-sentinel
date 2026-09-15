@@ -103,14 +103,18 @@ def set_variant(variant: str) -> None:
 # Strategy universe selection (runtime, persisted, same pattern as the variant)
 # ---------------------------------------------------------------------------
 
+def persisted_universe() -> str | None:
+    """The runtime-selected universe if it names a real universe file, else
+    None. Shared by every sim (daily sim, monthly, daily-core) so the one
+    Dashboard control sets the universe everywhere."""
+    u = _load_state().get("universe")
+    return u if u in universe_names() else None
+
+
 def current_universe() -> str:
-    """The effective qv-mom universe: the persisted runtime choice if it names
-    an available universe file, else the env/config default. Validated against
-    ``universes/*.txt`` so a stale/hand-edited state value can never reach the
-    loader. Drives the monthly + daily-core rankings (and thus backfills)."""
-    state = _load_state()
-    u = state.get("universe")
-    return u if u in universe_names() else settings.sim_monthly_universe
+    """The effective qv-mom universe (monthly + daily-core rankings, and thus
+    backfills): the persisted runtime choice if valid, else the config default."""
+    return persisted_universe() or settings.sim_monthly_universe
 
 
 def set_universe(name: str) -> None:

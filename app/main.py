@@ -317,7 +317,7 @@ async def sim_status():
     val = await sim.valuate()
     await sim.deposit_allowance()  # ensures account exists
     return {**val, "sim_enabled": settings.sim_enabled, "sim_strategy": settings.sim_strategy,
-            "sim_universe": settings.sim_universe,
+            "sim_universe": sim._universe(),
             "benchmark_enabled": settings.sim_benchmark_enabled,
             "benchmark_ticker": settings.sim_benchmark_ticker}
 
@@ -615,14 +615,15 @@ async def daily_core_protection(req: dict):
         raise HTTPException(422, str(e)) from e
     return {"ok": True, "mode": mode, "label": daily_core.PROTECTION_MODES[mode]}
 
-@app.post('/api/dailycore/universe')
-async def daily_core_universe(req: dict):
-    """Select the qv-mom strategy universe at runtime (persisted).
+@app.post('/api/sim/universe')
+async def sim_universe(req: dict):
+    """Set the universe for ALL sims at runtime (persisted).
     Body: {"universe": "<name from /api/screener/universes>"}.
 
-    Drives the monthly + daily-core rankings and every future backfill (both
-    read the same universe). It does NOT rewrite stored history — re-run the
-    backfill after switching to see the new universe's track record.
+    The single Dashboard control writes this. It drives the daily sim, the
+    monthly qv-mom portfolio and the daily-core portfolio, plus every future
+    backfill. It does NOT rewrite stored history — re-run a backfill after
+    switching to see the new universe's track record.
     """
     from . import daily_core
     name = (req or {}).get("universe", "")
@@ -630,14 +631,16 @@ async def daily_core_universe(req: dict):
         daily_core.set_universe(name)
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
-    # The stored ranking was computed on the previous universe; drop it so the
-    # next cycle recomputes on the new one.
+    # The stored daily-core ranking was computed on the previous universe;
+    # drop it so the next cycle recomputes on the new one.
     from .db import DailyCoreRanking
     from sqlalchemy import delete as sa_delete
     async with Session() as s:
         await s.execute(sa_delete(DailyCoreRanking))
         await s.commit()
     return {"ok": True, "universe": name}
+
+@app.get('/api/dailycore/trades')
 
 @app.get('/api/dailycore/trades')
 async def daily_core_trades(limit: int = Query(default=100, ge=1, le=500)):
