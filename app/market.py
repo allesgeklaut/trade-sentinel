@@ -28,6 +28,12 @@ def _twelve_key() -> str:
         logger.warning("Could not read Twelve Data key file %s: %s",path,e)
         return ""
 
+def _twelve_headers() -> dict[str, str]:
+    """Auth header for Twelve Data. The key goes in ``Authorization: apikey
+    <key>`` rather than the query string so it never lands in request logs
+    (httpx logs the URL at INFO)."""
+    return {"Authorization": f"apikey {_twelve_key()}"}
+
 def provider():
     """Primary market-data source.
 
@@ -110,7 +116,7 @@ async def _twelve_history(ticker: str, outputsize: int) -> list[dict]:
     async with httpx.AsyncClient(timeout=20) as c:
         data=(await c.get("https://api.twelvedata.com/time_series",params={
             "symbol":ticker,"interval":"1day","outputsize":outputsize,
-            "adjust":"all","apikey":_twelve_key()})).json()
+            "adjust":"all"},headers=_twelve_headers())).json()
     if not isinstance(data, dict) or data.get("status")=="error" or "values" not in data:
         msg = data.get("message","market-data response had no candles") if isinstance(data, dict) else "malformed market-data response"
         raise ValueError(msg)
@@ -120,12 +126,12 @@ async def _twelve_history(ticker: str, outputsize: int) -> list[dict]:
 
 def _twelve_profile(ticker: str) -> str:
     with httpx.Client(timeout=10) as c:
-        data=c.get("https://api.twelvedata.com/profile",params={"symbol":ticker,"apikey":_twelve_key()}).json()
+        data=c.get("https://api.twelvedata.com/profile",params={"symbol":ticker},headers=_twelve_headers()).json()
     return data.get("name","") if isinstance(data, dict) and data.get("status")!="error" else ""
 
 def _twelve_search(q: str) -> list[dict]:
     with httpx.Client(timeout=10) as c:
-        data=c.get("https://api.twelvedata.com/symbol_search",params={"symbol":q,"outputsize":8,"apikey":_twelve_key()}).json()
+        data=c.get("https://api.twelvedata.com/symbol_search",params={"symbol":q,"outputsize":8},headers=_twelve_headers()).json()
     if not isinstance(data, dict) or data.get("status")=="error":
         raise ValueError(data.get("message","Symbol search failed") if isinstance(data, dict) else "malformed symbol search response")
     return [{"symbol":x.get("symbol"),"name":x.get("instrument_name",x.get("symbol")),"exchange":x.get("exchange",""),"country":x.get("country",""),"type":x.get("instrument_type","")} for x in data.get("data",[])]

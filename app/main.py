@@ -28,6 +28,10 @@ logger = logging.getLogger("trade_sentinel.main")
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # httpx logs every request URL at INFO, which would echo provider API keys
+    # (and other query params) into the container logs. We use header auth, but
+    # keep this muted as defense-in-depth.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 @asynccontextmanager
 async def lifespan(app):
