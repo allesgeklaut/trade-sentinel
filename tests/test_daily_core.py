@@ -611,3 +611,45 @@ class TestUniverseSelection:
         # clearing falls back to the sim's own config default
         (tmp_path / "state.json").write_text("{}")
         assert sim._universe() == settings.sim_universe
+
+
+# ---------------------------------------------------------------------------
+# Target-volatility control (runtime, persisted)
+# ---------------------------------------------------------------------------
+
+class TestTargetVol:
+    def test_default_off(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        assert daily_core.current_target_vol() == 0.0
+
+    def test_set_and_persist(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core.set_target_vol("0.15")
+        assert daily_core.current_target_vol() == 0.15
+        daily_core.set_target_vol("off")
+        assert daily_core.current_target_vol() == 0.0
+
+    def test_rejects_unknown(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        with pytest.raises(ValueError):
+            daily_core.set_target_vol("0.5")
+
+    def test_room_infinite_when_calm_or_short_history(self):
+        assert daily_core._vol_deploy_room(1000.0, 500.0, [], 0.15) == float("inf")
+        calm = [0.0001] * 30
+        assert daily_core._vol_deploy_room(1000.0, 500.0, calm, 0.15) == float("inf")
+
+    def test_room_caps_when_vol_hot(self):
+        hot = [0.05, -0.05] * 15          # ~80% annualized
+        room = daily_core._vol_deploy_room(1000.0, 1000.0, hot, 0.15)
+        assert room == pytest.approx(1000.0 * 0.15 / (0.05 * (252 ** 0.5)), rel=0.25)
+
+    def test_room_nonnegative_when_over_deployed(self):
+        hot = [0.05, -0.05] * 15
+        assert daily_core._vol_deploy_room(1000.0, 0.0, hot, 0.15) == 0.0
+
+    def test_port_return_is_contribution_adjusted(self):
+        # equity flat at 1000 with a 100 contribution -> slightly negative
+        assert daily_core._port_return(1000.0, 1000.0, 100.0) < 0
+        # no contribution and flat equity -> zero
+        assert daily_core._port_return(1000.0, 1000.0, 0.0) == 0.0

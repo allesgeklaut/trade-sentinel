@@ -568,6 +568,8 @@ async def daily_core_status():
         "mom_variants": daily_core.STRATEGY_VARIANTS,
         "protection": daily_core.current_protection(),
         "protections": daily_core.PROTECTION_MODES,
+        "target_vol": daily_core.current_target_vol(),
+        "target_vols": daily_core.TARGET_VOL_MODES,
         # runtime-selectable qv-mom universe + the options (UI dropdown)
         "universe": daily_core.current_universe(),
         "universes": universe_names(),
@@ -615,6 +617,23 @@ async def daily_core_protection(req: dict):
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
     return {"ok": True, "mode": mode, "label": daily_core.PROTECTION_MODES[mode]}
+
+@app.post('/api/dailycore/targetvol')
+async def daily_core_targetvol(req: dict):
+    """Set the daily-core target-volatility control at runtime (persisted).
+    Body: {"mode": "off" | "0.10" | "0.15" | "0.20" | "0.25"}.
+
+    When the portfolio's own 21d realized vol exceeds the target, new cash is
+    parked instead of deployed (never sells, never leverages). Drives the next
+    deployment pass and every future backfill.
+    """
+    from . import daily_core
+    mode = (req or {}).get("mode", "")
+    try:
+        daily_core.set_target_vol(mode)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    return {"ok": True, "mode": mode, "label": daily_core.TARGET_VOL_MODES[mode]}
 
 @app.post('/api/sim/universe')
 async def sim_universe(req: dict):

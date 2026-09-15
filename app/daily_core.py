@@ -167,6 +167,86 @@ def set_protection(mode: str) -> None:
     _save_state(state)
 
 
+# ---------------------------------------------------------------------------
+# Target-volatility exposure control (runtime, persisted, same pattern)
+# ---------------------------------------------------------------------------
+
+# Barroso-Santa-Clara vol management — the broad-universe comparison winner:
+# when the portfolio's OWN 21-day realized vol exceeds the target, new
+# contributions are parked in cash instead of deployed. It only scales
+# deployment DOWN (a calm portfolio stays fully invested); it never sells an
+# existing position and never leverages. Measured on the broad S&P 500
+# universe: target 0.15 cut max drawdown 33.6% -> 28.0% for ~3pp of IRR and a
+# slightly BETTER Sharpe (0.90 -> 0.92) — unlike the binary §12-15 cash-out
+# overlays, which destroy value on a broad universe.
+TARGET_VOL_MODES: dict[str, str] = {
+    "off": "Off (deploy all cash — no vol control)",
+    "0.10": "Target 10% volatility",
+    "0.15": "Target 15% volatility",
+    "0.20": "Target 20% volatility",
+    "0.25": "Target 25% volatility",
+}
+
+# Realized-vol lookback (trading days), matching the backtest's window.
+_VOL_WINDOW = 21
+
+
+def current_target_vol() -> float:
+    """The effective annualized target vol (0.0 = off): the persisted runtime
+    choice if valid, else the config default."""
+    mode = _load_state().get("target_vol")
+    if mode == "off":
+        return 0.0
+    if mode in TARGET_VOL_MODES:
+        return float(mode)
+    return settings.sim_daily_core_target_vol
+
+
+def set_target_vol(mode: str) -> None:
+    if mode not in TARGET_VOL_MODES:
+        raise ValueError(f"unknown target-vol mode: {mode!r}")
+    state = _load_state()
+    state["target_vol"] = mode
+    _save_state(state)
+
+
+def _vol_deploy_room(equity: float, cash: float, port_rets: list[float],
+                     target_vol: float) -> float:
+    """How much NEW cash may be deployed before the portfolio's projected vol
+    exceeds the target. ``inf`` when vol is calm or not yet measurable (never
+    blocks deployment on missing history)."""
+    if not target_vol or len(port_rets) < _VOL_WINDOW:
+        return float("inf")
+    rv = float(np.std(port_rets[-_VOL_WINDOW:]) * math.sqrt(252.0))
+    if rv <= target_vol or rv <= 0.0:
+        return float("inf")
+    return max(equity * (target_vol / rv) - (equity - cash), 0.0)
+
+
+def _port_return(prev_equity: float, equity: float, contrib_today: float) -> float:
+    """Contribution-adjusted log return for the realized-vol tracker (same
+    definition as the backtest's per-day ``port_rets``)."""
+    base = prev_equity + contrib_today
+    return float(math.log(equity / base)) if base > 0 and equity > 0 else 0.0
+
+
+async def _recent_port_returns(days: int) -> list[float]:
+    """Contribution-adjusted daily log returns from stored snapshots — the
+    live twin of the backtest's ``port_rets``. Deduped to the last snapshot
+    per calendar day (manual cycles can add extras)."""
+    async with Session() as s:
+        rows = (await s.scalars(select(DailyCoreSnapshot)
+                                .order_by(DailyCoreSnapshot.created_at.desc())
+                                .limit(days * 3 + 5))).all()
+    by_day: dict[str, DailyCoreSnapshot] = {}
+    for r in rows:
+        by_day[r.created_at.strftime("%Y-%m-%d")] = r
+    seq = [by_day[k] for k in sorted(by_day)][-(days + 1):]
+    return [_port_return(p.total_equity, c.total_equity,
+                         max(c.allowance_total - p.allowance_total, 0.0))
+            for p, c in zip(seq, seq[1:], strict=False)]
+
+
 def _local_now() -> datetime:
     return datetime.now(_TZ)
 
@@ -591,25 +671,36 @@ async def run_deployment() -> dict:
                 "protection": protection, "blocked": protection_note,
                 "valuation": valuation}
     weight = valuation["total_equity"] / max(settings.sim_monthly_target_n, 1)
+    # Target-vol control: cap the cash deployed this pass when the portfolio's
+    # own 21d realized vol is above target (excess parks in cash; never sells).
+    target_vol = current_target_vol()
+    room = float("inf")
+    if target_vol:
+        room = _vol_deploy_room(valuation["total_equity"], valuation["cash"],
+                                await _recent_port_returns(_VOL_WINDOW), target_vol)
     for t in band[:settings.sim_monthly_target_n]:
+        if room < 1:
+            break
         price = px_map.get(t)
         if not price:
             continue
         held_pos = next((p for p in valuation["positions"] if p["ticker"] == t), None)
         current_value = held_pos["value"] if held_pos else 0.0
-        budget = min(weight - current_value, valuation["cash"])
+        budget = min(weight - current_value, valuation["cash"], room)
         if budget < 1:
             continue
         r = await _exec_buy(t, price, budget,
                             f"daily-core deploy: rank target {settings.sim_monthly_target_n}")
         if r:
             trades.append(r)
+            room -= r["cost"]
             # refresh cash so successive buys see the balance
             valuation = await valuate()
 
     return {"deployed": True, "band": band, "picks": picks,
             "held_before": held_before, "trades": trades,
-            "protection": protection, "valuation": await valuate()}
+            "protection": protection, "target_vol": target_vol,
+            "valuation": await valuate()}
 
 
 # ---------------------------------------------------------------------------
@@ -817,6 +908,12 @@ async def backfill(start: str | None = None) -> dict:
         grad_neg = 0
         grad_pos = 0
         grad_out = False
+        # Target-vol control replay state: the portfolio's own
+        # contribution-adjusted daily returns, exactly as the live engine
+        # derives them from the snapshot history.
+        target_vol = current_target_vol()
+        port_rets: list[float] = []
+        prev_equity_close: float | None = None
 
         def _market_ok_r(d: pd.Timestamp) -> bool:
             if mkt_sma_map is None:
@@ -830,6 +927,7 @@ async def backfill(start: str | None = None) -> dict:
         cur_month: int | None = None
         deposited_months: set[str] = set()  # months the replay actually funded
         for d in idx:
+            contrib_today = 0.0
             # Point-in-time discipline: each day uses the ranking of the most
             # recent month-end AT OR BEFORE d (the frame computed from facts
             # public by then). Using a future month-end's frame would leak
@@ -854,6 +952,7 @@ async def backfill(start: str | None = None) -> dict:
                 cur_month = d.month
                 cash += settings.sim_monthly_contribution
                 contributed += settings.sim_monthly_contribution
+                contrib_today = settings.sim_monthly_contribution
                 n_contribs += 1
                 deposited_months.add(d.strftime("%Y-%m"))
 
@@ -933,14 +1032,21 @@ async def backfill(start: str | None = None) -> dict:
             # Blocked while the market gate says "bad times" (contributions
             # park) — the gradient cash-out already emptied the book.
             if order and protect_ok and not grad_out:
+                room = (_vol_deploy_room(equity, cash, port_rets, target_vol)
+                        if target_vol else float("inf"))
                 for t in order[:target_n]:
+                    if room < 1:
+                        break
                     p = px_of(t, d)
                     if p is None:
                         continue
                     cur = shares.get(t, 0.0) * p
                     gap = weight - cur
-                    if gap > 1 and cash > 1:
-                        do_buy(t, gap)
+                    budget = min(gap, room)
+                    if budget > 1 and cash > 1:
+                        cash_before = cash
+                        do_buy(t, budget)
+                        room -= max(cash_before - cash, 0.0)
 
             # daily snapshot (one point per day). The snapshot carries the
             # contributed total AS OF that day — persisting the final total
@@ -948,6 +1054,9 @@ async def backfill(start: str | None = None) -> dict:
             # (999/2000 on day 1 instead of 999/1000).
             equity_close = cash + sum((shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0)
                                       for t in shares)
+            if prev_equity_close is not None:
+                port_rets.append(_port_return(prev_equity_close, equity_close, contrib_today))
+            prev_equity_close = equity_close
             snaps.append((d.strftime("%Y-%m-%d"), equity_close, contributed))
 
         # --- persist the end state ---
