@@ -7,13 +7,35 @@ A self-hosted, paper-only stock research dashboard. Market data is switched glob
 ## Choose a provider
 
 ```dotenv
-# Default: free/best-effort US + international coverage, including Yahoo symbols such as IFX.DE and OMV.VI
-MARKET_DATA_PROVIDER=yfinance
+# auto (default): Twelve Data when TWELVE_DATA_API_KEY is set, else yfinance
+MARKET_DATA_PROVIDER=auto
 
-# Alternative: requires an API key; Basic coverage is mainly US equities/ETFs, forex and crypto
+# Add a key to make Twelve Data the primary source. Tickers it cannot serve
+# (unknown symbol, rate/plan limit, outage) automatically fall back to yfinance.
+# Prefer a secret file over the inline env var (see below).
+TWELVE_DATA_API_KEY=your_key
+TWELVE_DATA_API_KEY_FILE=/run/secrets/twelvedata.key
+
+# Force a single source instead:
+# MARKET_DATA_PROVIDER=yfinance
 # MARKET_DATA_PROVIDER=twelvedata
-# TWELVE_DATA_API_KEY=your_key
 ```
+
+**Keeping the key out of the repo.** The key is read from
+`TWELVE_DATA_API_KEY_FILE` when `TWELVE_DATA_API_KEY` is empty. The provided
+`docker-compose.yml` mounts `/opt/secrets/twelvedata.key` (chmod `600`) read-only
+into the container, exactly like the LiteLLM key, so the secret never lives in
+`.env` or in git:
+
+```bash
+printf '%s\n' 'your_key' > /opt/secrets/twelvedata.key && chmod 600 /opt/secrets/twelvedata.key
+```
+
+With `auto`, `yfinance` is used until a `TWELVE_DATA_API_KEY` is present; then
+Twelve Data becomes primary and each request that it cannot satisfy (unknown
+symbol or unavailable ticker) is served by yfinance for that ticker. Both
+sources are normalized to the same adjusted-close OHLCV cache, so switching
+between them does not change the indicators.
 
 `yfinance` uses Yahoo Finance's public endpoints through the `yfinance` library. It enables global ticker search and mixed US/EU screeners without a data key, but it is not an official market-data API: cache aggressively, throttle manual screener runs, and treat it as EOD/best-effort research data. Do not use it for execution.
 

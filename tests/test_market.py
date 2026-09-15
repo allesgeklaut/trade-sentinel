@@ -6,6 +6,9 @@ All tests monkeypatch app.market.refresh so no provider is contacted.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
+
+import pytest
 
 from app import market
 
@@ -134,3 +137,142 @@ class TestRefreshMany:
 def test_period_counts_matches_previous_inline_dict():
     assert market.PERIOD_COUNTS == {"6m": 126, "2y": 504, "5y": 1260,
                                     "10y": 2520, "max": 5000}
+
+
+# ---------------------------------------------------------------------------
+# Provider selection (auto = Twelve Data when a key is set, else yfinance)
+# ---------------------------------------------------------------------------
+
+class TestProviderSelection:
+    def _set(self, monkeypatch, provider: str, key: str) -> None:
+        monkeypatch.setattr(market.settings, "market_data_provider", provider)
+        monkeypatch.setattr(market.settings, "twelve_data_api_key", key)
+
+    def test_auto_without_key_is_yfinance(self, monkeypatch):
+        self._set(monkeypatch, "auto", "")
+        assert market.provider() == "yfinance"
+
+    def test_auto_with_key_is_twelvedata(self, monkeypatch):
+        self._set(monkeypatch, "auto", "secret")
+        assert market.provider() == "twelvedata"
+
+    def test_yfinance_forces_yfinance_even_with_key(self, monkeypatch):
+        self._set(monkeypatch, "yfinance", "secret")
+        assert market.provider() == "yfinance"
+
+    def test_twelvedata_requires_key(self, monkeypatch):
+        self._set(monkeypatch, "twelvedata", "")
+        with pytest.raises(ValueError):
+            market.provider()
+
+    def test_unknown_value_rejected(self, monkeypatch):
+        self._set(monkeypatch, "nonsense", "")
+        with pytest.raises(ValueError):
+            market.provider()
+
+
+# ---------------------------------------------------------------------------
+# Twelve Data key resolution (inline env var vs secret file)
+# ---------------------------------------------------------------------------
+
+class TestTwelveKeyFile:
+    def _set(self, monkeypatch, key: str, key_file: str) -> None:
+        monkeypatch.setattr(market.settings, "twelve_data_api_key", key)
+        monkeypatch.setattr(market.settings, "twelve_data_api_key_file", key_file)
+
+    def test_env_key_wins(self, monkeypatch, tmp_path):
+        f = tmp_path / "k"
+        f.write_text("from-file\n")
+        self._set(monkeypatch, "from-env", str(f))
+        assert market._twelve_key() == "from-env"
+
+    def test_file_used_when_env_empty(self, monkeypatch, tmp_path):
+        f = tmp_path / "k"
+        f.write_text("from-file\n")
+        self._set(monkeypatch, "", str(f))
+        assert market._twelve_key() == "from-file"
+
+    def test_missing_file_is_empty(self, monkeypatch, tmp_path):
+        self._set(monkeypatch, "", str(tmp_path / "nope"))
+        assert market._twelve_key() == ""
+
+    def test_provider_uses_file_key(self, monkeypatch, tmp_path):
+        f = tmp_path / "k"
+        f.write_text("from-file\n")
+        monkeypatch.setattr(market.settings, "market_data_provider", "auto")
+        self._set(monkeypatch, "", str(f))
+        assert market.provider() == "twelvedata"
+
+
+# ---------------------------------------------------------------------------
+# refresh: Twelve Data primary, per-ticker yfinance fallback
+# ---------------------------------------------------------------------------
+
+class _FakeSession:
+    """Minimal async context manager standing in for the SQLAlchemy Session."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, *args, **kwargs):
+        return None
+
+    async def commit(self):
+        return None
+
+
+def _one_bar(ticker):
+    return [{"timestamp": datetime(2026, 1, 2), "open": 1.0, "high": 1.0,
+             "low": 1.0, "close": 1.0, "volume": 0.0}]
+
+
+class TestRefreshFallback:
+    async def test_twelve_success_skips_yfinance(self, monkeypatch):
+        monkeypatch.setattr(market, "provider", lambda: "twelvedata")
+        monkeypatch.setattr(market, "Session", lambda: _FakeSession())
+
+        async def fake_twelve(ticker, outputsize):
+            return _one_bar(ticker)
+
+        def boom(*a, **k):
+            raise AssertionError("yfinance must not be called on Twelve success")
+
+        monkeypatch.setattr(market, "_twelve_history", fake_twelve)
+        monkeypatch.setattr(market, "yahoo_history", boom)
+
+        await market.refresh("AAPL", "2y")  # must not raise
+
+    async def test_twelve_failure_falls_back_to_yfinance(self, monkeypatch):
+        monkeypatch.setattr(market, "provider", lambda: "twelvedata")
+        monkeypatch.setattr(market, "Session", lambda: _FakeSession())
+
+        async def boom(ticker, outputsize):
+            raise ValueError("symbol not found")
+
+        yahoo_calls: list[tuple[str, str]] = []
+
+        def fake_yahoo(ticker, period):
+            yahoo_calls.append((ticker, period))
+            return _one_bar(ticker)
+
+        monkeypatch.setattr(market, "_twelve_history", boom)
+        monkeypatch.setattr(market, "yahoo_history", fake_yahoo)
+
+        await market.refresh("NEIN", "2y")
+        assert yahoo_calls == [("NEIN", "2y")]
+
+    async def test_yfinance_provider_never_calls_twelve(self, monkeypatch):
+        monkeypatch.setattr(market, "provider", lambda: "yfinance")
+        monkeypatch.setattr(market, "Session", lambda: _FakeSession())
+
+        async def boom(*a, **k):
+            raise AssertionError("Twelve Data must not be called when provider=yfinance")
+
+        monkeypatch.setattr(market, "_twelve_history", boom)
+        monkeypatch.setattr(market, "yahoo_history", lambda t, p: _one_bar(t))
+
+        await market.refresh("AAPL", "2y")  # must not raise
+

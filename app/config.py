@@ -2,8 +2,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:////data/trading.db"
-    market_data_provider: str = "yfinance"
+    # auto = Twelve Data when TWELVE_DATA_API_KEY is set, else yfinance.
+    # yfinance / twelvedata force one source (twelvedata requires a key).
+    market_data_provider: str = "auto"
     twelve_data_api_key: str = ""
+    # Path to a file holding the bare key (single source of truth, e.g. a
+    # read-only /opt/secrets mount). Used when TWELVE_DATA_API_KEY is empty,
+    # mirroring LITELLM_API_KEY_FILE for the LLM backends.
+    twelve_data_api_key_file: str = ""
     watchlist: str = "AAPL,MSFT,NVDA,IFX.DE"
 
     ollama_url: str = "http://host.docker.internal:11434"

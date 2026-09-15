@@ -12,6 +12,9 @@ services:
       # read by the app via LITELLM_API_KEY_FILE (below) — the key is NOT
       # copied into any env file.
       - /opt/secrets/litellm.key:/run/secrets/litellm.key:ro
+      # Same pattern for the Twelve Data market-data key (optional; the app
+      # uses yfinance until this key is present).
+      - /opt/secrets/twelvedata.key:/run/secrets/twelvedata.key:ro
     security_opt: ["no-new-privileges:true"]
     cap_drop: [ALL]
     read_only: true
@@ -25,5 +28,6 @@ services:
     environment:
       - TZ=Europe/Vienna
       - LITELLM_API_KEY_FILE=/run/secrets/litellm.key
+      - TWELVE_DATA_API_KEY_FILE=/run/secrets/twelvedata.key
 volumes:
   trade_sentinel_data:

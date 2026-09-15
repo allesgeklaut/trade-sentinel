@@ -1,6 +1,7 @@
 from datetime import datetime
 import asyncio
 import logging
+from pathlib import Path
 import httpx
 import numpy as np
 import pandas as pd
@@ -13,11 +14,39 @@ from .config import settings
 logger = logging.getLogger("trade_sentinel.market")
 
 
+def _twelve_key() -> str:
+    """Twelve Data API key: TWELVE_DATA_API_KEY, else the file named by
+    TWELVE_DATA_API_KEY_FILE (a read-only secret mount — the preferred source,
+    so the key is never committed to the repo or duplicated in .env)."""
+    key=(settings.twelve_data_api_key or "").strip()
+    if key: return key
+    path=(settings.twelve_data_api_key_file or "").strip()
+    if not path: return ""
+    try:
+        return Path(path).read_text().strip()
+    except OSError as e:
+        logger.warning("Could not read Twelve Data key file %s: %s",path,e)
+        return ""
+
 def provider():
-    value=settings.market_data_provider.lower().strip()
-    if value not in {"yfinance","twelvedata"}: raise ValueError("MARKET_DATA_PROVIDER must be yfinance or twelvedata")
-    if value=="twelvedata" and not settings.twelve_data_api_key: raise ValueError("TWELVE_DATA_API_KEY is required when MARKET_DATA_PROVIDER=twelvedata")
-    return value
+    """Primary market-data source.
+
+    ``MARKET_DATA_PROVIDER``:
+      - ``yfinance``  → always Yahoo Finance (no key needed)
+      - ``twelvedata``→ Twelve Data (a key is required)
+      - ``auto`` (default) → Twelve Data when a key is configured, else yfinance
+
+    When Twelve Data is primary, :func:`refresh`/:func:`info`/:func:`search`
+    fall back to yfinance per request if Twelve Data has no data for that
+    ticker (unknown symbol, rate/plan limit, network error).
+    """
+    value=settings.market_data_provider.lower().strip() or "auto"
+    if value not in {"auto","yfinance","twelvedata"}: raise ValueError("MARKET_DATA_PROVIDER must be auto, yfinance or twelvedata")
+    if value=="yfinance": return "yfinance"
+    if not _twelve_key():
+        if value=="twelvedata": raise ValueError("TWELVE_DATA_API_KEY is required when MARKET_DATA_PROVIDER=twelvedata")
+        return "yfinance"
+    return "twelvedata"
 
 # Range presets: key → (yfinance period, twelvedata outputsize)
 RANGES = {
@@ -70,25 +99,65 @@ def yahoo_info(ticker):
 def yahoo_search(q):
     quotes=yf.Search(q,max_results=8,news_count=0,lists_count=0,enable_fuzzy_query=True,raise_errors=True).quotes
     return [{"symbol":x.get("symbol"),"name":x.get("shortname") or x.get("longname") or x.get("symbol"),"exchange":x.get("exchDisp") or x.get("exchange",""),"country":x.get("region", ""),"type":x.get("quoteType","")} for x in quotes if x.get("symbol")]
+async def _twelve_history(ticker: str, outputsize: int) -> list[dict]:
+    """Twelve Data daily OHLCV, split+dividend adjusted.
+
+    ``adjust=all`` matches yfinance's ``auto_adjust=True`` so the 12-1
+    momentum (which assumes adjusted closes) stays consistent across sources.
+    Raises ValueError on an API error, missing candles or malformed payloads
+    so callers can fall back to yfinance.
+    """
+    async with httpx.AsyncClient(timeout=20) as c:
+        data=(await c.get("https://api.twelvedata.com/time_series",params={
+            "symbol":ticker,"interval":"1day","outputsize":outputsize,
+            "adjust":"all","apikey":_twelve_key()})).json()
+    if not isinstance(data, dict) or data.get("status")=="error" or "values" not in data:
+        msg = data.get("message","market-data response had no candles") if isinstance(data, dict) else "malformed market-data response"
+        raise ValueError(msg)
+    values=[{"timestamp":datetime.fromisoformat(x["datetime"]),"open":float(x["open"]),"high":float(x["high"]),"low":float(x["low"]),"close":float(x["close"]),"volume":float(x.get("volume") or 0)} for x in data["values"]]
+    if not values: raise ValueError(f"No Twelve Data daily data for {ticker}")
+    return values
+
+def _twelve_profile(ticker: str) -> str:
+    with httpx.Client(timeout=10) as c:
+        data=c.get("https://api.twelvedata.com/profile",params={"symbol":ticker,"apikey":_twelve_key()}).json()
+    return data.get("name","") if isinstance(data, dict) and data.get("status")!="error" else ""
+
+def _twelve_search(q: str) -> list[dict]:
+    with httpx.Client(timeout=10) as c:
+        data=c.get("https://api.twelvedata.com/symbol_search",params={"symbol":q,"outputsize":8,"apikey":_twelve_key()}).json()
+    if not isinstance(data, dict) or data.get("status")=="error":
+        raise ValueError(data.get("message","Symbol search failed") if isinstance(data, dict) else "malformed symbol search response")
+    return [{"symbol":x.get("symbol"),"name":x.get("instrument_name",x.get("symbol")),"exchange":x.get("exchange",""),"country":x.get("country",""),"type":x.get("instrument_type","")} for x in data.get("data",[])]
+
 async def info(ticker):
     if provider()=="yfinance": return await asyncio.to_thread(yahoo_info,ticker)
-    async with httpx.AsyncClient(timeout=10) as c:
-        data=(await c.get("https://api.twelvedata.com/profile",params={"symbol":ticker,"apikey":settings.twelve_data_api_key})).json()
-    return data.get("name","") if data.get("status")!="error" else ""
+    try:
+        name=await asyncio.to_thread(_twelve_profile,ticker)
+        if name: return name
+    except Exception as e:
+        logger.warning("twelvedata profile failed for %s (%s) — falling back to yfinance",ticker,e)
+    return await asyncio.to_thread(yahoo_info,ticker)
 
 async def search(q):
     if provider()=="yfinance": return await asyncio.to_thread(yahoo_search,q)
-    async with httpx.AsyncClient(timeout=10) as c: data=(await c.get("https://api.twelvedata.com/symbol_search",params={"symbol":q,"outputsize":8,"apikey":settings.twelve_data_api_key})).json()
-    if data.get("status")=="error": raise ValueError(data.get("message","Symbol search failed"))
-    return [{"symbol":x.get("symbol"),"name":x.get("instrument_name",x.get("symbol")),"exchange":x.get("exchange",""),"country":x.get("country",""),"type":x.get("instrument_type","")} for x in data.get("data",[])]
+    try:
+        return await asyncio.to_thread(_twelve_search,q)
+    except Exception as e:
+        logger.warning("twelvedata symbol search failed for %r (%s) — falling back to yfinance",q,e)
+        return await asyncio.to_thread(yahoo_search,q)
+
 async def refresh(ticker, period="2y"):
     if period not in RANGES: raise ValueError(f"Unsupported range: {period}")
     yf_period, td_output = RANGES[period]
-    if provider()=="yfinance": values=await asyncio.to_thread(yahoo_history,ticker,yf_period)
+    if provider()=="yfinance":
+        values=await asyncio.to_thread(yahoo_history,ticker,yf_period)
     else:
-        async with httpx.AsyncClient(timeout=20) as c: data=(await c.get("https://api.twelvedata.com/time_series",params={"symbol":ticker,"interval":"1day","outputsize":td_output,"apikey":settings.twelve_data_api_key})).json()
-        if data.get("status")=="error" or "values" not in data: raise ValueError(data.get("message","market-data response had no candles"))
-        values=[{"timestamp":datetime.fromisoformat(x["datetime"]),"open":float(x["open"]),"high":float(x["high"]),"low":float(x["low"]),"close":float(x["close"]),"volume":float(x.get("volume") or 0)} for x in data["values"]]
+        try:
+            values=await _twelve_history(ticker,td_output)
+        except Exception as e:
+            logger.warning("twelvedata refresh failed for %s (%s) — falling back to yfinance",ticker,e)
+            values=await asyncio.to_thread(yahoo_history,ticker,yf_period)
     async with Session() as s:
         if values:
             stmt = sqlite_insert(Candle).values(
