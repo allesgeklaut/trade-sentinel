@@ -2550,3 +2550,45 @@ class TestUniversePrefetch:
         monkeypatch.setattr(sim, "_candidate_tickers", empty_candidates)
         r = await sim.prefetch_universe()
         assert r["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# Trading-day calendar (US NYSE)
+# ---------------------------------------------------------------------------
+
+class TestTradingDayCalendar:
+    def test_weekends_are_not_trading_days(self):
+        assert sim.is_trading_day(datetime(2026, 9, 19, 22, 30)) is False  # Sat
+        assert sim.is_trading_day(datetime(2026, 9, 20, 22, 30)) is False  # Sun
+
+    def test_nyse_holidays_2026(self):
+        for d in (
+            datetime(2026, 1, 1),   # New Year's Day
+            datetime(2026, 1, 19),  # MLK
+            datetime(2026, 2, 16),  # Washington's Birthday
+            datetime(2026, 4, 3),   # Good Friday
+            datetime(2026, 5, 25),  # Memorial Day
+            datetime(2026, 6, 19),  # Juneteenth
+            datetime(2026, 7, 3),   # July 4 (Sat) observed Friday
+            datetime(2026, 9, 7),   # Labor Day
+            datetime(2026, 11, 26),  # Thanksgiving
+            datetime(2026, 12, 25),  # Christmas
+        ):
+            assert sim.is_trading_day(d) is False, d
+
+    def test_normal_weekdays_are_trading_days(self):
+        assert sim.is_trading_day(datetime(2026, 9, 21)) is True   # Mon
+        assert sim.is_trading_day(datetime(2026, 1, 2)) is True    # Fri after NY
+        assert sim.is_trading_day(datetime(2026, 7, 6)) is True    # Mon after Jul 4
+
+    async def test_scheduler_tick_skips_a_weekend(self, monkeypatch):
+        from app import daily_core, monthly
+
+        monkeypatch.setattr(sim, "_utcnow", lambda: datetime(2026, 9, 19, 22, 30))  # Sat
+
+        async def boom(*a, **k):
+            raise AssertionError("a cycle ran on a non-trading day")
+
+        monkeypatch.setattr(monthly, "run_monthly_cycle", boom)
+        monkeypatch.setattr(daily_core, "run_daily_cycle", boom)
+        await sim._scheduler_tick()  # must return without running anything

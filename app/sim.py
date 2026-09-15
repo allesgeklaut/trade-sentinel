@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 import math
-from datetime import datetime, timedelta, UTC
+from datetime import date, datetime, timedelta, UTC
 from zoneinfo import ZoneInfo
 from collections.abc import Callable
 from typing import Any
@@ -2630,6 +2630,72 @@ _daily_snapshot_task: asyncio.Task | None = None
 _prefetch_task: asyncio.Task | None = None
 
 
+# --- Trading-day calendar (US NYSE) ---------------------------------------
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    d = date(year, month, 1)
+    d += timedelta(days=(weekday - d.weekday()) % 7)
+    return d + timedelta(weeks=n - 1)
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> date:
+    nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    d = nxt - timedelta(days=1)
+    while d.weekday() != weekday:
+        d -= timedelta(days=1)
+    return d
+
+
+def _observed(d: date) -> date:
+    """NYSE 'nearest weekday' rule: Saturday → Friday, Sunday → Monday."""
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def _us_market_holidays(year: int) -> set[date]:
+    from dateutil.easter import easter
+    days = {
+        _observed(date(year, 1, 1)),      # New Year's Day
+        _nth_weekday(year, 1, 0, 3),      # Martin Luther King Jr. Day
+        _nth_weekday(year, 2, 0, 3),      # Washington's Birthday
+        easter(year) - timedelta(days=2), # Good Friday
+        _last_weekday(year, 5, 0),        # Memorial Day
+        _observed(date(year, 7, 4)),      # Independence Day
+        _nth_weekday(year, 9, 0, 1),      # Labor Day
+        _nth_weekday(year, 11, 3, 4),     # Thanksgiving
+        _observed(date(year, 12, 25)),    # Christmas
+    }
+    if year >= 2022:
+        days.add(_observed(date(year, 6, 19)))  # Juneteenth (NYSE since 2022)
+    return days
+
+
+_holiday_cache: dict[int, set[date]] = {}
+
+
+def is_trading_day(dt: datetime) -> bool:
+    """True when ``dt``'s date is a US market day (Mon-Fri, not a NYSE holiday).
+
+    The portfolios are almost entirely US listings and the scheduler runs at
+    ``sim_run_hour`` UTC, so the NYSE calendar governs. EU holidays (e.g.
+    Vienna) are not modelled — those names just show a stale candle and the
+    engine no-ops. Guards the prefetch and all scheduled cycles so nothing runs
+    on weekends/holidays.
+    """
+    d = dt.date()
+    if d.weekday() >= 5:
+        return False
+    for y in (d.year - 1, d.year, d.year + 1):
+        if y not in _holiday_cache:
+            _holiday_cache[y] = _us_market_holidays(y)
+        if d in _holiday_cache[y]:
+            return False
+    return True
+
+
 async def prefetch_universe() -> dict[str, Any]:
     """Fetch the shared sim universe into the candle cache ONCE.
 
@@ -2667,6 +2733,9 @@ async def _prefetch_loop() -> None:
         await asyncio.sleep(wait_seconds)
         if not settings.sim_universe_prefetch:
             continue
+        if not is_trading_day(_utcnow()):
+            logger.info("Universe prefetch: %s is not a trading day — skipping", _utcnow().date())
+            continue
         try:
             await prefetch_universe()
         except Exception as e:
@@ -2681,6 +2750,14 @@ async def _scheduler_tick() -> None:
     the "each stage runs independently" behaviour is unit-testable. A stage
     that is skipped or fails must not prevent the later stages from running.
     """
+    # Nothing trades on weekends or NYSE holidays: skip the whole tick so the
+    # portfolios aren't marked/rebalanced on stale candles. The month-end
+    # rebalance always lands on a trading day, so it is never lost.
+    if not is_trading_day(_utcnow()):
+        logger.info("Sim scheduler: %s is not a trading day — skipping all cycles",
+                    _utcnow().date())
+        return
+
     # Monthly qv-mom portfolio first: it only acts on the last trading
     # day of the month, and a missed month has no catch-up — it must run
     # even when the daily cycle is skipped below (a manual run holding
@@ -2782,6 +2859,13 @@ async def _daily_monthly_snapshot_loop():
         logger.info("Monthly daily snapshot: next run at %s (in %.0f seconds)", target, wait_seconds)
         await asyncio.sleep(wait_seconds)
         if not settings.sim_monthly_enabled:
+            continue
+        # No new prices on weekends/holidays: a daily mark would just repeat the
+        # last close. Deposits/rebalances are idempotent and land on the next
+        # trading day or the month-end rebalance.
+        if not is_trading_day(_utcnow()):
+            logger.info("Monthly daily scheduler: %s is not a trading day — skipping",
+                        _utcnow().date())
             continue
         try:
             deposit = await deposit_allowance()
