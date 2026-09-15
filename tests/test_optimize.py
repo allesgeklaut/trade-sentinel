@@ -1344,7 +1344,7 @@ class TestDailyCoreMonthlyParity:
             for t in tickers
         }
 
-        async def fake_load_frames(_tickers, _asof):
+        async def fake_load_frames(_tickers, _asof, start=None):
             return close, vol
 
         async def fake_load_fundamentals(_tickers):
@@ -1535,7 +1535,7 @@ class TestDailyCoreRiskOverlays:
             for t in tickers
         }
 
-        async def fake_load_frames(_tickers, _asof):
+        async def fake_load_frames(_tickers, _asof, start=None):
             return close, vol
 
         async def fake_load_fundamentals(_tickers):
@@ -1669,7 +1669,7 @@ class TestDailyCoreProtection:
             for t in tickers
         }
 
-        async def fake_load_frames(_tickers, _asof):
+        async def fake_load_frames(_tickers, _asof, start=None):
             return close, vol
 
         async def fake_load_fundamentals(_tickers):

@@ -2209,8 +2209,8 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
                      SimAllowance as Al, SimSnapshot as Sn)
     from . import optimize as opt
 
-    def opt_load_series(tickers: list[str]):
-        return opt._load_series(tickers)
+    def opt_load_series(tickers: list[str], start=None):
+        return opt._load_series(tickers, start=start)
 
     def opt_live_sim_params():
         return opt._live_sim_params()
@@ -2228,7 +2228,7 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
         start_note = start or "first signal day"
 
         tickers = await _candidate_tickers()
-        series = await opt_load_series(tickers)
+        series = await opt_load_series(tickers, start)
         if not series:
             return {"ok": False, "error": "no tickers with enough candle history"}
 

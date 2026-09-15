@@ -60,6 +60,9 @@ _TZ = ZoneInfo(settings.allowance_tz)
 # unused history that broad universes carry.
 _PRICE_LOOKBACK_DAYS = 400
 
+# Momentum warmup kept ahead of a backfill start when bounding the candle load.
+_BACKFILL_WARMUP_DAYS = 600
+
 
 def _current_month() -> str:
     """Operator-local calendar month key (YYYY-MM), matching sim._current_month."""
@@ -1023,7 +1026,9 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
         fund = await fundamentals_mod.load_fundamentals(tickers)
         if not fund:
             return {"ok": False, "error": "no fundamentals loaded"}
-        close, vol = await load_frames(tickers, None)
+        load_start = ((pd.Timestamp(start) - timedelta(days=_BACKFILL_WARMUP_DAYS)).to_pydatetime()
+                      if start else None)
+        close, vol = await load_frames(tickers, None, start=load_start)
         if close.empty:
             return {"ok": False, "error": "no candle data"}
 

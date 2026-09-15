@@ -916,7 +916,7 @@ def fake_market(monkeypatch):
             "vol": [0.2, 0.25], "eligible": [True, True],
         }, index=pd.Index(["AAA", "BBB"], name="ticker"))
 
-    async def fake_load_frames(_tickers, _asof):
+    async def fake_load_frames(_tickers, _asof, start=None):
         return close, vol
 
     async def fake_load_fundamentals(_tickers):

@@ -2400,7 +2400,7 @@ class TestSimBackfill:
         up = signal_series(_gen_candles(100.0, 0.01, n=300, seed=1))
         dn = signal_series(_gen_candles(100.0, -0.01, n=300, seed=2))
 
-        async def fake_load_series(_tickers):
+        async def fake_load_series(_tickers, start=None):
             return {"UP": up, "DN": dn}
 
         monkeypatch.setattr(opt, "_load_series", fake_load_series)

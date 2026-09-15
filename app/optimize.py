@@ -316,29 +316,45 @@ def _max_drawdown(equity: list[float], invested: list[float] | None = None) -> f
     return max_dd
 
 
-async def _load_series(tickers: list[str]) -> dict[str, pd.DataFrame]:
-    """Load and precompute the signal series for each ticker."""
+# Warmup kept ahead of a replay start when bounding the series load. Signals
+# look backward (SMA200 needs 206 candles), so dropping rows older than this
+# cannot change any value from the replay start onward.
+_SERIES_WARMUP_DAYS = 500
+
+
+async def _load_series(tickers: list[str],
+                       start: datetime | None = None) -> dict[str, pd.DataFrame]:
+    """Load and precompute the signal series for each ticker.
+
+    ``start`` optionally bounds the load to a warmup window before the replay
+    start (``None`` = full history, for full-range replays). The old version
+    ran one query PER ticker and hydrated full ORM rows, which is what made
+    the broad-universe daily-sim backfill slow."""
     series: dict[str, pd.DataFrame] = {}
+    since = ((pd.Timestamp(start) - pd.Timedelta(days=_SERIES_WARMUP_DAYS)).to_pydatetime()
+             if start else None)
     async with Session() as s:
-        for idx, t in enumerate(tickers):
-            if idx and idx % 10 == 0:
-                logger.info("Loading series... %d/%d", idx, len(tickers))
-            rows = (
-                await s.scalars(
-                    select(Candle).where(Candle.ticker == t).order_by(Candle.timestamp)
-                )
-            ).all()
-            if len(rows) < MIN_CANDLES:
-                continue
-            data = [{
-                "time": r.timestamp.strftime("%Y-%m-%d"),
-                "open": r.open, "high": r.high, "low": r.low,
-                "close": r.close, "volume": r.volume,
-            } for r in rows]
-            try:
-                series[t] = _signal_series(data)
-            except Exception as e:
-                logger.warning("Could not compute series for %s: %s", t, e)
+        q = (select(Candle.ticker, Candle.timestamp, Candle.open, Candle.high,
+                    Candle.low, Candle.close, Candle.volume)
+             .where(Candle.ticker.in_(list(tickers))))
+        if since is not None:
+            q = q.where(Candle.timestamp >= since)
+        rows = (await s.execute(q.order_by(Candle.ticker, Candle.timestamp))).all()
+    by_ticker: dict[str, list] = {}
+    for r in rows:
+        by_ticker.setdefault(r.ticker, []).append(r)
+    for t, rs in by_ticker.items():
+        if len(rs) < MIN_CANDLES:
+            continue
+        data = [{
+            "time": r.timestamp.strftime("%Y-%m-%d"),
+            "open": r.open, "high": r.high, "low": r.low,
+            "close": r.close, "volume": r.volume,
+        } for r in rs]
+        try:
+            series[t] = _signal_series(data)
+        except Exception as e:
+            logger.warning("Could not compute series for %s: %s", t, e)
     return series
 
 
