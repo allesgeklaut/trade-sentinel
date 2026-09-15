@@ -436,10 +436,25 @@ async def backfill_all(start: str | None = Query(default=None)):
     out: dict[str, dict] = {}
     errors: dict[str, str] = {}
 
+    # The monthly and daily-core replays run on the same universe, window and
+    # momentum variant, so they share one preload: the fundamentals and the
+    # per-month-end eligibility frames (the expensive part) are built once and
+    # reused. daily_sim runs first (slowest, and it doesn't use qv-mom frames).
+    out: dict[str, dict] = {}
+    errors: dict[str, str] = {}
+    preload: dict = {}
+
+    async def _monthly_backfill():
+        preload["v"] = await monthly.preload_backfill(effective)
+        return await monthly.backfill(effective, preload=preload["v"])
+
+    async def _daily_core_backfill():
+        return await daily_core.backfill(effective, preload=preload.get("v"))
+
     for name, fn in (
         ("daily_sim", lambda: sim.backfill(effective)),
-        ("monthly", lambda: monthly.backfill(effective)),
-        ("daily_core", lambda: daily_core.backfill(effective)),
+        ("monthly", _monthly_backfill),
+        ("daily_core", _daily_core_backfill),
         ("benchmark", lambda: sim.backfill_benchmark(effective)),
     ):
         try:

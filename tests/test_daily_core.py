@@ -653,3 +653,32 @@ class TestTargetVol:
         assert daily_core._port_return(1000.0, 1000.0, 100.0) < 0
         # no contribution and flat equity -> zero
         assert daily_core._port_return(1000.0, 1000.0, 0.0) == 0.0
+
+
+class TestSharedBackfillPreload:
+    async def test_monthly_and_daily_core_share_frames(self, mem_db, fake_market,
+                                                       monkeypatch):
+        """backfill-all builds the per-month eligibility frames once and hands
+        them to both qv-mom replays (same universe/window/variant), so
+        eligible_frame runs once per month-end rather than twice."""
+        monkeypatch.setattr(monthly, "Session", mem_db)
+        monkeypatch.setattr(monthly, "universe_tickers", lambda _u: ["AAA", "BBB"])
+
+        calls: list = []
+        real = monthly.eligible_frame
+
+        def counting(m, c, v, f):
+            calls.append(m)
+            return real(m, c, v, f)
+
+        monkeypatch.setattr(monthly, "eligible_frame", counting)
+
+        start = "2026-07-01"
+        preload = await monthly.preload_backfill(start)
+        await monthly.backfill(start, preload=preload)
+        after_monthly = len(calls)
+        assert after_monthly > 0
+        assert preload.frames  # cache populated by the first replay
+
+        await daily_core.backfill(start, preload=preload)
+        assert len(calls) == after_monthly  # second replay recomputed nothing

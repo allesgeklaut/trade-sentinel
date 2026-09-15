@@ -778,7 +778,8 @@ async def _sync_start_date() -> str | None:
     return earliest.strftime("%Y-%m-%d") if earliest else None
 
 
-async def backfill(start: str | None = None) -> dict:
+async def backfill(start: str | None = None,
+                   *, preload: monthly_mod.BackfillPreload | None = None) -> dict:
     """Replay the winning daily-core strategy over historical data and
     REPLACE the portfolio state with the replay's end state.
 
@@ -813,16 +814,24 @@ async def backfill(start: str | None = None) -> dict:
             start = None  # full stored history
         start_note = start or "first eligible month"
 
-        tickers = universe_tickers(current_universe())
-        fund = await fundamentals_mod.load_fundamentals(tickers)
+        # `preload` (built once by backfill-all) carries the shared
+        # fundamentals + frames; otherwise load them here. Bound the candle
+        # load to the replay window + a momentum warmup (`start=None` means
+        # full stored history — start=all or before the data begins).
+        shared_frames: dict = {}
+        if preload is not None:
+            tickers = preload.tickers
+            fund = preload.fund
+            close, vol = preload.close, preload.vol
+            shared_frames = preload.frames
+        else:
+            tickers = universe_tickers(current_universe())
+            fund = await fundamentals_mod.load_fundamentals(tickers)
+            load_start = ((pd.Timestamp(start) - timedelta(days=_BACKFILL_WARMUP_DAYS)).to_pydatetime()
+                          if start else None)
+            close, vol = await monthly_mod.load_frames(tickers, None, start=load_start)
         if not fund:
             return {"ok": False, "error": "no fundamentals loaded"}
-        # Bound the candle load to the replay window + a momentum warmup.
-        # `start=None` means "full stored history" (start=all or before the
-        # data begins) — only then load everything.
-        load_start = ((pd.Timestamp(start) - timedelta(days=_BACKFILL_WARMUP_DAYS)).to_pydatetime()
-                      if start else None)
-        close, vol = await monthly_mod.load_frames(tickers, None, start=load_start)
         if close.empty:
             return {"ok": False, "error": "no candle data"}
 
@@ -854,8 +863,12 @@ async def backfill(start: str | None = None) -> dict:
                 prior_month_ends.append(prev_idx[-1])
         frame_cache: dict[pd.Timestamp, pd.DataFrame | None] = {}
         for m in prior_month_ends + months:
+            if m in shared_frames:
+                frame_cache[m] = shared_frames[m]
+                continue
             frame_cache[m] = await asyncio.to_thread(
                 monthly_mod.eligible_frame, m, close, vol, fund)
+            shared_frames[m] = frame_cache[m]
         def _has_eligible(m: pd.Timestamp) -> bool:
             f = frame_cache[m]
             return f is not None and bool(f["eligible"].any())

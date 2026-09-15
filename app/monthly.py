@@ -22,6 +22,7 @@ market cap / dollar volume / momentum are comparable across the universe.
 import asyncio
 import logging
 import math
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, UTC
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -49,6 +50,49 @@ def _strategy_universe() -> str:
     except Exception:  # noqa: BLE001 — never let selection break a cycle
         return settings.sim_monthly_universe
 
+
+def _strategy_variant() -> str:
+    """The runtime-selected momentum variant (daily-core state file), falling
+    back to the config default. The qv-mom ranking is shared by the monthly and
+    daily-core portfolios, so both must resolve it the same way — relying on
+    the ambient ``settings`` value made the monthly replay depend on call
+    order (whoever set it last won)."""
+    try:
+        from . import daily_core
+        return daily_core.current_variant()
+    except Exception:  # noqa: BLE001
+        return settings.sim_daily_core_mom_variant
+
+
+@dataclass
+class BackfillPreload:
+    """Inputs every qv-mom backfill replay shares for one universe + window.
+
+    ``frames`` is a read-through cache keyed by month-end: the first replay
+    that asks for a month computes it, the second reuses it. ``backfill-all``
+    builds one of these and hands it to both the monthly and daily-core
+    replays, which otherwise load the same fundamentals/frames twice (the
+    frames are the expensive part — ~1.6s per month on a 500-name universe).
+    """
+    tickers: list[str]
+    fund: dict[str, dict[str, list[dict]]]
+    close: pd.DataFrame
+    vol: pd.DataFrame
+    frames: dict[pd.Timestamp, pd.DataFrame | None] = field(default_factory=dict)
+
+
+async def preload_backfill(start: str | None) -> BackfillPreload:
+    """Load the inputs shared by the monthly and daily-core backfills for the
+    same window: point-in-time fundamentals and the USD close/volume frames
+    (frames are computed lazily, per month, by the replays themselves)."""
+    settings.sim_daily_core_mom_variant = _strategy_variant()
+    tickers = universe_tickers(_strategy_universe())
+    fund = await fundamentals_mod.load_fundamentals(tickers)
+    load_start = ((pd.Timestamp(start) - timedelta(days=_BACKFILL_WARMUP_DAYS)).to_pydatetime()
+                  if start else None)
+    close, vol = await load_frames(tickers, None, start=load_start)
+    return BackfillPreload(tickers=tickers, fund=fund, close=close, vol=vol)
+
 # Anchor for the allowance "month" key: the same operator-local timezone the
 # sim portfolio uses (settings.allowance_tz), so both portfolios' cumulative
 # contributed figures step at the same calendar-month boundary and the two
@@ -62,6 +106,16 @@ _PRICE_LOOKBACK_DAYS = 400
 
 # Momentum warmup kept ahead of a backfill start when bounding the candle load.
 _BACKFILL_WARMUP_DAYS = 600
+
+# Candle-history bound for the LIVE monthly ranking (~4y): ample for the 253d
+# momentum warmup, without loading decades of unused history every rebalance.
+_LIVE_HISTORY_DAYS = 1460
+
+
+def _live_history_start() -> datetime:
+    """Naive-UTC lower bound for the live ranking's candle load. Candle
+    timestamps are stored naive, so the bound must be naive too."""
+    return datetime.now(UTC).replace(tzinfo=None) - timedelta(days=_LIVE_HISTORY_DAYS)
 
 
 def _current_month() -> str:
@@ -880,9 +934,12 @@ async def _run_rebalance_locked(force: bool) -> dict[str, Any]:
 
     allowance = await deposit_allowance()
     tickers = universe_tickers(_strategy_universe())
+    # The ranking is shared with daily-core: resolve the runtime variant here
+    # too, rather than depending on whoever set settings last.
+    settings.sim_daily_core_mom_variant = _strategy_variant()
     refresh_errors, fund_status = await refresh_data(tickers)
 
-    close, vol = await load_frames(tickers, None)
+    close, vol = await load_frames(tickers, None, start=_live_history_start())
     fund = await fundamentals_mod.load_fundamentals(tickers)
     # tz-naive date: candle timestamps are stored naive (UTC), so the slice
     # index must be naive too (mixing tz-aware would raise in pandas).
@@ -984,7 +1041,8 @@ async def _sync_start_date() -> str | None:
     return d.strftime("%Y-%m-%d") if d else None
 
 
-async def backfill(start: str | None = None) -> dict[str, Any]:
+async def backfill(start: str | None = None,
+                   *, preload: BackfillPreload | None = None) -> dict[str, Any]:
     """Replay the monthly qv-mom strategy over historical data and REPLACE
     the portfolio state with the replay's end state.
 
@@ -1022,13 +1080,18 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
             start = None  # full stored history
         start_note = start or "first eligible month"
 
-        tickers = universe_tickers(_strategy_universe())
-        fund = await fundamentals_mod.load_fundamentals(tickers)
+        settings.sim_daily_core_mom_variant = _strategy_variant()
+        if preload is not None:
+            tickers, fund = preload.tickers, preload.fund
+            close, vol = preload.close, preload.vol
+        else:
+            tickers = universe_tickers(_strategy_universe())
+            fund = await fundamentals_mod.load_fundamentals(tickers)
+            load_start = ((pd.Timestamp(start) - timedelta(days=_BACKFILL_WARMUP_DAYS)).to_pydatetime()
+                          if start else None)
+            close, vol = await load_frames(tickers, None, start=load_start)
         if not fund:
             return {"ok": False, "error": "no fundamentals loaded"}
-        load_start = ((pd.Timestamp(start) - timedelta(days=_BACKFILL_WARMUP_DAYS)).to_pydatetime()
-                      if start else None)
-        close, vol = await load_frames(tickers, None, start=load_start)
         if close.empty:
             return {"ok": False, "error": "no candle data"}
 
@@ -1053,9 +1116,14 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
             prev_idx = close.index[close.index <= prev]
             if len(prev_idx):
                 prior_month_ends.append(prev_idx[-1])
+        shared = preload.frames if preload is not None else {}
         frame_cache: dict[pd.Timestamp, pd.DataFrame | None] = {}
         for m in sorted(set(prior_month_ends) | set(months)):
+            if m in shared:
+                frame_cache[m] = shared[m]
+                continue
             frame_cache[m] = await asyncio.to_thread(eligible_frame, m, close, vol, fund)
+            shared[m] = frame_cache[m]
         live_months = [m for m in months
                        if (f := frame_cache.get(m)) is not None
                        and bool(f["eligible"].any())]
