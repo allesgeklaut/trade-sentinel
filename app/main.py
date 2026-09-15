@@ -416,16 +416,21 @@ async def backfill_all(start: str | None = Query(default=None)):
     # Resolve the shared window ONCE. The per-backfill defaults would each
     # pick their own sync date (and wipe their own snapshots mid-run), so
     # the coordinator pins one start for everyone.
-    if start in (None, "all"):
+    #
+    # "all" is passed through as the literal "all" — each backfill maps it to
+    # ITS own full stored history (None internally). Passing None here would
+    # mean "synced window" to every backfill, so the full-history button would
+    # silently replay the short synced range instead (the bug this fixes).
+    if start == "all":
+        effective = "all"
+        start_note = "full stored history"
+    elif start is None:
         resolved = await daily_core._sync_start_date()
+        effective = resolved
         start_note = resolved or "first eligible window"
-        if start == "all":
-            start_note = "full stored history"
     else:
-        resolved = start
+        effective = start
         start_note = start
-    # "all" passes through so each backfill replays its own full window.
-    effective = None if start == "all" else resolved
 
     # Lock everything up-front so a scheduler cycle can't interleave with
     # the multi-portfolio wipe/replay. Backfills acquire their own locks
@@ -445,7 +450,10 @@ async def backfill_all(start: str | None = Query(default=None)):
     preload: dict = {}
 
     async def _monthly_backfill():
-        preload["v"] = await monthly.preload_backfill(effective)
+        # preload_backfill takes a real date or None (= load everything);
+        # backfill() takes "all" as its full-history sentinel.
+        preload_start = None if effective == "all" else effective
+        preload["v"] = await monthly.preload_backfill(preload_start)
         return await monthly.backfill(effective, preload=preload["v"])
 
     async def _daily_core_backfill():
