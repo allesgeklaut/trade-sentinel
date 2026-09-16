@@ -163,7 +163,7 @@ class Settings(BaseSettings):
     # times" for arming the gradient cash-out. 50 = only strong uptrends,
     # 200 = the classic bull/bear line. §15.
     sim_daily_core_basket_arm_sma: int = 200
-    sim_run_hour: int = 22
+    sim_run_hour: int = 23
     sim_run_minute: int = 30
     # Nightly shared universe prefetch: all sims share one universe, so fetch it
     # ONCE before the cycles and let them read the DB instead of each pulling it.

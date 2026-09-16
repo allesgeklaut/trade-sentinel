@@ -3864,6 +3864,11 @@ async def _sweep_daily_core(args: argparse.Namespace) -> None:
 
     fc: dict[pd.Timestamp, pd.DataFrame | None] = {}
     t0 = time.time()
+    # `fc` is the RAW momentum cache and the default for every non-residual
+    # arm. Pin the variant explicitly: the ambient setting (e.g. .env's
+    # SIM_DAILY_CORE_MOM_VARIANT=residual) would otherwise make the raw /
+    # control arms run residual frames while reporting `mom=raw`.
+    settings.sim_daily_core_mom_variant = "raw"
     for d in _sweep_months(close.index, "2016-06-01"):
         fc[d] = await asyncio.to_thread(monthly_mod.eligible_frame, d, close, vol, fund)
     print(f"frame cache: {len(fc)} months ({time.time() - t0:.0f}s)", flush=True)

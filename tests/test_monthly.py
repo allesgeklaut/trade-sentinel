@@ -984,6 +984,38 @@ class TestBackfill:
                     assert t.shares > 0 and t.price > 0
         asyncio.run(check())
 
+    def test_funds_months_without_an_eligible_frame(self, mem_db, fake_market,
+                                                    monkeypatch):
+        """A window month with no eligible ranking is still funded (the live
+        engine deposits before the frame check); only its rebalance is skipped."""
+        import pandas as pd
+
+        from app.db import MonthlyAllowance as Al
+        from app.db import MonthlyRebalance as Rb
+
+        real = monthly.eligible_frame
+
+        def frame_with_gap(m, c, v, f):
+            fr = real(m, c, v, f)
+            if fr is not None and pd.Timestamp(m).month == 8:
+                fr = fr.assign(eligible=False)
+            return fr
+        monkeypatch.setattr(monthly, "eligible_frame", frame_with_gap)
+        monkeypatch.setattr(monthly, "_current_month", lambda: "2026-09")
+
+        r = asyncio.run(monthly.backfill(start="2026-07-01"))
+        assert r["ok"] is True
+        # Jul + Aug (Aug has no ranking but is still funded)
+        assert r["contributed"] == pytest.approx(2 * settings.sim_monthly_contribution)
+
+        async def check():
+            async with mem_db() as s:
+                months = sorted(x.month for x in (await s.scalars(select(Al))).all())
+                assert months == ["2026-07", "2026-08"]
+                rows = (await s.scalars(select(Rb))).all()
+                assert sorted(x.rebal_month for x in rows) == ["2026-07"]
+        asyncio.run(check())
+
     def test_uncovered_current_month_keeps_its_contribution(self, mem_db, fake_market,
                                                             monkeypatch):
         """A backfill run before the current month has candles must not lose

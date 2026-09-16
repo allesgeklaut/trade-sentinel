@@ -2352,9 +2352,8 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
 
 
 async def _sync_start_date() -> str | None:
-    """Earliest snapshot date across the monthly / daily-core portfolios —
-    the sim backfill's default start so all three curves cover the same
-    window (mirrors daily_core._sync_start_date)."""
+    """Earliest MonthlySnapshot date — the sim backfill's default start so
+    the sim / monthly / daily-core curves cover the same window."""
     from .db import MonthlySnapshot
     async with Session() as s:
         d = await s.scalar(select(func.min(MonthlySnapshot.created_at)))

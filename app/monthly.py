@@ -1141,11 +1141,13 @@ async def backfill(start: str | None = None,
         # close frame — only the REPLAYED days start here.
         idx = idx[idx >= pd.Timestamp(live_months[0].replace(day=1))]
 
-        # contribution timing: first trading day of each window month
+        # contribution timing: first trading day of EVERY calendar month in the
+        # replayed window (not just the eligible ones — the live engine deposits
+        # monthly even when no ranking exists; only the rebalance needs a frame).
         contrib_days: dict[str, pd.Timestamp] = {}
-        for m in live_months:
-            key = f"{m.year}-{m.month:02d}"
-            month_days = idx[(idx.year == m.year) & (idx.month == m.month)]
+        for m in sorted({(d.year, d.month) for d in idx}):
+            key = f"{m[0]}-{m[1]:02d}"
+            month_days = idx[(idx.year == m[0]) & (idx.month == m[1])]
             if len(month_days):
                 contrib_days[key] = month_days[0]
         # valuation closes: forward-filled so missing candles carry the last
@@ -1185,19 +1187,16 @@ async def backfill(start: str | None = None,
         shares: dict[str, float] = {}
         cash = 0.0
         contributed = 0.0
+        deposited_months: set[str] = set()  # months the replay actually funded
         rebalance_rows: list[tuple[str, str, str, str, int]] = []
         trade_rows: list[tuple[str, str, str, float, float, float]] = []
         snaps: list[tuple[str, float, float]] = []
 
-        def month_first_day(m: pd.Timestamp) -> pd.Timestamp | None:
-            key = f"{m.year}-{m.month:02d}"
-            return contrib_days.get(key)
-
-        # replay from the first eligible month only (earlier months have no
-        # ranking — the trimmed idx already excludes their days, so iterate
-        # the live months directly with their index in the full month list)
-        first_live_set = {m for m in live_months}
-        replay_seq = [m for m in months if m in first_live_set]
+        # Replay from the first eligible month onward. Later window months are
+        # replayed even without an eligible ranking: the live engine still
+        # deposits monthly (deposit_allowance runs before the frame check), so
+        # their days are funded and snapshotted; only the rebalance is skipped.
+        replay_seq = [m for m in months if m >= live_months[0]]
         for i, m in enumerate(replay_seq):
             frame = frame_cache.get(m)
             has_frame = frame is not None and bool(frame["eligible"].any())
@@ -1207,13 +1206,15 @@ async def backfill(start: str | None = None,
             prev_td = replay_seq[i - 1] if i > 0 else None
             month_days = [d for d in idx if (prev_td is None or d > prev_td) and d <= m]
 
-            # contribution on the month's first trading day
-            cf = 0.0
-            first_day = month_first_day(m)
-            if first_day is not None and any(d == first_day for d in month_days):
-                cf = settings.sim_monthly_contribution
-                cash += cf
-                contributed += cf
+            # contribution on the first trading day of EVERY calendar month in
+            # this span (the live engine deposits monthly even without a
+            # ranking; only the rebalance needs a frame).
+            for d in month_days:
+                key = f"{d.year}-{d.month:02d}"
+                if contrib_days.get(key) == d:
+                    cash += settings.sim_monthly_contribution
+                    contributed += settings.sim_monthly_contribution
+                    deposited_months.add(key)
 
             # daily snapshots FIRST, on the holdings actually owned during
             # this month — the picks from the PREVIOUS month-end rebalance.
@@ -1225,47 +1226,49 @@ async def backfill(start: str | None = None,
                 eq = cash + sum(sh * (px_of(t, d) or 0.0) for t, sh in shares.items())
                 snaps.append((d.strftime("%Y-%m-%d"), eq, contributed))
 
-            # month-end rebuild: SELL dropped names at the close, then BUY
-            # the picks to equal weight with proceeds + contribution. The live
-            # engine rebalances once EVERY month (one audit row per month, no
-            # trades when already at weight), so this must not be gated on the
-            # pick set changing — a sorted/insertion-order comparison here was
-            # both order-dependent and skipped the monthly top-up.
-            adds = len(set(picks) - set(shares))
-            rebalance_rows.append((f"{m.year}-{m.month:02d}", m.strftime("%Y-%m-%d"),
-                                   ",".join(sorted(shares)), ",".join(sorted(picks)),
-                                   adds))
-            for t in list(shares):
-                if t in picks:
-                    continue
-                p = px_of(t, m)
-                sh = shares.get(t, 0.0)
-                if p is None or p <= 0 or sh <= 0:
-                    continue
-                notional = sh * p
-                cash += notional * (1.0 - cost)
-                del shares[t]
-                trade_rows.append((m.strftime("%Y-%m-%d"), "SELL", t, notional, sh, p))
-            equity_now = cash + sum(sh * (px_of(t, m) or 0.0)
-                                    for t, sh in shares.items())
-            weight = equity_now / max(len(picks), 1)
-            for t in picks:
-                p = px_of(t, m)
-                if p is None or p <= 0:
-                    continue
-                gap = weight - shares.get(t, 0.0) * p
-                if gap > 1 and cash > 1:
-                    notional = min(gap, max(cash, 0.0) / (1.0 + cost))
-                    if notional < 1:
+            # month-end rebuild (only when a ranking exists): SELL dropped names
+            # at the close, then BUY the picks to equal weight with proceeds +
+            # contribution. The live engine rebalances once EVERY month it has a
+            # frame (one audit row per month, no trades when already at weight),
+            # so this must not be gated on the pick set changing.
+            if has_frame:
+                adds = len(set(picks) - set(shares))
+                rebalance_rows.append((f"{m.year}-{m.month:02d}", m.strftime("%Y-%m-%d"),
+                                       ",".join(sorted(shares)), ",".join(sorted(picks)),
+                                       adds))
+                for t in list(shares):
+                    if t in picks:
                         continue
-                    sh = notional / p
-                    cash -= notional
-                    cash -= notional * cost
-                    shares[t] = shares.get(t, 0.0) + sh
-                    trade_rows.append((m.strftime("%Y-%m-%d"), "BUY", t, notional, sh, p))
+                    p = px_of(t, m)
+                    sh = shares.get(t, 0.0)
+                    if p is None or p <= 0 or sh <= 0:
+                        continue
+                    notional = sh * p
+                    cash += notional * (1.0 - cost)
+                    del shares[t]
+                    trade_rows.append((m.strftime("%Y-%m-%d"), "SELL", t, notional, sh, p))
+                equity_now = cash + sum(sh * (px_of(t, m) or 0.0)
+                                        for t, sh in shares.items())
+                weight = equity_now / max(len(picks), 1)
+                for t in picks:
+                    p = px_of(t, m)
+                    if p is None or p <= 0:
+                        continue
+                    gap = weight - shares.get(t, 0.0) * p
+                    if gap > 1 and cash > 1:
+                        notional = min(gap, max(cash, 0.0) / (1.0 + cost))
+                        if notional < 1:
+                            continue
+                        sh = notional / p
+                        cash -= notional
+                        cash -= notional * cost
+                        shares[t] = shares.get(t, 0.0) + sh
+                        trade_rows.append((m.strftime("%Y-%m-%d"), "BUY", t, notional, sh, p))
 
         # --- persist the end state ---
-        replay_months = sorted({f"{m.year}-{m.month:02d}" for m in live_months})
+        # allowance rows: exactly the months the replay funded (ineligible
+        # months included) — matches daily_core.backfill.
+        replay_months = sorted(deposited_months)
         # The live engine may already have deposited the CURRENT month while
         # the replay window has no candle for it yet — the wipe destroyed the
         # allowance row, so re-create it (same rule as daily_core.backfill).

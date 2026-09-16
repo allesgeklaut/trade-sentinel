@@ -599,6 +599,20 @@ class TestProtectionSelection:
         assert daily_core.current_gradient() == "always"
         assert "protection" not in daily_core._load_state()
 
+    def test_universe_change_resets_basket(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core._save_state({"basket_hist": [100.0, 110.0], "basket_day": "2026-08-31",
+                                "basket_neg_streak": 2, "basket_out": True})
+        daily_core.set_universe(daily_core.universe_names()[0])
+        state = daily_core._load_state()
+        assert not any(k.startswith("basket_") for k in state)
+
+    def test_variant_change_resets_basket(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core._save_state({"basket_hist": [100.0], "basket_out": True})
+        daily_core.set_variant("raw")
+        assert not any(k.startswith("basket_") for k in daily_core._load_state())
+
 
 class TestProtectionDecision:
     """The deployment gate and the gradient arm are independent: the gate can

@@ -518,8 +518,10 @@ async def backfill_all(start: str | None = Query(default=None)):
     # momentum variant, so they share one preload: the fundamentals and the
     # per-month-end eligibility frames (the expensive part) are built once and
     # reused. daily_sim runs first (slowest, and it doesn't use qv-mom frames).
-    # Runs are sequential and each backfill acquires its own lock, so the
-    # nightly cycle can't interleave with the multi-portfolio wipe/replay.
+    # Each replay holds its own cycle lock while it runs, so a scheduled cycle
+    # can't interleave *within* a replay; the four run sequentially and this
+    # coordinator holds no lock across them, so a nightly tick can still fire
+    # between two replays.
     out: dict[str, dict] = {}
     errors: dict[str, str] = {}
     preload: dict = {}

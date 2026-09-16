@@ -2796,12 +2796,6 @@
             return mdd * 100;
         }
 
-        // Current normalized gain (%) of a contributed-funded curve.
-        function gainOf(points) {
-            const last = points[points.length - 1];
-            return last && last.contributed > 0 ? (last.value / last.contributed - 1) * 100 : null;
-        }
-
         // Small caption under each equity chart marking the last data date —
         // makes stale curves visible instead of silently flat (#20).
         function updateAsOf(which, lastTime) {
@@ -3097,15 +3091,17 @@
                 await loadDailyCoreAll();
             } catch (e) {
                 status.textContent = 'Error: ' + escapeHtml(e.message);
-                await loadDailyCoreStatus();
+                await loadDailyCoreAll();  // restore the actual selection + chips
             }
         }
 
         async function setDCGate(mode) {
             const status = document.getElementById('dailycore-run-status');
             const label = (document.getElementById('dailycore-gate')?.selectedOptions || [])[0]?.textContent || mode;
-            if (!confirm(`Set the daily-core deployment gate to "${label}"?\n\nThe next cycle applies it to the live book (it only parks new buys, never sells), and every future backfill replays it.`))
+            if (!confirm(`Set the daily-core deployment gate to "${label}"?\n\nThe next cycle applies it to the live book (it only parks new buys, never sells), and every future backfill replays it.`)) {
+                await loadDailyCoreAll();  // cancel: resync the select to the persisted value
                 return;
+            }
             try {
                 await api('dailycore/gate', {
                     method: 'POST',
@@ -3116,15 +3112,17 @@
                 await loadDailyCoreAll();
             } catch (e) {
                 status.textContent = 'Error: ' + escapeHtml(e.message);
-                await loadDailyCoreStatus();  // restore the actual selection
+                await loadDailyCoreAll();  // restore the actual selection + chips
             }
         }
 
         async function setDCGradient(mode) {
             const status = document.getElementById('dailycore-run-status');
             const label = (document.getElementById('dailycore-gradient')?.selectedOptions || [])[0]?.textContent || mode;
-            if (!confirm(`Set the daily-core gradient cash-out to "${label}"?\n\nThe next cycle applies it to the live book (a triggered cash-out can SELL everything), and every future backfill replays it.`))
+            if (!confirm(`Set the daily-core gradient cash-out to "${label}"?\n\nThe next cycle applies it to the live book (a triggered cash-out can SELL everything), and every future backfill replays it.`)) {
+                await loadDailyCoreAll();  // cancel: resync the select to the persisted value
                 return;
+            }
             try {
                 await api('dailycore/gradient', {
                     method: 'POST',
@@ -3135,15 +3133,17 @@
                 await loadDailyCoreAll();
             } catch (e) {
                 status.textContent = 'Error: ' + escapeHtml(e.message);
-                await loadDailyCoreStatus();  // restore the actual selection
+                await loadDailyCoreAll();  // restore the actual selection + chips
             }
         }
 
         async function setDCVariant(variant) {
             const status = document.getElementById('dailycore-run-status');
             const label = (document.getElementById('dailycore-variant')?.selectedOptions || [])[0]?.textContent || variant;
-            if (!confirm(`Switch the daily-core ranking to "${label}"?\n\nThe next cycle will trade the new ranking, and every future backfill replays it. Re-run the backfill to see the new variant's full-history track record.`))
+            if (!confirm(`Switch the daily-core ranking to "${label}"?\n\nThe next cycle will trade the new ranking, and every future backfill replays it. Re-run the backfill to see the new variant's full-history track record.`)) {
+                await loadDailyCoreAll();  // cancel: resync the select to the persisted value
                 return;
+            }
             try {
                 await api('dailycore/strategy', {
                     method: 'POST',
@@ -3154,7 +3154,7 @@
                 await loadDailyCoreAll();
             } catch (e) {
                 status.textContent = 'Error: ' + escapeHtml(e.message);
-                await loadDailyCoreStatus();  // restore the actual selection
+                await loadDailyCoreAll();  // restore the actual selection + chips
             }
         }
 

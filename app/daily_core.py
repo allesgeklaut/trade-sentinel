@@ -81,6 +81,15 @@ def _save_state(state: dict) -> None:
         logger.warning("Could not write daily-core state file %s: %s", _STATE_FILE, e)
 
 
+def _reset_basket_state(state: dict) -> None:
+    """Drop the gradient basket chain. It is chained from a specific
+    universe/variant's target band, so a switch must not splice the old price
+    series into the new one (the protection overlay reads it next cycle)."""
+    for k in ("basket_hist", "basket_day", "basket_neg_streak",
+              "basket_pos_streak", "basket_out"):
+        state.pop(k, None)
+
+
 def current_variant() -> str:
     """The effective momentum variant: the persisted runtime choice if valid,
     else the env/config default. Reads the file per call (tiny JSON, called
@@ -96,6 +105,7 @@ def set_variant(variant: str) -> None:
         raise ValueError(f"unknown mom variant: {variant!r}")
     state = _load_state()
     state["mom_variant"] = variant
+    _reset_basket_state(state)  # the band (thus the basket) changes with variant
     _save_state(state)
 
 
@@ -122,6 +132,7 @@ def set_universe(name: str) -> None:
         raise ValueError(f"unknown universe: {name!r}")
     state = _load_state()
     state["universe"] = name
+    _reset_basket_state(state)  # the basket chain belongs to the old universe
     _save_state(state)
 
 
