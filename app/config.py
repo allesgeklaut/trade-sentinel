@@ -15,7 +15,10 @@ class Settings(BaseSettings):
     # is spent — so a broad universe prefetch can never trip 429s or overrun.
     twelve_data_max_per_min: int = 8
     twelve_data_daily_budget: int = 750
-    watchlist: str = "AAPL,MSFT,NVDA,IFX.DE"
+    # Seed watchlist (comma-separated). On startup, any ticker listed here that
+    # is missing from the DB is added. Additive only — a UI deletion of a ticker
+    # still listed here comes back on the next restart.
+    watchlist: str = "AAPL,GC=F,ICLN,IFX.DE,MSFT,NVDA,SPCX,SPY,TSLA,URTH"
 
     ollama_url: str = "http://host.docker.internal:11434"
     ollama_model: str = ""  # set via .env, e.g. "qwen3:32b"
