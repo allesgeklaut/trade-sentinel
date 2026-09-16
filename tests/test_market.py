@@ -238,6 +238,39 @@ class TestSearchUsesYahoo:
 
 
 # ---------------------------------------------------------------------------
+# info: always Yahoo (free), never the metered provider
+# ---------------------------------------------------------------------------
+
+class TestInfoUsesYahoo:
+    async def test_info_uses_yahoo_even_with_twelvedata(self, monkeypatch):
+        monkeypatch.setattr(market, "provider", lambda: "twelvedata")
+
+        yahoo_calls: list[str] = []
+
+        def fake_yahoo(t):
+            yahoo_calls.append(t)
+            return "Apple Inc."
+
+        monkeypatch.setattr(market, "yahoo_info", fake_yahoo)
+
+        assert await market.info("AAPL") == "Apple Inc."
+        assert yahoo_calls == ["AAPL"]
+
+    async def test_info_never_touches_the_metered_provider(self, monkeypatch):
+        monkeypatch.setattr(market, "provider", lambda: "twelvedata")
+
+        class BoomLimiter:
+            async def acquire(self):
+                raise AssertionError("info must not consume the Twelve Data budget")
+
+        monkeypatch.setattr(market, "_twelve_limiter", BoomLimiter())
+        monkeypatch.setattr(market, "yahoo_info", lambda t: "N")
+
+        # Would raise if info() still went through the limiter/rate-limited path.
+        assert await market.info("AAPL") == "N"
+
+
+# ---------------------------------------------------------------------------
 # refresh: Twelve Data primary, per-ticker yfinance fallback
 # ---------------------------------------------------------------------------
 

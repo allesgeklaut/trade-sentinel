@@ -2293,14 +2293,27 @@
             }
         }
 
+        // Bumped on every loadWatch so a stale name lookup can't write into a
+        // list that has since been re-rendered (e.g. after an add/delete).
+        let watchRenderToken = 0;
+
         async function loadWatch() {
-            let a = await api('watchlist');
-            const names = await Promise.all(a.map(t => resolveSymbolName(t)));
-            $('#watch').innerHTML = a.map((t, i) => {
-                const name = names[i] ? ` <span class="ticker-name">— ${escapeHtml(names[i])}</span>` : '';
-                return `<div class=ticker onclick="openTicker('${escapeHtml(t)}')">${escapeHtml(t)}${name}<button onclick="event.stopPropagation();del('${escapeHtml(t)}')">x</button></div>`;
-            }).join('');
+            const token = ++watchRenderToken;
+            const a = await api('watchlist');
+            if (token !== watchRenderToken) return;
+            const el = $('#watch');
+            // Paint the ticker list first. Company names are cosmetic and must
+            // never gate the list: awaiting them left the panel empty ("loading")
+            // whenever a name lookup was slow.
+            el.innerHTML = a.map(t => `<div class=ticker onclick="openTicker('${escapeHtml(t)}')">${escapeHtml(t)}<span class="ticker-name"></span><button onclick="event.stopPropagation();del('${escapeHtml(t)}')">x</button></div>`).join('');
+            const rows = el.querySelectorAll('.ticker');
             if (!current && a[0]) openTicker(a[0]);
+            await Promise.all(a.map(async (t, i) => {
+                const name = await resolveSymbolName(t);
+                if (!name || token !== watchRenderToken) return;
+                const span = rows[i] && rows[i].querySelector('.ticker-name');
+                if (span) span.textContent = ' — ' + name;
+            }));
         }
 
         async function openTicker(t) {

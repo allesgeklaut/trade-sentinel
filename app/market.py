@@ -53,22 +53,28 @@ class _TwelveLimiter:
         self._used = 0
 
     async def acquire(self) -> bool:
-        async with self._lock:
-            now = time.monotonic()
-            today = datetime.now(UTC).date()
-            if self._day != today:
-                self._day, self._used = today, 0
-                self._calls.clear()
-            if self._used >= max(1, settings.twelve_data_daily_budget):
-                return False
-            limit = max(1, settings.twelve_data_max_per_min)
-            while self._calls and now - self._calls[0] >= 60:
-                self._calls.popleft()
-            if len(self._calls) >= limit:
-                await asyncio.sleep(60 - (now - self._calls[0]) + 0.05)
-            self._calls.append(time.monotonic())
-            self._used += 1
-            return True
+        # Wait for a per-minute slot WITHOUT holding the lock while sleeping:
+        # callers may arrive concurrently (refresh_many runs 4 workers), and
+        # blocking them all behind one sleeper turned a 60s throttle into an
+        # unbounded stall for unrelated callers. Loop and re-check the slot.
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                today = datetime.now(UTC).date()
+                if self._day != today:
+                    self._day, self._used = today, 0
+                    self._calls.clear()
+                if self._used >= max(1, settings.twelve_data_daily_budget):
+                    return False
+                limit = max(1, settings.twelve_data_max_per_min)
+                while self._calls and now - self._calls[0] >= 60:
+                    self._calls.popleft()
+                if len(self._calls) < limit:
+                    self._calls.append(now)
+                    self._used += 1
+                    return True
+                wait = 60 - (now - self._calls[0]) + 0.05
+            await asyncio.sleep(max(wait, 0.01))
 
 
 _twelve_limiter = _TwelveLimiter()
@@ -182,19 +188,16 @@ async def _twelve_history(ticker: str, outputsize: int) -> list[dict]:
     if not values: raise ValueError(f"No Twelve Data daily data for {ticker}")
     return values
 
-def _twelve_profile(ticker: str) -> str:
-    with httpx.Client(timeout=10) as c:
-        data=c.get("https://api.twelvedata.com/profile",params={"symbol":ticker},headers=_twelve_headers()).json()
-    return data.get("name","") if isinstance(data, dict) and data.get("status")!="error" else ""
-
 async def info(ticker):
-    if provider()=="yfinance": return await asyncio.to_thread(yahoo_info,ticker)
-    if await _twelve_limiter.acquire():
-        try:
-            name=await asyncio.to_thread(_twelve_profile,ticker)
-            if name: return name
-        except Exception as e:
-            logger.warning("twelvedata profile failed for %s (%s) — falling back to yfinance",ticker,e)
+    """Human-readable company name for a ticker.
+
+    Always Yahoo Finance, regardless of the candle provider — same rationale as
+    :func:`search`. A display name is cosmetic, so it must never consume the
+    metered provider's per-minute/day budget (8/min, shared with the nightly
+    universe prefetch and the sims). Doing so made the watchlist render wait on
+    a 60s rate-limit slot for every 9th ticker. Yahoo serves names for free and
+    uses the app's canonical symbol form (e.g. ``IFX.DE``).
+    """
     return await asyncio.to_thread(yahoo_info,ticker)
 
 async def search(q):
