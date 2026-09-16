@@ -514,19 +514,12 @@ async def backfill_all(start: str | None = Query(default=None)):
         effective = start
         start_note = start
 
-    # Lock everything up-front so a scheduler cycle can't interleave with
-    # the multi-portfolio wipe/replay. Backfills acquire their own locks
-    # (asyncio.Lock is re-entrant-free but these are different locks), the
-    # cycle lock is the one that matters: dc's backfill holds _cycle_lock,
-    # so the nightly daily-core stage would wait; sim/monthly cycles run
-    # after this coroutine returns.
-    out: dict[str, dict] = {}
-    errors: dict[str, str] = {}
-
     # The monthly and daily-core replays run on the same universe, window and
     # momentum variant, so they share one preload: the fundamentals and the
     # per-month-end eligibility frames (the expensive part) are built once and
     # reused. daily_sim runs first (slowest, and it doesn't use qv-mom frames).
+    # Runs are sequential and each backfill acquires its own lock, so the
+    # nightly cycle can't interleave with the multi-portfolio wipe/replay.
     out: dict[str, dict] = {}
     errors: dict[str, str] = {}
     preload: dict = {}

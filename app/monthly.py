@@ -1223,40 +1223,43 @@ async def backfill(start: str | None = None,
                 snaps.append((d.strftime("%Y-%m-%d"), eq, contributed))
 
             # month-end rebuild: SELL dropped names at the close, then BUY
-            # the picks to equal weight with proceeds + contribution
+            # the picks to equal weight with proceeds + contribution. The live
+            # engine rebalances once EVERY month (one audit row per month, no
+            # trades when already at weight), so this must not be gated on the
+            # pick set changing — a sorted/insertion-order comparison here was
+            # both order-dependent and skipped the monthly top-up.
             adds = len(set(picks) - set(shares))
-            if picks != list(shares):
-                rebalance_rows.append((f"{m.year}-{m.month:02d}", m.strftime("%Y-%m-%d"),
-                                       ",".join(sorted(shares)), ",".join(sorted(picks)),
-                                       adds))
-                for t in list(shares):
-                    if t in picks:
+            rebalance_rows.append((f"{m.year}-{m.month:02d}", m.strftime("%Y-%m-%d"),
+                                   ",".join(sorted(shares)), ",".join(sorted(picks)),
+                                   adds))
+            for t in list(shares):
+                if t in picks:
+                    continue
+                p = px_of(t, m)
+                sh = shares.get(t, 0.0)
+                if p is None or p <= 0 or sh <= 0:
+                    continue
+                notional = sh * p
+                cash += notional * (1.0 - cost)
+                del shares[t]
+                trade_rows.append((m.strftime("%Y-%m-%d"), "SELL", t, notional, sh, p))
+            equity_now = cash + sum(sh * (px_of(t, m) or 0.0)
+                                    for t, sh in shares.items())
+            weight = equity_now / max(len(picks), 1)
+            for t in picks:
+                p = px_of(t, m)
+                if p is None or p <= 0:
+                    continue
+                gap = weight - shares.get(t, 0.0) * p
+                if gap > 1 and cash > 1:
+                    notional = min(gap, max(cash, 0.0) / (1.0 + cost))
+                    if notional < 1:
                         continue
-                    p = px_of(t, m)
-                    sh = shares.get(t, 0.0)
-                    if p is None or p <= 0 or sh <= 0:
-                        continue
-                    notional = sh * p
-                    cash += notional * (1.0 - cost)
-                    del shares[t]
-                    trade_rows.append((m.strftime("%Y-%m-%d"), "SELL", t, notional, sh, p))
-                equity_now = cash + sum(sh * (px_of(t, m) or 0.0)
-                                        for t, sh in shares.items())
-                weight = equity_now / max(len(picks), 1)
-                for t in picks:
-                    p = px_of(t, m)
-                    if p is None or p <= 0:
-                        continue
-                    gap = weight - shares.get(t, 0.0) * p
-                    if gap > 1 and cash > 1:
-                        notional = min(gap, max(cash, 0.0) / (1.0 + cost))
-                        if notional < 1:
-                            continue
-                        sh = notional / p
-                        cash -= notional
-                        cash -= notional * cost
-                        shares[t] = shares.get(t, 0.0) + sh
-                        trade_rows.append((m.strftime("%Y-%m-%d"), "BUY", t, notional, sh, p))
+                    sh = notional / p
+                    cash -= notional
+                    cash -= notional * cost
+                    shares[t] = shares.get(t, 0.0) + sh
+                    trade_rows.append((m.strftime("%Y-%m-%d"), "BUY", t, notional, sh, p))
 
         # --- persist the end state ---
         replay_months = sorted({f"{m.year}-{m.month:02d}" for m in live_months})
@@ -1289,7 +1292,11 @@ async def backfill(start: str | None = None,
                 s.add(Rb(rebal_month=m_key, rebal_date=pd.Timestamp(f"{td} 16:00:00+00:00").to_pydatetime(),
                          held_before=held, picked=picked, n_new=n_new,
                          snapshot=""))
-            acc.last_allowance_month = live_allowance_month or replay_months[-1]
+            # Never let the marker lag the newest inserted row, or the next
+            # live deposit would duplicate that month.
+            last_month = max(live_allowance_month or "",
+                             replay_months[-1] if replay_months else "")
+            acc.last_allowance_month = last_month or None
             acc.last_rebalance_month = live_rebalance_month
             for sd, eq, contrib_at_day in snaps:
                 s.add(Sn(cash=0.0, positions_value=eq, total_equity=eq,

@@ -251,7 +251,9 @@ async def _recent_port_returns(days: int) -> list[float]:
                                 .limit(days * 3 + 5))).all()
     by_day: dict[str, DailyCoreSnapshot] = {}
     for r in rows:
-        by_day[r.created_at.strftime("%Y-%m-%d")] = r
+        # rows are newest-first: keep the first seen per day = the latest
+        # snapshot that day (a plain assignment would keep the oldest).
+        by_day.setdefault(r.created_at.strftime("%Y-%m-%d"), r)
     seq = [by_day[k] for k in sorted(by_day)][-(days + 1):]
     return [_port_return(p.total_equity, c.total_equity,
                          max(c.allowance_total - p.allowance_total, 0.0))
@@ -318,8 +320,12 @@ async def _protection_decision(band: list[str], frame: pd.DataFrame | None,
     idx = cv.index
     start_i = 0
     if last_day:
+        # First UNprocessed day: `after` holds the days past the last one
+        # already folded into `hist`, so the next append must start there.
+        # (Starting one earlier re-appended the last stored day every call,
+        # roughly doubling the chained basket growth and the slope.)
         after = idx[idx > pd.Timestamp(last_day)]
-        start_i = len(idx) - len(after) - 1 if len(after) else len(idx) - 1
+        start_i = len(idx) - len(after)
     top = band[:settings.sim_monthly_target_n]
     for i in range(max(start_i, 1), len(idx)):
         d_prev, d_cur = idx[i - 1], idx[i]
@@ -1141,8 +1147,11 @@ async def backfill(start: str | None = None,
             for m in replay_months:
                 s.add(Al(amount=settings.sim_monthly_contribution, month=m))
             # Keep the account marker consistent so deposit_allowance() stays
-            # a no-op for the live month.
-            acc.last_allowance_month = live_allowance_month or replay_months[-1]
+            # a no-op for the live month. Never let it lag the newest inserted
+            # row, or the next live deposit would duplicate that month.
+            last_month = max(live_allowance_month or "",
+                             replay_months[-1] if replay_months else "")
+            acc.last_allowance_month = last_month or None
             for sd, eq, contrib_at_day in snaps:
                 # created_at = the replay day: the UI groups snapshots by
                 # this column's date, so synthetic history must carry the

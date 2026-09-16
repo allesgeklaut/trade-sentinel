@@ -2898,6 +2898,24 @@ async def _daily_core_backtest(
         if sma is None or idx is None or not np.isfinite(sma) or not np.isfinite(idx):
             return True  # warmup / missing -> don't block
         return bool(float(idx) >= float(sma))
+
+    # Distinct re-entry signal for the portfolio-stop brake. It cannot reuse
+    # `market_uptrend`: with the exposure gate disabled that returns True every
+    # day, so the brake would cash out and re-buy on alternating days (measured:
+    # 12 whipsaw events vs 1 with a trend window). Fall back to SMA200 (the
+    # daily-core market gate) when no exposure window is configured.
+    _reentry_days = (exposure_trend_days
+                     if exposure_trend_days and exposure_trend_days > 0 else 200)
+    _mkt_sma_reentry = mkt_index.rolling(_reentry_days).mean()
+
+    def market_recovered(d: pd.Timestamp) -> bool:
+        """True once the market index is back at/above its re-entry SMA."""
+        sma = _mkt_sma_reentry.get(d)
+        idx = mkt_index.get(d)
+        if sma is None or idx is None or not np.isfinite(sma) or not np.isfinite(idx):
+            return True  # warmup / missing -> allow re-entry
+        return bool(float(idx) >= float(sma))
+
     port_days: list[pd.Timestamp] = []
     port_eq: list[float] = []
     port_invested: list[float] = []  # cumulative contributions per day (for normalized DD)
@@ -3002,7 +3020,7 @@ async def _daily_core_backtest(
                     pending_pick.pop(t, None)
                 risk_off = True
                 brake_events += 1
-            elif risk_off and market_uptrend(d):
+            elif risk_off and market_recovered(d):
                 risk_off = False
 
         # --- Gradient filter cash-out: when the basket trend confirmed
@@ -3094,6 +3112,10 @@ async def _daily_core_backtest(
                     spend = min(gap, remaining)
                     trade(d, t, "BUY", spend)
                     remaining -= spend
+            # Propagate the consumed budget so the month-end NEW-entries block
+            # (which also draws on `room`) can't deploy past the vol cap.
+            if room != float("inf"):
+                room = remaining
 
         # Month-end equal-weight rebuild (dca="monthly" only): the baseline
         # semantics — spread the FULL portfolio (incl. fresh contribution)
@@ -3108,8 +3130,9 @@ async def _daily_core_backtest(
                 cur = shares.get(t, 0.0) * p
                 gap = weight_of(t, weight, frame) - cur
                 if gap > 1 and cash > 1 and room > 1:
-                    trade(d, t, "BUY", min(gap, cash, room))
-                    room -= min(gap, cash)
+                    spend = min(gap, cash, room)
+                    trade(d, t, "BUY", spend)
+                    room -= spend
 
         # daily top-up of underweight holdings (dca="daily" only; rank mode
         # and month-end days already allocated). NOT pro-rata: the fresh
@@ -3875,9 +3898,9 @@ async def _sweep_stage4(fc, close, vol, fund, out_path: str) -> None:
         {"label": "control (live=residual)", "mom": "residual"},
         {"label": "raw (reference)", "mom": "raw"},
         {"label": "residual+tv0.25", "mom": "residual", "target_vol": 0.25},
-        {"label": "tv0.25", "target_vol": 0.25},
-        {"label": "lowvol-tilt", "lowvol_tilt": True},
-        {"label": "vol-weight", "vol_weight": True},
+        {"label": "tv0.25", "mom": "raw", "target_vol": 0.25},
+        {"label": "lowvol-tilt", "mom": "raw", "lowvol_tilt": True},
+        {"label": "vol-weight", "mom": "raw", "vol_weight": True},
         # Protection overlays ("don't give the win back"): peak-to-trough
         # cash-out brake + exposure trend filter, on the residual core.
         {"label": "res+stop10", "mom": "residual", "portfolio_stop": 0.10},

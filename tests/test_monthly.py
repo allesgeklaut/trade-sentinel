@@ -961,9 +961,11 @@ class TestBackfill:
                 assert len(pos) == 2
                 for p in pos:
                     assert p.shares > 0 and p.avg_cost > 0
-                # rebalance audit rows exist with picks
+                # rebalance audit rows: one per replayed month (the live engine
+                # rebalances monthly, no-op months included)
                 rbs = (await s.scalars(select(Rb))).all()
-                assert rbs and all(x.picked for x in rbs)
+                assert sorted(x.rebal_month for x in rbs) == ["2026-07", "2026-08"]
+                assert all(x.picked for x in rbs)
                 # trades carry the replay day
                 trs = (await s.scalars(select(Tr))).all()
                 for t in trs:

@@ -2441,6 +2441,45 @@ class TestSimBackfill:
                     assert t.reason.startswith("backfill:")
         await check()
 
+    async def test_uncovered_current_month_keeps_its_contribution(
+            self, mem_db, fake_series, monkeypatch):
+        """A backfill run before the current month has candles must restore the
+        live deposit (marker + row + cash), not just the row — otherwise the
+        account is permanently one contribution short and the next live
+        deposit would hit the unique allowance constraint."""
+        from sqlalchemy import select
+
+        from app.db import SimAccount
+        from app.db import SimAllowance as Al
+
+        monkeypatch.setattr(sim, "_current_month", lambda: "2026-09")
+
+        # Control: no live marker -> the current month is not replayed at all.
+        await sim.backfill(start="2025-03-01")
+        async with mem_db() as s:
+            base_cash = (await s.get(SimAccount, 1)).cash
+
+        # Seed the live deposit marker, then re-run from the same window.
+        async def seed():
+            async with mem_db() as s:
+                acc = await s.get(SimAccount, 1)
+                acc.cash = 0.0
+                acc.last_allowance_month = "2026-09"
+                await s.commit()
+        await seed()
+
+        r = await sim.backfill(start="2025-03-01")
+        assert r["ok"] is True
+
+        async with mem_db() as s:
+            acc = await s.get(SimAccount, 1)
+            assert acc.last_allowance_month == "2026-09"
+            months = sorted(x.month for x in (await s.scalars(select(Al))).all())
+            assert "2026-09" in months
+            # the September contribution is actually funded, not just logged
+            assert acc.cash == pytest.approx(
+                base_cash + settings.sim_monthly_allowance, abs=0.5)
+
     async def test_backfill_zero_equity_days_not_persisted_negatively(
             self, mem_db, fake_series):
         """The replay starts flat (no cash until the first deposit): early

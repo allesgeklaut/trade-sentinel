@@ -2201,8 +2201,10 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
 
     ``start`` semantics (mirrors monthly.backfill / daily_core.backfill):
       - explicit "YYYY-MM-DD": replay from that day
-      - "all": the full stored history (candles to 1980; the replay trims to
-        the first day with computed signals)
+      - "all": the full stored history (candles to 1980; the replay walks
+        every stored trading day and deposits the monthly allowance on the
+        first trading day of each month it covers, so the curve starts at the
+        earliest stored candle rather than at the first signal)
       - None (default): synched with the other sims — the earliest snapshot
         date of the monthly / daily-core portfolios (the sim's own snapshots
         are wiped by the replay, so the other two anchor the shared window).
@@ -2244,15 +2246,9 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
         # day of each month (the _replay convention).
         days = [e["time"] for e in res.equity_curve]
         replay_months = sorted({d[:7] for d in days})
-        current_month = _current_month()
-        if current_month not in replay_months:
-            # the live engine already deposited this month; the replay's own
-            # deposit sequence doesn't include it (no candles yet) — keep the
-            # live allowance row so deposit_allowance() stays a no-op
-            replay_months = sorted(set(replay_months) | {current_month})
 
         # --- wipe + persist (keep the live allowance marker like the other
-        # backfills; also keep the current live month's allowance row) ---
+        # backfills) ---
         async with Session() as s:
             acc0 = await s.get(Acc, 1)
             live_allowance_month = acc0.last_allowance_month if acc0 else None
@@ -2296,6 +2292,18 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
         deposited_months = {e["time"][:7] for e in res.equity_curve}
         cash += params.monthly_allowance * len(deposited_months)
 
+        # The live engine deposits at the START of the month, so it may have
+        # already deposited the CURRENT month while the replay window has no
+        # candle for it yet (e.g. backfill on the 1st before the market opens).
+        # The replay never re-deposits it, so restore the contribution and the
+        # row — otherwise the account ends permanently short, and if the
+        # marker lagged behind the row the next live deposit would hit the
+        # unique allowance constraint. (Mirrors daily_core.backfill.)
+        current_month = _current_month()
+        if live_allowance_month == current_month and current_month not in replay_months:
+            cash += params.monthly_allowance
+            replay_months = sorted(set(replay_months) | {current_month})
+
         async with Session() as s:
             acc = await s.get(Acc, 1)
             assert acc is not None  # created in the wipe step above
@@ -2315,9 +2323,11 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
                          created_at=pd.Timestamp(f"{tr['date']} 16:00:00+00:00").to_pydatetime()))
             for m in replay_months:
                 s.add(Al(amount=settings.sim_monthly_allowance, month=m))
-            # Keep the marker consistent: the live month's allowance exists
-            # again, so deposit_allowance() stays a no-op for this month.
-            acc.last_allowance_month = live_allowance_month or replay_months[-1]
+            # Keep the marker consistent: never let it lag the newest inserted
+            # row, or the next live deposit would duplicate that month.
+            last_month = max(live_allowance_month or "",
+                             replay_months[-1] if replay_months else "")
+            acc.last_allowance_month = last_month or None
             allowance_running = 0.0
             for e in res.equity_curve:
                 d = e["time"]

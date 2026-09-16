@@ -119,7 +119,7 @@ async def _run(name):
         out = score(rows)
         if not out: return
         # Attach BUY/SELL/HOLD signal from the full analysis engine.
-        # candles() already returned ~2y of data from refresh(); compute()
+        # refresh_yfinance() above fetched ~2y of daily candles; compute()
         # needs >=206 rows. New IPOs with insufficient history get "N/A".
         try:
             r = compute(rows)

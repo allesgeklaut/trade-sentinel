@@ -609,6 +609,26 @@ class TestProtectionDecision:
         _market_ok, basket_out = self._run(False, tmp_path, monkeypatch)
         assert basket_out is False
 
+    def test_repeat_call_does_not_reprocess_the_last_day(self, tmp_path, monkeypatch):
+        """A second cycle on unchanged candles must not re-append the last
+        day's return (which doubled the chained basket growth per call)."""
+        close = self._market_close()
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        monkeypatch.setattr(daily_core, "universe_tickers", lambda _u: ["AAA"])
+
+        async def fake_load_frames(_tickers, _asof, start=None):
+            return close, None
+        monkeypatch.setattr(daily_core.monthly_mod, "load_frames", fake_load_frames)
+
+        async def run():
+            return await daily_core._protection_decision(["AAA"], None, 200, True)
+
+        asyncio.run(run())
+        first = list(daily_core._load_state()["basket_hist"])
+        asyncio.run(run())
+        second = list(daily_core._load_state()["basket_hist"])
+        assert first == second
+
 
 # ---------------------------------------------------------------------------
 # Strategy universe selection (runtime, persisted)
