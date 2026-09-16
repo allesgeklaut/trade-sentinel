@@ -179,11 +179,14 @@ async def refresh_watchlist(period: str = "2y"):
 
 @app.post('/api/sim/refresh')
 async def sim_refresh(period: str = "2y"):
-    """Refresh candle data for all sim holdings + benchmark so valuations use live prices."""
+    """Refresh candle data for all sim holdings + benchmark so valuations use live prices.
+
+    Pull-to-refresh is a user gesture and must feel fast: this uses the free
+    Yahoo bulk path (unmetered), NOT the rate-limited provider. With the 8/min
+    Twelve Data plan, >8 holdings made one pull take a full minute.
+    """
     tickers = await sim.held_tickers()
-    # Held tickers are few (≤10): use the configured provider (Twelve Data),
-    # with its per-ticker yfinance fallback — not the bulk Yahoo path.
-    refreshed, errors = await refresh_many(tickers, period, use_provider=True)
+    refreshed, errors = await refresh_many(tickers, period)
     return {"refreshed": refreshed, "errors": errors, "total": len(tickers)}
 @app.get('/api/dashboard/{ticker}')
 async def dashboard(ticker:str, period:str|None=None):
@@ -640,8 +643,9 @@ async def monthly_refresh():
     async with monthly.Session() as s:
         held = [p.ticker for p in (await s.scalars(select(monthly.MonthlyPosition))).all()]
     pairs = sorted({pm[0] for t in held if (pm := monthly.fundamentals_mod._suffix_fx(t))})
-    # Held-only pull-to-refresh: configured provider (Twelve Data) with fallback.
-    refreshed, errors = await refresh_many(held + pairs, "2y", use_provider=True)
+    # Held-only pull-to-refresh: free Yahoo bulk path (fast, unmetered). FX pairs
+    # are Yahoo symbols (EURUSD=X) anyway, so the provider path just 404'd them.
+    refreshed, errors = await refresh_many(held + pairs, "2y")
     return {"refreshed": refreshed, "errors": errors}
 
 @app.get('/api/dailycore/status')
@@ -794,8 +798,9 @@ async def daily_core_refresh():
         held = [p.ticker for p in (await s.scalars(select(DailyCorePosition))).all()]
     pairs = sorted({pm[0] for t in held
                     if (pm := daily_core.monthly_mod.fundamentals_mod._suffix_fx(t))})
-    # Held-only pull-to-refresh: configured provider (Twelve Data) with fallback.
-    refreshed, errors = await refresh_many(held + pairs, "2y", use_provider=True)
+    # Held-only pull-to-refresh: free Yahoo bulk path (fast, unmetered). FX pairs
+    # are Yahoo symbols (EURUSD=X) anyway, so the provider path just 404'd them.
+    refreshed, errors = await refresh_many(held + pairs, "2y")
     return {"refreshed": refreshed, "errors": errors, "total": len(refreshed) + len(errors)}
 
 @app.post('/api/dailycore/backfill')
