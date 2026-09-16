@@ -1,6 +1,6 @@
-import json, logging, re
+import asyncio, json, logging, re
 from contextlib import asynccontextmanager
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
@@ -9,7 +9,7 @@ from sqlalchemy import select
 from pydantic import BaseModel
 from .config import settings
 from .db import Watchlist, Session, init_db
-from .market import refresh, refresh_many, candles, search, info, provider, PERIOD_COUNTS
+from .market import refresh, refresh_many, refresh_yfinance, candles, search, info, provider, PERIOD_COUNTS
 from .analysis import compute, persist, history, MIN_CANDLES
 from .screener import universe_names, run, results, refresh_incremental, load_deep_history, get_screener_progress, ScreenerBusy
 from . import sim
@@ -18,6 +18,8 @@ from . import llm as llm_mod
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 logger = logging.getLogger("trade_sentinel.main")
+_WATCHLIST_REFRESH_PERIOD = "2y"
+_watchlist_prefetch_task: asyncio.Task | None = None
 
 # Uvicorn installs no handlers for the root logger, so app loggers
 # ("trade_sentinel.*") emit nothing at INFO: scheduler runs, allowance
@@ -33,8 +35,60 @@ if not logging.getLogger().handlers:
     # keep this muted as defense-in-depth.
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
+async def _watchlist_tickers() -> list[str]:
+    async with Session() as s:
+        return [x.ticker for x in (await s.scalars(select(Watchlist).order_by(Watchlist.ticker))).all()]
+
+
+async def prefetch_watchlist() -> dict:
+    """Fetch the watchlist's candles into the cache via the configured provider.
+
+    App-level and nightly: the Dashboard then opens straight from the DB with no
+    network fetch. Shares the Twelve Data limiter/budget with the universe
+    prefetch, and skips tickers fetched within ``market_fresh_seconds`` — so the
+    usual overlap (mega-caps also in the S&P 500) costs nothing extra.
+    """
+    tickers = await _watchlist_tickers()
+    if not tickers:
+        return {"ok": True, "total": 0, "refreshed": 0, "errors": []}
+    refreshed, errors = await refresh_many(
+        tickers, _WATCHLIST_REFRESH_PERIOD, use_provider=True,
+        max_age_seconds=settings.market_fresh_seconds)
+    logger.info("Watchlist prefetch: %d/%d fetched, %d errors",
+                len(refreshed), len(tickers), len(errors))
+    return {"ok": True, "total": len(tickers), "refreshed": len(refreshed), "errors": errors}
+
+
+async def _watchlist_prefetch_loop() -> None:
+    """Run :func:`prefetch_watchlist` nightly at ``sim_run_hour`` (UTC).
+
+    Deliberately independent of ``SIM_ENABLED`` / ``SIM_UNIVERSE_PREFETCH``: the
+    watchlist is a Dashboard feature, not a sim feature. Scheduled after the
+    universe prefetch window so the two don't contend for the rate limiter.
+    Skipped on weekends/NYSE holidays (EOD data doesn't change then).
+    """
+    while True:
+        now = datetime.now(UTC)
+        target = now.replace(hour=settings.sim_run_hour, minute=settings.sim_run_minute,
+                             second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        logger.info("Watchlist prefetch: next run at %s (in %.0f seconds)", target, wait_seconds)
+        await asyncio.sleep(wait_seconds)
+        if not sim.is_trading_day(datetime.now(UTC)):
+            logger.info("Watchlist prefetch: %s is not a trading day — skipping",
+                        datetime.now(UTC).date())
+            continue
+        try:
+            await prefetch_watchlist()
+        except Exception as e:
+            logger.error("Watchlist prefetch failed: %s", e, exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app):
+    global _watchlist_prefetch_task
     await init_db()
     async with Session() as s:
         for t in settings.watchlist.split(','):
@@ -44,9 +98,14 @@ async def lifespan(app):
             if not await s.get(Watchlist, ticker):
                 s.add(Watchlist(ticker=ticker))
         await s.commit()
+    if settings.watchlist_prefetch:
+        _watchlist_prefetch_task = asyncio.create_task(_watchlist_prefetch_loop())
     if settings.sim_enabled:
         sim.start_scheduler()
     yield
+    if _watchlist_prefetch_task and not _watchlist_prefetch_task.done():
+        _watchlist_prefetch_task.cancel()
+    _watchlist_prefetch_task = None
     if settings.sim_enabled:
         sim.stop_scheduler()
 app=FastAPI(title="Trade Sentinel",lifespan=lifespan)
@@ -64,7 +123,7 @@ async def security_headers(request, call_next):
 async def health(): return {"ok":True,"paper_trading":settings.paper_trading,"market_data_provider":provider()}
 @app.get('/api/watchlist')
 async def watchlist():
-    async with Session() as s: return [x.ticker for x in (await s.scalars(select(Watchlist).order_by(Watchlist.ticker))).all()]
+    return await _watchlist_tickers()
 @app.post('/api/watchlist/{ticker}')
 async def add(ticker:str):
     ticker=ticker.upper()
@@ -72,7 +131,15 @@ async def add(ticker:str):
         raise HTTPException(422, f"Invalid ticker symbol: {ticker!r}")
     async with Session() as s:
         if not await s.get(Watchlist,ticker): s.add(Watchlist(ticker=ticker)); await s.commit()
-    return {"ticker":ticker}
+    # Best-effort initial fetch so the new ticker charts immediately instead of
+    # waiting for a pull-to-refresh or the nightly prefetch. One Yahoo call.
+    try:
+        await refresh_yfinance(ticker, _WATCHLIST_REFRESH_PERIOD)
+        fetched = True
+    except Exception as e:
+        fetched = False
+        logger.warning("watchlist add: initial fetch failed for %s: %s", ticker, e)
+    return {"ticker":ticker,"fetched":fetched}
 @app.delete('/api/watchlist/{ticker}')
 async def remove(ticker:str):
     ticker=ticker.upper()
@@ -101,9 +168,12 @@ async def fetch(ticker:str, period:str|None=None):
 
 @app.post('/api/refresh-watchlist')
 async def refresh_watchlist(period: str = "2y"):
-    """Refresh candle data for every watchlist ticker. Returns per-ticker status."""
-    async with Session() as s:
-        tickers = [x.ticker for x in (await s.scalars(select(Watchlist).order_by(Watchlist.ticker))).all()]
+    """Refresh candle data for every watchlist ticker. Returns per-ticker status.
+
+    Uses the bulk Yahoo path (``refresh_many`` default), NOT the metered
+    provider: pull-to-refresh must be fast and free.
+    """
+    tickers = await _watchlist_tickers()
     refreshed, errors = await refresh_many(tickers, period)
     return {"refreshed": refreshed, "errors": errors, "total": len(tickers)}
 

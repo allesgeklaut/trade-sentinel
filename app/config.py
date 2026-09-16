@@ -171,6 +171,12 @@ class Settings(BaseSettings):
     sim_universe_prefetch: bool = True
     sim_prefetch_lead_minutes: int = 90
     market_fresh_seconds: int = 21600  # 6h: "already fetched, skip the re-pull"
+    # Nightly watchlist prefetch (app-level, NOT sim-level): fetch the watchlist
+    # with the configured provider each night so the Dashboard opens straight
+    # from the DB. Runs independently of SIM_ENABLED / SIM_UNIVERSE_PREFETCH, at
+    # sim_run_hour (the app's nightly refresh time). Overlaps are skipped via
+    # MARKET_FRESH_SECONDS; the Twelve Data limiter paces/falls back.
+    watchlist_prefetch: bool = True
 
     # --- Benchmark (DCA control portfolio) --------------------------------
     sim_benchmark_enabled: bool = True

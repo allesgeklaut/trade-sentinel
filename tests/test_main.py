@@ -80,3 +80,97 @@ class TestBackfillAllWindow:
         assert recorded["monthly"] == ["2026-03-04"]
         assert recorded["daily_core"] == ["2026-03-04"]
         assert r["requested_start"] == "synced (earliest of the other sims)"
+
+
+# ---------------------------------------------------------------------------
+# Watchlist: nightly prefetch (app-level, independent of the sims)
+# ---------------------------------------------------------------------------
+
+class TestWatchlistPrefetch:
+    async def test_uses_provider_and_skips_fresh(self, monkeypatch):
+        async def fake_tickers():
+            return ["AAPL", "GC=F"]
+
+        monkeypatch.setattr(main, "_watchlist_tickers", fake_tickers)
+        calls: dict = {}
+
+        async def fake_refresh_many(tickers, period, **kwargs):
+            calls["tickers"] = tickers
+            calls["period"] = period
+            calls["kwargs"] = kwargs
+            return list(tickers), []
+
+        monkeypatch.setattr(main, "refresh_many", fake_refresh_many)
+
+        r = await main.prefetch_watchlist()
+
+        assert calls["tickers"] == ["AAPL", "GC=F"]
+        assert calls["period"] == main._WATCHLIST_REFRESH_PERIOD
+        assert calls["kwargs"]["use_provider"] is True
+        assert calls["kwargs"]["max_age_seconds"] == main.settings.market_fresh_seconds
+        assert r == {"ok": True, "total": 2, "refreshed": 2, "errors": []}
+
+    async def test_empty_watchlist_is_a_noop(self, monkeypatch):
+        async def fake_tickers():
+            return []
+
+        monkeypatch.setattr(main, "_watchlist_tickers", fake_tickers)
+
+        async def boom(*a, **k):
+            raise AssertionError("refresh_many must not run for an empty watchlist")
+
+        monkeypatch.setattr(main, "refresh_many", boom)
+
+        r = await main.prefetch_watchlist()
+        assert r == {"ok": True, "total": 0, "refreshed": 0, "errors": []}
+
+
+# ---------------------------------------------------------------------------
+# Watchlist: fetch on add (so a new ticker charts immediately)
+# ---------------------------------------------------------------------------
+
+class _FakeSession:
+    def __init__(self):
+        self.added: list = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, model, key):
+        return None
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        return None
+
+
+class TestWatchlistAddFetches:
+    async def test_add_fetches_with_yfinance(self, monkeypatch):
+        monkeypatch.setattr(main, "Session", lambda: _FakeSession())
+        fetched: list[tuple[str, str]] = []
+
+        async def fake_yf(ticker, period):
+            fetched.append((ticker, period))
+
+        monkeypatch.setattr(main, "refresh_yfinance", fake_yf)
+
+        out = await main.add("msft")
+
+        assert fetched == [("MSFT", main._WATCHLIST_REFRESH_PERIOD)]
+        assert out == {"ticker": "MSFT", "fetched": True}
+
+    async def test_add_survives_a_failed_fetch(self, monkeypatch):
+        monkeypatch.setattr(main, "Session", lambda: _FakeSession())
+
+        async def boom(ticker, period):
+            raise ValueError("no data")
+
+        monkeypatch.setattr(main, "refresh_yfinance", boom)
+
+        out = await main.add("ZZZZ")
+        assert out == {"ticker": "ZZZZ", "fetched": False}
