@@ -3090,7 +3090,7 @@
                 status.textContent = `Target-vol set to ${label} — the next cycle applies it.`;
                 await loadDailyCoreAll();
             } catch (e) {
-                status.textContent = 'Error: ' + escapeHtml(e.message);
+                status.textContent = 'Error: ' + e.message;
                 await loadDailyCoreAll();  // restore the actual selection + chips
             }
         }
@@ -3111,7 +3111,7 @@
                 status.textContent = `Deployment gate set to ${label} — the next cycle applies it.`;
                 await loadDailyCoreAll();
             } catch (e) {
-                status.textContent = 'Error: ' + escapeHtml(e.message);
+                status.textContent = 'Error: ' + e.message;
                 await loadDailyCoreAll();  // restore the actual selection + chips
             }
         }
@@ -3132,7 +3132,7 @@
                 status.textContent = `Gradient cash-out set to ${label} — the next cycle applies it.`;
                 await loadDailyCoreAll();
             } catch (e) {
-                status.textContent = 'Error: ' + escapeHtml(e.message);
+                status.textContent = 'Error: ' + e.message;
                 await loadDailyCoreAll();  // restore the actual selection + chips
             }
         }
@@ -3153,7 +3153,7 @@
                 status.textContent = `Strategy switched to ${label} — the next cycle recomputes the ranking.`;
                 await loadDailyCoreAll();
             } catch (e) {
-                status.textContent = 'Error: ' + escapeHtml(e.message);
+                status.textContent = 'Error: ' + e.message;
                 await loadDailyCoreAll();  // restore the actual selection + chips
             }
         }
@@ -3173,7 +3173,7 @@
                     await loadDailyCoreAll();  // reload BEFORE re-enabling so
                     // the button never becomes clickable on stale data (#22)
                 }
-            } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
             btn.disabled = false;
         }
 
@@ -3203,7 +3203,7 @@
                 for (const b of document.querySelectorAll('#dc-range-bar .range-btn'))
                     b.classList.toggle('range-active', b.dataset.range === 'MAX');
                 await loadDailyCoreAll();
-            } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
             btn.disabled = false;
         }
 
@@ -3230,7 +3230,7 @@
                 for (const b of document.querySelectorAll('#dc-range-bar .range-btn'))
                     b.classList.toggle('range-active', b.dataset.range === 'MAX');
                 await loadDailyCoreAll();
-            } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
             btn.disabled = false;
         }
 
@@ -3445,7 +3445,7 @@
                     status.textContent = `Rebalanced ${r.month}: ${r.picks.length} picks, ${r.trades.length} trades.`;
                     loadMonthlyAll();
                 }
-            } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
             btn.disabled = false;
         }
 
@@ -3470,7 +3470,7 @@
                 for (const b of document.querySelectorAll('#m-range-bar .range-btn'))
                     b.classList.toggle('range-active', b.dataset.range === 'MAX');
                 await loadMonthlyAll();
-            } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
             btn.disabled = false;
         }
 
@@ -3952,7 +3952,7 @@
                 status.textContent = `Benchmark backfilled: ${r.days} days (${r.start} → ${r.end}), ` +
                     `${r.n_buys} monthly buys, contributed $${r.contributed.toFixed(2)}, final equity $${r.final_equity.toFixed(2)}.`;
                 await loadSimAll();
-            } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
             btn.disabled = false;
         }
 
@@ -3972,7 +3972,7 @@
                     `${r.snapshots} equity points, ${r.trades} trades, final equity $${r.final_equity.toFixed(2)}. ` +
                     '(deterministic approximation — no LLM overlay)';
                 await loadSimAll();
-            } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
             btn.disabled = false;
         }
 

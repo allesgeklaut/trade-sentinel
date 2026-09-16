@@ -29,6 +29,8 @@ import asyncio
 import json
 import logging
 import math
+import os
+import threading
 
 import numpy as np
 from datetime import datetime, timedelta, UTC
@@ -61,6 +63,11 @@ STRATEGY_VARIANTS: dict[str, str] = {
 }
 
 _STATE_FILE = Path("/data/daily_core_state.json")
+# Serialises read-modify-write of the state file: the runtime setters and the
+# protection decision all read the file, change one key, and write it back, so
+# two concurrent writers could drop each other's field. The critical sections
+# are tiny, so a plain threading lock is fine (they run in the event loop).
+_state_lock = threading.Lock()
 
 
 def _load_state() -> dict:
@@ -76,7 +83,10 @@ def _load_state() -> dict:
 def _save_state(state: dict) -> None:
     try:
         _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _STATE_FILE.write_text(json.dumps(state, indent=2))
+        # Atomic replace so a concurrent reader never sees a half-written file.
+        tmp = _STATE_FILE.with_suffix(_STATE_FILE.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        os.replace(tmp, _STATE_FILE)
     except Exception as e:
         logger.warning("Could not write daily-core state file %s: %s", _STATE_FILE, e)
 
@@ -103,10 +113,11 @@ def current_variant() -> str:
 def set_variant(variant: str) -> None:
     if variant not in STRATEGY_VARIANTS:
         raise ValueError(f"unknown mom variant: {variant!r}")
-    state = _load_state()
-    state["mom_variant"] = variant
-    _reset_basket_state(state)  # the band (thus the basket) changes with variant
-    _save_state(state)
+    with _state_lock:
+        state = _load_state()
+        state["mom_variant"] = variant
+        _reset_basket_state(state)  # the band (thus the basket) changes with variant
+        _save_state(state)
 
 
 # ---------------------------------------------------------------------------
@@ -130,10 +141,11 @@ def current_universe() -> str:
 def set_universe(name: str) -> None:
     if name not in universe_names():
         raise ValueError(f"unknown universe: {name!r}")
-    state = _load_state()
-    state["universe"] = name
-    _reset_basket_state(state)  # the basket chain belongs to the old universe
-    _save_state(state)
+    with _state_lock:
+        state = _load_state()
+        state["universe"] = name
+        _reset_basket_state(state)  # the basket chain belongs to the old universe
+        _save_state(state)
 
 
 # ---------------------------------------------------------------------------
@@ -211,24 +223,28 @@ def current_protection_config() -> tuple[int | None, bool, int | None]:
     return gate_sma, gradient != "off", arm_sma
 
 
-def _set_protection_pair(gate: str, gradient: str) -> None:
-    state = _load_state()
-    state["gate"] = gate
-    state["gradient_arm"] = gradient
-    state.pop("protection", None)  # drop the legacy key once migrated
-    _save_state(state)
-
-
 def set_gate(mode: str) -> None:
     if mode not in GATE_MODES:
         raise ValueError(f"unknown gate mode: {mode!r}")
-    _set_protection_pair(mode, current_gradient())
+    with _state_lock:
+        state = _load_state()
+        _, gradient = _protection_settings(state)  # read under the lock
+        state["gate"] = mode
+        state["gradient_arm"] = gradient
+        state.pop("protection", None)  # drop the legacy key once migrated
+        _save_state(state)
 
 
 def set_gradient(mode: str) -> None:
     if mode not in GRADIENT_MODES:
         raise ValueError(f"unknown gradient mode: {mode!r}")
-    _set_protection_pair(current_gate(), mode)
+    with _state_lock:
+        state = _load_state()
+        gate, _ = _protection_settings(state)  # read under the lock
+        state["gate"] = gate
+        state["gradient_arm"] = mode
+        state.pop("protection", None)  # drop the legacy key once migrated
+        _save_state(state)
 
 
 # ---------------------------------------------------------------------------
@@ -275,9 +291,10 @@ def current_target_vol() -> float:
 def set_target_vol(mode: str) -> None:
     if mode not in TARGET_VOL_MODES:
         raise ValueError(f"unknown target-vol mode: {mode!r}")
-    state = _load_state()
-    state["target_vol"] = mode
-    _save_state(state)
+    with _state_lock:
+        state = _load_state()
+        state["target_vol"] = mode
+        _save_state(state)
 
 
 def _vol_deploy_room(equity: float, cash: float, port_rets: list[float],
@@ -420,12 +437,13 @@ async def _protection_decision(band: list[str],
         elif was_out and pos >= _GRADIENT_CONFIRM:
             was_out = False
         out = was_out
-    state = _load_state()
-    state.update({"basket_hist": hist, "basket_day": str(idx[-1].date()),
-                  "basket_neg_streak": neg if gradient_active else 0,
-                  "basket_pos_streak": pos if gradient_active else 0,
-                  "basket_out": out})
-    _save_state(state)
+    with _state_lock:
+        state = _load_state()
+        state.update({"basket_hist": hist, "basket_day": str(idx[-1].date()),
+                      "basket_neg_streak": neg if gradient_active else 0,
+                      "basket_pos_streak": pos if gradient_active else 0,
+                      "basket_out": out})
+        _save_state(state)
     return market_ok, out
 
 

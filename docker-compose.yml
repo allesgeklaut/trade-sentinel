@@ -3,7 +3,9 @@ services:
     build: .
     container_name: trade-sentinel
     restart: unless-stopped
-    ports: ["8002:8000"]
+    # Bind to loopback only: the app has no auth, so it must not be reachable
+    # directly. Remote access goes through the Cloudflare tunnel (Zero Trust).
+    ports: ["127.0.0.1:8002:8000"]
     env_file:
       - .env
     volumes:

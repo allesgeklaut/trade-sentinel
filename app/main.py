@@ -1,6 +1,6 @@
 import asyncio, json, logging, re
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, UTC
+from datetime import date, datetime, timedelta, UTC
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
@@ -20,6 +20,22 @@ _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 logger = logging.getLogger("trade_sentinel.main")
 _WATCHLIST_REFRESH_PERIOD = "2y"
 _watchlist_prefetch_task: asyncio.Task | None = None
+
+# Serialises the four-portfolio backfill: concurrent clicks (or a click plus a
+# retry) would otherwise each queue all four multi-minute replays.
+_backfill_all_lock = asyncio.Lock()
+
+
+def _validated_start(start: str | None) -> str | None:
+    """Backfill ``start``: None, "all", or an ISO date. Reject anything else
+    with 422 here rather than a raw 500 from the backfill's pd.Timestamp."""
+    if start is None or start == "all":
+        return start
+    try:
+        date.fromisoformat(start)
+    except ValueError as e:
+        raise HTTPException(422, f"invalid start: {start!r} (use YYYY-MM-DD or 'all')") from e
+    return start
 
 # Uvicorn installs no handlers for the root logger, so app loggers
 # ("trade_sentinel.*") emit nothing at INFO: scheduler runs, allowance
@@ -458,7 +474,7 @@ async def sim_backfill(start: str | None = Query(default=None)):
     approximation by design; the response carries approximation: true.
     """
     from . import sim
-    r = await sim.backfill(start)
+    r = await sim.backfill(_validated_start(start))
     if r.get("skipped"):
         raise HTTPException(409, r.get("reason", "skipped"))
     if not r.get("ok"):
@@ -471,7 +487,7 @@ async def sim_backfill_benchmark(start: str | None = Query(default=None)):
     candles. The twin of the other backfills so all four curves can cover
     the same window. ``start``: date | "all" | default = synced."""
     from . import sim
-    r = await sim.backfill_benchmark(start)
+    r = await sim.backfill_benchmark(_validated_start(start))
     if not r.get("ok"):
         raise HTTPException(400, r.get("error", "backfill failed"))
     return r
@@ -493,6 +509,14 @@ async def backfill_all(start: str | None = Query(default=None)):
     long operation (several minutes) — the caller gets everything in one
     response when it finishes.
     """
+    start = _validated_start(start)
+    if _backfill_all_lock.locked():
+        raise HTTPException(409, "a backfill-all is already running")
+    async with _backfill_all_lock:
+        return await _backfill_all_locked(start)
+
+
+async def _backfill_all_locked(start: str | None) -> dict:
     from . import daily_core, monthly, sim
 
     # Resolve the shared window ONCE. The per-backfill defaults would each
@@ -544,9 +568,11 @@ async def backfill_all(start: str | None = Query(default=None)):
     ):
         try:
             out[name] = await fn()
-        except Exception as e:
+        except Exception:
             logger.exception("backfill-all: %s failed", name)
-            errors[name] = str(e)
+            # Don't return internal exception text to the client; the detail
+            # is in the server log.
+            errors[name] = f"{name} backfill failed (see server logs)"
 
     return {"ok": not errors, "start": start_note,
             "requested_start": start or "synced (earliest of the other sims)",
@@ -611,7 +637,7 @@ async def monthly_backfill(start: str | None = Query(default=None)):
     earliest snapshot.
     """
     from . import monthly
-    return await monthly.backfill(start)
+    return await monthly.backfill(_validated_start(start))
 
 
 @app.get('/api/monthly/rebalances')
@@ -830,7 +856,7 @@ async def daily_core_backfill(start: str | None = Query(default=None)):
     portfolios so all three equity curves cover the same window.
     """
     from . import daily_core
-    r = await daily_core.backfill(start)
+    r = await daily_core.backfill(_validated_start(start))
     if not r.get("ok"):
         raise HTTPException(400, r.get("error", "backfill failed"))
     return r
