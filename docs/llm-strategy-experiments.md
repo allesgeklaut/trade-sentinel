@@ -642,3 +642,10 @@ parameter to distrust.
 SMA200 arming (fewest parameters, best drawdown, no window choice to overfit)
 — or expose the window to the experiment selector and judge forward, not on
 this table. All variants remain opt-in.
+
+**Live wiring (2026-09-16):** the daily-core tab now exposes the two mechanisms
+as INDEPENDENT controls — a deployment gate (off/200/100/50) and a gradient
+cash-out arm (off/always/200/100/50) — so any combination here is selectable
+without bundling. `trend200`+`gradient200` reproduces `g10c3gt+t200`;
+`gradient=always` (gate off) reproduces the ungated `g10c3`. Both drive the
+next cycle and every backfill.

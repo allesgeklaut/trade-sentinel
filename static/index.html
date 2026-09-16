@@ -1634,8 +1634,10 @@
                 <button id="dailycore-run-btn" onclick="runDailyCore()">Run Cycle Now</button>
                 <select id="dailycore-variant" title="Momentum variant used by the ranking — the next cycle and every backfill honor it"
                     onchange="setDCVariant(this.value)" style="max-width:260px"></select>
-                <select id="dailycore-protection" title="Protection overlay (§12-15) — the next cycle and every backfill honor it"
-                    onchange="setDCProtection(this.value)" style="max-width:300px"></select>
+                <select id="dailycore-gate" title="Deployment gate (§12) — park new buys while the market index is below its N-day SMA. Independent of the gradient arm; the next cycle and every backfill honor it"
+                    onchange="setDCGate(this.value)" style="max-width:250px"></select>
+                <select id="dailycore-gradient" title="Gradient cash-out (§13-15) — sell the book on a confirmed negative basket slope, armed only in good times (or always). Independent of the gate"
+                    onchange="setDCGradient(this.value)" style="max-width:300px"></select>
                 <select id="dailycore-targetvol" title="Target-vol control — park new cash when the portfolio's own 21d vol exceeds the target"
                     onchange="setDCTargetVol(this.value)" style="max-width:220px"></select>
                 <button id="dailycore-backfill-btn" onclick="backfillDailyCore()">Backfill (daily-core only)</button>
@@ -2895,16 +2897,25 @@
                     }
                 }
                 if (sel && s.mom_variant) sel.value = s.mom_variant;
-                // Protection dropdown (§12-15 mechanisms), same pattern.
-                const psel = document.getElementById('dailycore-protection');
-                if (psel && !psel.options.length) {
-                    for (const [key, label] of Object.entries(s.protections || {})) {
+                // Deployment gate + gradient arm dropdowns (§12-15), same pattern.
+                const gsel = document.getElementById('dailycore-gate');
+                if (gsel && !gsel.options.length) {
+                    for (const [key, label] of Object.entries(s.gates || {})) {
                         const opt = document.createElement('option');
                         opt.value = key; opt.textContent = label;
-                        psel.appendChild(opt);
+                        gsel.appendChild(opt);
                     }
                 }
-                if (psel && s.protection) psel.value = s.protection;
+                if (gsel && s.gate) gsel.value = s.gate;
+                const gradsel = document.getElementById('dailycore-gradient');
+                if (gradsel && !gradsel.options.length) {
+                    for (const [key, label] of Object.entries(s.gradients || {})) {
+                        const opt = document.createElement('option');
+                        opt.value = key; opt.textContent = label;
+                        gradsel.appendChild(opt);
+                    }
+                }
+                if (gradsel && s.gradient) gradsel.value = s.gradient;
                 // Target-vol dropdown, same pattern.
                 const tvsel = document.getElementById('dailycore-targetvol');
                 if (tvsel && !tvsel.options.length) {
@@ -3090,18 +3101,37 @@
             }
         }
 
-        async function setDCProtection(mode) {
+        async function setDCGate(mode) {
             const status = document.getElementById('dailycore-run-status');
-            const label = (document.getElementById('dailycore-protection')?.selectedOptions || [])[0]?.textContent || mode;
-            if (!confirm(`Switch the daily-core protection to "${label}"?\n\nThe next cycle applies it to the live book (a gradient cash-out can SELL everything), and every future backfill replays it.`))
+            const label = (document.getElementById('dailycore-gate')?.selectedOptions || [])[0]?.textContent || mode;
+            if (!confirm(`Set the daily-core deployment gate to "${label}"?\n\nThe next cycle applies it to the live book (it only parks new buys, never sells), and every future backfill replays it.`))
                 return;
             try {
-                await api('dailycore/protection', {
+                await api('dailycore/gate', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ mode }),
                 });
-                status.textContent = `Protection switched to ${label} — the next cycle applies it.`;
+                status.textContent = `Deployment gate set to ${label} — the next cycle applies it.`;
+                await loadDailyCoreAll();
+            } catch (e) {
+                status.textContent = 'Error: ' + escapeHtml(e.message);
+                await loadDailyCoreStatus();  // restore the actual selection
+            }
+        }
+
+        async function setDCGradient(mode) {
+            const status = document.getElementById('dailycore-run-status');
+            const label = (document.getElementById('dailycore-gradient')?.selectedOptions || [])[0]?.textContent || mode;
+            if (!confirm(`Set the daily-core gradient cash-out to "${label}"?\n\nThe next cycle applies it to the live book (a triggered cash-out can SELL everything), and every future backfill replays it.`))
+                return;
+            try {
+                await api('dailycore/gradient', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode }),
+                });
+                status.textContent = `Gradient cash-out set to ${label} — the next cycle applies it.`;
                 await loadDailyCoreAll();
             } catch (e) {
                 status.textContent = 'Error: ' + escapeHtml(e.message);

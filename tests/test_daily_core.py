@@ -545,39 +545,65 @@ class TestVariantSelection:
 # ---------------------------------------------------------------------------
 
 class TestProtectionSelection:
-    def test_default_is_none(self, monkeypatch, tmp_path):
+    def test_default_off(self, monkeypatch, tmp_path):
         monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
-        assert daily_core.current_protection() == "none"
+        assert daily_core.current_gate() == "off"
+        assert daily_core.current_gradient() == "off"
+        assert daily_core.current_protection_config() == (None, False, None)
 
-    def test_set_and_persist(self, monkeypatch, tmp_path):
+    def test_set_and_persist_independent(self, monkeypatch, tmp_path):
         monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
-        daily_core.set_protection("gradient200")
-        assert daily_core.current_protection() == "gradient200"
-        # variant + protection coexist in the same state file
+        daily_core.set_gate("200")
+        daily_core.set_gradient("100")
+        assert daily_core.current_gate() == "200"
+        assert daily_core.current_gradient() == "100"
+        # setting one leaves the other untouched, and they share the file
+        daily_core.set_gradient("off")
         daily_core.set_variant("raw")
+        assert daily_core.current_gate() == "200"
+        assert daily_core.current_gradient() == "off"
         assert daily_core.current_variant() == "raw"
-        assert daily_core.current_protection() == "gradient200"
 
     def test_rejects_unknown(self, monkeypatch, tmp_path):
         monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
         with pytest.raises(ValueError):
-            daily_core.set_protection("turbo")
+            daily_core.set_gate("turbo")
+        with pytest.raises(ValueError):
+            daily_core.set_gradient("turbo")
 
     def test_all_modes_have_labels(self):
-        for mode in daily_core.PROTECTION_MODES:
-            assert daily_core.PROTECTION_MODES[mode]
-        assert set(daily_core._ARM_SMA) <= set(daily_core.PROTECTION_MODES)
+        assert all(daily_core.GATE_MODES.values())
+        assert all(daily_core.GRADIENT_MODES.values())
 
-    def test_every_gate_mode_has_an_sma(self):
-        # `none` has no market gate; every other mode must map to an SMA
-        # window, otherwise the gate silently never fires.
-        assert set(daily_core._ARM_SMA) == set(daily_core.PROTECTION_MODES) - {"none"}
+    def test_config_resolution(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core.set_gate("200")
+        daily_core.set_gradient("always")
+        assert daily_core.current_protection_config() == (200, True, None)
+        daily_core.set_gate("off")
+        daily_core.set_gradient("50")
+        assert daily_core.current_protection_config() == (None, True, 50)
+        daily_core.set_gradient("off")
+        assert daily_core.current_protection_config() == (None, False, None)
+
+    def test_legacy_protection_migrates(self, monkeypatch, tmp_path):
+        """A state file written before the gate/arm split still selects the
+        same behavior, and the legacy key is dropped once either is set."""
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core._save_state({"protection": "gradient100"})
+        assert daily_core.current_gate() == "100"
+        assert daily_core.current_gradient() == "100"
+        assert daily_core.current_protection_config() == (100, True, 100)
+        daily_core.set_gradient("always")
+        assert daily_core.current_gate() == "100"
+        assert daily_core.current_gradient() == "always"
+        assert "protection" not in daily_core._load_state()
 
 
 class TestProtectionDecision:
-    """`_protection_decision` must only arm the gradient cash-out for
-    gradient modes. `trend200` has an SMA (200) but no cash-out, so the old
-    `arm_sma is not None` proxy wrongly armed it in the backfill replay."""
+    """The deployment gate and the gradient arm are independent: the gate can
+    park buys without disarming the cash-out, and the arm can disarm the
+    cash-out with the gate off."""
 
     @staticmethod
     def _market_close():
@@ -587,27 +613,38 @@ class TestProtectionDecision:
         return pd.DataFrame({"AAA": px}, index=dates)
 
     @staticmethod
-    def _run(gradient_active, tmp_path, monkeypatch):
+    def _run(tmp_path, monkeypatch, *, gate_sma, gradient_active, arm_sma, seed=None):
         close = TestProtectionDecision._market_close()
         monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
         monkeypatch.setattr(daily_core, "universe_tickers", lambda _u: ["AAA"])
-        # Two prior negative days: this call's negative slope is the third
-        # and must confirm the cash-out.
-        daily_core._save_state({"basket_neg_streak": 2, "basket_out": False})
+        if seed:
+            daily_core._save_state(seed)
 
         async def fake_load_frames(_tickers, _asof, start=None):
             return close, None
         monkeypatch.setattr(daily_core.monthly_mod, "load_frames", fake_load_frames)
         return asyncio.run(
-            daily_core._protection_decision(["AAA"], None, 200, gradient_active))
+            daily_core._protection_decision(["AAA"], gate_sma, gradient_active, arm_sma))
 
-    def test_gradient_mode_arms_cash_out(self, tmp_path, monkeypatch):
-        _market_ok, basket_out = self._run(True, tmp_path, monkeypatch)
-        assert basket_out is True
+    def test_always_arm_confirms_cash_out(self, tmp_path, monkeypatch):
+        # Two prior negative days: this call's negative slope is the third.
+        gate_ok, basket_out = self._run(
+            tmp_path, monkeypatch, gate_sma=200, gradient_active=True, arm_sma=None,
+            seed={"basket_neg_streak": 2, "basket_out": False})
+        assert gate_ok is True and basket_out is True
 
-    def test_trend_only_mode_never_arms_cash_out(self, tmp_path, monkeypatch):
-        _market_ok, basket_out = self._run(False, tmp_path, monkeypatch)
-        assert basket_out is False
+    def test_disarmed_in_bad_times_does_not_cash_out(self, tmp_path, monkeypatch):
+        # arm on SMA20: the fixture's last close is below its 20-day SMA, so the
+        # same negative slope must NOT confirm — independent of the (SMA200) gate.
+        gate_ok, basket_out = self._run(
+            tmp_path, monkeypatch, gate_sma=200, gradient_active=True, arm_sma=20,
+            seed={"basket_neg_streak": 2, "basket_out": False})
+        assert gate_ok is True and basket_out is False
+
+    def test_gate_parks_buys_without_gradient(self, tmp_path, monkeypatch):
+        gate_ok, basket_out = self._run(
+            tmp_path, monkeypatch, gate_sma=20, gradient_active=False, arm_sma=None)
+        assert gate_ok is False and basket_out is False
 
     def test_repeat_call_does_not_reprocess_the_last_day(self, tmp_path, monkeypatch):
         """A second cycle on unchanged candles must not re-append the last
@@ -621,7 +658,8 @@ class TestProtectionDecision:
         monkeypatch.setattr(daily_core.monthly_mod, "load_frames", fake_load_frames)
 
         async def run():
-            return await daily_core._protection_decision(["AAA"], None, 200, True)
+            return await daily_core._protection_decision(
+                ["AAA"], 200, True, None)
 
         asyncio.run(run())
         first = list(daily_core._load_state()["basket_hist"])

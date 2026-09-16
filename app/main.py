@@ -666,8 +666,10 @@ async def daily_core_status():
         # runtime-selectable momentum variant + the options (UI dropdown)
         "mom_variant": daily_core.current_variant(),
         "mom_variants": daily_core.STRATEGY_VARIANTS,
-        "protection": daily_core.current_protection(),
-        "protections": daily_core.PROTECTION_MODES,
+        "gate": daily_core.current_gate(),
+        "gates": daily_core.GATE_MODES,
+        "gradient": daily_core.current_gradient(),
+        "gradients": daily_core.GRADIENT_MODES,
         "target_vol": daily_core.current_target_vol(),
         "target_vols": daily_core.TARGET_VOL_MODES,
         # runtime-selectable qv-mom universe + the options (UI dropdown)
@@ -701,22 +703,40 @@ async def daily_core_strategy(req: dict):
     return {"ok": True, "variant": variant,
             "label": daily_core.STRATEGY_VARIANTS[variant]}
 
-@app.post('/api/dailycore/protection')
-async def daily_core_protection(req: dict):
-    """Select the daily-core protection overlay at runtime (persisted).
-    Body: {"mode": "none" | "trend200" | "gradient200" | "gradient100" | "gradient50"}.
+@app.post('/api/dailycore/gate')
+async def daily_core_gate(req: dict):
+    """Set the daily-core DEPLOYMENT GATE at runtime (persisted).
+    Body: {"mode": "off" | "200" | "100" | "50"}.
 
-    The mode drives the NEXT deployment pass and every future backfill. With a
-    gradient mode a confirmed negative basket slope (armed only in good times)
-    cashes out the book; the engine re-enters on its own rule, no cooldown.
+    While the market index is below its N-day SMA the gate parks new buys
+    (contributions stay in cash). It does NOT sell. Drives the next cycle and
+    every future backfill.
     """
     from . import daily_core
     mode = (req or {}).get("mode", "")
     try:
-        daily_core.set_protection(mode)
+        daily_core.set_gate(mode)
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
-    return {"ok": True, "mode": mode, "label": daily_core.PROTECTION_MODES[mode]}
+    return {"ok": True, "mode": mode, "label": daily_core.GATE_MODES[mode]}
+
+@app.post('/api/dailycore/gradient')
+async def daily_core_gradient(req: dict):
+    """Set the daily-core GRADIENT CASH-OUT arm at runtime (persisted).
+    Body: {"mode": "off" | "always" | "200" | "100" | "50"}.
+
+    On a confirmed negative slope of the target basket the book is sold to
+    cash; "always" fires ungated, an SMA value arms it only in good times
+    (market above that SMA). Re-entry is unconditional (no cooldown). Drives
+    the next cycle and every future backfill.
+    """
+    from . import daily_core
+    mode = (req or {}).get("mode", "")
+    try:
+        daily_core.set_gradient(mode)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    return {"ok": True, "mode": mode, "label": daily_core.GRADIENT_MODES[mode]}
 
 @app.post('/api/dailycore/targetvol')
 async def daily_core_targetvol(req: dict):
