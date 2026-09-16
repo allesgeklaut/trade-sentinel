@@ -2555,6 +2555,45 @@ class TestSimBackfill:
                 assert by_day["2025-04-01"] == 2 * settings.sim_monthly_allowance
         await check()
 
+    async def test_benchmark_backfill_marker_not_ahead_of_funded_months(
+            self, mem_db, monkeypatch):
+        """If the current month has no candle, the marker must stay at the last
+        FUNDED month — writing the current month would suppress its next live
+        deposit forever (the benchmark ends a contribution behind)."""
+        from unittest.mock import patch
+
+        import pandas as pd
+
+        from app.db import Candle, SimBenchmarkAccount
+
+        dates = pd.bdate_range("2025-03-01", "2025-03-31")
+        candles = [Candle(ticker="URTH", timestamp=ts.to_pydatetime(), open=100.0,
+                          high=101.0, low=99.0, close=100.0, volume=1e6) for ts in dates]
+
+        async def fake_refresh(ticker, period):
+            return None
+
+        async def fake_sync_start():
+            return None
+
+        async def seed():
+            async with mem_db() as s:
+                for c in candles:
+                    s.add(c)
+                await s.commit()
+        await seed()
+
+        monkeypatch.setattr(sim, "_current_month", lambda: "2025-04")
+        with patch("app.market.refresh", fake_refresh), \
+             patch.object(sim, "_sync_start_date", fake_sync_start):
+            r = await sim.backfill_benchmark(start="2025-03-01")
+        assert r["ok"] is True
+
+        async with mem_db() as s:
+            acc = await s.get(SimBenchmarkAccount, 1)
+            # March was the last funded month; April had no candle.
+            assert acc.last_allowance_month == "2025-03"
+
 
 # ---------------------------------------------------------------------------
 # Nightly shared universe prefetch

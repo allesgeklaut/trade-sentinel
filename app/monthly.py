@@ -1272,7 +1272,8 @@ async def backfill(start: str | None = None,
         # The live engine may already have deposited the CURRENT month while
         # the replay window has no candle for it yet — the wipe destroyed the
         # allowance row, so re-create it (same rule as daily_core.backfill).
-        current_month = datetime.now(UTC).strftime("%Y-%m")
+        # `_current_month()` (operator-local) matches deposit_allowance.
+        current_month = _current_month()
         if live_allowance_month == current_month and current_month not in replay_months:
             cash += settings.sim_monthly_contribution
             contributed += settings.sim_monthly_contribution

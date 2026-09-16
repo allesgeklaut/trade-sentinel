@@ -2614,9 +2614,13 @@ async def backfill_benchmark(start: str | None = None) -> dict[str, Any]:
                     extra = amount
             await s.execute(sa_delete(SimBenchmarkSnapshot))
             await s.execute(sa_delete(Acc))
+            # Marker = the newest month actually funded (or the live month when
+            # it was booked above). Never `current_month` blindly: with no
+            # candle for the current month that would suppress the next live
+            # deposit forever (and a lagging marker would double-deposit).
             acc = Acc(id=1, cash=round(cash, 2), shares=round(shares, 6),
                       avg_cost=round(avg_cost, 6),
-                      last_allowance_month=live_month or current_month)
+                      last_allowance_month=max(live_month or "", max(seen_months)))
             s.add(acc)
             for d, sh, _px, eq, contrib in snaps:
                 s.add(SimBenchmarkSnapshot(

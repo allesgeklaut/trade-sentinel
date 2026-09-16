@@ -557,6 +557,10 @@ async def _exec_buy(ticker: str, price: float, budget: float, reason: str) -> di
 
 
 async def _exec_sell(ticker: str, price: float, reason: str) -> dict | None:
+    if price <= 0:
+        # No usable price (e.g. a backfilled avg_cost of 0): booking $0
+        # proceeds would delete the position for nothing. Mirror _exec_buy.
+        return None
     async with Session() as s:
         pos = await s.scalar(select(DailyCorePosition).where(DailyCorePosition.ticker == ticker))
         if pos is None:
