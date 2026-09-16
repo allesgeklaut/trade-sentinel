@@ -145,7 +145,12 @@ PROTECTION_MODES: dict[str, str] = {
     "gradient50": "Gradient cash-out in good times + SMA50 gate",
 }
 
-_ARM_SMA = {"gradient200": 200, "gradient100": 100, "gradient50": 50}
+_ARM_SMA = {
+    "trend200": 200,
+    "gradient200": 200,
+    "gradient100": 100,
+    "gradient50": 50,
+}
 
 # Gradient window/confirmation for the live signal (the §15 backtest values:
 # 10-day slope, 3 consecutive closes).
@@ -272,7 +277,8 @@ def _live_history_start() -> datetime:
 # ---------------------------------------------------------------------------
 
 async def _protection_decision(band: list[str], frame: pd.DataFrame | None,
-                               arm_sma: int | None) -> tuple[bool, bool]:
+                               arm_sma: int | None,
+                               gradient_active: bool) -> tuple[bool, bool]:
     """Evaluate the live protection signal: ``(market_ok, basket_out)``.
 
     Market gate: the equal-weight universe index vs its `arm_sma`-day SMA
@@ -282,9 +288,11 @@ async def _protection_decision(band: list[str], frame: pd.DataFrame | None,
     Gradient: the target basket (the day's top-N band names) is chained one
     day at a time from stored closes; a confirmed negative N-day slope
     (`_GRADIENT_DAYS`, `_GRADIENT_CONFIRM`) sets ``basket_out`` — armed only
-    when ``arm_sma`` is None (always) or the market is above its SMA. Streaks
-    and the basket history persist in the daily-core state file so the signal
-    is stable across cycles (the scheduler runs once a day).
+    when the market is above its SMA. Only evaluated (and persisted) when
+    ``gradient_active`` is set, so `trend200` gates contributions without
+    arming the cash-out. Streaks and the basket history persist in the
+    daily-core state file so the signal is stable across cycles (the
+    scheduler runs once a day).
     """
     tickers = universe_tickers(current_universe())
     close, _vol = await monthly_mod.load_frames(
@@ -327,7 +335,7 @@ async def _protection_decision(band: list[str], frame: pd.DataFrame | None,
     out = False
     neg = 0
     pos = 0
-    if arm_sma is not None and len(hist) > _GRADIENT_DAYS:
+    if gradient_active and len(hist) > _GRADIENT_DAYS:
         armed = market_ok  # good times only
         slope = hist[-1] / hist[-1 - _GRADIENT_DAYS] - 1.0
         state = _load_state()
@@ -345,8 +353,8 @@ async def _protection_decision(band: list[str], frame: pd.DataFrame | None,
         out = was_out
     state = _load_state()
     state.update({"basket_hist": hist, "basket_day": str(idx[-1].date()),
-                  "basket_neg_streak": neg if arm_sma is not None else 0,
-                  "basket_pos_streak": pos if arm_sma is not None else 0,
+                  "basket_neg_streak": neg if gradient_active else 0,
+                  "basket_pos_streak": pos if gradient_active else 0,
                   "basket_out": out})
     _save_state(state)
     return market_ok, out
@@ -637,7 +645,8 @@ async def run_deployment() -> dict:
     block_buys = False
     protection_note = None
     if gate_active and frame is not None:
-        market_ok, basket_out = await _protection_decision(band, frame, arm_sma)
+        market_ok, basket_out = await _protection_decision(
+            band, frame, arm_sma, gradient_active)
         if not market_ok:
             block_buys = True
             protection_note = "market below SMA — contributions parked"
@@ -935,6 +944,7 @@ async def backfill(start: str | None = None,
         # currently selected protection mode.
         protection = current_protection()
         arm_sma = _ARM_SMA.get(protection)
+        gradient_active = protection in ("gradient200", "gradient100", "gradient50")
         mkt_index = close_val.mean(axis=1)
         mkt_sma_map = (mkt_index.rolling(max(arm_sma, 2)).mean()
                        if arm_sma else None)
@@ -1023,7 +1033,7 @@ async def backfill(start: str | None = None,
             protect_ok = True
             if arm_sma is not None:
                 protect_ok = _market_ok_r(d)
-                if protect_ok:
+                if protect_ok and gradient_active:
                     rets = []
                     for t in order[:target_n]:
                         p0 = px_of(t, prev_day_r) if prev_day_r is not None else None
@@ -1053,7 +1063,7 @@ async def backfill(start: str | None = None,
                         do_sell(t)
 
             # gradient cash-out (confirmed negative slope in good times)
-            if arm_sma is not None and grad_out and shares:
+            if gradient_active and grad_out and shares:
                 for t in list(shares):
                     do_sell(t)
 

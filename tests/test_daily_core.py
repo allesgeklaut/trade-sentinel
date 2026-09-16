@@ -568,6 +568,47 @@ class TestProtectionSelection:
             assert daily_core.PROTECTION_MODES[mode]
         assert set(daily_core._ARM_SMA) <= set(daily_core.PROTECTION_MODES)
 
+    def test_every_gate_mode_has_an_sma(self):
+        # `none` has no market gate; every other mode must map to an SMA
+        # window, otherwise the gate silently never fires.
+        assert set(daily_core._ARM_SMA) == set(daily_core.PROTECTION_MODES) - {"none"}
+
+
+class TestProtectionDecision:
+    """`_protection_decision` must only arm the gradient cash-out for
+    gradient modes. `trend200` has an SMA (200) but no cash-out, so the old
+    `arm_sma is not None` proxy wrongly armed it in the backfill replay."""
+
+    @staticmethod
+    def _market_close():
+        dates = pd.bdate_range("2026-01-01", periods=32)
+        px = ([100.0 + i * (10.0 / 19) for i in range(20)]
+              + [109.0 - i * (43.0 / 11) for i in range(1, 13)])
+        return pd.DataFrame({"AAA": px}, index=dates)
+
+    @staticmethod
+    def _run(gradient_active, tmp_path, monkeypatch):
+        close = TestProtectionDecision._market_close()
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        monkeypatch.setattr(daily_core, "universe_tickers", lambda _u: ["AAA"])
+        # Two prior negative days: this call's negative slope is the third
+        # and must confirm the cash-out.
+        daily_core._save_state({"basket_neg_streak": 2, "basket_out": False})
+
+        async def fake_load_frames(_tickers, _asof, start=None):
+            return close, None
+        monkeypatch.setattr(daily_core.monthly_mod, "load_frames", fake_load_frames)
+        return asyncio.run(
+            daily_core._protection_decision(["AAA"], None, 200, gradient_active))
+
+    def test_gradient_mode_arms_cash_out(self, tmp_path, monkeypatch):
+        _market_ok, basket_out = self._run(True, tmp_path, monkeypatch)
+        assert basket_out is True
+
+    def test_trend_only_mode_never_arms_cash_out(self, tmp_path, monkeypatch):
+        _market_ok, basket_out = self._run(False, tmp_path, monkeypatch)
+        assert basket_out is False
+
 
 # ---------------------------------------------------------------------------
 # Strategy universe selection (runtime, persisted)

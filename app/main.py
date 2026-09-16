@@ -768,8 +768,6 @@ async def sim_universe(req: dict):
     return {"ok": True, "universe": name}
 
 @app.get('/api/dailycore/trades')
-
-@app.get('/api/dailycore/trades')
 async def daily_core_trades(limit: int = Query(default=100, ge=1, le=500)):
     from . import daily_core
     return await daily_core.get_trades(limit)
