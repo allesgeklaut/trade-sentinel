@@ -3045,9 +3045,12 @@ async def _daily_core_backtest(
         if trailing_stop_pct > 0:
             for t in list(shares):
                 p = px_of(t, d)
-                pk = peak_px.get(t)
-                if p is None or not pk or pk <= 0:
+                if p is None or p <= 0:
                     continue
+                # Advance the peak to today's close first: the stop is
+                # measured from the high since entry, not the highest buy.
+                pk = max(peak_px.get(t, 0.0), p)
+                peak_px[t] = pk
                 if p <= pk * (1.0 - trailing_stop_pct):
                     trade(d, t, "SELL", 0.0)
                     pending_pick.pop(t, None)

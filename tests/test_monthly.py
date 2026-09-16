@@ -266,6 +266,17 @@ def test_month_last_trading_day():
     assert out.date() == datetime(2026, 8, 31).date() and out.weekday() == 0
 
 
+def test_rebalance_day_skips_holiday_month_end():
+    """A month whose last weekday is a NYSE holiday (2024-03-29 Good Friday)
+    must rebalance on the prior trading day, not be skipped entirely by the
+    scheduler's trading-day guard."""
+    tz = UTC
+    assert monthly.month_last_trading_day(datetime(2024, 3, 15, tzinfo=tz)).date() \
+        == datetime(2024, 3, 28).date()
+    assert monthly.is_rebalance_day(datetime(2024, 3, 28, 22, 0, tzinfo=tz))
+    assert not monthly.is_rebalance_day(datetime(2024, 3, 29, 22, 0, tzinfo=tz))
+
+
 # ---------------------------------------------------------------------------
 # Engine: allowance + rebalance execution
 # ---------------------------------------------------------------------------

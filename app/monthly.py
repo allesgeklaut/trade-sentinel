@@ -606,24 +606,27 @@ def pick_portfolio(rebal_date: pd.Timestamp, close: pd.DataFrame, vol: pd.DataFr
 # ---------------------------------------------------------------------------
 
 def month_last_trading_day(now: datetime) -> datetime:
-    """Last weekday of `now`'s month (holiday approximation, documented)."""
+    """Last US trading day of `now`'s month (weekday, non-NYSE-holiday).
+
+    Walks back over weekends AND NYSE holidays so a month whose last weekday
+    is a holiday (e.g. 2027-05-31 Memorial Day) rebalances on the prior actual
+    trading day, instead of being skipped when the scheduler's trading-day
+    guard suppresses that holiday's tick."""
+    from .sim import is_trading_day  # local: sim imports monthly at module load
     if now.month == 12:
         last = datetime(now.year + 1, 1, 1, tzinfo=now.tzinfo) - timedelta(days=1)
     else:
         last = datetime(now.year, now.month + 1, 1, tzinfo=now.tzinfo) - timedelta(days=1)
-    while last.weekday() >= 5:
+    while not is_trading_day(last):
         last = last - timedelta(days=1)
     return last
 
 
 def is_rebalance_day(today: datetime | None = None) -> bool:
-    """True when `today` is the last US trading day of its month.
-
-    Heuristic: the last calendar day of the month walked back to a weekday.
-    A holiday on the final weekday is accepted as an approximation for paper
-    trading (documented caveat)."""
+    """True when `today` is the last US trading day of its month (weekday,
+    non-NYSE-holiday)."""
     now = today or datetime.now(UTC)
-    return now.weekday() < 5 and now.date() == month_last_trading_day(now).date()
+    return now.date() == month_last_trading_day(now).date()
 
 
 # ---------------------------------------------------------------------------

@@ -2329,11 +2329,14 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
                              replay_months[-1] if replay_months else "")
             acc.last_allowance_month = last_month or None
             allowance_running = 0.0
+            months_seen: set[str] = set()
             for e in res.equity_curve:
                 d = e["time"]
+                # equity_curve is ascending, so counting distinct months as we
+                # go is O(days) rather than re-scanning the curve per point.
+                months_seen.add(d[:7])
                 allowance_running = round(
-                    params.start_cash + params.monthly_allowance
-                    * len({x["time"][:7] for x in res.equity_curve if x["time"] <= d}), 2)
+                    params.start_cash + params.monthly_allowance * len(months_seen), 2)
                 s.add(Sn(cash=0.0, positions_value=e["equity"],
                          total_equity=e["equity"],
                          allowance_total=round(allowance_running, 2),
