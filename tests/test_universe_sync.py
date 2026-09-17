@@ -14,22 +14,28 @@ from app import screener, universe_sync
 
 def _csv(n_symbols: int = 0, as_of: str = "Sep 15, 2026",
          extra_equities: list[str] | None = None,
-         include_non_equity: bool = True) -> bytes:
+         include_non_equity: bool = True,
+         residual: list[str] | None = None) -> bytes:
     """Build an iShares-style holdings CSV (preamble + header + rows)."""
     rows: list[list[str]] = [
         ["iShares Core S&P 500 ETF"],
         ["Fund Holdings as of", as_of],
         ["Stock", "-"],
         [],
-        ["Ticker", "Name", "Sector", "Asset Class", "Weight (%)"],
+        ["Ticker", "Name", "Sector", "Asset Class", "Weight (%)", "Exchange"],
     ]
     if include_non_equity:
-        rows.append(["USD", "US DOLLAR", "Cash", "Cash", "0.10"])
-        rows.append(["BZX", "MONEY MARKET", "Money Market", "Money Market", "0.05"])
-        rows.append(["ES", "S&P FUTURE", "Futures", "Futures", "0.01"])
+        rows.append(["USD", "US DOLLAR", "Cash", "Cash", "0.10", "-"])
+        rows.append(["BZX", "MONEY MARKET", "Money Market", "Money Market", "0.05", "-"])
+        rows.append(["ES", "S&P FUTURE", "Futures", "Futures", "0.01", "-"])
+    # Acquired/delisted residual stubs: marked Equity, but weight 0.00 with no
+    # live market (e.g. HOLOGIC after its buyout) — not constituents.
+    for t in residual or []:
+        rows.append([t, t + " INC", "Health Care", "Equity", "0.00",
+                     "NO MARKET (E.G. UNLISTED)"])
     equities = list(extra_equities or []) + [f"T{i:03d}" for i in range(n_symbols)]
     for t in equities:
-        rows.append([t, t + " INC", "Information Technology", "Equity", "0.10"])
+        rows.append([t, t + " INC", "Information Technology", "Equity", "0.10", "NYSE"])
     buf = io.StringIO()
     csv.writer(buf).writerows(rows)
     return buf.getvalue().encode("utf-8")
@@ -56,6 +62,25 @@ class TestParse:
         symbols, as_of = universe_sync.parse_constituents(payload)
         assert symbols == ["AAPL", "BF-B", "BRK-B"]  # cash/futures rows dropped
         assert as_of == "Sep 15, 2026"
+
+    def test_drops_residual_stub_rows(self):
+        """Acquired/delisted names linger as Equity rows with weight 0.00 and
+        no market; they must not become constituents (real HOLOGIC case)."""
+        payload = _csv(extra_equities=["AAPL", "CBOE"], residual=["HOLX"])
+        symbols, _ = universe_sync.parse_constituents(payload)
+        assert symbols == ["AAPL", "CBOE"]
+        assert "HOLX" not in symbols
+
+    def test_drops_zero_weight_row_with_real_exchange(self):
+        rows = [
+            ["Ticker", "Name", "Sector", "Asset Class", "Weight (%)", "Exchange"],
+            ["AAPL", "APPLE", "Tech", "Equity", "5.00", "NASDAQ"],
+            ["ZZZ", "ZERO", "Tech", "Equity", "0.00", "NYSE"],
+        ]
+        buf = io.StringIO()
+        csv.writer(buf).writerows(rows)
+        symbols, _ = universe_sync.parse_constituents(buf.getvalue().encode("utf-8"))
+        assert symbols == ["AAPL"]
 
     def test_missing_header_raises(self):
         with pytest.raises(ValueError, match="Ticker"):

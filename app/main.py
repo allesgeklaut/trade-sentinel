@@ -152,8 +152,10 @@ async def _universe_sync_loop() -> None:
     while True:
         now = datetime.now(UTC)
         days_ahead = (settings.universe_sync_weekday - now.weekday()) % 7
+        # % 24: an out-of-range config value must not raise here and kill the
+        # task (the scheduling math runs outside the try below).
         target = (now + timedelta(days=days_ahead)).replace(
-            hour=settings.universe_sync_hour, minute=0, second=0, microsecond=0)
+            hour=settings.universe_sync_hour % 24, minute=0, second=0, microsecond=0)
         if target <= now:
             target += timedelta(days=7)
         wait_seconds = (target - now).total_seconds()

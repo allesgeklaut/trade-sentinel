@@ -41,6 +41,12 @@ _SYMBOL_RE = re.compile(r"^[A-Z0-9.\-]{1,10}$")
 # the CSV shape changed or the download was truncated — never overwrite with it.
 _MIN_CONSTITUENTS = 400
 
+# Exchange values that mean "no live listing": residual stubs of acquired or
+# delisted names linger in the holdings file marked "Equity" (e.g. HOLOGIC
+# after its buyout: weight 0.00, price $0.01, "NO MARKET"). Dropping them keeps
+# non-constituents out of the screener/sim universe.
+_EXCHANGE_PLACEHOLDERS = {"", "-", "NO MARKET", "NO MARKET (E.G. UNLISTED)", "IFLL"}
+
 _UA = {"User-Agent": "Mozilla/5.0 (trade-sentinel research)", "Accept": "*/*"}
 
 _sync_lock: asyncio.Lock = asyncio.Lock()
@@ -87,6 +93,10 @@ def parse_constituents(payload: bytes) -> tuple[list[str], str | None]:
         col = {name: header.index(name) for name in ("Ticker", "Asset Class")}
     except ValueError as e:
         raise ValueError(f"holdings CSV: missing expected column ({e})") from e
+    # Optional guards: applied only when the columns exist, so the parser still
+    # works if iShares drops or reorders them.
+    ex_col = header.index("Exchange") if "Exchange" in header else None
+    wt_col = header.index("Weight (%)") if "Weight (%)" in header else None
 
     # "Fund Holdings as of" lives in the preamble, e.g. Fund Holdings as of,"Sep 15, 2026"
     as_of = None
@@ -96,11 +106,26 @@ def parse_constituents(payload: bytes) -> tuple[list[str], str | None]:
             break
 
     needed = max(col.values())
+
+    def _is_constituent(r: list[str]) -> bool:
+        if r[col["Asset Class"]].strip() != "Equity":
+            return False
+        if ex_col is not None and len(r) > ex_col:
+            if r[ex_col].strip().upper() in _EXCHANGE_PLACEHOLDERS:
+                return False
+        if wt_col is not None and len(r) > wt_col:
+            try:
+                if float(r[wt_col].strip().replace(",", "")) <= 0:
+                    return False
+            except ValueError:
+                pass  # unexpected format: don't drop a name on that basis
+        return True
+
     symbols: set[str] = set()
     for r in rows[hdr_i + 1:]:
         if len(r) <= needed or not r[0].strip():
             continue
-        if r[col["Asset Class"]].strip() != "Equity":
+        if not _is_constituent(r):
             continue
         sym = _normalize_symbol(r[col["Ticker"]])
         if sym:

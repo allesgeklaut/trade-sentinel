@@ -45,13 +45,6 @@ async def mem_db(monkeypatch):
 # Universe parsing
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(autouse=True)
-def _isolate_extra_universes(tmp_path, monkeypatch):
-    """Point the generated-universe dir at a nonexistent path so the real
-    /data/universes (or a developer's dev box) can never leak into a test."""
-    monkeypatch.setattr(screener, "_EXTRA_UNIVERSES_DIR", tmp_path / "_no_extra_universes")
-
-
 class TestUniverseParsing:
     def test_tickers_strips_whitespace_and_uppercases(self, tmp_path, monkeypatch):
         monkeypatch.setattr(screener, "_UNIVERSES_DIR", tmp_path)

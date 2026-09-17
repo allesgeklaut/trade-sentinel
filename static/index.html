@@ -2736,8 +2736,10 @@
                 if (x.removed && x.removed.length) parts.push('-' + x.removed.join(', '));
                 const detail = parts.length ? parts.join('  ') : 'no membership change';
                 setStatus(`${x.universe} synced: ${x.count} tickers (as of ${x.as_of || '?'}); ${detail}`, true);
+                // Reload re-selects the persisted sim universe; don't force the
+                // dropdown to x.universe (that would display a universe the sims
+                // aren't actually using, since .value doesn't fire onchange).
                 await loadUniverses();
-                $('#universe').value = x.universe;
                 showScreen();
             } catch (e) {
                 setStatus(e.message, false);
