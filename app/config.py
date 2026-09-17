@@ -2,9 +2,23 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:////data/trading.db"
-    market_data_provider: str = "yfinance"
+    # auto = Twelve Data when TWELVE_DATA_API_KEY is set, else yfinance.
+    # yfinance / twelvedata force one source (twelvedata requires a key).
+    market_data_provider: str = "auto"
     twelve_data_api_key: str = ""
-    watchlist: str = "AAPL,MSFT,NVDA,IFX.DE"
+    # Path to a file holding the bare key (single source of truth, e.g. a
+    # read-only /opt/secrets mount). Used when TWELVE_DATA_API_KEY is empty,
+    # mirroring LITELLM_API_KEY_FILE for the LLM backends.
+    twelve_data_api_key_file: str = ""
+    # Twelve Data Basic plan: 8 credits/min and 800/day. The limiter paces
+    # requests to max_per_min and falls back to yfinance once the day's budget
+    # is spent — so a broad universe prefetch can never trip 429s or overrun.
+    twelve_data_max_per_min: int = 8
+    twelve_data_daily_budget: int = 750
+    # Seed watchlist (comma-separated). On startup, any ticker listed here that
+    # is missing from the DB is added. Additive only — a UI deletion of a ticker
+    # still listed here comes back on the next restart.
+    watchlist: str = "AAPL,GC=F,ICLN,IFX.DE,MSFT,NVDA,SPCX,SPY,TSLA,URTH"
 
     ollama_url: str = "http://host.docker.internal:11434"
     ollama_model: str = ""  # set via .env, e.g. "qwen3:32b"
@@ -82,8 +96,96 @@ class Settings(BaseSettings):
     # Default 0.0 = flat equal-weight targets, the measured winner (experiment
     # doc §10); the live run_deployment is flat too.
     sim_monthly_rank_boost: float = 0.0
-    sim_run_hour: int = 22
+
+    # --- Daily-core risk overlays (all opt-in, measured via daily-core-sweep) ---
+    # mom_variant: "raw" = classic 12-1 close/close momentum. "residual" =
+    # Blitz-Huij-Martens residual momentum: rank by the residuals of each
+    # stock's 12-1 daily log returns regressed on the market's, scaled by
+    # their std-dev (momentum per unit of idiosyncratic vol). Literature:
+    # ~2x Sharpe and roughly half the crash risk of raw momentum.
+    sim_daily_core_mom_variant: str = "raw"
+    # target_vol (annualized, 0 = off): when the portfolio's own 21d realized
+    # vol exceeds this, hold (realized/target - 1) of the equity in cash.
+    # Barroso-Santa-Clara vol management, capped so bull markets stay ~fully
+    # invested — it never scales UP past 100%, only down.
+    sim_daily_core_target_vol: float = 0.0
+    # vol_weight: position targets proportional to 1/realized-vol (risk parity)
+    # instead of equal weight. Independent of mom_variant.
+    sim_daily_core_vol_weight: bool = False
+    # lowvol_tilt: adds pct_rank(-vol) as a 4th equal term in the qv-mom
+    # score. The classic defensive tilt — expect lower vol AND lower return;
+    # kept for completeness (the sweep decides).
+    sim_daily_core_lowvol_tilt: bool = False
+    # portfolio_stop_pct (0 = off): peak-to-trough circuit breaker — when the
+    # strategy's own equity is this % below its running peak, sell everything
+    # to cash and park contributions until the market trend recovers. The
+    # "don't give the win back" brake. Wired live only if the walk-forward
+    # says the avoided drawdown beats the missed rebound (§12).
+    sim_daily_core_portfolio_stop: float = 0.0
+    # exposure_trend_days (0 = off): deploy cash only while the equal-weight
+    # universe index is above its N-day SMA (Faber-style). Also the re-entry
+    # gate after a portfolio-stop trigger.
+    sim_daily_core_exposure_trend: int = 0
+    # trailing_stop_pct (0 = off): per-name trailing stop — exit a holding when
+    # its price falls this fraction below its own peak since entry. Targets
+    # momentum-sleeve crashes the market-trend brakes cannot see (§12).
+    sim_daily_core_trailing_stop: float = 0.0
+    # basket_trend_days (0 = off): "gradient filter" — N-day rate-of-change of
+    # the strategy's own target basket (equal-weight top-N candidates). Cash
+    # out when the gradient stays negative for basket_confirm_days, re-enter
+    # when it stays positive. §12-13.
+    sim_daily_core_basket_trend: int = 0
+    sim_daily_core_basket_confirm: int = 3
+    # basket_threshold (fraction, 0 = any negative slope): the gradient must
+    # be BELOW -threshold (a real drawdown, not noise) to count toward the
+    # cash-out streak. Re-entry stays on any positive slope for the same
+    # confirm streak — sell on deep drops, re-enter on the recovery. This is
+    # the "on demand" switch: small dips in calm markets no longer trigger.
+    sim_daily_core_basket_threshold: float = 0.0
+    # basket_drawdown (fraction, 0 = off): cash out when the target basket is
+    # this far below its own running peak; re-enter when the drawdown halves
+    # (built-in hysteresis — one event per real drawdown, no slope whipsaw).
+    # The basket keeps moving in cash, so re-entry can trigger.
+    sim_daily_core_basket_drawdown: float = 0.0
+    # basket_er_min (0 = off): Kaufman efficiency ratio gate — only ARM the
+    # gradient/drawdown cash-out when the basket's recent path is efficient
+    # (|net move| / path length above this). Trend-following pays in
+    # efficient trends and whipsaws in chop; the ER is the classic
+    # distinguisher. §13.
+    sim_daily_core_basket_er_min: float = 0.0
+    # basket_good_times (bool): arm the gradient cash-out ONLY while the
+    # market is above its 200-day SMA — "gradient filter only in good times".
+    # Catches momentum-sleeve crashes in healthy bull markets (Jul 2026) while
+    # the §12 market-trend gate handles bad times; no cooldown, the normal
+    # deployment re-enters as soon as the signal allows. §15.
+    sim_daily_core_basket_good_times: bool = False
+    # basket_arm_sma (default 200): the market SMA window that defines "good
+    # times" for arming the gradient cash-out. 50 = only strong uptrends,
+    # 200 = the classic bull/bear line. §15.
+    sim_daily_core_basket_arm_sma: int = 200
+    sim_run_hour: int = 23
     sim_run_minute: int = 30
+    # Nightly shared universe prefetch: all sims share one universe, so fetch it
+    # ONCE before the cycles and let them read the DB instead of each pulling it.
+    # Uses the configured provider (auto → Twelve Data, rate-limited/budgeted)
+    # with a yfinance fallback per ticker. Starts `sim_prefetch_lead_minutes`
+    # before sim_run_hour; the cycles skip tickers fetched within
+    # `market_fresh_seconds`.
+    sim_universe_prefetch: bool = True
+    sim_prefetch_lead_minutes: int = 90
+    # After the nightly universe prefetch stores fresh candles, recompute the
+    # screener ranking + signals from the CACHE (no provider calls) so the
+    # dashboard table is current each morning instead of only after a manual
+    # Update. Runs only when SIM_UNIVERSE_PREFETCH succeeded (never re-stamps a
+    # stale cache as fresh). App-level: independent of SIM_ENABLED.
+    screener_auto_rescore: bool = True
+    market_fresh_seconds: int = 21600  # 6h: "already fetched, skip the re-pull"
+    # Nightly watchlist prefetch (app-level, NOT sim-level): fetch the watchlist
+    # with the configured provider each night so the Dashboard opens straight
+    # from the DB. Runs independently of SIM_ENABLED / SIM_UNIVERSE_PREFETCH, at
+    # sim_run_hour (the app's nightly refresh time). Overlaps are skipped via
+    # MARKET_FRESH_SECONDS; the Twelve Data limiter paces/falls back.
+    watchlist_prefetch: bool = True
 
     # --- Benchmark (DCA control portfolio) --------------------------------
     sim_benchmark_enabled: bool = True

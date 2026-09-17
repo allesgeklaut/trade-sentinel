@@ -316,29 +316,45 @@ def _max_drawdown(equity: list[float], invested: list[float] | None = None) -> f
     return max_dd
 
 
-async def _load_series(tickers: list[str]) -> dict[str, pd.DataFrame]:
-    """Load and precompute the signal series for each ticker."""
+# Warmup kept ahead of a replay start when bounding the series load. Signals
+# look backward (SMA200 needs 206 candles), so dropping rows older than this
+# cannot change any value from the replay start onward.
+_SERIES_WARMUP_DAYS = 500
+
+
+async def _load_series(tickers: list[str],
+                       start: datetime | None = None) -> dict[str, pd.DataFrame]:
+    """Load and precompute the signal series for each ticker.
+
+    ``start`` optionally bounds the load to a warmup window before the replay
+    start (``None`` = full history, for full-range replays). The old version
+    ran one query PER ticker and hydrated full ORM rows, which is what made
+    the broad-universe daily-sim backfill slow."""
     series: dict[str, pd.DataFrame] = {}
+    since = ((pd.Timestamp(start) - pd.Timedelta(days=_SERIES_WARMUP_DAYS)).to_pydatetime()
+             if start else None)
     async with Session() as s:
-        for idx, t in enumerate(tickers):
-            if idx and idx % 10 == 0:
-                logger.info("Loading series... %d/%d", idx, len(tickers))
-            rows = (
-                await s.scalars(
-                    select(Candle).where(Candle.ticker == t).order_by(Candle.timestamp)
-                )
-            ).all()
-            if len(rows) < MIN_CANDLES:
-                continue
-            data = [{
-                "time": r.timestamp.strftime("%Y-%m-%d"),
-                "open": r.open, "high": r.high, "low": r.low,
-                "close": r.close, "volume": r.volume,
-            } for r in rows]
-            try:
-                series[t] = _signal_series(data)
-            except Exception as e:
-                logger.warning("Could not compute series for %s: %s", t, e)
+        q = (select(Candle.ticker, Candle.timestamp, Candle.open, Candle.high,
+                    Candle.low, Candle.close, Candle.volume)
+             .where(Candle.ticker.in_(list(tickers))))
+        if since is not None:
+            q = q.where(Candle.timestamp >= since)
+        rows = (await s.execute(q.order_by(Candle.ticker, Candle.timestamp))).all()
+    by_ticker: dict[str, list] = {}
+    for r in rows:
+        by_ticker.setdefault(r.ticker, []).append(r)
+    for t, rs in by_ticker.items():
+        if len(rs) < MIN_CANDLES:
+            continue
+        data = [{
+            "time": r.timestamp.strftime("%Y-%m-%d"),
+            "open": r.open, "high": r.high, "low": r.low,
+            "close": r.close, "volume": r.volume,
+        } for r in rs]
+        try:
+            series[t] = _signal_series(data)
+        except Exception as e:
+            logger.warning("Could not compute series for %s: %s", t, e)
     return series
 
 
@@ -2466,6 +2482,39 @@ class BacktestSummary:
     avg_turnover: float
     n_trades: int
     window: tuple[str, str]
+    sharpe: float = 0.0       # annualized, contribution-adjusted daily returns
+    max_drawdown: float = 0.0  # peak-to-trough, fraction (positive number)
+    brake_events: int = 0      # portfolio-stop cash-outs that fired
+    basket_events: int = 0     # gradient-filter cash-outs that fired
+
+
+def _inv_vol_weights(names: list[str], frame: pd.DataFrame | None,
+                     target_n: int, default_w: float) -> dict[str, float]:
+    """Inverse-vol target weights for the portfolio's candidate names.
+
+    The names with measurable positive vol split the pool proportionally
+    to 1/vol; names with missing/non-finite vol keep ``default_w`` (never
+    silently zeroed over missing data). The weights sum to
+    ``len(names) * default_w`` — i.e. the same total equity the equal-
+    weight deployment would spread — so the two modes deploy cash at the
+    same overall rate."""
+    out = {t: default_w for t in names}
+    if frame is None or "vol" not in frame.columns or not names:
+        return out
+    ivals: dict[str, float] = {}
+    for t in names:
+        v = frame["vol"].get(t)
+        if v is not None and np.isfinite(v) and float(v) > 0:
+            ivals[t] = 1.0 / float(v)
+    if len(ivals) <= 1:
+        return out
+    total = sum(ivals.values())
+    # measurable names split the pool REMAINING after the unmeasurable
+    # names take their equal weight — the total sums to len(names)*default_w.
+    pool = len(ivals) * default_w
+    for t, iv in ivals.items():
+        out[t] = (iv / total) * pool
+    return out
 
 
 def _fill_buy(cash: float, price: float, delta_value: float,
@@ -2536,6 +2585,18 @@ async def _daily_core_backtest(
     close_preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
     fund_preloaded: dict[str, dict[str, list[dict]]] | None = None,
     with_baseline: bool = True,
+    vol_weight: bool | None = None,
+    target_vol: float | None = None,
+    portfolio_stop_pct: float | None = None,
+    exposure_trend_days: int | None = None,
+    trailing_stop_pct: float | None = None,
+    basket_trend_days: int | None = None,
+    basket_confirm_days: int | None = None,
+    basket_threshold: float | None = None,
+    basket_drawdown: float | None = None,
+    basket_er_min: float | None = None,
+    basket_good_times: bool | None = None,
+    basket_arm_sma: int | None = None,
 ) -> BacktestSummary | None:
     """Deterministic "daily-core" backtest: the monthly qv-mom portfolio as the
     FUNDAMENTAL core, with minor candle-driven daily adjustments on top.
@@ -2656,6 +2717,7 @@ async def _daily_core_backtest(
 
     # --- Portfolio state ---
     shares: dict[str, float] = {}     # ticker -> shares held
+    peak_px: dict[str, float] = {}    # ticker -> highest close since entry (trailing stop)
     cash = 0.0
     contributed = 0.0
     n_contribs = 0
@@ -2694,6 +2756,9 @@ async def _daily_core_backtest(
                 return
             notional, sh, cash = fill
             shares[t] = shares.get(t, 0.0) + sh
+            # trailing-stop peak: a fresh position starts at its entry price;
+            # an add to an existing one keeps the higher peak.
+            peak_px[t] = max(peak_px.get(t, p), p)
             month_buys += notional
         else:
             sh = shares.get(t, 0.0)
@@ -2702,6 +2767,7 @@ async def _daily_core_backtest(
             notional = sh * p
             cash += notional * (1.0 - cost)
             del shares[t]
+            peak_px.pop(t, None)
             month_sells += notional
         trades_log.append((d.strftime("%Y-%m-%d"), side, t, notional))
 
@@ -2732,6 +2798,175 @@ async def _daily_core_backtest(
 
     pending_cash = 0.0  # contributions not yet deployed (dca="monthly")
     contrib_days = _contribution_days(days_all, months)
+
+    # --- Risk overlays (opt-in; measured via the daily-core sweep) ---
+    # vol_weight: per-name target weights proportional to 1/realized vol
+    # (the frame's `vol` column, annualized) instead of 1/N. Held names not
+    # in the current frame keep equal weight (can't compute what we don't
+    # measure — never silently zero a position).
+    if vol_weight is None:
+        vol_weight = settings.sim_daily_core_vol_weight
+    # target_vol: Barroso-Santa-Clara vol management. Track the portfolio's
+    # own daily returns; when its 21d realized vol exceeds the target, cap
+    # deployment so (realized/target-1) of equity stays in cash. Only caps
+    # DOWN — a calm portfolio never leverages up past fully invested.
+    if target_vol is None:
+        target_vol = settings.sim_daily_core_target_vol
+    # portfolio_stop_pct (0 = off): peak-to-trough circuit breaker — when the
+    # strategy's own equity is this % below its running peak, CASH OUT (sell
+    # every holding) and park contributions until the market trend recovers.
+    # This is the "don't give the win back" brake: the qv-mom design has no
+    # exits except the monthly hysteresis band, so a momentum crash round-trips
+    # the run-up (e.g. Jun→Jul 2026: peak 137% → 112%).
+    if portfolio_stop_pct is None:
+        portfolio_stop_pct = settings.sim_daily_core_portfolio_stop
+    # exposure_trend_days (0 = off): deploy cash only while the equal-weight
+    # universe index trades above its N-day SMA. Park contributions in cash in
+    # a downtrend (Faber-style time-series momentum on the deployment stream);
+    # also serves as the RE-ENTRY gate after a portfolio-stop trigger, since a
+    # fully-cashed portfolio's own drawdown is frozen and can't recover.
+    if exposure_trend_days is None:
+        exposure_trend_days = settings.sim_daily_core_exposure_trend
+    # trailing_stop_pct (0 = off): per-name trailing stop — exit a holding
+    # when its price falls this % below its own peak since entry. This is the
+    # factor-level protection the portfolio/market brakes can't provide: a
+    # momentum-SLEEVE crash while the broad market holds (Jul 2026). The name
+    # can be re-bought later if the ranking brings it back.
+    if trailing_stop_pct is None:
+        trailing_stop_pct = settings.sim_daily_core_trailing_stop
+    # basket_trend_days (0 = off): the "gradient filter" — the N-day
+    # rate-of-change (the slope) of the strategy's OWN target basket
+    # (equal-weight top-N candidates). When it is negative for
+    # `basket_confirm_days` consecutive days, cash out and park
+    # contributions; re-enter when it is positive for the same streak.
+    # Unlike the market-trend gate this sees a momentum-SLEEVE reversal
+    # (the basket's own trend), and unlike a frozen equity curve the
+    # basket index keeps moving while in cash so re-entry can trigger.
+    if basket_trend_days is None:
+        basket_trend_days = settings.sim_daily_core_basket_trend
+    if basket_confirm_days is None:
+        basket_confirm_days = settings.sim_daily_core_basket_confirm
+    if basket_threshold is None:
+        basket_threshold = settings.sim_daily_core_basket_threshold
+    # basket_drawdown (0 = off): cash out when the SIGNAL BASKET is this far
+    # below its running peak; re-enter when the drawdown halves. Unlike the
+    # portfolio-equity brake, the basket keeps moving while in cash, so the
+    # re-entry rule can actually fire; the halving gives hysteresis so a
+    # single real drawdown is one event, not a slope-driven whipsaw.
+    if basket_drawdown is None:
+        basket_drawdown = settings.sim_daily_core_basket_drawdown
+    # basket_er_min (0 = off): Kaufman efficiency ratio gate. ER = |net move|
+    # over N days / sum of |daily moves| (1 = perfect trend, ~0 = pure chop).
+    # When set, the cash-out triggers are armed ONLY while ER >= the minimum:
+    # trend-following signals pay in efficient moves and whipsaw in chop.
+    if basket_er_min is None:
+        basket_er_min = settings.sim_daily_core_basket_er_min
+    # basket_good_times: arm the gradient cash-out only while the market is
+    # above its 200-day SMA ("gradient filter only in good times"). The
+    # market-trend gate itself handles bad times; this is the bull-market
+    # sleeve-crash catcher.
+    if basket_good_times is None:
+        basket_good_times = settings.sim_daily_core_basket_good_times
+    if basket_arm_sma is None:
+        basket_arm_sma = settings.sim_daily_core_basket_arm_sma
+
+    # Equal-weight universe price index (closes, forward-filled) and its SMA.
+    # Point-in-time safe: a rolling mean of closes at/ before d only.
+    mkt_index = close_val.mean(axis=1)
+    mkt_sma = (mkt_index.rolling(exposure_trend_days).mean()
+               if exposure_trend_days and exposure_trend_days > 0 else None)
+    # Market SMA used to ARM the gradient filter in "good times"
+    # (independent of the deployment gate's window; window configurable).
+    mkt_sma_arm = mkt_index.rolling(max(basket_arm_sma, 2)).mean()
+
+    def market_above_arm_sma(d: pd.Timestamp) -> bool:
+        """True while the market index is at/above its 200-day SMA (the
+        good-times arming condition). Warmup/missing -> True (armed)."""
+        sma = mkt_sma_arm.get(d)
+        idx = mkt_index.get(d)
+        if sma is None or idx is None or not np.isfinite(sma) or not np.isfinite(idx):
+            return True
+        return bool(float(idx) >= float(sma))
+
+    def market_uptrend(d: pd.Timestamp) -> bool:
+        """True when the universe index is at/above its SMA (always True when
+        the filter is disabled)."""
+        if mkt_sma is None:
+            return True
+        sma = mkt_sma.get(d)
+        idx = mkt_index.get(d)
+        if sma is None or idx is None or not np.isfinite(sma) or not np.isfinite(idx):
+            return True  # warmup / missing -> don't block
+        return bool(float(idx) >= float(sma))
+
+    # Distinct re-entry signal for the portfolio-stop brake. It cannot reuse
+    # `market_uptrend`: with the exposure gate disabled that returns True every
+    # day, so the brake would cash out and re-buy on alternating days (measured:
+    # 12 whipsaw events vs 1 with a trend window). Fall back to SMA200 (the
+    # daily-core market gate) when no exposure window is configured.
+    _reentry_days = (exposure_trend_days
+                     if exposure_trend_days and exposure_trend_days > 0 else 200)
+    _mkt_sma_reentry = mkt_index.rolling(_reentry_days).mean()
+
+    def market_recovered(d: pd.Timestamp) -> bool:
+        """True once the market index is back at/above its re-entry SMA."""
+        sma = _mkt_sma_reentry.get(d)
+        idx = mkt_index.get(d)
+        if sma is None or idx is None or not np.isfinite(sma) or not np.isfinite(idx):
+            return True  # warmup / missing -> allow re-entry
+        return bool(float(idx) >= float(sma))
+
+    port_days: list[pd.Timestamp] = []
+    port_eq: list[float] = []
+    port_invested: list[float] = []  # cumulative contributions per day (for normalized DD)
+    port_rets: list[float] = []
+    peak_eq = 0.0        # running peak of the portfolio's own equity
+    risk_off = False     # portfolio-stop brake is active (all cash)
+    brake_events = 0     # how many times the brake fired (for the report)
+    # gradient filter ("basket trend") state: chained equal-weight index of
+    # the current month's top-N target basket, its N-day ROC, and the
+    # consecutive-day streaks that arm the cash-out / re-entry.
+    basket_hist: list[float] = []
+    basket_out = False
+    basket_events = 0
+    neg_streak = 0
+    pos_streak = 0
+    basket_peak = 0.0
+    prev_day: pd.Timestamp | None = None
+
+    def _record_equity(d: pd.Timestamp, equity: float, contrib_today: float) -> None:
+        """Append one day of equity; maintain the matching log-return list
+        (contribution-adjusted) that `realized_vol` reads, plus the running
+        invested total for the contributed-normalized drawdown."""
+        nonlocal peak_eq
+        port_days.append(d)
+        port_eq.append(equity)
+        prev_inv = port_invested[-1] if port_invested else 0.0
+        port_invested.append(prev_inv + contrib_today)
+        peak_eq = max(peak_eq, equity)
+        if len(port_eq) < 2:
+            port_rets.append(0.0)
+            return
+        base = port_eq[-2] + contrib_today
+        port_rets.append(float(np.log(equity / base)) if base > 0 and equity > 0 else 0.0)
+
+    def realized_vol(days: int = 21) -> float | None:
+        if len(port_rets) < days:
+            return None
+        recent = port_rets[-days:]
+        return float(np.std(recent) * np.sqrt(252.0))
+
+    # Per-day inverse-vol weight map, built from the day's order — see
+    # _inv_vol_weights. Empty dict when vol_weight is off.
+    vw_map: dict[str, float] = {}
+
+    def weight_of(t: str, default_w: float, frame: pd.DataFrame | None) -> float:
+        """Target weight for ticker t: the day's inverse-vol weight when
+        vol_weight is on (the map covers the deployment candidates), else
+        the equal weight."""
+        if not vol_weight or not vw_map:
+            return default_w
+        return vw_map.get(t, default_w)
 
     for d in days_all:
         month_td = month_for(d)
@@ -2770,6 +3005,31 @@ async def _daily_core_backtest(
             cash += pending_cash
             pending_cash = 0.0
 
+        # --- Portfolio-stop brake (peak-to-trough cash-out) ---
+        # Mark the book, measure the drawdown from the running equity peak,
+        # and CASH OUT when it breaches the stop. Re-engage only on a market
+        # uptrend: once fully cashed the portfolio's own drawdown is frozen,
+        # so a drawdown-recovery rule could never fire.
+        if portfolio_stop_pct > 0:
+            eq_mark = cash + pending_cash + sum(
+                (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0) for t in shares)
+            dd = (peak_eq - eq_mark) / peak_eq if peak_eq > 0 else 0.0
+            if not risk_off and dd >= portfolio_stop_pct:
+                for t in list(shares):
+                    trade(d, t, "SELL", 0.0)
+                    pending_pick.pop(t, None)
+                risk_off = True
+                brake_events += 1
+            elif risk_off and market_recovered(d):
+                risk_off = False
+
+        # --- Gradient filter cash-out: when the basket trend confirmed
+        # negative, exit the book (the flip was set at yesterday's close).
+        if (basket_trend_days > 0 or basket_drawdown > 0) and basket_out and shares:
+            for t in list(shares):
+                trade(d, t, "SELL", 0.0)
+                pending_pick.pop(t, None)
+
         # --- SELL phase: releases from the hysteresis band ---
         if order:
             band = set(order[:hold_band])
@@ -2779,10 +3039,30 @@ async def _daily_core_backtest(
                         trade(d, t, "SELL", 0.0)
                         pending_pick.pop(t, None)
 
+        # --- Per-name trailing stop: exit any holding fallen X% below its
+        # own peak since entry. Runs every day (not just month-end) and cuts
+        # individual reversals regardless of the market regime.
+        if trailing_stop_pct > 0:
+            for t in list(shares):
+                p = px_of(t, d)
+                if p is None or p <= 0:
+                    continue
+                # Advance the peak to today's close first: the stop is
+                # measured from the high since entry, not the highest buy.
+                pk = max(peak_px.get(t, 0.0), p)
+                peak_px[t] = pk
+                if p <= pk * (1.0 - trailing_stop_pct):
+                    trade(d, t, "SELL", 0.0)
+                    pending_pick.pop(t, None)
+
         # --- BUY phase: keep the portfolio at target weights ---
         equity_now = cash + pending_cash + sum(
             (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0) for t in shares)
         weight = equity_now / max(target_n, 1)
+        # Inverse-vol weights among the day's deployment candidates (the top
+        # target_n of the ranking). Sums to the same total as equal weight.
+        vw_map = (_inv_vol_weights(order[:target_n], frame, target_n, weight)
+                  if vol_weight and order else {})
 
         # month-end rebuild: pick the portfolio with hysteresis (monthly cadence)
         picks: list[str] = []
@@ -2790,7 +3070,21 @@ async def _daily_core_backtest(
             held = list(shares)
             picks = monthly_mod._band_fill(order, held, target_n, hold_band)
 
-        paused = crash_pause and pullback_day(d)
+        paused = ((crash_pause and pullback_day(d)) or risk_off
+                  or basket_out
+                  or (exposure_trend_days > 0 and not market_uptrend(d)))
+
+        # Barroso-Santa-Clara vol management: cap deployment when the
+        # portfolio's own recent vol exceeds the target. Only scales DOWN
+        # (a calm portfolio stays fully invested); the excess sits in cash
+        # until vol normalises.
+        room = float("inf")
+        if target_vol and len(port_rets) >= 21:
+            rv = realized_vol(21)
+            if rv is not None and rv > target_vol:
+                deploy_cap = equity_now * (target_vol / rv)
+                deployed_now = equity_now - cash - pending_cash
+                room = max(deploy_cap - deployed_now, 0.0)
 
         # --- Rank-weighted cash deployment (dca="rank") ---
         # Fresh cash goes where the qv-mom ranking says it belongs: each day,
@@ -2803,7 +3097,7 @@ async def _daily_core_backtest(
         # fresh capital into the top of the ranking — rank deployment does
         # that every day without the ~2-week cash drag.
         if dca == "rank" and order and not paused:
-            remaining = cash - (0 if d in months else 0)  # spendable cash
+            remaining = min(cash, room)
             for rank_i, t in enumerate(order[:target_n]):
                 if remaining < 1:
                     break
@@ -2814,13 +3108,17 @@ async def _daily_core_backtest(
                 # linearly decaying to the equal weight at the band edge.
                 boost = 1.0 + settings.sim_monthly_rank_boost * (
                     1.0 - rank_i / max(target_n - 1, 1))
-                tgt = weight * boost
+                tgt = weight_of(t, weight, frame) * boost
                 cur = shares.get(t, 0.0) * p
                 gap = tgt - cur
                 if gap > 1:
                     spend = min(gap, remaining)
                     trade(d, t, "BUY", spend)
                     remaining -= spend
+            # Propagate the consumed budget so the month-end NEW-entries block
+            # (which also draws on `room`) can't deploy past the vol cap.
+            if room != float("inf"):
+                room = remaining
 
         # Month-end equal-weight rebuild (dca="monthly" only): the baseline
         # semantics — spread the FULL portfolio (incl. fresh contribution)
@@ -2833,9 +3131,11 @@ async def _daily_core_backtest(
                 if p is None:
                     continue
                 cur = shares.get(t, 0.0) * p
-                gap = weight - cur
-                if gap > 1 and cash > 1:
-                    trade(d, t, "BUY", min(gap, cash))
+                gap = weight_of(t, weight, frame) - cur
+                if gap > 1 and cash > 1 and room > 1:
+                    spend = min(gap, cash, room)
+                    trade(d, t, "BUY", spend)
+                    room -= spend
 
         # daily top-up of underweight holdings (dca="daily" only; rank mode
         # and month-end days already allocated). NOT pro-rata: the fresh
@@ -2850,11 +3150,11 @@ async def _daily_core_backtest(
                 p = px_of(t, d)
                 if p is None:
                     continue
-                gap = weight - shares[t] * p
+                gap = weight_of(t, weight, frame) - shares[t] * p
                 if gap > worst_gap:
                     worst_t, worst_gap = t, gap
             if worst_t is not None and worst_gap > 1.0:
-                trade(d, worst_t, "BUY", worst_gap)
+                trade(d, worst_t, "BUY", min(worst_gap, room))
 
         # --- NEW entries (core names not yet held) ---
         if d in months and order:
@@ -2875,9 +3175,10 @@ async def _daily_core_backtest(
                 if not ok:
                     pending_pick[t] = d  # wait for the gate to open
                     continue
-                budget = min(weight, cash)
+                budget = min(weight_of(t, weight, frame), cash, room)
                 if budget > 1:
                     trade(d, t, "BUY", budget)
+                    room -= budget
         elif entry_gate != "none" and order:
             # daily re-check of gated entries once the gate opens
             for t in list(pending_pick):
@@ -2895,10 +3196,77 @@ async def _daily_core_backtest(
                     r5 = px_of_col(run5_frame, d, t)
                     ok = r5 is None or r5 > -0.10
                 if ok:
-                    budget = min(weight, cash)
+                    budget = min(weight_of(t, weight, frame), cash, room)
                     if budget > 1:
                         trade(d, t, "BUY", budget)
+                        room -= budget
                     pending_pick.pop(t, None)
+
+        # Track the portfolio's own daily equity for the vol gate. The 21d
+        # realized vol is computed from log returns of *invested* equity;
+        # contribution days subtract the deposit from the base so a fresh
+        # $1000 doesn't read as a +x% return.
+        equity_close = cash + pending_cash + sum(
+            (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0) for t in shares)
+        contrib_today = contribution if d in contrib_days else 0.0
+        _record_equity(d, equity_close, contrib_today)
+
+        # --- Gradient filter: the N-day slope of the target basket ---
+        # Chain the equal-weight top-N basket from yesterday to today (one
+        # day's cross-sectional mean return). The day-over-day log return is
+        # the gradient's building block; the N-day ROC over `basket_hist` is
+        # the slope. Cash out when the slope is below -`basket_threshold` (a
+        # real drawdown, not noise) for the confirm streak; re-enter on any
+        # positive slope for the same streak. The threshold is the "on
+        # demand" switch: calm-market dips no longer trigger.
+        if basket_trend_days > 0 or basket_drawdown > 0:
+            top = order[:target_n]
+            rets = []
+            for t in top:
+                p0 = px_of(t, prev_day) if prev_day is not None else None
+                p1 = px_of(t, d)
+                if p0 and p1 and p0 > 0 and p1 > 0:
+                    rets.append(float(np.log(p1 / p0)))
+            day_ret = float(np.mean(rets)) if rets else 0.0
+            if not basket_hist:
+                basket_hist.append(100.0)
+            basket_hist.append(basket_hist[-1] * float(np.exp(day_ret)))
+            basket_peak = max(basket_peak, basket_hist[-1])
+            # Efficiency ratio over the last 20 basket prints: |net| / path.
+            er = 1.0
+            er_win = 20
+            if basket_er_min > 0 and len(basket_hist) > er_win:
+                seg = basket_hist[-er_win:]
+                path = sum(abs(seg[i] - seg[i - 1]) for i in range(1, len(seg)))
+                er = (abs(seg[-1] - seg[0]) / path) if path > 0 else 1.0
+            armed = (basket_er_min <= 0) or (er >= basket_er_min)
+            if basket_good_times:
+                armed = armed and market_above_arm_sma(d)
+            # (a) slope trigger (gradient filter). The ER gate arms the EXIT
+            # only: re-entry stays unconditional so chop can never lock the
+            # portfolio in cash forever.
+            if basket_trend_days > 0 and len(basket_hist) > basket_trend_days:
+                slope = basket_hist[-1] / basket_hist[-1 - basket_trend_days] - 1.0
+                if slope < -basket_threshold:
+                    neg_streak += 1
+                    pos_streak = 0
+                elif slope > 0:
+                    pos_streak += 1
+                    neg_streak = 0
+                if not basket_out and armed and neg_streak >= basket_confirm_days:
+                    basket_out = True
+                    basket_events += 1
+                elif basket_out and pos_streak >= basket_confirm_days:
+                    basket_out = False
+            # (b) drawdown trigger (on-demand, hysteresis via halving)
+            if basket_drawdown > 0 and basket_peak > 0:
+                bdd = (basket_peak - basket_hist[-1]) / basket_peak
+                if not basket_out and armed and bdd >= basket_drawdown:
+                    basket_out = True
+                    basket_events += 1
+                elif basket_out and bdd <= basket_drawdown / 2.0:
+                    basket_out = False
+        prev_day = d
 
     # final valuation
     value = cash + pending_cash + sum(
@@ -2922,13 +3290,42 @@ async def _daily_core_backtest(
     cfg = (f"dca={dca} entry-gate={entry_gate} exit-cadence={exit_cadence} "
            f"crash-pause={'on' if crash_pause else 'off'}"
            + (f" rank-boost={settings.sim_monthly_rank_boost:g}"
-              if dca == "rank" else ""))
+              if dca == "rank" else "")
+           + (f" mom={settings.sim_daily_core_mom_variant}"
+              if settings.sim_daily_core_mom_variant != "raw" else "")
+           + (" vol-weight" if vol_weight else "")
+           + (f" target-vol={target_vol:g}" if target_vol else "")
+           + (f" portfolio-stop={portfolio_stop_pct:g}" if portfolio_stop_pct else "")
+           + (f" exposure-trend={exposure_trend_days}" if exposure_trend_days else "")
+           + (f" trailing-stop={trailing_stop_pct:g}" if trailing_stop_pct else "")
+           + (f" basket-trend={basket_trend_days}/{basket_confirm_days}"
+              + (f" threshold={basket_threshold:g}" if basket_threshold else "")
+              if basket_trend_days else "")
+           + (f" basket-drawdown={basket_drawdown:g}" if basket_drawdown else "")
+           + (f" basket-er-min={basket_er_min:g}"
+              if basket_er_min else "")
+           + (f" basket-good-times(sma{basket_arm_sma})"
+              if basket_good_times else "")
+           + (" lowvol-tilt" if settings.sim_daily_core_lowvol_tilt else ""))
+    ann_sharpe = 0.0
+    if len(port_rets) >= 21:
+        mu = float(np.mean(port_rets))
+        sd = float(np.std(port_rets))
+        ann_sharpe = (mu / sd) * np.sqrt(252.0) if sd > 0 else 0.0
+    # Max drawdown on the CONTRIBUTED-NORMALIZED curve (equity / invested so
+    # far) — the same convention as the live UI and _max_drawdown's DCA mode.
+    # Raw-equity DD understates a DCA portfolio's real peak-to-trough loss.
+    mdd = _max_drawdown(port_eq, port_invested) / 100.0
     print(f"\n=== Daily-core backtest [{universe}] {days_all[0].date()}..{last_day.date()} ===")
     print(f"  config: {cfg}")
     print(f"  contributions: {n_contribs} x ${contribution:,.0f} = ${contributed:,.0f}")
     print(f"  final value:   ${value:,.0f}  (multiple {value / max(contributed, 1e-9):.2f}x)")
-    print(f"  money-weighted IRR: {irr:.2%}/yr   avg monthly turnover: "
-          f"{(sum(churns) / len(churns)) if churns else 0:.1%}  trades: {len(trades_log)}")
+    print(f"  money-weighted IRR: {irr:.2%}/yr   Sharpe (ann): {ann_sharpe:.2f}   "
+          f"max DD: {mdd:.1%}   avg monthly turnover: "
+          f"{(sum(churns) / len(churns)) if churns else 0:.1%}  trades: {len(trades_log)}"
+          + (f"  brake events: {brake_events}" if portfolio_stop_pct else "")
+          + (f"  basket events: {basket_events}"
+             if (basket_trend_days or basket_drawdown) else ""))
     if verbose:
         print("\nLast 15 trades:")
         for td, side, t, notional in trades_log[-15:]:
@@ -2955,6 +3352,10 @@ async def _daily_core_backtest(
         n_trades=len(trades_log),
         window=(pd.Timestamp(days_all[0]).strftime("%Y-%m-%d"),
                 pd.Timestamp(last_day).strftime("%Y-%m-%d")),
+        sharpe=ann_sharpe,
+        max_drawdown=mdd,
+        brake_events=brake_events,
+        basket_events=basket_events,
     )
 
 
@@ -2973,12 +3374,28 @@ async def _main(args: argparse.Namespace) -> None:
         return
 
     if args.command == "daily-core":
+        if getattr(args, "mom", None):
+            settings.sim_daily_core_mom_variant = args.mom
+        if getattr(args, "lowvol_tilt", False):
+            settings.sim_daily_core_lowvol_tilt = True
         await _daily_core_backtest(
             args.start, args.end,
             args.universe or settings.sim_monthly_universe,
             args.contribution if args.contribution is not None else settings.sim_monthly_contribution,
             args.verbose,
             args.entry_gate, args.exit_cadence, args.crash_pause, args.dca,
+            vol_weight=getattr(args, "vol_weight", False) or None,
+            target_vol=getattr(args, "target_vol", None) or None,
+            portfolio_stop_pct=getattr(args, "portfolio_stop", None) or None,
+            exposure_trend_days=getattr(args, "exposure_trend", None) or None,
+            trailing_stop_pct=getattr(args, "trailing_stop", None) or None,
+            basket_trend_days=getattr(args, "basket_trend", None) or None,
+            basket_confirm_days=getattr(args, "basket_confirm", None) or None,
+            basket_threshold=getattr(args, "basket_threshold", None) or None,
+            basket_drawdown=getattr(args, "basket_drawdown", None) or None,
+            basket_er_min=getattr(args, "basket_er_min", None) or None,
+            basket_good_times=getattr(args, "basket_good_times", False) or None,
+            basket_arm_sma=getattr(args, "basket_arm_sma", None) or None,
         )
         return
 
@@ -3275,8 +3692,12 @@ async def _sweep_load_market(universe: str):
     return tickers, close, vol, fund
 
 
-def _sweep_grid() -> list[tuple[str, str, str, bool, float]]:
-    """The knob grid: dca x entry-gate x exit-cadence x crash-pause x boost."""
+def _sweep_grid() -> list[tuple]:
+    """The knob grid: dca x entry-gate x exit-cadence x crash-pause x boost.
+    The risk overlays (mom variant / vol-weight / target-vol / lowvol-tilt)
+    are swept separately in stage-3 (they interact but a full cross would be
+    10x the configs — stage-3 fixes the stage-1 winner and varies one risk
+    knob at a time, then the best 2-3 combinations)."""
     grid = []
     for dca, gate, exit_c, pause in itertools.product(
             ["monthly", "daily", "rank"], ["none", "not-crash", "above-sma50"],
@@ -3284,6 +3705,25 @@ def _sweep_grid() -> list[tuple[str, str, str, bool, float]]:
         for boost in ([0.0, 0.25, 0.5] if dca == "rank" else [0.0]):
             grid.append((dca, gate, exit_c, pause, boost))
     return grid
+
+
+def _sweep_risk_grid() -> list[dict]:
+    """Risk-overlay grid, evaluated on top of the stage-1 winner. Each dict
+    overrides settings for one config; {} = the stage-1 winner unchanged
+    (control arm)."""
+    return [
+        {},
+        {"mom": "residual"},
+        {"vol_weight": True},
+        {"target_vol": 0.20},
+        {"target_vol": 0.25},
+        {"target_vol": 0.30},
+        {"lowvol_tilt": True},
+        {"mom": "residual", "vol_weight": True},
+        {"mom": "residual", "target_vol": 0.25},
+        {"vol_weight": True, "target_vol": 0.25},
+        {"mom": "residual", "vol_weight": True, "target_vol": 0.25},
+    ]
 
 
 # Per-worker state, set once by the pool initializer. NOTE: on Python 3.12+
@@ -3326,6 +3766,7 @@ def _sweep_run_config(task: tuple[str, str, str, bool, float]) -> dict:
         "dca": dca, "gate": gate, "exit": exit_c, "pause": pause, "boost": boost,
         "irr": r.irr if r else None, "value": r.final_value if r else 0.0,
         "turnover": r.avg_turnover if r else 0.0, "trades": r.n_trades if r else 0,
+        "sharpe": r.sharpe if r else 0.0, "max_dd": r.max_drawdown if r else 0.0,
     }
 
 
@@ -3423,6 +3864,11 @@ async def _sweep_daily_core(args: argparse.Namespace) -> None:
 
     fc: dict[pd.Timestamp, pd.DataFrame | None] = {}
     t0 = time.time()
+    # `fc` is the RAW momentum cache and the default for every non-residual
+    # arm. Pin the variant explicitly: the ambient setting (e.g. .env's
+    # SIM_DAILY_CORE_MOM_VARIANT=residual) would otherwise make the raw /
+    # control arms run residual frames while reporting `mom=raw`.
+    settings.sim_daily_core_mom_variant = "raw"
     for d in _sweep_months(close.index, "2016-06-01"):
         fc[d] = await asyncio.to_thread(monthly_mod.eligible_frame, d, close, vol, fund)
     print(f"frame cache: {len(fc)} months ({time.time() - t0:.0f}s)", flush=True)
@@ -3438,6 +3884,179 @@ async def _sweep_daily_core(args: argparse.Namespace) -> None:
     if args.stage in ("2", "all"):
         await _sweep_stage2(fc, close, vol, fund, results,
                             top_n=args.top, out_path=stage2_path)
+    if args.stage in ("3", "all"):
+        await _sweep_stage3(fc, close, vol, fund, results,
+                            out_path=os.path.join(out_dir, "daily_core_risk_overlays.json"))
+    if args.stage in ("4", "all"):
+        await _sweep_stage4(fc, close, vol, fund,
+                            out_path=os.path.join(out_dir, "daily_core_risk_walkforward.json"))
+
+
+async def _sweep_stage4(fc, close, vol, fund, out_path: str) -> None:
+    """Walk-forward A/B of the risk overlays on the LIVE daily-core config
+    (rank deploy, boost=0, no gates) across the non-overlapping OOS windows.
+    In-sample stage-3 numbers are necessary but not sufficient — the 2026-09
+    doc methodology treats walk-forward as the decision grade. The frame
+    cache depends on the mom variant (raw vs residual), so both are built
+    once up front and reused across windows."""
+    from . import monthly as monthly_mod
+    # Live config: rank deploy, boost 0, entry-gate none, exit monthly,
+    # no crash pause — the overlays sit on top.
+    overlays: list[dict] = [
+        {"label": "control (live=residual)", "mom": "residual"},
+        {"label": "raw (reference)", "mom": "raw"},
+        {"label": "residual+tv0.25", "mom": "residual", "target_vol": 0.25},
+        {"label": "tv0.25", "mom": "raw", "target_vol": 0.25},
+        {"label": "lowvol-tilt", "mom": "raw", "lowvol_tilt": True},
+        {"label": "vol-weight", "mom": "raw", "vol_weight": True},
+        # Protection overlays ("don't give the win back"): peak-to-trough
+        # cash-out brake + exposure trend filter, on the residual core.
+        {"label": "res+stop10", "mom": "residual", "portfolio_stop": 0.10},
+        {"label": "res+stop15", "mom": "residual", "portfolio_stop": 0.15},
+        {"label": "res+stop10+t200", "mom": "residual", "portfolio_stop": 0.10,
+         "exposure_trend": 200},
+        {"label": "res+trend200", "mom": "residual", "exposure_trend": 200},
+        {"label": "res+trend100", "mom": "residual", "exposure_trend": 100},
+        {"label": "res+trail15", "mom": "residual", "trailing_stop": 0.15},
+        {"label": "res+trail20", "mom": "residual", "trailing_stop": 0.20},
+        # Gradient filter ("basket trend"): cash out when the N-day slope of
+        # the strategy's own target basket stays negative for the confirm
+        # streak. The candidate that beat everything on the Jul-2026 episode.
+        {"label": "res+basket10c3", "mom": "residual",
+         "basket_trend": 10, "basket_confirm": 3},
+        {"label": "res+basket15c3", "mom": "residual",
+         "basket_trend": 15, "basket_confirm": 3},
+        {"label": "res+basket20c3", "mom": "residual",
+         "basket_trend": 20, "basket_confirm": 3},
+        {"label": "res+basket30c5", "mom": "residual",
+         "basket_trend": 30, "basket_confirm": 5},
+        {"label": "res+g10t5", "mom": "residual", "basket_trend": 10,
+         "basket_confirm": 3, "basket_threshold": 0.05},
+        {"label": "res+bdd8", "mom": "residual", "basket_drawdown": 0.08},
+        # Owner's insight (§15): arm the gradient cash-out ONLY in good times
+        # (market > SMA200) so bad-market chop can't whipsaw it.
+        {"label": "res+g10c3gt", "mom": "residual", "basket_trend": 10,
+         "basket_confirm": 3, "basket_good_times": True},
+        {"label": "res+g15c3gt", "mom": "residual", "basket_trend": 15,
+         "basket_confirm": 3, "basket_good_times": True},
+        {"label": "res+g20c3gt", "mom": "residual", "basket_trend": 20,
+         "basket_confirm": 3, "basket_good_times": True},
+        {"label": "res+g10c3gt+t200", "mom": "residual", "basket_trend": 10,
+         "basket_confirm": 3, "basket_good_times": True, "exposure_trend": 200},
+        # Arming-window study (§15): SMA50 = strong uptrends only.
+        {"label": "res+g10c3gt50+t200", "mom": "residual", "basket_trend": 10,
+         "basket_confirm": 3, "basket_good_times": True, "basket_arm_sma": 50,
+         "exposure_trend": 200},
+        {"label": "res+g10c3gt100+t200", "mom": "residual", "basket_trend": 10,
+         "basket_confirm": 3, "basket_good_times": True, "basket_arm_sma": 100,
+         "exposure_trend": 200},
+        {"label": "res+g10c3gt50", "mom": "residual", "basket_trend": 10,
+         "basket_confirm": 3, "basket_good_times": True, "basket_arm_sma": 50},
+        {"label": "res+bdd12", "mom": "residual", "basket_drawdown": 0.12},
+    ]
+    # one frame cache per mom variant
+    print("stage4: building residual frame cache...", flush=True)
+    t0 = time.time()
+    settings.sim_daily_core_mom_variant = "residual"
+    fc_res: dict[pd.Timestamp, pd.DataFrame | None] = {}
+    for d in _sweep_months(close.index, "2016-06-01"):
+        fc_res[d] = await asyncio.to_thread(monthly_mod.eligible_frame, d, close, vol, fund)
+    settings.sim_daily_core_mom_variant = "raw"
+    print(f"stage4: residual cache done ({time.time() - t0:.0f}s)", flush=True)
+
+    report = []
+    for w_start, w_end in _SWEEP_WINDOWS:
+        row = {"window": f"{w_start[:4]}-{w_end[:4]}", "arms": []}
+        for ov in overlays:
+            settings.sim_daily_core_mom_variant = ov.get("mom", "raw")
+            settings.sim_daily_core_lowvol_tilt = ov.get("lowvol_tilt", False)
+            use_fc = fc_res if ov.get("mom") == "residual" else fc
+            r = await _daily_core_backtest(
+                w_start, w_end, settings.sim_monthly_universe,
+                settings.sim_monthly_contribution, False,
+                "none", "monthly", False, "rank",
+                frame_cache=use_fc, close_preloaded=(close, vol), fund_preloaded=fund,
+                with_baseline=False,
+                vol_weight=ov.get("vol_weight") or None,
+                target_vol=ov.get("target_vol") or None,
+                portfolio_stop_pct=ov.get("portfolio_stop") or None,
+                exposure_trend_days=ov.get("exposure_trend") or None,
+                trailing_stop_pct=ov.get("trailing_stop") or None,
+                basket_trend_days=ov.get("basket_trend") or None,
+                basket_confirm_days=ov.get("basket_confirm") or None,
+                basket_threshold=ov.get("basket_threshold") or None,
+                basket_drawdown=ov.get("basket_drawdown") or None,
+                basket_good_times=ov.get("basket_good_times") or None,
+                basket_arm_sma=ov.get("basket_arm_sma") or None)
+            if r is not None:
+                row["arms"].append({"label": ov["label"], "irr": r.irr,
+                                    "sharpe": r.sharpe, "max_dd": r.max_drawdown,
+                                    "turnover": r.avg_turnover,
+                                    "brake_events": r.brake_events})
+            settings.sim_daily_core_mom_variant = "raw"
+            settings.sim_daily_core_lowvol_tilt = False
+        report.append(row)
+        print(f"\n=== {row['window']} (OOS walk-forward, rank deploy b0) ===")
+        for a in sorted(row["arms"], key=lambda x: -x["sharpe"]):
+            print(f"  {a['label']:<22} IRR {a['irr']:7.2%}  Sharpe {a['sharpe']:5.2f}  "
+                  f"maxDD {a['max_dd']:6.1%}  turn {a['turnover']:.1%}", flush=True)
+    with open(out_path, "w") as f:
+        json.dump(report, f, indent=1)
+
+
+async def _sweep_stage3(fc, close, vol, fund, results: list[dict],
+                        out_path: str) -> None:
+    """Risk-overlay sweep on top of the stage-1 winner: fix the best
+    (dca/gate/exit/pause/boost) config, then vary the risk knobs one at a
+    time (plus the 2-3 natural combinations). Reports IRR + Sharpe + max-DD
+    for each so the winner is chosen on risk-adjusted return, not IRR alone.
+    Mirrors the 2026-09-14 sweep verdict: boost=0 rank deploy was already
+    optimal on the deployment knobs, so the remaining edge is risk control.
+    """
+    if not results:
+        print("stage3: no stage-1 results — run stage 1 first")
+        return
+    from . import monthly as monthly_mod
+    best = results[0]
+    # Apply the winner's boost: stage-1 set it inside worker processes, so
+    # the parent's settings still hold the default — without this the
+    # "control" arm runs the wrong config (found 2026-09-14: winner b=0.25,
+    # control ran b=0).
+    settings.sim_monthly_rank_boost = best["boost"]
+    print(f"\nstage3: risk overlays on top of stage-1 winner "
+          f"{best['dca']}/{best['gate']}/{best['exit']}/p{int(best['pause'])}/b{best['boost']}",
+          flush=True)
+    report = []
+    for ov in _sweep_risk_grid():
+        settings.sim_daily_core_mom_variant = ov.get("mom", "raw")
+        settings.sim_daily_core_lowvol_tilt = ov.get("lowvol_tilt", False)
+        # frames depend on mom variant + tilt => rebuild when they change
+        local_fc = fc
+        if ov.get("mom") == "residual" or ov.get("lowvol_tilt"):
+            local_fc = {}
+            for d in _sweep_months(close.index, "2016-06-01"):
+                local_fc[d] = await asyncio.to_thread(
+                    monthly_mod.eligible_frame, d, close, vol, fund)
+        r = await _daily_core_backtest(
+            "2017-01-01", None, settings.sim_monthly_universe,
+            settings.sim_monthly_contribution, False,
+            best["gate"], best["exit"], best["pause"], best["dca"],
+            frame_cache=local_fc, close_preloaded=(close, vol), fund_preloaded=fund,
+            with_baseline=False,
+            vol_weight=ov.get("vol_weight") or None,
+            target_vol=ov.get("target_vol") or None)
+        label = "+".join(f"{k}={v}" for k, v in ov.items()) or "control"
+        if r is not None:
+            report.append({"overlay": ov, "label": label, "irr": r.irr,
+                           "sharpe": r.sharpe, "max_dd": r.max_drawdown,
+                           "turnover": r.avg_turnover, "trades": r.n_trades})
+            print(f"  {label:<55} IRR {r.irr:7.2%}  Sharpe {r.sharpe:5.2f}  "
+                  f"maxDD {r.max_drawdown:6.1%}  turn {r.avg_turnover:.1%}", flush=True)
+        # restore defaults before the next overlay
+        settings.sim_daily_core_mom_variant = "raw"
+        settings.sim_daily_core_lowvol_tilt = False
+    with open(out_path, "w") as f:
+        json.dump(report, f, indent=1)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -3617,14 +4236,55 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Release held names that left the hysteresis band at "
                          "month-end (monthly sim) or the next day")
     dc.add_argument("--crash-pause", action="store_true",
-                    help="Pause NEW entries when the universe is in a pullback regime")
+                    help="Pause new entries in a pullback regime")
+    dc.add_argument("--mom", choices=["raw", "residual"], default=None,
+                    help="Momentum variant: raw 12-1 close/close (default) or "
+                         "Blitz-Huij-Martens residual momentum")
+    dc.add_argument("--vol-weight", action="store_true",
+                    help="Weight positions ∝ 1/realized-vol instead of equal weight")
+    dc.add_argument("--target-vol", type=float, default=None,
+                    help="Cap deployment when portfolio 21d realized vol exceeds this "
+                         "(annualized, e.g. 0.25); 0/unset = off")
+    dc.add_argument("--lowvol-tilt", action="store_true",
+                    help="Add pct_rank(-vol) as a 4th score term (defensive tilt)")
+    dc.add_argument("--portfolio-stop", type=float, default=None,
+                    help="Peak-to-trough cash-out brake: sell everything to cash when the "
+                         "portfolio's equity is this %% below its running peak (0 = off)")
+    dc.add_argument("--exposure-trend", type=int, default=None,
+                    help="Deploy cash only while the equal-weight universe index is above "
+                         "its N-day SMA (0 = off); also the re-entry gate after a stop")
+    dc.add_argument("--trailing-stop", type=float, default=None,
+                    help="Per-name trailing stop: exit a holding when its price falls this "
+                         "fraction (e.g. 0.15) below its own peak since entry (0 = off)")
+    dc.add_argument("--basket-trend", type=int, default=None,
+                    help="Gradient filter: N-day rate-of-change of the target basket; "
+                         "cash out when negative for --basket-confirm days (0 = off)")
+    dc.add_argument("--basket-confirm", type=int, default=None,
+                    help="Consecutive days the basket gradient must stay negative "
+                         "(and positive to re-enter) — default 3")
+    dc.add_argument("--basket-threshold", type=float, default=None,
+                    help="Minimum |slope| to count as a negative (e.g. 0.05 = only a "
+                         "real 5% N-day drop triggers; 0 = any negative slope)")
+    dc.add_argument("--basket-drawdown", type=float, default=None,
+                    help="Cash out when the target basket is this far below its peak "
+                         "(e.g. 0.08); re-enter when the drawdown halves (0 = off)")
+    dc.add_argument("--basket-er-min", type=float, default=None,
+                    help="Kaufman efficiency-ratio gate: only arm the trigger while the "
+                         "basket path is efficient (e.g. 0.3; 0 = always armed)")
+    dc.add_argument("--basket-good-times", action="store_true",
+                    help="Arm the gradient cash-out only while the market is above its "
+                         "SMA (bull-market sleeve-crash catcher)")
+    dc.add_argument("--basket-arm-sma", type=int, default=None,
+                    help="Window of the good-times arming SMA (default 200; e.g. 50)")
     dc.add_argument("--verbose", action="store_true", help="Print the last trades")
 
     sw = sub.add_parser("daily-core-sweep",
                         help="Grid-search the daily-core knobs in parallel, then "
                              "walk-forward the top configs against the monthly baseline")
-    sw.add_argument("--stage", default="all", choices=["1", "2", "all"],
-                    help="1 = in-sample grid, 2 = walk-forward of the top configs")
+    sw.add_argument("--stage", default="all", choices=["1", "2", "3", "4", "all"],
+                    help="1 = in-sample grid, 2 = walk-forward of the top configs, "
+                         "3 = risk-overlay sweep on the stage-1 winner, "
+                         "4 = walk-forward A/B of the risk overlays on the live config")
     sw.add_argument("--workers", type=int, default=6,
                     help="Worker processes for stage1 (default 6)")
     sw.add_argument("--universe", default=None,

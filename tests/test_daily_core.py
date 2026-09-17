@@ -308,7 +308,7 @@ class TestStoredRanking:
             await asyncio.sleep(0)  # yield so a racer could interleave
             return {"AAA": {}}
 
-        async def fake_frames(_tickers, _asof):
+        async def fake_frames(_tickers, _asof, start=None):
             return pd.DataFrame({"AAA": [1.0]}, index=day), \
                    pd.DataFrame({"AAA": [1.0]}, index=day)
 
@@ -352,7 +352,7 @@ def fake_market(monkeypatch):
     def fake_order(frame):
         return frame["eligible"], ["AAA", "BBB"]
 
-    async def fake_load_frames(_tickers, _asof):
+    async def fake_load_frames(_tickers, _asof, start=None):
         return close, vol
 
     async def fake_load_fundamentals(_tickers):
@@ -417,6 +417,42 @@ class TestBackfill:
                     assert tr.created_at.strftime("%Y-%m") == "2026-08"
         asyncio.run(check())
 
+    def test_allowance_rows_match_deposited_months_only(self, mem_db, fake_market,
+                                                        monkeypatch):
+        """Found 2026-09-14 with start=all: the persisted allowance rows were
+        derived from EVERY month in the candle window (1980+ → ~550 rows)
+        while the replay only deposits once a ranking exists (2017+ → 110).
+        The phantom rows inflated allowance_total to $550k and broke every
+        contributed-normalized UI metric. Rows must match the months the
+        replay actually funded — in this fixture July 1 has no prior
+        month-end ranking yet, so only August deposits (plus the live
+        current-month add-back)."""
+        from app.db import DailyCoreAllowance as Al
+
+        monkeypatch.setattr(daily_core, "_current_month", lambda: "2026-09")
+        # Seed the live marker to 2026-09 (deposit already made live): the
+        # replay wipes it and the add-back must restore it.
+        async def seed():
+            async with mem_db() as s:
+                acc = await daily_core._account(s)
+                acc.cash = 0.0
+                acc.last_allowance_month = "2026-09"
+                await s.commit()
+        asyncio.run(seed())
+
+        r = asyncio.run(daily_core.backfill(start="2026-08-01"))
+        assert r["ok"] is True
+        # One replayed deposit (August) + the live current-month add-back.
+        assert r["contributed"] == pytest.approx(2 * settings.sim_monthly_contribution)
+
+        async def check():
+            async with mem_db() as s:
+                rows = (await s.scalars(select(Al))).all()
+                # August (replayed) + September (live add-back). No phantom
+                # rows for months outside what the replay actually funded.
+                assert sorted(x.month for x in rows) == ["2026-08", "2026-09"]
+        asyncio.run(check())
+
 
 # ---------------------------------------------------------------------------
 # Data refresh
@@ -443,8 +479,9 @@ class TestRefreshData:
                             lambda _u: ["AAA", "BBB", "CCC"])
         seen = {}
 
-        async def fake_refresh_many(tickers, period):
+        async def fake_refresh_many(tickers, period, **kwargs):
             seen["tickers"] = list(tickers)
+            seen["kwargs"] = kwargs
             return list(tickers), []
         monkeypatch.setattr(market, "refresh_many", fake_refresh_many)
 
@@ -461,10 +498,304 @@ class TestRefreshData:
                             lambda _u: ["AAA", "BBB"])
         seen = {}
 
-        async def fake_refresh_many(tickers, period):
+        async def fake_refresh_many(tickers, period, **kwargs):
             seen["tickers"] = list(tickers)
+            seen["kwargs"] = kwargs
             return list(tickers), []
         monkeypatch.setattr(market, "refresh_many", fake_refresh_many)
 
         asyncio.run(daily_core.refresh_data())
         assert seen["tickers"] == ["AAA", "BBB", "HELD"]
+        # The nightly prefetch is reused via the freshness window.
+        assert seen["kwargs"].get("max_age_seconds") == settings.market_fresh_seconds
+
+
+# ---------------------------------------------------------------------------
+# Strategy selection (runtime variant dropdown)
+# ---------------------------------------------------------------------------
+
+class TestVariantSelection:
+    def test_default_falls_back_to_config(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        assert daily_core.current_variant() == settings.sim_daily_core_mom_variant
+
+    def test_set_and_persist(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core.set_variant("raw")
+        assert daily_core.current_variant() == "raw"
+        daily_core.set_variant("residual")
+        # persisted across "restarts" (a fresh read from the file)
+        assert daily_core.current_variant() == "residual"
+
+    def test_set_variant_rejects_unknown(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        with pytest.raises(ValueError):
+            daily_core.set_variant("turbo-momentum")
+
+    def test_invalid_state_file_falls_back(self, monkeypatch, tmp_path):
+        state_file = tmp_path / "state.json"
+        state_file.write_text('{"mom_variant": "bogus"}')
+        monkeypatch.setattr(daily_core, "_STATE_FILE", state_file)
+        # the stored variant is unknown -> config default wins
+        assert daily_core.current_variant() == settings.sim_daily_core_mom_variant
+
+
+# ---------------------------------------------------------------------------
+# Protection selection (runtime, persisted)
+# ---------------------------------------------------------------------------
+
+class TestProtectionSelection:
+    def test_default_off(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        assert daily_core.current_gate() == "off"
+        assert daily_core.current_gradient() == "off"
+        assert daily_core.current_protection_config() == (None, False, None)
+
+    def test_set_and_persist_independent(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core.set_gate("200")
+        daily_core.set_gradient("100")
+        assert daily_core.current_gate() == "200"
+        assert daily_core.current_gradient() == "100"
+        # setting one leaves the other untouched, and they share the file
+        daily_core.set_gradient("off")
+        daily_core.set_variant("raw")
+        assert daily_core.current_gate() == "200"
+        assert daily_core.current_gradient() == "off"
+        assert daily_core.current_variant() == "raw"
+
+    def test_rejects_unknown(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        with pytest.raises(ValueError):
+            daily_core.set_gate("turbo")
+        with pytest.raises(ValueError):
+            daily_core.set_gradient("turbo")
+
+    def test_all_modes_have_labels(self):
+        assert all(daily_core.GATE_MODES.values())
+        assert all(daily_core.GRADIENT_MODES.values())
+
+    def test_config_resolution(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core.set_gate("200")
+        daily_core.set_gradient("always")
+        assert daily_core.current_protection_config() == (200, True, None)
+        daily_core.set_gate("off")
+        daily_core.set_gradient("50")
+        assert daily_core.current_protection_config() == (None, True, 50)
+        daily_core.set_gradient("off")
+        assert daily_core.current_protection_config() == (None, False, None)
+
+    def test_legacy_protection_migrates(self, monkeypatch, tmp_path):
+        """A state file written before the gate/arm split still selects the
+        same behavior, and the legacy key is dropped once either is set."""
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core._save_state({"protection": "gradient100"})
+        assert daily_core.current_gate() == "100"
+        assert daily_core.current_gradient() == "100"
+        assert daily_core.current_protection_config() == (100, True, 100)
+        daily_core.set_gradient("always")
+        assert daily_core.current_gate() == "100"
+        assert daily_core.current_gradient() == "always"
+        assert "protection" not in daily_core._load_state()
+
+    def test_universe_change_resets_basket(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core._save_state({"basket_hist": [100.0, 110.0], "basket_day": "2026-08-31",
+                                "basket_neg_streak": 2, "basket_out": True})
+        daily_core.set_universe(daily_core.universe_names()[0])
+        state = daily_core._load_state()
+        assert not any(k.startswith("basket_") for k in state)
+
+    def test_variant_change_resets_basket(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core._save_state({"basket_hist": [100.0], "basket_out": True})
+        daily_core.set_variant("raw")
+        assert not any(k.startswith("basket_") for k in daily_core._load_state())
+
+
+class TestProtectionDecision:
+    """The deployment gate and the gradient arm are independent: the gate can
+    park buys without disarming the cash-out, and the arm can disarm the
+    cash-out with the gate off."""
+
+    @staticmethod
+    def _market_close():
+        dates = pd.bdate_range("2026-01-01", periods=32)
+        px = ([100.0 + i * (10.0 / 19) for i in range(20)]
+              + [109.0 - i * (43.0 / 11) for i in range(1, 13)])
+        return pd.DataFrame({"AAA": px}, index=dates)
+
+    @staticmethod
+    def _run(tmp_path, monkeypatch, *, gate_sma, gradient_active, arm_sma, seed=None):
+        close = TestProtectionDecision._market_close()
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        monkeypatch.setattr(daily_core, "universe_tickers", lambda _u: ["AAA"])
+        if seed:
+            daily_core._save_state(seed)
+
+        async def fake_load_frames(_tickers, _asof, start=None):
+            return close, None
+        monkeypatch.setattr(daily_core.monthly_mod, "load_frames", fake_load_frames)
+        return asyncio.run(
+            daily_core._protection_decision(["AAA"], gate_sma, gradient_active, arm_sma))
+
+    def test_always_arm_confirms_cash_out(self, tmp_path, monkeypatch):
+        # Two prior negative days: this call's negative slope is the third.
+        gate_ok, basket_out = self._run(
+            tmp_path, monkeypatch, gate_sma=200, gradient_active=True, arm_sma=None,
+            seed={"basket_neg_streak": 2, "basket_out": False})
+        assert gate_ok is True and basket_out is True
+
+    def test_disarmed_in_bad_times_does_not_cash_out(self, tmp_path, monkeypatch):
+        # arm on SMA20: the fixture's last close is below its 20-day SMA, so the
+        # same negative slope must NOT confirm — independent of the (SMA200) gate.
+        gate_ok, basket_out = self._run(
+            tmp_path, monkeypatch, gate_sma=200, gradient_active=True, arm_sma=20,
+            seed={"basket_neg_streak": 2, "basket_out": False})
+        assert gate_ok is True and basket_out is False
+
+    def test_gate_parks_buys_without_gradient(self, tmp_path, monkeypatch):
+        gate_ok, basket_out = self._run(
+            tmp_path, monkeypatch, gate_sma=20, gradient_active=False, arm_sma=None)
+        assert gate_ok is False and basket_out is False
+
+    def test_repeat_call_does_not_reprocess_the_last_day(self, tmp_path, monkeypatch):
+        """A second cycle on unchanged candles must not re-append the last
+        day's return (which doubled the chained basket growth per call)."""
+        close = self._market_close()
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        monkeypatch.setattr(daily_core, "universe_tickers", lambda _u: ["AAA"])
+
+        async def fake_load_frames(_tickers, _asof, start=None):
+            return close, None
+        monkeypatch.setattr(daily_core.monthly_mod, "load_frames", fake_load_frames)
+
+        async def run():
+            return await daily_core._protection_decision(
+                ["AAA"], 200, True, None)
+
+        asyncio.run(run())
+        first = list(daily_core._load_state()["basket_hist"])
+        asyncio.run(run())
+        second = list(daily_core._load_state()["basket_hist"])
+        assert first == second
+
+
+# ---------------------------------------------------------------------------
+# Strategy universe selection (runtime, persisted)
+# ---------------------------------------------------------------------------
+
+class TestUniverseSelection:
+    def test_default_falls_back_to_config(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        assert daily_core.current_universe() == daily_core.settings.sim_monthly_universe
+
+    def test_set_and_persist(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        avail = daily_core.universe_names()
+        assert avail, "expected at least one universe file"
+        daily_core.set_universe(avail[0])
+        assert daily_core.current_universe() == avail[0]
+
+    def test_rejects_unknown(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        with pytest.raises(ValueError):
+            daily_core.set_universe("does-not-exist")
+
+    def test_stale_state_value_falls_back(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        (tmp_path / "state.json").write_text('{"universe": "gone"}')
+        assert daily_core.current_universe() == daily_core.settings.sim_monthly_universe
+
+    def test_sp500_available(self):
+        assert "sp500" in daily_core.universe_names()
+
+    def test_monthly_helper_resolves(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core.set_universe("sp500")
+        assert monthly._strategy_universe() == "sp500"
+
+    def test_persisted_universe_none_when_unset(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        assert daily_core.persisted_universe() is None
+
+    def test_sim_uses_shared_universe(self, monkeypatch, tmp_path):
+        from app import sim
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core.set_universe("sp500")
+        assert sim._universe() == "sp500"
+        # clearing falls back to the sim's own config default
+        (tmp_path / "state.json").write_text("{}")
+        assert sim._universe() == settings.sim_universe
+
+
+# ---------------------------------------------------------------------------
+# Target-volatility control (runtime, persisted)
+# ---------------------------------------------------------------------------
+
+class TestTargetVol:
+    def test_default_off(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        assert daily_core.current_target_vol() == 0.0
+
+    def test_set_and_persist(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        daily_core.set_target_vol("0.15")
+        assert daily_core.current_target_vol() == 0.15
+        daily_core.set_target_vol("off")
+        assert daily_core.current_target_vol() == 0.0
+
+    def test_rejects_unknown(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        with pytest.raises(ValueError):
+            daily_core.set_target_vol("0.5")
+
+    def test_room_infinite_when_calm_or_short_history(self):
+        assert daily_core._vol_deploy_room(1000.0, 500.0, [], 0.15) == float("inf")
+        calm = [0.0001] * 30
+        assert daily_core._vol_deploy_room(1000.0, 500.0, calm, 0.15) == float("inf")
+
+    def test_room_caps_when_vol_hot(self):
+        hot = [0.05, -0.05] * 15          # ~80% annualized
+        room = daily_core._vol_deploy_room(1000.0, 1000.0, hot, 0.15)
+        assert room == pytest.approx(1000.0 * 0.15 / (0.05 * (252 ** 0.5)), rel=0.25)
+
+    def test_room_nonnegative_when_over_deployed(self):
+        hot = [0.05, -0.05] * 15
+        assert daily_core._vol_deploy_room(1000.0, 0.0, hot, 0.15) == 0.0
+
+    def test_port_return_is_contribution_adjusted(self):
+        # equity flat at 1000 with a 100 contribution -> slightly negative
+        assert daily_core._port_return(1000.0, 1000.0, 100.0) < 0
+        # no contribution and flat equity -> zero
+        assert daily_core._port_return(1000.0, 1000.0, 0.0) == 0.0
+
+
+class TestSharedBackfillPreload:
+    async def test_monthly_and_daily_core_share_frames(self, mem_db, fake_market,
+                                                       monkeypatch):
+        """backfill-all builds the per-month eligibility frames once and hands
+        them to both qv-mom replays (same universe/window/variant), so
+        eligible_frame runs once per month-end rather than twice."""
+        monkeypatch.setattr(monthly, "Session", mem_db)
+        monkeypatch.setattr(monthly, "universe_tickers", lambda _u: ["AAA", "BBB"])
+
+        calls: list = []
+        real = monthly.eligible_frame
+
+        def counting(m, c, v, f):
+            calls.append(m)
+            return real(m, c, v, f)
+
+        monkeypatch.setattr(monthly, "eligible_frame", counting)
+
+        start = "2026-07-01"
+        preload = await monthly.preload_backfill(start)
+        await monthly.backfill(start, preload=preload)
+        after_monthly = len(calls)
+        assert after_monthly > 0
+        assert preload.frames  # cache populated by the first replay
+
+        await daily_core.backfill(start, preload=preload)
+        assert len(calls) == after_monthly  # second replay recomputed nothing

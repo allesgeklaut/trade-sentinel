@@ -22,6 +22,7 @@ market cap / dollar volume / momentum are comparable across the universe.
 import asyncio
 import logging
 import math
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, UTC
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -38,11 +39,83 @@ from .screener import tickers as universe_tickers
 
 logger = logging.getLogger("trade_sentinel.monthly")
 
+
+def _strategy_universe() -> str:
+    """The runtime-selected qv-mom universe (daily-core state file), falling
+    back to the config default. Imported lazily: daily_core imports this module,
+    so a module-level import here would be circular."""
+    try:
+        from . import daily_core
+        return daily_core.current_universe()
+    except Exception:  # noqa: BLE001 — never let selection break a cycle
+        return settings.sim_monthly_universe
+
+
+def _strategy_variant() -> str:
+    """The runtime-selected momentum variant (daily-core state file), falling
+    back to the config default. The qv-mom ranking is shared by the monthly and
+    daily-core portfolios, so both must resolve it the same way — relying on
+    the ambient ``settings`` value made the monthly replay depend on call
+    order (whoever set it last won)."""
+    try:
+        from . import daily_core
+        return daily_core.current_variant()
+    except Exception:  # noqa: BLE001
+        return settings.sim_daily_core_mom_variant
+
+
+@dataclass
+class BackfillPreload:
+    """Inputs every qv-mom backfill replay shares for one universe + window.
+
+    ``frames`` is a read-through cache keyed by month-end: the first replay
+    that asks for a month computes it, the second reuses it. ``backfill-all``
+    builds one of these and hands it to both the monthly and daily-core
+    replays, which otherwise load the same fundamentals/frames twice (the
+    frames are the expensive part — ~1.6s per month on a 500-name universe).
+    """
+    tickers: list[str]
+    fund: dict[str, dict[str, list[dict]]]
+    close: pd.DataFrame
+    vol: pd.DataFrame
+    frames: dict[pd.Timestamp, pd.DataFrame | None] = field(default_factory=dict)
+
+
+async def preload_backfill(start: str | None) -> BackfillPreload:
+    """Load the inputs shared by the monthly and daily-core backfills for the
+    same window: point-in-time fundamentals and the USD close/volume frames
+    (frames are computed lazily, per month, by the replays themselves)."""
+    settings.sim_daily_core_mom_variant = _strategy_variant()
+    tickers = universe_tickers(_strategy_universe())
+    fund = await fundamentals_mod.load_fundamentals(tickers)
+    load_start = ((pd.Timestamp(start) - timedelta(days=_BACKFILL_WARMUP_DAYS)).to_pydatetime()
+                  if start else None)
+    close, vol = await load_frames(tickers, None, start=load_start)
+    return BackfillPreload(tickers=tickers, fund=fund, close=close, vol=vol)
+
 # Anchor for the allowance "month" key: the same operator-local timezone the
 # sim portfolio uses (settings.allowance_tz), so both portfolios' cumulative
 # contributed figures step at the same calendar-month boundary and the two
 # equity curves are directly comparable.
 _TZ = ZoneInfo(settings.allowance_tz)
+
+# Recent-window bound for "latest price" lookups (see _price_usd_map): long
+# enough that a stale feed still resolves, short enough to skip the decades of
+# unused history that broad universes carry.
+_PRICE_LOOKBACK_DAYS = 400
+
+# Momentum warmup kept ahead of a backfill start when bounding the candle load.
+_BACKFILL_WARMUP_DAYS = 600
+
+# Candle-history bound for the LIVE monthly ranking (~4y): ample for the 253d
+# momentum warmup, without loading decades of unused history every rebalance.
+_LIVE_HISTORY_DAYS = 1460
+
+
+def _live_history_start() -> datetime:
+    """Naive-UTC lower bound for the live ranking's candle load. Candle
+    timestamps are stored naive, so the bound must be naive too."""
+    return datetime.now(UTC).replace(tzinfo=None) - timedelta(days=_LIVE_HISTORY_DAYS)
 
 
 def _current_month() -> str:
@@ -212,15 +285,31 @@ def px_at(frame: pd.DataFrame, d: pd.Timestamp, ticker: str) -> float | None:
     return float(np.asarray(p).reshape(-1)[0])
 
 
-async def load_frames(tickers: list[str], asof: datetime | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+async def load_frames(tickers: list[str], asof: datetime | None = None,
+                      start: datetime | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """(close, volume) DataFrames {date: {ticker: value}} from the candles
     cache, loaded in a thread. Foreign-listing closes are converted to USD at
-    the historical FX rate from the FX pseudo-tickers in the same cache."""
+    the historical FX rate from the FX pseudo-tickers in the same cache.
+
+    ``start`` optionally bounds the history: the strategy only ever needs a
+    momentum-warmup window before its decision date, and after the broad
+    universes were fetched with full history ~61% of the candle table sits
+    before 2015 — loading it on every call is pure waste. Callers that need
+    the full series (e.g. a ``start=all`` backfill) pass ``None``."""
     async with Session() as s:
-        q = select(Candle).order_by(Candle.timestamp)
+        # Load ONLY the requested tickers (+ the FX pairs their closes need
+        # converting), and only the four columns the frame builder reads —
+        # full-ORM hydration of millions of rows was the other half of the
+        # slowness. Same ticker-filter pattern as _price_usd_map.
+        pairs = sorted({pm[0] for t in tickers if (pm := fundamentals_mod._suffix_fx(t))})
+        q = (select(Candle.ticker, Candle.timestamp, Candle.close, Candle.volume)
+             .where(Candle.ticker.in_(set(tickers) | set(pairs)))
+             .order_by(Candle.timestamp))
+        if start is not None:
+            q = q.where(Candle.timestamp >= start)
         if asof is not None:
             q = q.where(Candle.timestamp <= asof)
-        rows = list((await s.scalars(q)).all())
+        rows = list((await s.execute(q)).all())
     return await asyncio.to_thread(load_frames_sync, tickers, rows, asof)
 
 
@@ -245,12 +334,19 @@ def eligible_frame(rebal_date: pd.Timestamp, close: pd.DataFrame, vol: pd.DataFr
     n_valid = valid.sum()
 
     c = hist.ffill()
-    # 12-1 momentum: close[t-21td] / close[t-252td] - 1
+    # 12-1 momentum: close[t-21td] / close[t-252td] - 1. Default "raw";
+    # settings.sim_daily_core_mom_variant == "residual" swaps in the
+    # Blitz-Huij-Martens residual momentum (mom per unit of idiosyncratic
+    # vol) — same `mom` column semantic downstream (higher = better) so the
+    # rest of the frame logic is untouched.
     if len(hist) <= 252:
         return None
-    mom_start = c.iloc[-21]
-    mom_end = c.iloc[-252]
-    mom = mom_start / mom_end - 1.0
+    if getattr(settings, "sim_daily_core_mom_variant", "raw") == "residual":
+        mom = residual_momentum(hist, d)
+    else:
+        mom_start = c.iloc[-21]
+        mom_end = c.iloc[-252]
+        mom = mom_start / mom_end - 1.0
     vol_ann = hist.tail(121).pct_change().std() * np.sqrt(252.0)
 
     rows: dict[str, dict[str, float | None]] = {}
@@ -309,11 +405,15 @@ def eligible_frame(rebal_date: pd.Timestamp, close: pd.DataFrame, vol: pd.DataFr
     if not rows:
         return None
     df = pd.DataFrame(rows).T
+    # The mom > -0.99 gate is a raw-momentum "went to zero" sanity floor
+    # (close-ratio - 1). Residual momentum is a scaled t-stat; a -2 value is
+    # meaningful signal, not a busted name — apply the floor to raw only.
+    raw_mom = getattr(settings, "sim_daily_core_mom_variant", "raw") != "residual"
     df["eligible"] = (
         (df["mcap"] > settings.sim_monthly_min_mcap)
         & (df["dollar_vol"] > settings.sim_monthly_min_dollar_vol)
         & np.isfinite(df["mom"])
-        & (df["mom"] > -0.99)
+        & ((df["mom"] > -0.99) if raw_mom else True)
     )
     return df
 
@@ -381,10 +481,71 @@ def _band_fill(order: list[str], holdings: list[str], target_n: int, hold_band: 
     return sorted(picked)
 
 
-def _qv_order(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+def residual_momentum(close: pd.DataFrame, asof: pd.Timestamp,
+                      market: pd.Series | None = None,
+                      lookback: int = 252, skip: int = 21) -> pd.Series:
+    """Residual momentum per Blitz-Huij-Martens (2011): for each ticker, run
+    the daily log returns in [asof-lookback+skip .. asof-skip] through a
+    one-factor market regression, then return mean(residuals)/std(residuals)
+    * sqrt(n) — momentum per unit of idiosyncratic risk. Empirically ~2x the
+    Sharpe of raw 12-1 momentum with roughly half the crash exposure.
+
+    `market` defaults to the equal-weight mean of the frame's own returns.
+    Returns a Series indexed by ticker; tickers with <60 valid days are NaN.
+
+    Note: with the default in-frame market on a SMALL universe the common
+    drift absorbs into the market leg and the residuals cluster ~0 — the
+    method separates names on idiosyncratic VOL (its purpose) rather than
+    on raw trend, which is exactly what reduces crash exposure. For the
+    production use the frame spans ~100 names, so the market leg behaves
+    like a true index.
+    """
+    hist = close.loc[:asof]
+    if len(hist) < lookback + skip:
+        return pd.Series({t: float("nan") for t in close.columns}, dtype=float)
+    # Window: [asof - (lookback+skip) .. asof - skip] — ends `skip` days
+    # before asof (the classic 12-1 skip: excludes the most-recent month to
+    # avoid the short-term reversal that contaminates momentum).
+    win: pd.DataFrame = hist.iloc[-(lookback + skip + 1):-(skip + 1) if skip else None]
+    rets = win.apply(lambda s: np.log(s / s.shift(1))).iloc[1:]
+    if market is None:
+        mkt = rets.mean(axis=1)
+    else:
+        m = market.reindex(rets.index).ffill()
+        mkt = pd.Series(np.log(m / m.shift(1)), index=m.index).iloc[1:]
+        mkt = mkt.reindex(rets.index)
+    mv = mkt.to_numpy(dtype=float)
+    out: dict[str, float] = {}
+    for t in rets.columns:
+        r = rets[t].to_numpy(dtype=float)
+        mask = np.isfinite(r) & np.isfinite(mv)
+        if mask.sum() < 60:
+            out[t] = float("nan")
+            continue
+        r_ = r[mask]
+        m_ = mv[mask]
+        # OLS with intercept on the RAW market returns: r = a + b*m + e.
+        # Momentum lives in E[r]; removing a + b*m leaves the idiosyncratic
+        # drift in E[e] = a, so the score is alpha / resid-std * sqrt(n) —
+        # the alpha t-statistic (the Blitz-Huij-Martens ranking).
+        m_var = float(np.dot(m_ - m_.mean(), m_ - m_.mean()))
+        beta = float(np.dot(r_ - r_.mean(), m_ - m_.mean()) / m_var) if m_var > 0 else 0.0
+        alpha = float(r_.mean() - beta * m_.mean())
+        resid = r_ - (alpha + beta * m_)
+        sd = float(resid.std())
+        # Ranking = alpha t-statistic: OLS forces mean(resid)=0, so score
+        # the ALPHA itself per unit of residual vol, annualized by sqrt(n).
+        out[t] = float(alpha / sd * np.sqrt(len(resid))) if sd > 0 else float("nan")
+    return pd.Series(out)
+
+
+def _qv_order(frame: pd.DataFrame, lowvol_tilt: bool | None = None) -> tuple[pd.DataFrame, list[str]]:
     """Score = pct_rank(ROE) + pct_rank(momentum) + pct_rank(1 / P-FCF if
-    available). Explicit total order (unique ranking => unique portfolio):
+    available) [+ pct_rank(-vol) when the low-vol tilt is on]. Explicit total
+    order (unique ranking => unique portfolio):
       score desc -> higher ROE -> lower P/FCF (missing last) -> ticker asc."""
+    if lowvol_tilt is None:
+        lowvol_tilt = settings.sim_daily_core_lowvol_tilt
     elig = frame[frame["eligible"]].copy()
     if elig.empty:
         return elig, []
@@ -405,6 +566,11 @@ def _qv_order(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     else:
         # degenerate: no value data anywhere -> quality+momentum only
         elig["score"] = elig["roe_rank"].fillna(0) + elig["mom_rank"].fillna(0)
+    if lowvol_tilt:
+        # pct_rank(-vol): the LOWEST-vol names rank highest. Finite-missing
+        # vol stays neutral at 0 (can't penalise what we can't measure).
+        vol_rank = (-elig["vol"]).rank(pct=True)
+        elig["score"] = elig["score"] + vol_rank.where(np.isfinite(elig["vol"]), 0.0)
 
     order = (
         elig.assign(_pf=elig["p_fcf"].fillna(np.inf), _tk=elig.index)
@@ -440,24 +606,27 @@ def pick_portfolio(rebal_date: pd.Timestamp, close: pd.DataFrame, vol: pd.DataFr
 # ---------------------------------------------------------------------------
 
 def month_last_trading_day(now: datetime) -> datetime:
-    """Last weekday of `now`'s month (holiday approximation, documented)."""
+    """Last US trading day of `now`'s month (weekday, non-NYSE-holiday).
+
+    Walks back over weekends AND NYSE holidays so a month whose last weekday
+    is a holiday (e.g. 2027-05-31 Memorial Day) rebalances on the prior actual
+    trading day, instead of being skipped when the scheduler's trading-day
+    guard suppresses that holiday's tick."""
+    from .sim import is_trading_day  # local: sim imports monthly at module load
     if now.month == 12:
         last = datetime(now.year + 1, 1, 1, tzinfo=now.tzinfo) - timedelta(days=1)
     else:
         last = datetime(now.year, now.month + 1, 1, tzinfo=now.tzinfo) - timedelta(days=1)
-    while last.weekday() >= 5:
+    while not is_trading_day(last):
         last = last - timedelta(days=1)
     return last
 
 
 def is_rebalance_day(today: datetime | None = None) -> bool:
-    """True when `today` is the last US trading day of its month.
-
-    Heuristic: the last calendar day of the month walked back to a weekday.
-    A holiday on the final weekday is accepted as an approximation for paper
-    trading (documented caveat)."""
+    """True when `today` is the last US trading day of its month (weekday,
+    non-NYSE-holiday)."""
     now = today or datetime.now(UTC)
-    return now.weekday() < 5 and now.date() == month_last_trading_day(now).date()
+    return now.date() == month_last_trading_day(now).date()
 
 
 # ---------------------------------------------------------------------------
@@ -547,9 +716,14 @@ async def _price_usd_map(tickers: list[str]) -> dict[str, float | None]:
 
     wanted = set(tickers)
     pairs = sorted({pm[0] for t in tickers if (pm := fundamentals_mod._suffix_fx(t))})
+    # Only the recent tail is needed for a "latest close": held tickers with
+    # full history (broad universes) otherwise hydrate ~16k rows each on every
+    # valuation, which dominated the status endpoints.
+    since = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=_PRICE_LOOKBACK_DAYS)
     async with Session() as s:
-        rows = (await s.scalars(
-            _select(Candle).where(Candle.ticker.in_(wanted | set(pairs)))
+        rows = (await s.execute(
+            _select(Candle.ticker, Candle.timestamp, Candle.close)
+            .where(Candle.ticker.in_(wanted | set(pairs)), Candle.timestamp >= since)
             .order_by(Candle.timestamp))).all()
     pair_close = {p: _fx_close_series([r for r in rows if r.ticker == p])
                   for p in pairs}
@@ -723,12 +897,13 @@ async def refresh_data(tickers: list[str]) -> tuple[list[str], dict[str, str]]:
     history to ~2009), yfinance fallback for CIK-less listings (ETFs, European
     exchanges). Same split as the stockstrat research pipeline."""
     from . import edgar
-    from .market import refresh
+    from .market import refresh_yfinance
     refresh_errors: list[str] = []
     wanted = list(tickers) + sorted({pm[0] for t in tickers if (pm := fundamentals_mod._suffix_fx(t))})
     for t in wanted:
         try:
-            await refresh(t, "10y")
+            # Universe-sized batch → Yahoo only (see market.refresh_many).
+            await refresh_yfinance(t, "10y")
         except Exception as e:
             refresh_errors.append(f"{t}: {e}")
     fund_status: dict[str, str]
@@ -762,10 +937,13 @@ async def _run_rebalance_locked(force: bool) -> dict[str, Any]:
             return {"skipped": True, "reason": f"already rebalanced {month}"}
 
     allowance = await deposit_allowance()
-    tickers = universe_tickers(settings.sim_monthly_universe)
+    tickers = universe_tickers(_strategy_universe())
+    # The ranking is shared with daily-core: resolve the runtime variant here
+    # too, rather than depending on whoever set settings last.
+    settings.sim_daily_core_mom_variant = _strategy_variant()
     refresh_errors, fund_status = await refresh_data(tickers)
 
-    close, vol = await load_frames(tickers, None)
+    close, vol = await load_frames(tickers, None, start=_live_history_start())
     fund = await fundamentals_mod.load_fundamentals(tickers)
     # tz-naive date: candle timestamps are stored naive (UTC), so the slice
     # index must be naive too (mixing tz-aware would raise in pandas).
@@ -850,6 +1028,295 @@ async def run_monthly_cycle() -> dict[str, Any]:
     if not is_rebalance_day():
         return {"skipped": True, "reason": "not last trading day of month"}
     return await run_rebalance()
+
+
+# ---------------------------------------------------------------------------
+# Backfill (synthetic history, same contract as daily_core.backfill)
+# ---------------------------------------------------------------------------
+
+async def _sync_start_date() -> str | None:
+    """Earliest daily-sim snapshot date — the monthly backfill's default
+    start so the three equity curves cover the same window (same rule as
+    daily_core._sync_start_date; the daily-sim curve is the longest-running
+    live one, so it anchors the shared window)."""
+    from .db import SimSnapshot
+    async with Session() as s:
+        d = await s.scalar(select(func.min(SimSnapshot.created_at)))
+    return d.strftime("%Y-%m-%d") if d else None
+
+
+async def backfill(start: str | None = None,
+                   *, preload: BackfillPreload | None = None) -> dict[str, Any]:
+    """Replay the monthly qv-mom strategy over historical data and REPLACE
+    the portfolio state with the replay's end state.
+
+    Wipes account/positions/trades/allowances/snapshots/rebalances, then
+    walks every stored month-end from `start` to today: deposits the
+    allowance on each month's FIRST trading day (same timing as the live
+    deposit_allowance so the contributed figures step in lockstep with the
+    other portfolios), picks the top-N with hysteresis at the month-end and
+    trades at that day's close with 10 bps one-way paper costs — the same
+    simulation as `optimize monthly-backtest`, but materialized as real
+    trade/rebalance/snapshot rows the UI can render.
+
+    ``start`` semantics (mirrors daily_core.backfill):
+      - explicit "YYYY-MM-DD": replay from that day
+      - None (default): synched with the other sims — starts on the earliest
+        snapshot date of the daily sim / daily-core portfolios so all three
+        equity curves cover the same window
+      - "all": the full stored history (2017+, first month with an eligible
+        frame) — the long-view replay
+
+    Paper-portfolio convenience, not a live track record. Point-in-time
+    discipline: a rebalance on date d only sees fundamentals public by then
+    (same EDGAR-first fact store as the backtest).
+    """
+    from sqlalchemy import delete as sa_delete
+    from .db import (MonthlyAccount as Acc, MonthlyPosition as Pos,
+                     MonthlyTrade as Tr, MonthlyAllowance as Al,
+                     MonthlySnapshot as Sn, MonthlyRebalance as Rb)
+
+    async with _rebalance_lock:
+        if start is None:
+            # synched with the other sims: the earliest daily-sim snapshot
+            start = await _sync_start_date()
+        elif start == "all":
+            start = None  # full stored history
+        start_note = start or "first eligible month"
+
+        settings.sim_daily_core_mom_variant = _strategy_variant()
+        if preload is not None:
+            tickers, fund = preload.tickers, preload.fund
+            close, vol = preload.close, preload.vol
+        else:
+            tickers = universe_tickers(_strategy_universe())
+            fund = await fundamentals_mod.load_fundamentals(tickers)
+            load_start = ((pd.Timestamp(start) - timedelta(days=_BACKFILL_WARMUP_DAYS)).to_pydatetime()
+                          if start else None)
+            close, vol = await load_frames(tickers, None, start=load_start)
+        if not fund:
+            return {"ok": False, "error": "no fundamentals loaded"}
+        if close.empty:
+            return {"ok": False, "error": "no candle data"}
+
+        idx = pd.DatetimeIndex(close.index)
+        if start:
+            idx = idx[idx >= pd.Timestamp(start)]
+        if idx.empty:
+            return {"ok": False, "error": f"no trading days since {start_note}"}
+
+        # last trading day of each month in the window
+        months: list[pd.Timestamp] = []
+        for ym in sorted({(d.year, d.month) for d in idx}):
+            sub = idx[(idx.year == ym[0]) & (idx.month == ym[1])]
+            if len(sub):
+                months.append(sub[-1])
+
+        # eligibility frames per month-end (plus the month-end before the
+        # window so a mid-month start ranks against the prior frame)
+        prior_month_ends: list[pd.Timestamp] = []
+        if months:
+            prev = months[0] - pd.offsets.MonthEnd(1)
+            prev_idx = close.index[close.index <= prev]
+            if len(prev_idx):
+                prior_month_ends.append(prev_idx[-1])
+        shared = preload.frames if preload is not None else {}
+        frame_cache: dict[pd.Timestamp, pd.DataFrame | None] = {}
+        for m in sorted(set(prior_month_ends) | set(months)):
+            if m in shared:
+                frame_cache[m] = shared[m]
+                continue
+            frame_cache[m] = await asyncio.to_thread(eligible_frame, m, close, vol, fund)
+            shared[m] = frame_cache[m]
+        live_months = [m for m in months
+                       if (f := frame_cache.get(m)) is not None
+                       and bool(f["eligible"].any())]
+        if not live_months:
+            return {"ok": False, "error": "no month with eligible names"}
+        # Trim the day index to the FIRST eligible month: months before it
+        # would only produce dead flat-zero snapshots (the replay deposits
+        # from the first eligible month), flooding the curve with ~9k empty
+        # points for start=all (1980-2017) and clipping the equity API's
+        # 4000-point cap to 2011. The momentum warmup still uses the full
+        # close frame — only the REPLAYED days start here.
+        idx = idx[idx >= pd.Timestamp(live_months[0].replace(day=1))]
+
+        # contribution timing: first trading day of EVERY calendar month in the
+        # replayed window (not just the eligible ones — the live engine deposits
+        # monthly even when no ranking exists; only the rebalance needs a frame).
+        contrib_days: dict[str, pd.Timestamp] = {}
+        for m in sorted({(d.year, d.month) for d in idx}):
+            key = f"{m[0]}-{m[1]:02d}"
+            month_days = idx[(idx.year == m[0]) & (idx.month == m[1])]
+            if len(month_days):
+                contrib_days[key] = month_days[0]
+        # valuation closes: forward-filled so missing candles carry the last
+        # known close (never value a held position at 0)
+        close_val = close.ffill()
+
+        def px_of(t: str, d: pd.Timestamp) -> float | None:
+            return px_at(close_val, d, t)
+
+        cost = settings.sim_monthly_cost_oneway
+
+        # --- wipe + reset (preserve the live month markers like daily-core) ---
+        live_allowance_month: str | None = None
+        live_rebalance_month: str | None = None
+        async with Session() as s:
+            acc0 = await s.get(Acc, 1)
+            if acc0 is not None:
+                live_allowance_month = acc0.last_allowance_month
+                live_rebalance_month = acc0.last_rebalance_month
+            for tbl in (Tr, Pos, Al, Sn, Rb):
+                await s.execute(sa_delete(tbl))
+            acc = await s.get(Acc, 1)
+            if acc is None:
+                acc = Acc(id=1)
+                s.add(acc)
+            acc.cash = 0.0
+            acc.last_allowance_month = None
+            await s.commit()
+
+        # --- in-memory month-by-month replay ---
+        # Real share/cash bookkeeping (not the optimize backtest's
+        # aggregate-value shortcut) so the trade log can carry actual
+        # shares/prices: each month-end, SELL dropped names at that day's
+        # close, then BUY the new picks to equal weight with the proceeds
+        # plus the month's contribution. Between rebalances the portfolio
+        # is untouched (the monthly engine trades once a month).
+        shares: dict[str, float] = {}
+        cash = 0.0
+        contributed = 0.0
+        deposited_months: set[str] = set()  # months the replay actually funded
+        rebalance_rows: list[tuple[str, str, str, str, int]] = []
+        trade_rows: list[tuple[str, str, str, float, float, float]] = []
+        snaps: list[tuple[str, float, float]] = []
+
+        # Replay from the first eligible month onward. Later window months are
+        # replayed even without an eligible ranking: the live engine still
+        # deposits monthly (deposit_allowance runs before the frame check), so
+        # their days are funded and snapshotted; only the rebalance is skipped.
+        replay_seq = [m for m in months if m >= live_months[0]]
+        for i, m in enumerate(replay_seq):
+            frame = frame_cache.get(m)
+            has_frame = frame is not None and bool(frame["eligible"].any())
+            picks, _ = (await asyncio.to_thread(
+                pick_portfolio, m, close, vol, fund, list(shares), frame)) \
+                if has_frame else (list(shares), None)
+            prev_td = replay_seq[i - 1] if i > 0 else None
+            month_days = [d for d in idx if (prev_td is None or d > prev_td) and d <= m]
+
+            # contribution on the first trading day of EVERY calendar month in
+            # this span (the live engine deposits monthly even without a
+            # ranking; only the rebalance needs a frame).
+            for d in month_days:
+                key = f"{d.year}-{d.month:02d}"
+                if contrib_days.get(key) == d:
+                    cash += settings.sim_monthly_contribution
+                    contributed += settings.sim_monthly_contribution
+                    deposited_months.add(key)
+
+            # daily snapshots FIRST, on the holdings actually owned during
+            # this month — the picks from the PREVIOUS month-end rebalance.
+            # (Snapshotting after the rebuild below valued this month's days
+            # on this month's own month-end purchases: a look-ahead that made
+            # every month start distorted — the first point of a 2025 backfill
+            # read 91% instead of 100%.)
+            for d in month_days:
+                eq = cash + sum(sh * (px_of(t, d) or 0.0) for t, sh in shares.items())
+                snaps.append((d.strftime("%Y-%m-%d"), eq, contributed))
+
+            # month-end rebuild (only when a ranking exists): SELL dropped names
+            # at the close, then BUY the picks to equal weight with proceeds +
+            # contribution. The live engine rebalances once EVERY month it has a
+            # frame (one audit row per month, no trades when already at weight),
+            # so this must not be gated on the pick set changing.
+            if has_frame:
+                adds = len(set(picks) - set(shares))
+                rebalance_rows.append((f"{m.year}-{m.month:02d}", m.strftime("%Y-%m-%d"),
+                                       ",".join(sorted(shares)), ",".join(sorted(picks)),
+                                       adds))
+                for t in list(shares):
+                    if t in picks:
+                        continue
+                    p = px_of(t, m)
+                    sh = shares.get(t, 0.0)
+                    if p is None or p <= 0 or sh <= 0:
+                        continue
+                    notional = sh * p
+                    cash += notional * (1.0 - cost)
+                    del shares[t]
+                    trade_rows.append((m.strftime("%Y-%m-%d"), "SELL", t, notional, sh, p))
+                equity_now = cash + sum(sh * (px_of(t, m) or 0.0)
+                                        for t, sh in shares.items())
+                weight = equity_now / max(len(picks), 1)
+                for t in picks:
+                    p = px_of(t, m)
+                    if p is None or p <= 0:
+                        continue
+                    gap = weight - shares.get(t, 0.0) * p
+                    if gap > 1 and cash > 1:
+                        notional = min(gap, max(cash, 0.0) / (1.0 + cost))
+                        if notional < 1:
+                            continue
+                        sh = notional / p
+                        cash -= notional
+                        cash -= notional * cost
+                        shares[t] = shares.get(t, 0.0) + sh
+                        trade_rows.append((m.strftime("%Y-%m-%d"), "BUY", t, notional, sh, p))
+
+        # --- persist the end state ---
+        # allowance rows: exactly the months the replay funded (ineligible
+        # months included) — matches daily_core.backfill.
+        replay_months = sorted(deposited_months)
+        # The live engine may already have deposited the CURRENT month while
+        # the replay window has no candle for it yet — the wipe destroyed the
+        # allowance row, so re-create it (same rule as daily_core.backfill).
+        # `_current_month()` (operator-local) matches deposit_allowance.
+        current_month = _current_month()
+        if live_allowance_month == current_month and current_month not in replay_months:
+            cash += settings.sim_monthly_contribution
+            contributed += settings.sim_monthly_contribution
+            replay_months = sorted(set(replay_months) | {current_month})
+        async with Session() as s:
+            acc = await s.get(Acc, 1)
+            assert acc is not None  # created in the wipe step above
+            # converge to the live engine's state shape: cash = replay cash,
+            # positions booked at their last close (avg_cost not tracked by
+            # the replay; the equity curve is what matters)
+            acc.cash = cash
+            for t, sh in shares.items():
+                p = px_of(t, idx[-1]) or 0.0
+                s.add(Pos(ticker=t, shares=sh, avg_cost=p))
+            for td, side, t, notional, sh, pr in trade_rows:
+                s.add(Tr(ticker=t, side=side, shares=round(sh, 6), price=round(pr, 6),
+                         cash_after=0.0,
+                         reason=f"backfill {side.lower()} ${notional:,.0f}",
+                         created_at=pd.Timestamp(f"{td} 16:00:00+00:00").to_pydatetime()))
+            for m_key in replay_months:
+                s.add(Al(amount=settings.sim_monthly_contribution, month=m_key))
+            for m_key, td, held, picked, n_new in rebalance_rows:
+                s.add(Rb(rebal_month=m_key, rebal_date=pd.Timestamp(f"{td} 16:00:00+00:00").to_pydatetime(),
+                         held_before=held, picked=picked, n_new=n_new,
+                         snapshot=""))
+            # Never let the marker lag the newest inserted row, or the next
+            # live deposit would duplicate that month.
+            last_month = max(live_allowance_month or "",
+                             replay_months[-1] if replay_months else "")
+            acc.last_allowance_month = last_month or None
+            acc.last_rebalance_month = live_rebalance_month
+            for sd, eq, contrib_at_day in snaps:
+                s.add(Sn(cash=0.0, positions_value=eq, total_equity=eq,
+                         allowance_total=round(contrib_at_day, 2),
+                         created_at=pd.Timestamp(f"{sd} 16:00:00+00:00").to_pydatetime()))
+            await s.commit()
+
+        return {"ok": True, "months": len(live_months), "start": str(idx[0].date()),
+                "end": str(idx[-1].date()), "requested_start": start_note,
+                "contributed": round(contributed, 2),
+                "final_equity": round(snaps[-1][1], 2) if snaps else 0.0,
+                "trades": len(trade_rows), "rebalances": len(rebalance_rows),
+                "snapshots": len(snaps)}
 
 
 # ---------------------------------------------------------------------------

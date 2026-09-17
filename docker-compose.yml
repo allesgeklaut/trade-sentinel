@@ -3,7 +3,9 @@ services:
     build: .
     container_name: trade-sentinel
     restart: unless-stopped
-    ports: ["8002:8000"]
+    # Bind to loopback only: the app has no auth, so it must not be reachable
+    # directly. Remote access goes through the Cloudflare tunnel (Zero Trust).
+    ports: ["127.0.0.1:8002:8000"]
     env_file:
       - .env
     volumes:
@@ -12,6 +14,9 @@ services:
       # read by the app via LITELLM_API_KEY_FILE (below) — the key is NOT
       # copied into any env file.
       - /opt/secrets/litellm.key:/run/secrets/litellm.key:ro
+      # Same pattern for the Twelve Data market-data key (optional; the app
+      # uses yfinance until this key is present).
+      - /opt/secrets/twelvedata.key:/run/secrets/twelvedata.key:ro
     security_opt: ["no-new-privileges:true"]
     cap_drop: [ALL]
     read_only: true
@@ -25,5 +30,6 @@ services:
     environment:
       - TZ=Europe/Vienna
       - LITELLM_API_KEY_FILE=/run/secrets/litellm.key
+      - TWELVE_DATA_API_KEY_FILE=/run/secrets/twelvedata.key
 volumes:
   trade_sentinel_data:

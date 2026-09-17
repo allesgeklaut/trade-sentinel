@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 import math
-from datetime import datetime, timedelta, UTC
+from datetime import date, datetime, timedelta, UTC
 from zoneinfo import ZoneInfo
 from collections.abc import Callable
 from typing import Any
@@ -39,7 +39,7 @@ from .db import (
     SimTrade,
     Session,
 )
-from .market import candles, refresh, refresh_many
+from .market import candles, latest_close, refresh, refresh_many
 from .screener import tickers as universe_tickers
 from .strategy import (
     StrategyParams,
@@ -142,11 +142,11 @@ def _week_diff(current: str, last: str) -> int:
 
 
 async def _latest_close(ticker: str) -> float | None:
-    """Return the most recent cached close price for *ticker*, or None."""
-    rows = await candles(ticker)
-    if not rows:
-        return None
-    return float(rows[-1]["close"])
+    """Return the most recent cached close price for *ticker*, or None.
+
+    Delegates to market.latest_close (single-row query) — the old path loaded
+    the ticker's entire history via candles() just to read the last bar."""
+    return await latest_close(ticker)
 
 
 async def held_tickers() -> list[str]:
@@ -265,16 +265,29 @@ async def valuate() -> dict[str, Any]:
 async def _candidate_tickers() -> list[str]:
     """Return the list of tickers the sim should consider.
 
-    If ``sim_universe`` is ``watchlist``, use the watchlist table; otherwise
-    load from the universe file.
+    If the (runtime or configured) universe is ``watchlist``, use the watchlist
+    table; otherwise load from the universe file. The universe is the shared
+    Dashboard selection, so it applies to every sim.
     """
-    if settings.sim_universe.lower() == "watchlist":
+    name = _universe()
+    if name.lower() == "watchlist":
         from .db import Watchlist
         async with Session() as s:
             rows = (await s.scalars(select(Watchlist).order_by(Watchlist.ticker))).all()
             return [r.ticker for r in rows]
     else:
-        return universe_tickers(settings.sim_universe)
+        return universe_tickers(name)
+
+
+def _universe() -> str:
+    """The runtime-selected sim universe (shared across all sims, persisted in
+    the daily-core state file), else the config default. Lazy import avoids any
+    import cycle with daily_core."""
+    try:
+        from . import daily_core
+        return daily_core.persisted_universe() or settings.sim_universe
+    except Exception:  # noqa: BLE001 — selection must never break a cycle
+        return settings.sim_universe
 
 
 async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str) -> dict | None:
@@ -1792,10 +1805,13 @@ async def run_cycle() -> dict[str, Any]:
             _set_progress("allowance", "Depositing monthly allowance", started_at=started_at)
             allowance_result = await deposit_allowance()
 
-            # 2. Refresh candles for the universe
+            # 2. Refresh candles for the universe (reuse the nightly prefetch:
+            # tickers already fetched within the freshness window are skipped).
             _set_progress("refresh", "Refreshing candle data", started_at=started_at)
             tickers = await _candidate_tickers()
-            _, refresh_errors = await refresh_many(tickers, _SIM_REFRESH_PERIOD)
+            _, refresh_errors = await refresh_many(
+                tickers, _SIM_REFRESH_PERIOD,
+                max_age_seconds=settings.market_fresh_seconds)
             detail = f" ({len(refresh_errors)} failed)" if refresh_errors else ""
             _set_progress("refresh", f"Refreshed {len(tickers)} tickers{detail}", started_at=started_at)
 
@@ -2163,6 +2179,188 @@ async def get_equity_curve(limit: int = 365) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Backfill (deterministic synthetic history, no LLM calls)
+# ---------------------------------------------------------------------------
+
+async def backfill(start: str | None = None) -> dict[str, Any]:
+    """Replay the DETERMINISTIC sim strategy over historical data and REPLACE
+    the portfolio state with the replay's end state.
+
+    The live sim runs ``SIM_STRATEGY=hybrid`` (deterministic engine + LLM
+    review), but the LLM cannot be replayed faithfully (tokens, and its
+    cloud behaviour isn't reproducible), so this backfill is a DETERMINISTIC
+    APPROXIMATION: the engine's own rules only — the same SELL/ATR-stop/BUY
+    logic, the same risk config (max-positions, stops, run-up block, cash
+    floor), zero LLM calls. The curve approximates the engine the hybrid
+    mode overlays; treat it as context for comparison, not a track record.
+
+    Wipes account/positions/trades/allowances/snapshots (NOT the benchmark,
+    NOT chat history), then walks every stored trading day from `start` to
+    today, depositing the allowance on each month's first trading day and
+    applying the engine's decisions at the day's close.
+
+    ``start`` semantics (mirrors monthly.backfill / daily_core.backfill):
+      - explicit "YYYY-MM-DD": replay from that day
+      - "all": the full stored history (candles to 1980; the replay walks
+        every stored trading day and deposits the monthly allowance on the
+        first trading day of each month it covers, so the curve starts at the
+        earliest stored candle rather than at the first signal)
+      - None (default): synched with the other sims — the earliest snapshot
+        date of the monthly / daily-core portfolios (the sim's own snapshots
+        are wiped by the replay, so the other two anchor the shared window).
+    """
+    from sqlalchemy import delete as sa_delete
+    from .db import (SimAccount as Acc, SimPosition as Pos, SimTrade as Tr,
+                     SimAllowance as Al, SimSnapshot as Sn)
+    from . import optimize as opt
+
+    def opt_load_series(tickers: list[str], start=None):
+        return opt._load_series(tickers, start=start)
+
+    def opt_live_sim_params():
+        return opt._live_sim_params()
+
+    def opt_replay(series, params, start):
+        return opt._replay(series, params, start=start)
+
+    if _run_cycle_lock.locked():
+        return {"skipped": True, "reason": "a sim cycle is already running"}
+    async with _run_cycle_lock:
+        if start is None:
+            start = await _sync_start_date()
+        elif start == "all":
+            start = None  # full stored history
+        start_note = start or "first signal day"
+
+        tickers = await _candidate_tickers()
+        series = await opt_load_series(tickers, start)
+        if not series:
+            return {"ok": False, "error": "no tickers with enough candle history"}
+
+        params = opt_live_sim_params()
+        res = opt_replay(series, params, start=start)
+        if not res.equity_curve:
+            return {"ok": False, "error": "replay produced no days"}
+
+        # The replay's allowance cadence: contribution on the first trading
+        # day of each month (the _replay convention).
+        days = [e["time"] for e in res.equity_curve]
+        replay_months = sorted({d[:7] for d in days})
+
+        # --- wipe + persist (keep the live allowance marker like the other
+        # backfills) ---
+        async with Session() as s:
+            acc0 = await s.get(Acc, 1)
+            live_allowance_month = acc0.last_allowance_month if acc0 else None
+            await s.execute(sa_delete(Tr))
+            await s.execute(sa_delete(Pos))
+            await s.execute(sa_delete(Al))
+            await s.execute(sa_delete(Sn))
+            acc = await s.get(Acc, 1)
+            if acc is None:
+                acc = Acc(id=1, cash=0.0)
+                s.add(acc)
+            acc.cash = 0.0
+            acc.last_allowance_month = None
+            acc.last_review_week = None
+            await s.commit()
+
+        # Replay state comes from the result's curves; shares/cash are not
+        # exported by ReplayResult, so rebuild the end-state holdings from
+        # the trade log (executing it forward from zero). The allowance
+        # deposits are NOT in the trade log (_replay adds them straight to
+        # pf.cash) — add one deposit per replayed month or cash ends ~$100k
+        # negative and the equity curve cliffs on the live point.
+        shares: dict[str, float] = {}
+        cash = params.start_cash
+        deposited_months: set[str] = set()
+        for tr in res.trades:
+            d = tr["date"]
+            deposited_months.add(d[:7])
+            notional = tr["shares"] * tr["price"]
+            if tr["side"] == "BUY":
+                shares[tr["ticker"]] = shares.get(tr["ticker"], 0.0) + tr["shares"]
+                cash -= notional
+            else:
+                shares[tr["ticker"]] = shares.get(tr["ticker"], 0.0) - tr["shares"]
+                if shares[tr["ticker"]] <= 0.0001:
+                    shares.pop(tr["ticker"], None)
+                cash += notional
+        # deposits: _replay deposits on the first trading day of every month
+        # it processes — including months where the portfolio stayed flat
+        # (no trades), so count months from the equity curve, not the trades.
+        deposited_months = {e["time"][:7] for e in res.equity_curve}
+        cash += params.monthly_allowance * len(deposited_months)
+
+        # The live engine deposits at the START of the month, so it may have
+        # already deposited the CURRENT month while the replay window has no
+        # candle for it yet (e.g. backfill on the 1st before the market opens).
+        # The replay never re-deposits it, so restore the contribution and the
+        # row — otherwise the account ends permanently short, and if the
+        # marker lagged behind the row the next live deposit would hit the
+        # unique allowance constraint. (Mirrors daily_core.backfill.)
+        current_month = _current_month()
+        if live_allowance_month == current_month and current_month not in replay_months:
+            cash += params.monthly_allowance
+            replay_months = sorted(set(replay_months) | {current_month})
+
+        async with Session() as s:
+            acc = await s.get(Acc, 1)
+            assert acc is not None  # created in the wipe step above
+            acc.cash = round(cash, 2)
+            for t, sh in shares.items():
+                # avg_cost not tracked per-fill here — book at the last close
+                # like the other backfills (the equity curve is what matters).
+                last_px = None
+                df = series.get(t)
+                if df is not None and len(df):
+                    last_px = float(df["close"].iloc[-1])
+                s.add(Pos(ticker=t, shares=round(sh, 6), avg_cost=round(last_px or 0.0, 6)))
+            for tr in res.trades:
+                s.add(Tr(ticker=tr["ticker"], side=tr["side"],
+                         shares=round(tr["shares"], 6), price=round(tr["price"], 6),
+                         cash_after=0.0, reason=f"backfill: {tr['reason']}",
+                         created_at=pd.Timestamp(f"{tr['date']} 16:00:00+00:00").to_pydatetime()))
+            for m in replay_months:
+                s.add(Al(amount=settings.sim_monthly_allowance, month=m))
+            # Keep the marker consistent: never let it lag the newest inserted
+            # row, or the next live deposit would duplicate that month.
+            last_month = max(live_allowance_month or "",
+                             replay_months[-1] if replay_months else "")
+            acc.last_allowance_month = last_month or None
+            allowance_running = 0.0
+            months_seen: set[str] = set()
+            for e in res.equity_curve:
+                d = e["time"]
+                # equity_curve is ascending, so counting distinct months as we
+                # go is O(days) rather than re-scanning the curve per point.
+                months_seen.add(d[:7])
+                allowance_running = round(
+                    params.start_cash + params.monthly_allowance * len(months_seen), 2)
+                s.add(Sn(cash=0.0, positions_value=e["equity"],
+                         total_equity=e["equity"],
+                         allowance_total=round(allowance_running, 2),
+                         created_at=pd.Timestamp(f"{d} 16:00:00+00:00").to_pydatetime()))
+            await s.commit()
+
+        return {"ok": True, "days": len(res.equity_curve),
+                "start": res.equity_curve[0]["time"], "end": res.equity_curve[-1]["time"],
+                "requested_start": start_note,
+                "final_equity": round(res.final_equity, 2),
+                "trades": res.n_trades, "snapshots": len(res.equity_curve),
+                "approximation": True}
+
+
+async def _sync_start_date() -> str | None:
+    """Earliest MonthlySnapshot date — the sim backfill's default start so
+    the sim / monthly / daily-core curves cover the same window."""
+    from .db import MonthlySnapshot
+    async with Session() as s:
+        d = await s.scalar(select(func.min(MonthlySnapshot.created_at)))
+    return d.strftime("%Y-%m-%d") if d else None
+
+
+# ---------------------------------------------------------------------------
 # Reset
 # ---------------------------------------------------------------------------
 
@@ -2208,7 +2406,12 @@ async def benchmark_valuate() -> dict[str, Any]:
         "avg_cost": round(acc.avg_cost, 4),
         "current_price": round(price, 4),
         "total_equity": round(value, 2),
-        "allowance_total": 0.0,  # filled below
+        # total deposited: acc.cash tracks the cumulative allowances (see
+        # _benchmark_deposit_and_buy). The old placeholder 0.0 made every
+        # contributed-normalized view of the live bench divide by zero —
+        # the pct conversion fell back to the RAW value and the 1Y chart
+        # showed the bench at 1986% instead of ~99%.
+        "allowance_total": round(acc.cash, 2),
     }
 
 
@@ -2318,12 +2521,214 @@ async def reset_benchmark() -> None:
     logger.info("Benchmark reset")
 
 
+async def backfill_benchmark(start: str | None = None) -> dict[str, Any]:
+    """Replay the DCA benchmark over historical URTH candles and REPLACE the
+    benchmark state with the replay's end state.
+
+    The benchmark has no decisions to approximate: each month's allowance is
+    deposited on the month's FIRST trading day and fully invested at that
+    day's close (the live _benchmark_deposit_and_buy rule). Fetches the
+    benchmark ticker's full available candle history first (the cache only
+    carries ~2y by default), so the synthetic curve matches the other
+    backfills' window.
+
+    ``start``: "YYYY-MM-DD" to replay from that date, "all" for the full
+    candle history of the ticker, or omit (default) to synch with the other
+    sims (earliest monthly/daily-core snapshot).
+    """
+    from sqlalchemy import delete as sa_delete
+    from .db import Candle, SimBenchmarkAccount as Acc
+    from .market import refresh as market_refresh
+
+    async with _run_cycle_lock:
+        ticker = settings.sim_benchmark_ticker
+        try:
+            await market_refresh(ticker, "max")
+        except Exception as e:
+            logger.warning("Benchmark backfill: could not refresh %s (%s) — using cache", ticker, e)
+
+        async with Session() as s:
+            rows = (await s.scalars(select(Candle).where(Candle.ticker == ticker)
+                                    .order_by(Candle.timestamp))).all()
+        if not rows:
+            return {"ok": False, "error": f"no candles for {ticker}"}
+
+        dates = pd.DatetimeIndex([r.timestamp.replace(tzinfo=None) for r in rows])
+        closes = pd.Series([r.close for r in rows], index=dates)
+
+        if start is None:
+            start = await _sync_start_date()
+        elif start == "all":
+            start = None
+        start_note = start or "first candle"
+        if start:
+            closes = closes[closes.index >= pd.Timestamp(start)]
+        if closes.empty:
+            return {"ok": False, "error": f"no candles since {start_note}"}
+
+        # DCA replay: deposit on each month's first trading day, buy at that
+        # day's close (same rule as the live engine; no fees for the ETF).
+        amount = settings.sim_monthly_allowance
+        shares = 0.0
+        cash = 0.0  # cumulative deposited (the account's contributed total)
+        avg_cost = 0.0
+        snaps: list[tuple[datetime, float, float, float, float]] = []
+        seen_months: set[str] = set()
+        n_buys = 0
+        for ts in closes.index:
+            px = float(closes.loc[ts])
+            day = pd.Timestamp(ts)
+            month = day.strftime("%Y-%m")
+            if month not in seen_months:
+                seen_months.add(month)
+                cash += amount
+                new_shares = amount / px if px > 0 else 0.0
+                avg_cost = (shares * avg_cost + amount) / (shares + new_shares) \
+                    if (shares + new_shares) > 0 else px
+                shares += new_shares
+                n_buys += 1
+            snaps.append((day.to_pydatetime(), shares, px,
+                          round(shares * px, 2), round(cash, 2)))
+
+        if not snaps:
+            return {"ok": False, "error": "no days in window"}
+
+        # The live engine may already have deposited the CURRENT month while
+        # the replay window ends before it (e.g. backfill on the 1st) — the
+        # wipe would destroy that allowance, so preserve the marker and the
+        # deposit (same rule as the other backfills).
+        async with Session() as s:
+            acc0 = await s.get(Acc, 1)
+            live_month = acc0.last_allowance_month if acc0 else None
+            current_month = _current_month()
+            extra = 0.0
+            if live_month == current_month and current_month not in seen_months:
+                # no candle for today's month yet: book the live deposit at
+                # the last close (the live engine's next cycle will buy it)
+                px = float(closes.iloc[-1])
+                if px > 0:
+                    cash += amount
+                    avg_cost = (shares * avg_cost + amount) / (shares + amount / px) \
+                        if (shares + amount / px) > 0 else px
+                    shares += amount / px
+                    extra = amount
+            await s.execute(sa_delete(SimBenchmarkSnapshot))
+            await s.execute(sa_delete(Acc))
+            # Marker = the newest month actually funded (or the live month when
+            # it was booked above). Never `current_month` blindly: with no
+            # candle for the current month that would suppress the next live
+            # deposit forever (and a lagging marker would double-deposit).
+            acc = Acc(id=1, cash=round(cash, 2), shares=round(shares, 6),
+                      avg_cost=round(avg_cost, 6),
+                      last_allowance_month=max(live_month or "", max(seen_months)))
+            s.add(acc)
+            for d, sh, _px, eq, contrib in snaps:
+                s.add(SimBenchmarkSnapshot(
+                    shares=round(sh, 6), price=0.0, total_equity=eq,
+                    allowance_total=contrib,
+                    created_at=d))
+            await s.commit()
+
+        return {"ok": True, "ticker": ticker, "days": len(snaps),
+                "start": snaps[0][0].strftime("%Y-%m-%d"),
+                "end": snaps[-1][0].strftime("%Y-%m-%d"),
+                "requested_start": start or "first candle",
+                "contributed": round(cash, 2), "final_equity": snaps[-1][3],
+                "n_buys": n_buys, "extra_current_month": round(extra, 2)}
+
+
 # ---------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------
 
 _scheduler_task: asyncio.Task | None = None
 _daily_snapshot_task: asyncio.Task | None = None
+
+
+# --- Trading-day calendar (US NYSE) ---------------------------------------
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    d = date(year, month, 1)
+    d += timedelta(days=(weekday - d.weekday()) % 7)
+    return d + timedelta(weeks=n - 1)
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> date:
+    nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    d = nxt - timedelta(days=1)
+    while d.weekday() != weekday:
+        d -= timedelta(days=1)
+    return d
+
+
+def _observed(d: date) -> date:
+    """NYSE 'nearest weekday' rule: Saturday → Friday, Sunday → Monday."""
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def _us_market_holidays(year: int) -> set[date]:
+    from dateutil.easter import easter
+    days = {
+        _observed(date(year, 1, 1)),      # New Year's Day
+        _nth_weekday(year, 1, 0, 3),      # Martin Luther King Jr. Day
+        _nth_weekday(year, 2, 0, 3),      # Washington's Birthday
+        easter(year) - timedelta(days=2), # Good Friday
+        _last_weekday(year, 5, 0),        # Memorial Day
+        _observed(date(year, 7, 4)),      # Independence Day
+        _nth_weekday(year, 9, 0, 1),      # Labor Day
+        _nth_weekday(year, 11, 3, 4),     # Thanksgiving
+        _observed(date(year, 12, 25)),    # Christmas
+    }
+    if year >= 2022:
+        days.add(_observed(date(year, 6, 19)))  # Juneteenth (NYSE since 2022)
+    return days
+
+
+_holiday_cache: dict[int, set[date]] = {}
+
+
+def is_trading_day(dt: datetime) -> bool:
+    """True when ``dt``'s date is a US market day (Mon-Fri, not a NYSE holiday).
+
+    The portfolios are almost entirely US listings and the scheduler runs at
+    ``sim_run_hour`` UTC, so the NYSE calendar governs. EU holidays (e.g.
+    Vienna) are not modelled — those names just show a stale candle and the
+    engine no-ops. Guards the prefetch and all scheduled cycles so nothing runs
+    on weekends/holidays.
+    """
+    d = dt.date()
+    if d.weekday() >= 5:
+        return False
+    for y in (d.year - 1, d.year, d.year + 1):
+        if y not in _holiday_cache:
+            _holiday_cache[y] = _us_market_holidays(y)
+        if d in _holiday_cache[y]:
+            return False
+    return True
+
+
+async def prefetch_universe() -> dict[str, Any]:
+    """Fetch the shared sim universe into the candle cache ONCE.
+
+    All three portfolios share one universe, so fetching it here (before the
+    nightly cycles) means they read the DB instead of each re-pulling it. Uses
+    the configured provider — with ``auto`` Twelve Data serves the tickers it
+    has, paced by the rate limiter and capped by the daily budget, and every
+    miss (``IFX.DE`` etc.) falls back to yfinance per ticker. Marks each fetched
+    ticker fresh so run_cycle()/daily-core skip it.
+    """
+    tickers = await _candidate_tickers()
+    if not tickers:
+        return {"ok": False, "reason": "empty universe"}
+    refreshed, errors = await refresh_many(tickers, _SIM_REFRESH_PERIOD, use_provider=True)
+    logger.info("Universe prefetch %s: %d/%d fetched, %d errors",
+                _universe(), len(refreshed), len(tickers), len(errors))
+    return {"ok": True, "universe": _universe(), "total": len(tickers),
+            "refreshed": len(refreshed), "errors": errors}
 
 
 async def _scheduler_tick() -> None:
@@ -2334,6 +2739,14 @@ async def _scheduler_tick() -> None:
     the "each stage runs independently" behaviour is unit-testable. A stage
     that is skipped or fails must not prevent the later stages from running.
     """
+    # Nothing trades on weekends or NYSE holidays: skip the whole tick so the
+    # portfolios aren't marked/rebalanced on stale candles. The month-end
+    # rebalance always lands on a trading day, so it is never lost.
+    if not is_trading_day(_utcnow()):
+        logger.info("Sim scheduler: %s is not a trading day — skipping all cycles",
+                    _utcnow().date())
+        return
+
     # Monthly qv-mom portfolio first: it only acts on the last trading
     # day of the month, and a missed month has no catch-up — it must run
     # even when the daily cycle is skipped below (a manual run holding
@@ -2436,6 +2849,13 @@ async def _daily_monthly_snapshot_loop():
         await asyncio.sleep(wait_seconds)
         if not settings.sim_monthly_enabled:
             continue
+        # No new prices on weekends/holidays: a daily mark would just repeat the
+        # last close. Deposits/rebalances are idempotent and land on the next
+        # trading day or the month-end rebalance.
+        if not is_trading_day(_utcnow()):
+            logger.info("Monthly daily scheduler: %s is not a trading day — skipping",
+                        _utcnow().date())
+            continue
         try:
             deposit = await deposit_allowance()
             if deposit.get("deposited"):
@@ -2453,7 +2873,11 @@ async def _daily_monthly_snapshot_loop():
 
 
 def start_scheduler():
-    """Start the background scheduler task (called from main.py lifespan)."""
+    """Start the sim scheduler tasks (called from main.py lifespan).
+
+    The universe prefetch is NOT here: it lives in main.py as an app-level task
+    so the Dashboard keeps fresh candles / a fresh screener even when the sim
+    is disabled."""
     global _scheduler_task, _daily_snapshot_task
     if _scheduler_task is None or _scheduler_task.done():
         _scheduler_task = asyncio.create_task(_scheduler_loop())

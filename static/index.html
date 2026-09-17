@@ -414,6 +414,18 @@
                 padding: 10px;
                 font-size: 14px
             }
+
+            /* Range/compare buttons participate in the mobile touch-target
+               sizing too (they're tiny on phones otherwise) and the action
+               rows wrap so the backfill date input can't overflow (#34/#35). */
+            .range-btn {
+                padding: 10px 12px;
+                font-size: 14px
+            }
+
+            .sim-actions {
+                flex-wrap: wrap
+            }
         }
 
         @media (max-width: 480px) {
@@ -1391,10 +1403,10 @@
         <aside class="panel screen-panel"><b>DISCOVER // LOCAL SCREENER</b>
             <details id="screen-details" open>
                 <summary>Screen results</summary>
-                <p><select id="universe"></select> <button onclick="runScreen(this)">Update</button>
-                    <button onclick="refreshUniverse(this)"
+                <p><select id="universe"></select> <button id="screen-run-btn" onclick="runScreen(this)">Update</button>
+                    <button id="screen-refresh-btn" onclick="refreshUniverse(this)"
                         title="Only fetch tickers with missing or stale data">Refresh</button>
-                    <button onclick="loadDeepHistory(this)" title="Fetch 10y of history for optimization/backtest">Load
+                    <button id="screen-deep-btn" onclick="loadDeepHistory(this)" title="Fetch 10y of history for optimization/backtest">Load
                         10y</button>
                 </p><small>Ranks cached
                     daily candles by trend, 20/60d momentum, RSI and relative volume. <b>Update</b> re-downloads ~2y and
@@ -1420,8 +1432,16 @@
                     title="Each curve as % of its contributed allowance — fair growth comparison">% View</button>
                 <button id="sim-cmp-usd" class="range-btn" onclick="setSimCompareMode('usd')" title="Absolute dollars">$
                     View</button>
+                <span id="s-range-bar" style="display:inline-flex;gap:4px;margin-left:10px">
+                    <button class="range-btn" data-range="6M" onclick="setSimRange('6M')">6M</button>
+                    <button class="range-btn range-active" data-range="1Y" onclick="setSimRange('1Y')">1Y</button>
+                    <button class="range-btn" data-range="2Y" onclick="setSimRange('2Y')">2Y</button>
+                    <button class="range-btn" data-range="5Y" onclick="setSimRange('5Y')">5Y</button>
+                    <button class="range-btn" data-range="MAX" onclick="setSimRange('MAX')">MAX</button>
+                </span>
             </div>
             <div id="sim-chart"></div>
+                <div id="sim-asof" style="font-size:10px;color:#7aaa81;text-align:right;margin-top:2px"></div>
         </div>
         <div class="sim-grid2">
             <div class="sim-section">
@@ -1447,6 +1467,8 @@
             <div class="bench-label">ACTIONS</div>
             <div class="sim-actions">
                 <button id="sim-run-btn" onclick="runSim()">Run Bot Now</button>
+                <button id="sim-backfill-btn" onclick="backfillSim()">Backfill (deterministic, no LLM)</button>
+                <button id="sim-backfill-bench-btn" onclick="backfillBenchmark()">Backfill DCA Benchmark</button>
                 <button onclick="resetSim()">Reset Sim</button>
             </div>
             <div id="sim-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
@@ -1496,8 +1518,16 @@
                     View</button>
                 <button id="cmp-usd" class="range-btn" onclick="setCompareMode('usd')" title="Absolute dollars">$
                     View</button>
+                <span id="m-range-bar" style="display:inline-flex;gap:4px;margin-left:10px">
+                    <button class="range-btn" data-range="6M" onclick="setMonthlyRange('6M')">6M</button>
+                    <button class="range-btn range-active" data-range="1Y" onclick="setMonthlyRange('1Y')">1Y</button>
+                    <button class="range-btn" data-range="2Y" onclick="setMonthlyRange('2Y')">2Y</button>
+                    <button class="range-btn" data-range="5Y" onclick="setMonthlyRange('5Y')">5Y</button>
+                    <button class="range-btn" data-range="MAX" onclick="setMonthlyRange('MAX')">MAX</button>
+                </span>
             </div>
             <div id="monthly-chart"></div>
+                <div id="monthly-asof" style="font-size:10px;color:#7aaa81;text-align:right;margin-top:2px"></div>
         </div>
         <div class="sim-grid2">
             <div class="sim-section">
@@ -1530,6 +1560,13 @@
             <div class="bench-label">ACTIONS</div>
             <div class="sim-actions">
                 <button id="monthly-run-btn" onclick="runMonthly()">Rebalance Now</button>
+                <button id="monthly-backfill-btn" onclick="backfillMonthly()">Backfill (sync with other sims)</button>
+                <input type="date" id="monthly-backfill-date" title="Optional: replay from this date instead"
+                    onchange="if(this.value) document.getElementById('monthly-backfill-all').checked = false">
+                <label style="font-size:12px;color:#7aaa81;display:flex;align-items:center;gap:4px">
+                    <input type="checkbox" id="monthly-backfill-all"
+                        onchange="if(this.checked) document.getElementById('monthly-backfill-date').value = ''"> full history
+                </label>
             </div>
             <div id="monthly-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
         </div>
@@ -1539,9 +1576,10 @@
             <div id="dailycore-summary"></div>
         </div>
         <div class="sim-section">
-            <div class="sim-section-title">Equity Curve (vs daily sim, contributed &amp; DCA benchmark)</div>
+            <div class="sim-section-title">Equity Curve (vs monthly sim, daily sim, contributed &amp; DCA benchmark)</div>
             <div style="display:flex;gap:16px;margin-bottom:8px;flex-wrap:wrap">
                 <span style="color:#b48cff;font-size:12px">● Daily-Core</span>
+                <span style="color:#4d9fff;font-size:12px">● Monthly sim</span>
                 <span style="color:#42ff72;font-size:12px">● Daily sim (Bot)</span>
                 <span style="color:#7aaa81;font-size:12px">● Contributed</span>
                 <span style="color:#ff9f43;font-size:12px">● DCA benchmark</span>
@@ -1551,8 +1589,16 @@
                     View</button>
                 <button id="dc-cmp-usd" class="range-btn" onclick="setDCCompareMode('usd')" title="Absolute dollars">$
                     View</button>
+                <span id="dc-range-bar" style="display:inline-flex;gap:4px;margin-left:10px">
+                    <button class="range-btn" data-range="6M" onclick="setDCRange('6M')">6M</button>
+                    <button class="range-btn range-active" data-range="1Y" onclick="setDCRange('1Y')">1Y</button>
+                    <button class="range-btn" data-range="2Y" onclick="setDCRange('2Y')">2Y</button>
+                    <button class="range-btn" data-range="5Y" onclick="setDCRange('5Y')">5Y</button>
+                    <button class="range-btn" data-range="MAX" onclick="setDCRange('MAX')">MAX</button>
+                </span>
             </div>
             <div id="dailycore-chart"></div>
+            <div id="dailycore-asof" style="font-size:10px;color:#7aaa81;text-align:right;margin-top:2px"></div>
         </div>
         <div class="sim-grid2">
             <div class="sim-section">
@@ -1575,9 +1621,10 @@
                     <b>daily-core (qv-mom + daily deployment)</b> — the Monthly sim's qv-mom ranking decides
                     WHAT to own (top-10 equal-weight, top-20 hysteresis band, no stops). Candles only adjust
                     WHEN: every trading day free cash deploys into the top-ranked names toward their
-                    equal-weight target — no month-end parking, no pro-rata spread into laggards. Measured
-                    +3.4..+7.5pp IRR over the Monthly sim on 2020-2026 windows (experiment doc §10). Funded by
-                    the same monthly allowance as the other portfolios.
+                    equal-weight target — no month-end parking, no pro-rata spread into laggards. Funded by
+                    the same monthly allowance as the other portfolios. The <b>vs Monthly</b> / <b>vs DCA</b>
+                    chips above show the live alpha over the shared window; the full research record lives in
+                    <i>docs/llm-strategy-experiments.md</i> §10-11.
                 </div>
             </div>
         </div>
@@ -1585,13 +1632,23 @@
             <div class="bench-label">ACTIONS</div>
             <div class="sim-actions">
                 <button id="dailycore-run-btn" onclick="runDailyCore()">Run Cycle Now</button>
-                <button id="dailycore-backfill-btn" onclick="backfillDailyCore()">Backfill (sync with other sims)</button>
+                <select id="dailycore-variant" title="Momentum variant used by the ranking — the next cycle and every backfill honor it"
+                    onchange="setDCVariant(this.value)" style="max-width:260px"></select>
+                <select id="dailycore-gate" title="Deployment gate (§12) — park new buys while the market index is below its N-day SMA. Independent of the gradient arm; the next cycle and every backfill honor it"
+                    onchange="setDCGate(this.value)" style="max-width:250px"></select>
+                <select id="dailycore-gradient" title="Gradient cash-out (§13-15) — sell the book on a confirmed negative basket slope, armed only in good times (or always). Independent of the gate"
+                    onchange="setDCGradient(this.value)" style="max-width:300px"></select>
+                <select id="dailycore-targetvol" title="Target-vol control — park new cash when the portfolio's own 21d vol exceeds the target"
+                    onchange="setDCTargetVol(this.value)" style="max-width:220px"></select>
+                <button id="dailycore-backfill-btn" onclick="backfillDailyCore()">Backfill (daily-core only)</button>
                 <input type="date" id="dailycore-backfill-date" title="Optional: replay from this date instead"
                     onchange="if(this.value) document.getElementById('dailycore-backfill-all').checked = false">
                 <label style="font-size:12px;color:#7aaa81;display:flex;align-items:center;gap:4px">
                     <input type="checkbox" id="dailycore-backfill-all"
                         onchange="if(this.checked) document.getElementById('dailycore-backfill-date').value = ''"> full history
                 </label>
+                <button id="backfill-all-btn" onclick="backfillAll()"
+                    title="Backfill ALL FOUR portfolios (daily sim, monthly, daily-core, DCA benchmark) over the same window — the date/full-history inputs apply to all">Backfill All 4 (synced)</button>
             </div>
             <div id="dailycore-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
             <div style="margin-top:6px;font-size:11px;color:#7aaa81">
@@ -2007,23 +2064,22 @@
             ptr.refreshing = true;
             ptrSet('refreshing');
             try {
-                const dash = document.getElementById('dashboard-view');
-                const sim = document.getElementById('sim-view');
-                if (dash.style.display !== 'none') {
+                const view = window._currentView || 'dashboard';
+                if (view === 'dashboard') {
                     // Refresh candle data for ALL watchlist tickers, then re-render.
                     const r = await api('refresh-watchlist?period=2y', { method: 'POST' });
                     await Promise.all([loadWatch(), showScreen()]);
                     const n = r.refreshed.length, errs = r.errors.length;
                     ptrShowResult(errs === 0,
                         errs ? `${n} updated, ${errs} failed` : `${n} tickers updated`);
-                } else if (sim.classList.contains('active')) {
+                } else if (view === 'sim') {
                     // Refresh candle data for sim holdings + benchmark, then re-read valuations.
                     const r = await api('sim/refresh?period=2y', { method: 'POST' });
                     await loadSimAll();
                     const n = r.refreshed.length, errs = r.errors.length;
                     ptrShowResult(errs === 0,
                         errs ? `${n} updated, ${errs} failed` : `Sim updated (${n} tickers)`);
-                } else if (document.getElementById('monthly-view').style.display !== 'none') {
+                } else if (view === 'monthly') {
                     // Monthly view: refresh candles for the holdings (+ FX
                     // pairs) so valuation/equity reflect current prices,
                     // then re-read everything.
@@ -2032,7 +2088,7 @@
                     const n = r.refreshed.length, errs = r.errors.length;
                     ptrShowResult(errs === 0,
                         errs ? `${n} updated, ${errs} failed` : `Monthly updated (${n} tickers)`);
-                } else if (document.getElementById('dailycore-view').style.display !== 'none') {
+                } else if (view === 'dailycore') {
                     // Daily-core view: refresh candles (+FX) for the universe
                     // and holdings, then re-read status/positions/equity.
                     const r = await api('dailycore/refresh', { method: 'POST' });
@@ -2147,7 +2203,11 @@
         async function api(p, o) {
             let r = await fetch('/api/' + p, o);
             if (!r.ok) {
-                const err = new Error(await r.text());
+                const text = await r.text();
+                let msg = text;
+                // FastAPI errors are {"detail": ...}; show the detail, not the JSON.
+                try { const j = JSON.parse(text); if (j && typeof j.detail === 'string') msg = j.detail; } catch (e) { }
+                const err = new Error(msg);
                 err.status = r.status;
                 throw err;
             }
@@ -2235,14 +2295,27 @@
             }
         }
 
+        // Bumped on every loadWatch so a stale name lookup can't write into a
+        // list that has since been re-rendered (e.g. after an add/delete).
+        let watchRenderToken = 0;
+
         async function loadWatch() {
-            let a = await api('watchlist');
-            const names = await Promise.all(a.map(t => resolveSymbolName(t)));
-            $('#watch').innerHTML = a.map((t, i) => {
-                const name = names[i] ? ` <span class="ticker-name">— ${escapeHtml(names[i])}</span>` : '';
-                return `<div class=ticker onclick="openTicker('${escapeHtml(t)}')">${escapeHtml(t)}${name}<button onclick="event.stopPropagation();del('${escapeHtml(t)}')">x</button></div>`;
-            }).join('');
+            const token = ++watchRenderToken;
+            const a = await api('watchlist');
+            if (token !== watchRenderToken) return;
+            const el = $('#watch');
+            // Paint the ticker list first. Company names are cosmetic and must
+            // never gate the list: awaiting them left the panel empty ("loading")
+            // whenever a name lookup was slow.
+            el.innerHTML = a.map(t => `<div class=ticker onclick="openTicker('${escapeHtml(t)}')">${escapeHtml(t)}<span class="ticker-name"></span><button onclick="event.stopPropagation();del('${escapeHtml(t)}')">x</button></div>`).join('');
+            const rows = el.querySelectorAll('.ticker');
             if (!current && a[0]) openTicker(a[0]);
+            await Promise.all(a.map(async (t, i) => {
+                const name = await resolveSymbolName(t);
+                if (!name || token !== watchRenderToken) return;
+                const span = rows[i] && rows[i].querySelector('.ticker-name');
+                if (span) span.textContent = ' — ' + name;
+            }));
         }
 
         async function openTicker(t) {
@@ -2451,7 +2524,27 @@
         async function loadUniverses() {
             let u = await api('screener/universes');
             $('#universe').innerHTML = u.map(x => `<option>${escapeHtml(x)}</option>`).join('');
-            $('#universe').value = 'diversified-plus';
+            let current = 'diversified-plus';
+            try { current = (await api('sim/status')).sim_universe || current; } catch (e) { }
+            if (u.length && !u.includes(current)) current = u[0];
+            $('#universe').value = current;
+            showScreen();
+        }
+        // The Dashboard universe dropdown is the single control for the
+        // universe of EVERY sim (daily sim, monthly, daily-core). Changing it
+        // persists the choice app-wide and re-runs the local screener.
+        async function setSimUniverse(name) {
+            try {
+                await api('sim/universe', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ universe: name }),
+                });
+                setStatus(`Universe set to ${name} for all sims.`, true);
+            } catch (e) { setStatus('Error: ' + e.message, false); }
+        }
+        function onUniverseChange() {
+            setSimUniverse($('#universe').value);
             showScreen();
         }
         function timeAgo(iso) {
@@ -2515,9 +2608,20 @@
         };
         let screenerPollTimer = null;
 
+        // Disable all three bulk buttons while any screener op is running, so
+        // an Update/Refresh/Load-10y can't be double-fired (it doubles the
+        // provider load and can exhaust the data quota).
+        function screenerSetBusy(busy) {
+            for (const id of ['screen-run-btn', 'screen-refresh-btn', 'screen-deep-btn']) {
+                const b = document.getElementById(id);
+                if (b) b.disabled = busy;
+            }
+        }
+
         function renderScreenerStatus(p) {
             const el = document.getElementById('screener-status');
             if (!el) return;
+            screenerSetBusy(!!(p && p.running));
             if (!p || (!p.running && !p.op)) { el.innerHTML = ''; return; }
             const label = SCREENER_OP_LABELS[p.op] || p.op;
             const total = p.total || 0;
@@ -2614,13 +2718,28 @@
                 if (screenerPollTimer) { clearInterval(screenerPollTimer); screenerPollTimer = null; }
             }
         }
-        $('#universe').onchange = showScreen; loadWatch(); loadUniverses(); loadLLMModels()
+        $('#universe').onchange = onUniverseChange; loadWatch(); loadUniverses(); loadLLMModels()
+        // Deep link: open the tab the URL points at (#/dailycore, #/monthly,
+        // #/sim). Default dashboard. showView writes the hash on every
+        // switch, so a reload restores the tab the user was on.
+        const initialView = (location.hash.match(/^#\/(sim|monthly|dailycore)$/) || [])[1];
+        if (initialView) setTimeout(() => showView(initialView), 0);
 
         // --- Simulation view ---
         let simChart = null;
         let simLoaded = false;
 
         function showView(view) {
+            // Single source of truth for "which view is active" — the PTR
+            // refresh path keys off this instead of inferring it from three
+            // different display mechanisms (class 'active' for sim,
+            // style.display for monthly/dailycore, grid for dashboard).
+            window._currentView = view;
+            ptrReset();
+            // Deep-linkable tabs: #/dailycore etc. survive a reload.
+            if (history.replaceState && location.hash !== '#/' + view) {
+                history.replaceState(null, '', '#/' + view);
+            }
             const dash = document.getElementById('dashboard-view');
             const sim = document.getElementById('sim-view');
             const monthly = document.getElementById('monthly-view');
@@ -2661,10 +2780,47 @@
             }
         }
 
+        // ===================== Shared portfolio risk metrics =====================
+        // Max drawdown on the contributed-normalized curve (each point =
+        // equity/contributed): the honest "worst peak-to-trough" for a
+        // DCA-funded portfolio — raw USD drawdown misleads because the
+        // denominator steps up every month.
+        function mddOf(points) {
+            let peak = -Infinity, mdd = 0;
+            for (const p of points) {
+                const v = p.contributed > 0 ? p.value / p.contributed : 0;
+                if (v <= 0) continue;
+                peak = Math.max(peak, v);
+                mdd = Math.max(mdd, (peak - v) / peak);
+            }
+            return mdd * 100;
+        }
+
+        // Small caption under each equity chart marking the last data date —
+        // makes stale curves visible instead of silently flat (#20).
+        function updateAsOf(which, lastTime) {
+            const el = document.getElementById(which + '-asof');
+            if (!el) return;
+            const today = new Date().toISOString().slice(0, 10);
+            const stale = lastTime && lastTime < today;
+            el.textContent = lastTime ? `data as of ${lastTime}${stale ? ' (stale — live valuation may differ)' : ''}` : '';
+            el.style.color = stale ? '#e6a23c' : '#7aaa81';
+        }
+
         // ===================== Daily-core portfolio =====================
         let dailyCoreChart = null;
         let dailyCoreLoaded = false;
         let dcCompareMode = 'pct';
+        let dcRange = '1Y';
+        let dailyCoreChartReq = 0;
+        const DC_RANGE_LIMIT = { '6M': 126, '1Y': 252, '2Y': 504, '5Y': 1260, 'MAX': 12000 };
+
+        function setDCRange(r) {
+            dcRange = r;
+            for (const b of document.querySelectorAll('#dc-range-bar .range-btn'))
+                b.classList.toggle('range-active', b.dataset.range === r);
+            loadDailyCoreEquity();
+        }
 
         function setDCCompareMode(mode) {
             dcCompareMode = mode;
@@ -2673,27 +2829,113 @@
             loadDailyCoreEquity();
         }
 
-        async function loadDailyCoreStatus() {
+        // Append/overwrite today's live point on an overlay curve so all
+        // tabs agree on "today" (snapshots end at the last nightly cycle;
+        // the live valuation is fresher — same rule as each tab's own line).
+        function withLiveToday(points, live) {
+            if (!live || live.total_equity == null) return points;
+            const today = new Date().toISOString().slice(0, 10);
+            const last = points[points.length - 1];
+            const lastDay = last ? last.time : null;
+            if (!lastDay || lastDay < today) {
+                return points.concat([{ time: today, value: live.total_equity, contributed: live.allowance_total }]);
+            }
+            const copy = points.slice();
+            copy[copy.length - 1] = { time: today, value: live.total_equity, contributed: live.allowance_total };
+            return copy;
+        }
+
+        async function loadDailyCoreStatus(status, snaps, monthlyStatus, bench) {
             try {
-                const s = await api('dailycore/status');
+                const s = status || await api('dailycore/status');
                 const v = s.valuation || {};
                 const gain = v.allowance_total > 0 ? (v.total_equity / v.allowance_total * 100 - 100) : null;
+                // Risk metrics from the already-fetched curves (no extra
+                // endpoints): max drawdown of the contributed-normalized
+                // curve + live alpha vs the monthly sim and the DCA bench.
+                // The alpha chips compare LIVE valuations on both sides —
+                // snapshot vintages would mix "today" vs "last night".
+                const points = (snaps || []).map(x => ({ value: x.total_equity, contributed: x.allowance_total }));
+                const mdd = points.length ? mddOf(points) : null;
+                const dcGain = gain != null ? gain : null;
+                const mLive = (monthlyStatus && monthlyStatus.total_equity != null)
+                    ? (monthlyStatus.allowance_total > 0
+                        ? monthlyStatus.total_equity / monthlyStatus.allowance_total * 100 - 100 : null)
+                    : null;
+                const bLive = (bench && bench.total_equity != null && bench.allowance_total > 0)
+                    ? bench.total_equity / bench.allowance_total * 100 - 100 : null;
+                const alphaM = (dcGain != null && mLive != null) ? dcGain - mLive : null;
+                const alphaB = (dcGain != null && bLive != null) ? dcGain - bLive : null;
+                const rankingDate = s.ranking_date;
+                const stale = rankingDate && rankingDate < new Date().toISOString().slice(0, 10);
                 const m = [
                     ['Total Equity', v.total_equity != null ? '$' + v.total_equity.toFixed(2) : '—'],
                     ['Contributed', v.allowance_total != null ? '$' + v.allowance_total.toFixed(2) : '—'],
                     ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(1) + '%' : '—'],
+                    ['Max DD', mdd != null ? '-' + mdd.toFixed(1) + '%' : '—'],
+                    ['vs Monthly', alphaM != null ? (alphaM >= 0 ? '+' : '') + alphaM.toFixed(1) + 'pp' : '—'],
+                    ['vs DCA', alphaB != null ? (alphaB >= 0 ? '+' : '') + alphaB.toFixed(1) + 'pp' : '—'],
                     ['Cash', v.cash != null ? '$' + v.cash.toFixed(2) : '—'],
-                    ['Picks', (s.picks || []).length ? s.picks.join(', ') : '—'],
+                    ['Picks', (s.picks || []).length || '—'],
+                    ['Ranking', rankingDate ? (stale ? rankingDate + ' ⚠' : rankingDate) : '—'],
                 ];
                 document.getElementById('dailycore-summary').innerHTML = m.map(([k, x]) => `<span class="metric">${k}<br><b>${x}</b></span>`).join('');
+                // Strategy dropdown: keep the options static, sync the
+                // selection with the server's effective variant.
+                const sel = document.getElementById('dailycore-variant');
+                if (sel && !sel.options.length) {
+                    for (const [key, label] of Object.entries(s.mom_variants || {})) {
+                        const opt = document.createElement('option');
+                        opt.value = key; opt.textContent = label;
+                        sel.appendChild(opt);
+                    }
+                }
+                if (sel && s.mom_variant) sel.value = s.mom_variant;
+                // Deployment gate + gradient arm dropdowns (§12-15), same pattern.
+                const gsel = document.getElementById('dailycore-gate');
+                if (gsel && !gsel.options.length) {
+                    for (const [key, label] of Object.entries(s.gates || {})) {
+                        const opt = document.createElement('option');
+                        opt.value = key; opt.textContent = label;
+                        gsel.appendChild(opt);
+                    }
+                }
+                if (gsel && s.gate) gsel.value = s.gate;
+                const gradsel = document.getElementById('dailycore-gradient');
+                if (gradsel && !gradsel.options.length) {
+                    for (const [key, label] of Object.entries(s.gradients || {})) {
+                        const opt = document.createElement('option');
+                        opt.value = key; opt.textContent = label;
+                        gradsel.appendChild(opt);
+                    }
+                }
+                if (gradsel && s.gradient) gradsel.value = s.gradient;
+                // Target-vol dropdown, same pattern.
+                const tvsel = document.getElementById('dailycore-targetvol');
+                if (tvsel && !tvsel.options.length) {
+                    for (const [key, label] of Object.entries(s.target_vols || {})) {
+                        const opt = document.createElement('option');
+                        opt.value = key; opt.textContent = label;
+                        tvsel.appendChild(opt);
+                    }
+                }
+                if (tvsel) tvsel.value = s.target_vol ? s.target_vol.toFixed(2) : 'off';
+                const rankMap = s.rank_map || {};
                 const pos = v.positions || [];
-                document.getElementById('dailycore-positions').innerHTML = pos.length ? `<table><tr><th>Ticker</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>P&L%</th></tr>${pos.map(p => {
+                document.getElementById('dailycore-positions').innerHTML = pos.length ? `<table><tr><th>Ticker</th><th>Rank</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>Weight</th><th>P&L%</th></tr>${pos.map(p => {
                     const pnl = p.pnl_pct;
                     const cls = pnl > 0 ? 'buy' : pnl < 0 ? 'sell' : '';
-                    return `<tr><td>${escapeHtml(p.ticker)}</td><td>${p.shares.toFixed(4)}</td><td>$${p.avg_cost.toFixed(2)}</td><td>$${p.current_price.toFixed(2)}</td><td>$${p.value.toFixed(2)}</td><td class="${cls}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</td></tr>`;
+                    const w = v.total_equity > 0 ? p.value / v.total_equity * 100 : 0;
+                    const rank = rankMap[p.ticker] || '—';
+                    return `<tr><td>${escapeHtml(p.ticker)}</td><td>${rank}</td><td>${p.shares.toFixed(4)}</td><td>$${p.avg_cost.toFixed(2)}</td><td>$${p.current_price.toFixed(2)}</td><td>$${p.value.toFixed(2)}</td><td>${w.toFixed(1)}%</td><td class="${cls}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</td></tr>`;
                 }).join('')}</table>` : '<div class="sim-empty">No open positions — waiting for the first cycle.</div>';
                 const band = s.band || [];
-                document.getElementById('dailycore-band').innerHTML = band.length ? `<table><tr><th>#</th><th>Ticker</th><th>In Top-10</th></tr>${band.map((t, i) => `<tr><td>${i + 1}</td><td>${escapeHtml(t)}</td><td>${i < 10 ? '✓' : ''}</td></tr>`).join('')}</table>` : '<div class="sim-empty">No eligible ranking yet.</div>';
+                const held = new Set(pos.map(p => p.ticker));
+                document.getElementById('dailycore-band').innerHTML = band.length ? `<table><tr><th>#</th><th>Ticker</th><th>Status</th></tr>${band.map((t, i) => {
+                    const zone = i < 10 ? 'buy' : '';
+                    const tag = held.has(t) ? (i < 10 ? 'held · core' : 'held · band') : (i < 10 ? 'core' : '');
+                    return `<tr><td class="${zone}">${i + 1}</td><td>${escapeHtml(t)}${held.has(t) ? ' ●' : ''}</td><td class="${zone}">${tag}</td></tr>`;
+                }).join('')}</table>` : '<div class="sim-empty">No eligible ranking yet.</div>';
             } catch (e) { document.getElementById('dailycore-summary').innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
 
@@ -2704,13 +2946,21 @@
             } catch (e) { document.getElementById('dailycore-trades').innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
 
-        async function loadDailyCoreEquity() {
-            const [snaps, live, simSnaps, bench] = await Promise.all([
-                api('dailycore/equity?limit=365').catch(() => null),
-                api('dailycore/status').catch(() => null),
-                api('sim/equity?limit=365').catch(() => null),
-                api('sim/benchmark').catch(() => null),
+        async function loadDailyCoreEquity(shared) {
+            shared = shared || {};
+            const limit = DC_RANGE_LIMIT[dcRange] || 4000;
+            const reqId = ++dailyCoreChartReq;  // stale-chart guard (#19):
+            // a second toggle while fetches are in flight drops the first.
+            const [snaps, live, simSnaps, bench, monthlySnaps, monthlyLiveStatus, simLiveStatus] = await Promise.all([
+                shared.snaps || api(`dailycore/equity?limit=${limit}`).catch(() => null),
+                shared.status || api('dailycore/status').catch(() => null),
+                api(`sim/equity?limit=${limit}`).catch(() => null),
+                api(`sim/benchmark?limit=${limit}`).catch(() => null),
+                api(`monthly/equity?limit=${limit}`).catch(() => null),
+                shared.monthlyStatus || api('monthly/status').catch(() => null),
+                shared.simStatus || api('sim/status').catch(() => null),
             ]);
+            if (reqId !== dailyCoreChartReq) return;  // superseded mid-flight
             if (dailyCoreChart) { dailyCoreChart.remove(); dailyCoreChart = null; }
             if (!snaps || !snaps.length) {
                 document.getElementById('dailycore-chart').innerHTML = '<div class="sim-empty">No data yet — the equity curve appears after the first cycle.</div>';
@@ -2722,19 +2972,12 @@
             // duplicate timestamps.
             const byDay = new Map();
             for (const s of snaps) byDay.set(s.date, { value: s.total_equity, contributed: s.allowance_total });
-            const points = [...byDay.entries()]
-                .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
-                .sort((a, b) => a.time < b.time ? -1 : 1);
-            const last = points[points.length - 1];
-            const today = new Date().toISOString().slice(0, 10);
-            if (live && live.valuation && live.valuation.total_equity != null) {
-                // Live valuation wins for today: it is fresher than any
-                // same-day snapshot (which may be a stale intraday mark).
-                // Without this, a morning snapshot hides today's real
-                // drop/gain from the chart while the other tabs show live.
-                if (last.time < today) points.push({ time: today, value: live.valuation.total_equity, contributed: live.valuation.allowance_total });
-                else points[points.length - 1] = { time: today, value: live.valuation.total_equity, contributed: live.valuation.allowance_total };
-            }
+            const points = withLiveToday(
+                [...byDay.entries()]
+                    .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                    .sort((a, b) => a.time < b.time ? -1 : 1),
+                live && live.valuation && live.valuation.total_equity != null
+                    ? live.valuation : null);
             const toPct = p => p.contributed > 0 ? (p.value / p.contributed * 100) : p.value;
             // Sim + benchmark overlays: same series the Monthly tab plots.
             // In pct mode each series is normalized by ITS OWN contributed
@@ -2746,19 +2989,44 @@
                 simByDay.set(new Date(s.at).toISOString().slice(0, 10),
                     { value: s.total_equity, contributed: s.allowance_total });
             }
-            const simPoints = [...simByDay.entries()].map(([time, p]) => ({
-                time,
-                value: dcCompareMode === 'pct' ? toPct(p) : p.value,
-            })).sort((a, b) => a.time < b.time ? -1 : 1);
+            const simPoints = withLiveToday(
+                [...simByDay.entries()]
+                    .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                    .sort((a, b) => a.time < b.time ? -1 : 1),
+                simLiveStatus && simLiveStatus.total_equity != null ? simLiveStatus : null,
+            ).map(p => ({ time: p.time, value: dcCompareMode === 'pct' ? toPct(p) : p.value }));
             const benchByDay = new Map();
             for (const s of ((bench && bench.equity_curve) || [])) {
                 benchByDay.set(new Date(s.at).toISOString().slice(0, 10),
                     { value: s.total_equity, contributed: s.allowance_total });
             }
-            const benchPoints = [...benchByDay.entries()].map(([time, p]) => ({
-                time,
-                value: dcCompareMode === 'pct' ? toPct(p) : p.value,
-            })).sort((a, b) => a.time < b.time ? -1 : 1);
+            const benchPoints = withLiveToday(
+                [...benchByDay.entries()]
+                    .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                    .sort((a, b) => a.time < b.time ? -1 : 1),
+                bench && bench.total_equity != null
+                    ? { total_equity: bench.total_equity, allowance_total: bench.allowance_total } : null,
+            ).map(p => ({ time: p.time, value: dcCompareMode === 'pct' ? toPct(p) : p.value }));
+            // Monthly-sim overlay: the strategy's own parent portfolio, the
+            // comparison that matters most for this tab (same universe,
+            // monthly cadence). Blue, matching the Monthly tab's line.
+            // Today's live monthly valuation is appended/overwritten so the
+            // overlay's "today" matches the Monthly tab exactly (snapshots
+            // end at last night's cycle; the tab's own line shows live).
+            const monthlyByDay = new Map();
+            for (const s of (monthlySnaps || [])) {
+                monthlyByDay.set((s.date || new Date(s.at).toISOString().slice(0, 10)),
+                    { value: s.total_equity, contributed: s.allowance_total });
+            }
+            const monthlyLive = (monthlyLiveStatus && monthlyLiveStatus.total_equity != null)
+                ? { total_equity: monthlyLiveStatus.total_equity, allowance_total: monthlyLiveStatus.allowance_total }
+                : null;
+            const monthlyPoints = withLiveToday(
+                [...monthlyByDay.entries()]
+                    .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                    .sort((a, b) => a.time < b.time ? -1 : 1),
+                monthlyLive,
+            ).map(p => ({ time: p.time, value: dcCompareMode === 'pct' ? toPct(p) : p.value }));
             document.getElementById('dailycore-chart').innerHTML = '';
             dailyCoreChart = LightweightCharts.createChart(document.getElementById('dailycore-chart'), {
                 autoSize: true,
@@ -2795,7 +3063,99 @@
                     priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
                 }).setData(benchPoints);
             }
+            if (monthlyPoints.length) {
+                // Monthly sim: solid blue (matches its own tab's color).
+                dailyCoreChart.addLineSeries({
+                    color: '#4d9fff', lineWidth: 1,
+                    priceScaleId: dcCompareMode === 'pct' ? 'right' : 'left',
+                    priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+                }).setData(monthlyPoints);
+                if (dcCompareMode !== 'pct') {
+                    dailyCoreChart.priceScale('left').applyOptions({ visible: false });
+                }
+            }
             dailyCoreChart.timeScale().fitContent();
+            updateAsOf('dailycore', points.length ? points[points.length - 1].time : null);
+        }
+
+        async function setDCTargetVol(mode) {
+            const status = document.getElementById('dailycore-run-status');
+            const label = (document.getElementById('dailycore-targetvol')?.selectedOptions || [])[0]?.textContent || mode;
+            try {
+                await api('dailycore/targetvol', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode }),
+                });
+                status.textContent = `Target-vol set to ${label} — the next cycle applies it.`;
+                await loadDailyCoreAll();
+            } catch (e) {
+                status.textContent = 'Error: ' + e.message;
+                await loadDailyCoreAll();  // restore the actual selection + chips
+            }
+        }
+
+        async function setDCGate(mode) {
+            const status = document.getElementById('dailycore-run-status');
+            const label = (document.getElementById('dailycore-gate')?.selectedOptions || [])[0]?.textContent || mode;
+            if (!confirm(`Set the daily-core deployment gate to "${label}"?\n\nThe next cycle applies it to the live book (it only parks new buys, never sells), and every future backfill replays it.`)) {
+                await loadDailyCoreAll();  // cancel: resync the select to the persisted value
+                return;
+            }
+            try {
+                await api('dailycore/gate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode }),
+                });
+                status.textContent = `Deployment gate set to ${label} — the next cycle applies it.`;
+                await loadDailyCoreAll();
+            } catch (e) {
+                status.textContent = 'Error: ' + e.message;
+                await loadDailyCoreAll();  // restore the actual selection + chips
+            }
+        }
+
+        async function setDCGradient(mode) {
+            const status = document.getElementById('dailycore-run-status');
+            const label = (document.getElementById('dailycore-gradient')?.selectedOptions || [])[0]?.textContent || mode;
+            if (!confirm(`Set the daily-core gradient cash-out to "${label}"?\n\nThe next cycle applies it to the live book (a triggered cash-out can SELL everything), and every future backfill replays it.`)) {
+                await loadDailyCoreAll();  // cancel: resync the select to the persisted value
+                return;
+            }
+            try {
+                await api('dailycore/gradient', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode }),
+                });
+                status.textContent = `Gradient cash-out set to ${label} — the next cycle applies it.`;
+                await loadDailyCoreAll();
+            } catch (e) {
+                status.textContent = 'Error: ' + e.message;
+                await loadDailyCoreAll();  // restore the actual selection + chips
+            }
+        }
+
+        async function setDCVariant(variant) {
+            const status = document.getElementById('dailycore-run-status');
+            const label = (document.getElementById('dailycore-variant')?.selectedOptions || [])[0]?.textContent || variant;
+            if (!confirm(`Switch the daily-core ranking to "${label}"?\n\nThe next cycle will trade the new ranking, and every future backfill replays it. Re-run the backfill to see the new variant's full-history track record.`)) {
+                await loadDailyCoreAll();  // cancel: resync the select to the persisted value
+                return;
+            }
+            try {
+                await api('dailycore/strategy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ variant }),
+                });
+                status.textContent = `Strategy switched to ${label} — the next cycle recomputes the ranking.`;
+                await loadDailyCoreAll();
+            } catch (e) {
+                status.textContent = 'Error: ' + e.message;
+                await loadDailyCoreAll();  // restore the actual selection + chips
+            }
         }
 
         async function runDailyCore() {
@@ -2805,17 +3165,53 @@
             status.textContent = 'Running cycle… (refreshes candles + fundamentals, can take a few minutes)';
             try {
                 const r = await api('dailycore/run', { method: 'POST' });
+                const stamp = new Date().toTimeString().slice(0, 5);
                 if (r.skipped) {
-                    status.textContent = 'Skipped: ' + (r.reason || 'unknown');
+                    status.textContent = `Skipped: ${r.reason || 'unknown'} (${stamp})`;
                 } else {
-                    status.textContent = `Cycle complete: ${(r.deployment?.trades || []).length} trades.`;
-                    loadDailyCoreAll();
+                    status.textContent = `Cycle complete: ${(r.deployment?.trades || []).length} trades (${stamp}).`;
+                    await loadDailyCoreAll();  // reload BEFORE re-enabling so
+                    // the button never becomes clickable on stale data (#22)
                 }
-            } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
+            btn.disabled = false;
+        }
+
+        async function backfillAll() {
+            // One action, four portfolios, ONE shared window: the date /
+            // full-history inputs here apply to every backfill.
+            const dateVal = document.getElementById('dailycore-backfill-date').value;
+            const allHist = document.getElementById('dailycore-backfill-all').checked;
+            const qs = dateVal ? `?start=${dateVal}` : (allHist ? '?start=all' : '');
+            const rangeDesc = dateVal ? `from ${dateVal}` : (allHist ? 'over FULL history' : 'synced (earliest shared window)');
+            if (!confirm(`Backfill ALL FOUR portfolios (daily sim, monthly, daily-core, DCA benchmark) ${rangeDesc}?\n\nEach backfill REPLACES that portfolio's state — this takes several minutes.`))
+                return;
+            const btn = document.getElementById('backfill-all-btn');
+            const status = document.getElementById('dailycore-run-status');
+            btn.disabled = true;
+            status.textContent = `Backfilling ALL portfolios ${rangeDesc}… (several minutes)`;
+            try {
+                const r = await api('backfill-all' + qs, { method: 'POST' });
+                const parts = [];
+                for (const [name, r2] of Object.entries(r.results || {})) {
+                    parts.push(r2.ok ? `${name}: $${(r2.final_equity ?? 0).toFixed(0)}` : `${name}: FAILED`);
+                }
+                const errNames = Object.keys(r.errors || {});
+                status.textContent = `All-backfills done (${r.start}): ` + parts.join(' · ')
+                    + (errNames.length ? ` — ERRORS: ${errNames.join(', ')}` : '');
+                dcRange = 'MAX';
+                for (const b of document.querySelectorAll('#dc-range-bar .range-btn'))
+                    b.classList.toggle('range-active', b.dataset.range === 'MAX');
+                await loadDailyCoreAll();
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
             btn.disabled = false;
         }
 
         async function backfillDailyCore() {
+            // Destructive: replaces the portfolio's state with a synthetic
+            // replay. Same confirm() pattern as resetSim / loadDeepHistory.
+            if (!confirm('Backfill REPLACES the daily-core portfolio state with a synthetic replay of the strategy. Continue?'))
+                return;
             const btn = document.getElementById('dailycore-backfill-btn');
             const status = document.getElementById('dailycore-run-status');
             const dateVal = document.getElementById('dailycore-backfill-date').value;
@@ -2827,16 +3223,34 @@
             status.textContent = 'Backfilling… (replays the strategy over stored history — can take a few minutes)';
             try {
                 const r = await api('dailycore/backfill' + qs, { method: 'POST' });
-                status.textContent = `Backfilled ${r.days} trading days (${r.start} → ${r.end}, from ${r.requested_start}): ` +
+                status.textContent = `Backfilled ${r.days} trading days (${r.start} → ${r.end}, from ${r.requested_start}` +
+                    (r.mom_variant ? `, ${r.mom_variant} momentum` : '') + `): ` +
                     `${r.snapshots} equity points, ${r.trades} trades, final equity $${r.final_equity.toFixed(2)}.`;
-                loadDailyCoreAll();
-            } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
+                dcRange = 'MAX';  // show the replayed history in full
+                for (const b of document.querySelectorAll('#dc-range-bar .range-btn'))
+                    b.classList.toggle('range-active', b.dataset.range === 'MAX');
+                await loadDailyCoreAll();
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
             btn.disabled = false;
         }
 
         async function loadDailyCoreAll() {
+            // Fetch once, render twice: the status endpoint used to be
+            // requested twice per tab load (status + equity loader), and the
+            // ranking math behind it is the expensive one. Share the fetches
+            // across the summary, positions/band tables, and the chart.
+            const limit = DC_RANGE_LIMIT[dcRange] || 4000;
+            const [status, snaps, monthlyStatus, simStatus, bench] = await Promise.all([
+                api('dailycore/status').catch(() => null),
+                api(`dailycore/equity?limit=${limit}`).catch(() => null),
+                api('monthly/status').catch(() => null),
+                api('sim/status').catch(() => null),
+                api(`sim/benchmark?limit=${limit}`).catch(() => null),
+            ]);
             await Promise.all([
-                loadDailyCoreStatus(), loadDailyCoreTrades(), loadDailyCoreEquity(),
+                loadDailyCoreStatus(status, snaps, monthlyStatus, bench),
+                loadDailyCoreTrades(),
+                loadDailyCoreEquity({ status, snaps, monthlyStatus, simStatus }),
             ]);
         }
 
@@ -2851,15 +3265,28 @@
         // historically at month end) — absolute dollars would compare apples
         // to oranges.
         let compareMode = 'pct';
+        let monthlyRange = '1Y';
+        let monthlyChartReq = 0;
+        const M_RANGE_LIMIT = { '6M': 126, '1Y': 252, '2Y': 504, '5Y': 1260, 'MAX': 12000 };
 
-        async function loadMonthlyStatus() {
+        function setMonthlyRange(r) {
+            monthlyRange = r;
+            for (const b of document.querySelectorAll('#m-range-bar .range-btn'))
+                b.classList.toggle('range-active', b.dataset.range === r);
+            loadMonthlyEquity();
+        }
+
+        async function loadMonthlyStatus(snaps) {
             try {
                 const s = await api('monthly/status');
                 const gain = s.allowance_total > 0 ? (s.total_equity / s.allowance_total * 100 - 100) : null;
+                const points = (snaps || []).map(x => ({ value: x.total_equity, contributed: x.allowance_total }));
+                const mdd = points.length ? mddOf(points) : null;
                 const m = [
                     ['Total Equity', s.total_equity != null ? '$' + s.total_equity.toFixed(2) : '—'],
                     ['Contributed', s.allowance_total != null ? '$' + s.allowance_total.toFixed(2) : '—'],
                     ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(1) + '%' : '—'],
+                    ['Max DD', mdd != null ? '-' + mdd.toFixed(1) + '%' : '—'],
                     ['Cash', s.cash != null ? '$' + s.cash.toFixed(2) : '—'],
                     ['Universe', s.sim_monthly_universe || '—'],
                     ['Next Rebalance', s.next_rebalance || '—'],
@@ -2881,55 +3308,52 @@
             } catch (e) { document.getElementById('monthly-trades').innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
 
-        async function loadMonthlyEquity() {
-            const [snaps, live, simSnaps, bench] = await Promise.all([
-                api('monthly/equity?limit=365').catch(() => null),
-                api('monthly/status').catch(() => null),
-                api('sim/equity?limit=365').catch(() => null),
-                api('sim/benchmark').catch(() => null),
+        async function loadMonthlyEquity(shared) {
+            shared = shared || {};
+            const limit = M_RANGE_LIMIT[monthlyRange] || 4000;
+            const reqId = ++monthlyChartReq;
+            const [snaps, live, simSnaps, bench, simLiveStatus] = await Promise.all([
+                shared.snaps || api(`monthly/equity?limit=${limit}`).catch(() => null),
+                shared.status || api('monthly/status').catch(() => null),
+                api(`sim/equity?limit=${limit}`).catch(() => null),
+                api(`sim/benchmark?limit=${limit}`).catch(() => null),
+                shared.simStatus || api('sim/status').catch(() => null),
             ]);
+            if (reqId !== monthlyChartReq) return;
             if (monthlyChart) { monthlyChart.remove(); monthlyChart = null; }
             if (!snaps || !snaps.length) {
                 document.getElementById('monthly-chart').innerHTML = '<div class="sim-empty">No data yet — equity is tracked after each monthly rebalance.</div>';
                 return;
             }
-            // Live point: today's valuation, so the curve reflects current
-            // prices between snapshots (deduped if today IS a snapshot day).
-            // Each point carries its own contributed total — the allowance
-            // steps $1000 at every month start, and dividing by the WRONG
-            // vintage would spike the pct curve. One point per day, the LAST
-            // snapshot winning — the daily mark overwrites a same-day
-            // rebalance snapshot. Deduping is also required: lightweight-charts
-            // line series throw on duplicate timestamps and never render.
+            // One point per day, the LAST snapshot winning; today's LIVE
+            // valuation appended/overwritten (fresher than a same-day
+            // snapshot — same rule as the Daily-Core chart).
             const monthlyByDay = new Map();
             for (const s of snaps) {
                 monthlyByDay.set(s.date, { value: s.total_equity, contributed: s.allowance_total });
             }
-            const points = [...monthlyByDay.entries()]
-                .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
-                .sort((a, b) => a.time < b.time ? -1 : 1);
-            const last = points[points.length - 1];
-            const today = new Date().toISOString().slice(0, 10);
-            if (live && live.total_equity != null) {
-                // Live valuation wins for today (fresher than a same-day
-                // snapshot — same rule as the Daily-Core chart).
-                if (last.time < today) points.push({ time: today, value: live.total_equity, contributed: live.allowance_total });
-                else points[points.length - 1] = { time: today, value: live.total_equity, contributed: live.allowance_total };
-            }
+            const points = withLiveToday(
+                [...monthlyByDay.entries()]
+                    .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                    .sort((a, b) => a.time < b.time ? -1 : 1),
+                live && live.total_equity != null ? live : null);
             const toPct = p => p.contributed > 0 ? (p.value / p.contributed * 100) : p.value;
             // Sim overlay: same data the Simulation tab plots. The sim's
             // contributed total can differ from the monthly's (deposit timing
             // drift), so each sim point is normalized by ITS OWN
-            // contributed value in pct mode.
+            // contributed value in pct mode. Live-today appended so overlays
+            // agree across tabs.
             const byDay = new Map();  // collapse intraday snapshots -> last per day
             for (const s of (simSnaps || [])) {
                 byDay.set(new Date(s.at).toISOString().slice(0, 10),
                     { value: s.total_equity, contributed: s.allowance_total });
             }
-            const simPoints = [...byDay.entries()].map(([time, p]) => ({
-                time,
-                value: compareMode === 'pct' ? toPct(p) : p.value,
-            })).sort((a, b) => a.time < b.time ? -1 : 1);
+            const simPoints = withLiveToday(
+                [...byDay.entries()]
+                    .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                    .sort((a, b) => a.time < b.time ? -1 : 1),
+                simLiveStatus && simLiveStatus.total_equity != null ? simLiveStatus : null,
+            ).map(p => ({ time: p.time, value: compareMode === 'pct' ? toPct(p) : p.value }));
             // DCA benchmark overlay (orange, same series the Daily Sim chart
             // plots): the URTH control portfolio, normalized by ITS OWN
             // contributed total so pct mode shares the 100 baseline.
@@ -2938,10 +3362,13 @@
                 benchByDay.set(new Date(s.at).toISOString().slice(0, 10),
                     { value: s.total_equity, contributed: s.allowance_total });
             }
-            const benchPoints = [...benchByDay.entries()].map(([time, p]) => ({
-                time,
-                value: compareMode === 'pct' ? toPct(p) : p.value,
-            })).sort((a, b) => a.time < b.time ? -1 : 1);
+            const benchPoints = withLiveToday(
+                [...benchByDay.entries()]
+                    .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                    .sort((a, b) => a.time < b.time ? -1 : 1),
+                bench && bench.total_equity != null
+                    ? { total_equity: bench.total_equity, allowance_total: bench.allowance_total } : null,
+            ).map(p => ({ time: p.time, value: compareMode === 'pct' ? toPct(p) : p.value }));
             document.getElementById('monthly-chart').innerHTML = '';
             monthlyChart = LightweightCharts.createChart(document.getElementById('monthly-chart'), {
                 autoSize: true,
@@ -2986,6 +3413,7 @@
                 }).setData(benchPoints);
             }
             monthlyChart.timeScale().fitContent();
+            updateAsOf('monthly', points.length ? points[points.length - 1].time : null);
         }
 
         function fmtPct(v) { return v.toFixed(1) + '%'; }
@@ -3017,27 +3445,69 @@
                     status.textContent = `Rebalanced ${r.month}: ${r.picks.length} picks, ${r.trades.length} trades.`;
                     loadMonthlyAll();
                 }
-            } catch (e) { status.textContent = 'Error: ' + escapeHtml(e.message); }
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
+            btn.disabled = false;
+        }
+
+        async function backfillMonthly() {
+            // Destructive: replaces the portfolio's state with a synthetic
+            // replay (same contract as the Daily-Core backfill).
+            if (!confirm('Backfill REPLACES the Monthly portfolio state with a synthetic replay of the qv-mom strategy. Continue?'))
+                return;
+            const btn = document.getElementById('monthly-backfill-btn');
+            const status = document.getElementById('monthly-run-status');
+            const dateVal = document.getElementById('monthly-backfill-date').value;
+            const allHist = document.getElementById('monthly-backfill-all').checked;
+            const qs = dateVal ? `?start=${dateVal}` : (allHist ? '?start=all' : '');
+            btn.disabled = true;
+            status.textContent = 'Backfilling… (replays qv-mom over stored history — can take a few minutes)';
+            try {
+                const r = await api('monthly/backfill' + qs, { method: 'POST' });
+                if (!r.ok) throw new Error(r.error || 'backfill failed');
+                status.textContent = `Backfilled ${r.months} months (${r.start} → ${r.end}, from ${r.requested_start}): ` +
+                    `${r.snapshots} equity points, ${r.trades} trades, ${r.rebalances} rebalances, final equity $${r.final_equity.toFixed(2)}.`;
+                monthlyRange = 'MAX';  // show the replayed history in full
+                for (const b of document.querySelectorAll('#m-range-bar .range-btn'))
+                    b.classList.toggle('range-active', b.dataset.range === 'MAX');
+                await loadMonthlyAll();
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
             btn.disabled = false;
         }
 
         async function loadMonthlyAll() {
+            const limit = M_RANGE_LIMIT[monthlyRange] || 4000;
+            const snaps = await api(`monthly/equity?limit=${limit}`).catch(() => null);
             await Promise.all([
-                loadMonthlyStatus(), loadMonthlyTrades(), loadMonthlyEquity(),
-                loadMonthlyRebalances(),
+                loadMonthlyStatus(snaps), loadMonthlyTrades(),
+                loadMonthlyEquity({ snaps }), loadMonthlyRebalances(),
             ]);
         }
 
         async function loadSimStatus() {
             try {
-                const [s, bench] = await Promise.all([api('sim/status'), api('sim/benchmark').catch(() => null)]);
+                const [s, bench, snaps] = await Promise.all([
+                    api('sim/status'), api('sim/benchmark').catch(() => null),
+                    api('sim/equity?limit=12000').catch(() => null)]);
                 const benchEquity = bench && bench.total_equity != null ? '$' + bench.total_equity.toFixed(2) : '—';
+                // Normalized gain + max drawdown; alpha vs the DCA bench is
+                // the number that matters for this engine's churn-prone sim.
+                // Both gains compare LIVE valuations (bench contributed total
+                // is acc.cash — total deposited) so the chip matches the
+                // Daily-Core tab's live-vs-live convention.
+                const points = (snaps || []).map(x => ({ value: x.total_equity, contributed: x.allowance_total }));
+                const mdd = points.length ? mddOf(points) : null;
+                const gain = (s.allowance_total > 0) ? (s.total_equity / s.allowance_total * 100 - 100) : null;
+                const bGain = (bench && bench.total_equity != null && bench.allowance_total > 0)
+                    ? bench.total_equity / bench.allowance_total * 100 - 100 : null;
+                const alpha = (gain != null && bGain != null) ? gain - bGain : null;
                 const m = [
                     ['Total Equity', s.total_equity != null ? '$' + s.total_equity.toFixed(2) : '—'],
                     ['Bench Equity', benchEquity, 'bench-metric'],
+                    ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(1) + '%' : '—'],
+                    ['Max DD', mdd != null ? '-' + mdd.toFixed(1) + '%' : '—'],
+                    ['vs DCA', alpha != null ? (alpha >= 0 ? '+' : '') + alpha.toFixed(1) + 'pp' : '—'],
                     ['Cash', s.cash != null ? '$' + s.cash.toFixed(2) : '—'],
                     ['Positions Value', s.positions_value != null ? '$' + s.positions_value.toFixed(2) : '—'],
-                    ['Allowance Total', s.allowance_total != null ? '$' + s.allowance_total.toFixed(2) : '—'],
                     ['Strategy', s.sim_strategy || '—'],
                     ['Universe', s.sim_universe || '—'],
                 ];
@@ -3133,6 +3603,16 @@
         // and benchmark can receive deposits at different times, so absolute
         // dollars would compare apples to oranges.
         let simCompareMode = 'pct';
+        let simRange = '1Y';
+        let simChartReq = 0;
+        const S_RANGE_LIMIT = { '6M': 126, '1Y': 252, '2Y': 504, '5Y': 1260, 'MAX': 12000 };
+
+        function setSimRange(r) {
+            simRange = r;
+            for (const b of document.querySelectorAll('#s-range-bar .range-btn'))
+                b.classList.toggle('range-active', b.dataset.range === r);
+            loadSimEquity();
+        }
 
         function setSimCompareMode(mode) {
             simCompareMode = mode;
@@ -3142,29 +3622,32 @@
         }
 
         async function loadSimEquity() {
-            const [snaps, bench] = await Promise.all([
-                api('sim/equity?limit=365').catch(() => null),
-                api('sim/benchmark').catch(() => null),
+            const limit = S_RANGE_LIMIT[simRange] || 12000;
+            const reqId = ++simChartReq;
+            const [snaps, bench, live] = await Promise.all([
+                api(`sim/equity?limit=${limit}`).catch(() => null),
+                api(`sim/benchmark?limit=${limit}`).catch(() => null),
+                api('sim/status').catch(() => null),
             ]);
+            if (reqId !== simChartReq) return;  // superseded mid-flight
             if (simChart) { simChart.remove(); simChart = null; }
             if (!snaps || !snaps.length) {
                 document.getElementById('sim-chart').innerHTML = '<div class="sim-empty">No data yet — run the bot to start tracking.</div>';
                 return;
             }
-            // Live point: today's valuation so the curve reflects current
-            // prices between snapshots. Each point carries its own contributed
-            // total — the allowance steps $1000 at every month start, and
-            // dividing by the WRONG vintage would spike the pct curve.
-            const points = snaps.map(s => ({ time: s.at, value: s.total_equity, contributed: s.allowance_total }));
-            try {
-                const live = await api('sim/status');
-                if (live && live.total_equity != null) {
-                    const last = points[points.length - 1];
-                    const lastDay = new Date(last.time).toISOString().slice(0, 10);
-                    const today = new Date().toISOString().slice(0, 10);
-                    if (lastDay < today) points.push({ time: new Date().toISOString(), value: live.total_equity, contributed: live.allowance_total });
-                }
-            } catch (e) { /* chart falls back to snapshots only */ }
+            // One point per day (the LAST snapshot winning), then today's
+            // LIVE valuation appended/overwritten — same vintage rule as the
+            // other tabs so all charts agree on "today".
+            const byDay = new Map();
+            for (const s of (snaps || [])) {
+                byDay.set(new Date(s.at).toISOString().slice(0, 10),
+                    { value: s.total_equity, contributed: s.allowance_total });
+            }
+            const points = withLiveToday(
+                [...byDay.entries()]
+                    .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed }))
+                    .sort((a, b) => a.time < b.time ? -1 : 1),
+                live && live.total_equity != null ? live : null);
             const toPct = p => p.contributed > 0 ? (p.value / p.contributed * 100) : p.value;
             const val = p => simCompareMode === 'pct' ? toPct(p) : p.value;
             document.getElementById('sim-chart').innerHTML = '';
@@ -3212,6 +3695,7 @@
                 benchLine.setData(benchPoints);
             }
             simChart.timeScale().fitContent();
+            updateAsOf('sim', points.length ? new Date(points[points.length - 1].time).toISOString().slice(0, 10) : null);
         }
 
         async function loadSimBenchmark() {
@@ -3451,6 +3935,45 @@
             if (!confirm('Reset simulation? This clears all trades, positions, and equity history.')) return;
             try { await api('sim/reset', { method: 'POST' }); } catch (e) { /* ignore */ }
             loadSimAll();
+        }
+
+        async function backfillBenchmark() {
+            // Replaces the DCA benchmark's state with a synthetic replay of
+            // the dead-simple rule ($1000/month into URTH at the first
+            // trading day's close). Destructive for the bench curve only.
+            if (!confirm('Backfill REPLACES the DCA benchmark curve with a synthetic replay ($1000/month into ' + 'the benchmark ETF at each month\'s first close). Continue?'))
+                return;
+            const btn = document.getElementById('sim-backfill-bench-btn');
+            const status = document.getElementById('sim-run-status');
+            btn.disabled = true;
+            status.textContent = 'Backfilling DCA benchmark… (fetches full ETF history first — can take a minute)';
+            try {
+                const r = await api('sim/backfill-benchmark', { method: 'POST' });
+                status.textContent = `Benchmark backfilled: ${r.days} days (${r.start} → ${r.end}), ` +
+                    `${r.n_buys} monthly buys, contributed $${r.contributed.toFixed(2)}, final equity $${r.final_equity.toFixed(2)}.`;
+                await loadSimAll();
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
+            btn.disabled = false;
+        }
+
+        async function backfillSim() {
+            // Destructive: replaces the sim's state with a DETERMINISTIC
+            // replay (no LLM calls — the live hybrid overlay can't be
+            // replayed). Same confirm() pattern as resetSim.
+            if (!confirm('Backfill REPLACES the Daily Sim state with a deterministic replay of the engine rules (no LLM calls — an approximation of the live hybrid strategy). Continue?'))
+                return;
+            const btn = document.getElementById('sim-backfill-btn');
+            const status = document.getElementById('sim-run-status');
+            btn.disabled = true;
+            status.textContent = 'Backfilling… (deterministic replay over stored history — can take a few minutes, no LLM calls)';
+            try {
+                const r = await api('sim/backfill', { method: 'POST' });
+                status.textContent = `Backfilled ${r.days} trading days (${r.start} → ${r.end}, from ${r.requested_start}): ` +
+                    `${r.snapshots} equity points, ${r.trades} trades, final equity $${r.final_equity.toFixed(2)}. ` +
+                    '(deterministic approximation — no LLM overlay)';
+                await loadSimAll();
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
+            btn.disabled = false;
         }
 
         // --- Sim portfolio manager chat ---

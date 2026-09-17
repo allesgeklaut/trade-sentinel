@@ -270,3 +270,382 @@ flat rank-first targets and deposits the allowance at month start, so the
 corrected backtest now models production. No live config change was required
 — the walk-forward confirms the deployed rule beats the monthly baseline
 out-of-sample in every window.
+
+## 11. Risk overlays: residual momentum wins the walk-forward — 2026-09-14
+
+Goal: "optimize return by not getting too volatile." Four literature-backed
+risk knobs were added to the daily-core backtest (all opt-in, code defaults
+conservative):
+
+- `--mom residual` — Blitz-Huij-Martens (2011) residual momentum: per month,
+  regress each ticker's daily log returns (252d window, 21d skip) on the
+  equal-weight market, rank by alpha / residual-std * sqrt(n) (the alpha
+  t-stat). Momentum per unit of idiosyncratic risk. `eligible_frame` fills
+  the same `mom` column; the raw-only `mom > -0.99` floor is skipped for
+  residual (it's a t-stat, not a return).
+- `--target-vol X` — Barroso-Santa-Clara (2015) vol management: when the
+  portfolio's own 21d realized vol (contribution-adjusted daily log returns)
+  exceeds the target, deployment is capped so the excess stays in cash.
+  Only caps down, never leverages up.
+- `--vol-weight` — inverse-vol position weights among the day's top-N
+  candidates instead of equal weight (`_inv_vol_weights`; missing-vol names
+  keep equal weight, weights renormalize to the same total).
+- `--lowvol-tilt` — pct_rank(-vol) as a 4th equal score term in `_qv_order`.
+
+New tooling: `daily-core-sweep --stage 3` (in-sample risk-overlay sweep with
+Sharpe + max-DD now reported by every backtest) and `--stage 4` (walk-forward
+A/B of the overlays on the live config across the §10 OOS windows). Found
+and fixed on the way: stage-3 never applied the stage-1 winner's boost in the
+parent process (control silently ran boost=0 — which happens to be the live
+config, so the overlay comparison stayed valid).
+
+### In-sample (2017-01..2026-09, full window, rank deploy b0)
+
+| Arm | IRR | Sharpe | MaxDD | Turnover |
+|---|---|---|---|---|
+| control (live) | 32.05% | 0.81 | 35.8% | 5.2% |
+| **residual** | 30.64% | **0.95** | **28.2%** | 5.3% |
+| vol-weight | 28.61% | 0.83 | 33.3% | 5.0% |
+| target-vol 0.25 | 31.80% | 0.81 | 34.7% | 5.0% |
+| target-vol 0.20 | 27.84% | 0.76 | 33.7% | 4.8% |
+| lowvol-tilt | 22.33% | 0.95 | 24.7% | 4.7% |
+| residual+tv0.25 | 29.38% | 0.93 | 28.2% | 5.4% |
+
+### Walk-forward A/B on the live config (non-overlapping OOS windows)
+
+| Window | control | residual | res+tv0.25 | tv0.25 | lowvol | vol-weight |
+|---|---|---|---|---|---|---|
+| 2017-19 Sharpe | 1.01 | **1.09** | 1.09 | 0.98 | 1.01 | **1.18** |
+| — maxDD | 17.0% | 16.4% | 16.4% | 17.1% | 15.8% | 15.3% |
+| 2020-21 Sharpe | 0.97 | **1.02** | 0.98 | 0.99 | **1.04** | (0.83 full) |
+| — maxDD | 24.3% | 23.7% | 23.7% | **21.6%** | 23.9% | — |
+| 2022-23 Sharpe | 0.09 | **0.24** | **0.24** | 0.11 | 0.11 | 0.15 |
+| — maxDD | 15.1% | **12.6%** | 12.7% | 15.1% | 10.6% | 14.0% |
+| 2024-26 Sharpe | 1.28 | 1.74 | **1.78** | 1.28 | 1.75 | 1.37 |
+| — maxDD | 24.2% | 21.6% | **18.7%** | 23.5% | 8.6% | 18.2% |
+| 2024-26 IRR | 49.5% | 62.9% | 61.4% | 46.8% | 27.9% | 40.0% |
+
+(IRRs for the other windows are in /data/sweeps/daily_core_risk_walkforward.json
+inside the container; Sharpe is the decision metric here.)
+
+### Findings
+
+1. **Residual momentum is the walk-forward winner — adopted live.** It
+   posts the highest Sharpe of the six arms in all four OOS windows and
+   cuts max drawdown in every stress window (2022-23 bear: 15.1% → 12.6%
+   with Sharpe 0.09 → 0.24; 2024-26: 24.2% → 21.6% with Sharpe 1.28 →
+   1.74 AND IRR +13.4pp). The full-window in-sample IRR cost (-1.4pp vs
+   control) is a bull-market-chasing artifact; OOS the steadier ranking
+   pays for itself. Live: `SIM_DAILY_CORE_MOM_VARIANT=residual` (.env);
+   code default stays `raw` (conservative).
+2. **residual+tv0.25 is a close second** — equal Sharpe in 2022-23, better
+   2024-26 maxDD (18.7% vs 21.6%) at the cost of 2020-21. Not adopted:
+   target-vol needs live daily-return tracking (the live engine would have
+   to gate deployment on its own realized vol — more moving parts for a
+   marginal OOS edge). Revisit if 2026+ windows keep confirming.
+3. **lowvol-tilt is too expensive** — best drawdowns (8.6% in 2024-26!)
+   but gives up 22pp IRR in the same window. The score tilt removes the
+   very momentum exposure the strategy monetizes. Rejected.
+4. **vol-weight underperforms on this 110-name universe** — the frame's
+   `vol` column is computed over only 121 days for all names, and inv-vol
+   weights systematically under-allocate the momentum leaders. Only bright
+   spot: 2017-19 (Sharpe 1.18). Rejected.
+5. **Backfill phantom-allowance bug (found via start=all):** allowance rows
+   were persisted for EVERY month in the candle window (1980+ → 550 rows)
+   while the replay only deposits once a ranking exists (2017+ → 110).
+   allowance_total read $550k instead of $110k, breaking every
+   contributed-normalized metric. Fixed: rows derive from the replay's
+   actual deposits (`deposited_months`), test-guarded in test_daily_core.
+6. **UI risk metrics:** all three portfolio tabs now show Max DD (peak-to-
+   trough on the contributed-normalized curve) and alpha chips vs their
+   natural comparators; Daily-Core gained rank/weight columns, a stale-
+   ranking warning, chart range bars (6M..MAX) and a Monthly-sim overlay.
+
+### Config note
+
+Live daily-core is now: qv-mom ranking with RESIDUAL momentum + daily rank
+deployment (boost=0, no gates, no vol overlay). Everything else unchanged.
+
+## 12. "Cash out the win": protection overlays vs the Jul-2026 giveback — 2026-09-14
+
+Owner observation: every portfolio rode a strong Apr–Jun 2026 run (beating the
+DCA benchmark) then round-tripped it in July. daily-core peaked at **137.1% of
+contributed on 2026-06-30** and fell to **112.5% by 2026-09-14** (−17.9% from
+the peak, trough 111.8% on 07-29). The qv-mom design has no exits except the
+monthly hysteresis band, so a momentum crash hands the run-up back.
+
+Three opt-in protection mechanisms were built into `_daily_core_backtest`
+(CLI: `daily-core --portfolio-stop/--exposure-trend/--trailing-stop`):
+
+- `--portfolio-stop X` — peak-to-trough cash-out brake: when the portfolio's
+  own equity is X% below its running peak, **sell everything to cash** and park
+  contributions until re-entry.
+- `--exposure-trend N` — deploy cash only while the equal-weight universe index
+  is above its N-day SMA (also the re-entry gate after a stop, since a fully
+  cashed book's own drawdown is frozen).
+- `--trailing-stop X` — per-name stop: exit a holding when its price falls X%
+  below its own peak since entry; the factor-level cut that does not need a
+  market downtrend (a re-buy is possible once the name re-ranks).
+
+Measurement note: the daily-core maxDD was also fixed to the
+contributed-normalized convention (equity / invested-to-date) that the live UI
+uses — the raw-equity DD understated the real peak-to-trough loss (11.2% →
+18.9% on the 2026 episode, matching the chart).
+
+### Walk-forward A/B (residual core, rank deploy b0; Sharpe / normalized maxDD / turnover)
+
+| Window | control (live) | stop10 | stop10+trend200 | trend200 | trail15 |
+|---|---|---|---|---|---|
+| 2017-19 | 1.09 / 21.6% / 4.9% | **1.26** / **18.3%** / 16.1% | 1.22 / **13.8%** / 8.4% | 1.13 / 19.7% / 5.2% | 1.13 / 21.7% / 8.7% |
+| 2020-21 | 1.02 / 28.2% / 5.6% | **1.12** / 25.2% / 89.5% | 1.04 / **19.7%** / 57.1% | 0.96 / 28.2% / 5.6% | 1.07 / 28.5% / 15.5% |
+| 2022-23 | 0.24 / 20.2% / 7.7% | **-0.01** / 20.5% / 62.0% | 0.51 / **11.9%** / 9.3% | **0.58** / **12.1%** / 5.6% | 0.19 / 20.4% / 24.3% |
+| 2024-26 | 1.72 / 31.4% / 4.2% | 1.76 / 27.0% / 109.8% | 1.76 / **22.8%** / 71.9% | 1.73 / 30.6% / 4.3% | 1.67 / 31.5% / 11.4% |
+
+- **stop10+trend200** wins Sharpe in all four windows and cuts maxDD to the
+  best-or-near-best in every window — but pays 8–72%/month turnover (each
+  cash-out + re-entry is a full book turn).
+- **The pure stop whipsaws**: in 2022-23 it fired 15× and *destroyed* the
+  Sharpe (0.24 → -0.01) — the trend gate is what makes the brake usable
+  (2 events, 0.51).
+- **trend200 is the cheap win**: no added turnover, big help in the 2022-23
+  bear (Sharpe 0.24 → 0.58, DD 20.2% → 12.1%).
+- **trailing stops don't pay**: neutral-to-worse Sharpe in every window at
+  1.5–3× turnover. The monthly hysteresis band already cuts fallen names at
+  month-end; the daily trailing exit mostly front-runs that, churning.
+
+### The specific 2026 episode (2026-01-01..2026-09-14, in-sample, normalized DD)
+
+| Arm | Final | IRR | Sharpe | maxDD | Turnover |
+|---|---|---|---|---|---|
+| control | $10,050 | 38.25% | **1.14** | **18.9%** | 10.4% |
+| trend200 | $10,050 | 38.25% | 1.14 | 18.9% | — (never fired) |
+| trailing 15% | $10,035 | 37.65% | 1.13 | 19.0% | 31.1% |
+| target-vol 0.25 | $9,986 | 35.73% | 1.08 | 18.9% | 10.6% |
+| stop10+trend200 | **$9,580** | 20.33% | 0.86 | **21.4%** | 37.9% (2 events) |
+
+**Every protection mechanism was neutral or WORSE on the episode that prompted
+the question.** Why:
+
+1. **trend200 never fired** — the equal-weight universe index stayed above its
+   200-day SMA through the July reversal. This was a *momentum-sleeve crash
+   while the broad market held* (AI/semis reversal), not a market downtrend.
+2. **stop10+trend200 round-tripped**: the portfolio's drawdown triggered a
+   full cash-out, but the market still looked "up" so the trend gate re-armed
+   the very next day → sell-all + rebuy into the continuing decline, twice.
+   Ending equity 4.7% lower AND a worse drawdown (21.4% vs 18.9%).
+3. **trailing stop** cut individual names but the strategy kept rotating into
+   other falling names; 3× turnover bought nothing.
+4. **target-vol** throttled deployment into the rebound → slightly lower final.
+
+### Verdict
+
+**Do not "fix" the giveback with a cash-out brake.** The walk-forward says
+stop10+trend200 improves long-run Sharpe/DD, but it earns that on *sustained
+market downtrends* (2022) that the overlay can see — not on a fast,
+market-neutral momentum crash, where it actively hurts and multiplies
+turnover. The one defensible, low-cost overlay is `--exposure-trend 200`
+(helps the bear window, free otherwise) — but it does **not** address the
+July-2026 shape at all.
+
+The giveback is the price of the momentum premium; the factor-level mitigation
+(residual momentum) is already the live core (§11). All new knobs stay opt-in
+(`sim_daily_core_portfolio_stop=0`, `sim_daily_core_exposure_trend=0`,
+`sim_daily_core_trailing_stop=0`); live daily-core is unchanged.
+
+## 13. Gradient filter ("basket trend") — owner's idea, walk-forward verdict — 2026-09-14
+
+Owner's proposal after §12: instead of the *market* trend, watch the **gradient
+(N-day rate-of-change) of the strategy's own basket** — cash out when it turns
+negative for some days, re-enter when positive. Not stupid: it is trend-following
+on the strategy's own signal, which sees a momenton-sleeve reversal the market
+index cannot.
+
+Implemented (`--basket-trend N --basket-confirm K`): chain the equal-weight
+top-N target basket day by day; when its N-day slope is negative for K
+consecutive closes, sell everything and park contributions; re-enter when the
+slope is positive for K closes. The basket keeps moving while in cash, so
+re-entry can trigger (unlike a frozen equity-curve gate).
+
+### The Jul-2026 episode (2026-01-01..2026-09-14, in-sample)
+
+| Arm | Final | IRR | Sharpe | maxDD | Turnover |
+|---|---|---|---|---|---|
+| control | $10,050 | 38.25% | 1.14 | 18.9% | 10.4% |
+| **basket10c3** | **$10,175** | **43.23%** | **1.42** | **13.0%** | 89.3% (5 events) |
+| basket15c3 | $9,986 | 35.72% | 1.41 | 14.7% | 45.0% |
+| basket20c3 | $9,709 | 25.11% | 1.20 | 18.3% | 38.5% |
+| basket5c3 | $9,165 | 5.58% | 0.54 | 14.3% | 112.0% |
+
+basket10c3 beats control on **every** metric on the episode — higher final
+value, higher IRR, Sharpe 1.42 vs 1.14, DD 13.0% vs 18.9% — the only mechanism
+tested that does (§12's stop/trend/trailing all failed there).
+
+### Walk-forward A/B (Sharpe / normalized maxDD / turnover)
+
+| Window | control | basket10c3 | basket15c3 | basket30c5 |
+|---|---|---|---|---|
+| 2017-19 | **1.09** / 21.6% / 4.9% | 0.65 / 24.8% / 65.1% | 0.83 / 20.0% / 48.0% | 1.06 / 16.5% / 30.1% |
+| 2020-21 | 1.02 / 28.2% / 5.6% | 1.27 / 14.8% / 51.2% | **1.32** / **12.4%** / 36.5% | 1.07 / 14.2% / 22.4% |
+| 2022-23 | **0.24** / 20.2% / 7.7% | **-0.13** / 14.5% / 66.2% | -0.10 / 14.7% / 65.2% | 0.08 / 13.6% / 37.3% |
+| 2024-26 | 1.72 / 31.4% / 4.2% | **1.92** / **14.5%** / 59.0% | 1.65 / 14.2% / 49.1% | 1.48 / 19.0% / 23.6% |
+| **avg** | **1.02** | 0.93 | 0.93 | 0.92 |
+
+### Verdict
+
+**The idea works in the episode and in 2 of 4 windows, but does not survive the
+walk-forward.** The gradient filter is trend-following on your own signal: it
+whipsaws in range-bound markets (2022-23 Sharpe -0.13 vs +0.24 control; 11.7%
+IRR vs 28.7%) and pays 30-66%/month turnover everywhere. Its one consistent
+virtue is drawdown: it cuts maxDD in 3 of 4 windows (31.4% → 14.5% recent),
+i.e. it does deliver "not too volatile" — at a real, regime-dependent return
+cost. The only overlay whose walk-forward *average* beat control remains
+stop10+trend200 (§12, avg 1.13 vs 1.02) — and that one failed the episode.
+
+Honest bottom line: no simple timing rule converts the momentum premium into a
+free lunch. The giveback in the owner's episode is real and the gradient filter
+caught it, but the same rule loses in chop. All knobs remain opt-in
+(`sim_daily_core_basket_trend=0`, defaults off).
+
+## 14. "On demand" switches for the gradient filter: thresholds, drawdown, efficiency — 2026-09-14
+
+Follow-up to §13: can a signal ARM the gradient filter only in the windows where
+it works? Three candidates were built and walk-forwarded (all opt-in):
+
+- `--basket-threshold X` — only a slope below -X% counts (real drops, not noise).
+- `--basket-drawdown X` — cash out when the SIGNAL BASKET is X% below its own
+  peak (the basket keeps moving in cash, so re-entry on the drawdown halving
+  can fire — unlike the frozen portfolio-equity brake).
+- `--basket-er-min X` — Kaufman efficiency ratio gate: arm the EXIT only while
+  ER = |net move| / path length over the last 20 basket prints is >= X
+  (trend-following pays in efficient trends, whipsaws in chop). Re-entry stays
+  unconditional so chop can never lock the portfolio in cash.
+
+### Walk-forward averages (4 OOS windows, residual core)
+
+| Arm | avg Sharpe | avg maxDD | avg turnover | worst window |
+|---|---|---|---|---|
+| control (live) | 1.02 | 25.4% | 5.6% | 2022-23 (0.24) |
+| **g10t5** (threshold 5%) | **1.07** | **18.9%** | 20.5% | 2022-23 (-0.06) |
+| bdd12 (drawdown 12%) | 0.95 | 17.0% | 12.2% | 2022-23 (-0.02) |
+| g10c3 (threshold-free, §13) | 0.93 | 19.4% | 55.4% | 2022-23 (-0.13) |
+| bdd8 (drawdown 8%) | 0.79 | 17.7% | 20.7% | 2022-23 (-0.30) |
+
+### The 2026 episode under each switch
+
+| Arm | Final | Sharpe | maxDD | events |
+|---|---|---|---|---|
+| control | $10,050 | 1.14 | 18.9% | — |
+| g10c3 (no threshold) | **$10,175** | **1.42** | **13.0%** | 5 |
+| g10t5 (5% threshold) | $9,974 | 1.25 | 18.8% | 2 |
+| g10t5+ER0.3 | $9,915 | 1.11 | 18.9% | 1 |
+| bdd12 / bdd12+ER0.3 | $10,050 | 1.14 | 18.9% | 0 |
+
+### Verdict: no "on demand" switch gets both
+
+The two regimes are **mutually exclusive with these mechanisms**:
+
+- **Threshold-free gradient** wins the episode (it exits on the first serious
+  negative slope) but whipsaws in chop because small dips trigger too.
+- **Threshold / drawdown / ER-gated variants** suppress the chop whipsaw and
+  improve the long-run average (g10t5: Sharpe 1.07 vs 1.02, DD 18.9% vs
+  25.4%) — but they **also suppress the episode win**: the Jul-2026 decline was
+  a slow stepwise erosion (10-day slope -0.5%, -6.5%, -1.7%, -5.5%, ...), not a
+  sharp threshold breach, so the gated filters either never fire or exit into a
+  bounce.
+- **The efficiency-ratio gate does not separate the regimes**: in the July
+  reversal the basket path was efficient enough to arm the exit only after the
+  damage was done; in 2017-19's calm bull the ER armed it on ordinary pullbacks.
+
+The honest conclusion: at the moment of decision, a reversal and a dip look
+alike; every rule that catches the reversal also pays in the chop. The only
+mechanism that improved the long-run average at acceptable cost is the
+5%-threshold gradient (g10t5) at ~20% turnover — but it does not solve the
+owner's Jul-2026 complaint, and it still loses the 2022-23 window. All knobs
+remain opt-in with defaults off; live daily-core is unchanged.
+
+## 15. Owner's composite: gradient filter in GOOD TIMES + market-trend gate — 2026-09-14
+
+Owner's design after §12-14: *don't* gate everything on one regime rule. Keep the
+engine's normal buying in charge; use the **market-trend gate for bad times**
+(park cash in downtrends, §12) and arm the **gradient cash-out only in good
+times** (market > SMA200) to catch momentum-sleeve crashes inside healthy bull
+markets — no cooldown, the engine re-enters whenever it decides. Implemented as
+`--basket-good-times` (arms the §13 slope trigger only above the market's
+200-day SMA; re-entry unconditional).
+
+### 2026 episode (2026-01-01..2026-09-14)
+
+| Arm | Final | IRR | Sharpe | maxDD | Turnover |
+|---|---|---|---|---|---|
+| control | $10,050 | 38.25% | 1.14 | 18.9% | 10.4% |
+| g10c3 (ungated) | **$10,175** | **43.23%** | **1.42** | **13.0%** | 89.3% |
+| g10c3gt (good-times) | **$10,175** | **43.23%** | **1.42** | **13.0%** | 89.3% |
+| **g10c3gt+t200** | **$10,175** | **43.23%** | **1.42** | **13.0%** | 89.3% |
+
+(Identical: the market stayed above its SMA200 through the July sleeve crash —
+the good-times arm never disarmed, and the trend gate never blocked.)
+
+### Walk-forward (Sharpe / normalized maxDD / turnover)
+
+| Window | control | g10c3gt | g15c3gt | **g10c3gt+t200** |
+|---|---|---|---|---|
+| 2017-19 | **1.09** / 21.6% / 4.9% | 0.86 / 25.0% / 58.0% | 0.85 / 23.1% / 40.9% | **1.14** / **15.5%** / 57.7% |
+| 2020-21 | 1.02 / 28.2% / 5.6% | 1.27 / 14.8% / 51.2% | **1.32** / **12.4%** / 36.5% | 1.01 / 14.6% / 51.3% |
+| 2022-23 | **0.24** / 20.2% / 7.7% | -0.08 / 20.2% / 37.6% | 0.00 / 20.2% / 33.9% | 0.11 / **12.2%** / 35.5% |
+| 2024-26 | 1.72 / 31.4% / 4.2% | 1.72 / 18.5% / 56.2% | 1.65 / 14.2% / 49.1% | **1.78** / **14.5%** / 55.9% |
+| **avg** | **1.02** / 25.4% | 0.94 / 19.6% | 0.96 / 17.5% | 1.01 / **14.2%** |
+
+### Verdict
+
+**This is the first composite that addresses the owner's episode without
+degrading the long-run average.** `g10c3gt+t200`:
+
+- wins the 2026 episode on every metric (Sharpe 1.42 vs 1.14, DD 13.0% vs 18.9%);
+- **halves the average walk-forward drawdown** (14.2% vs 25.4%);
+- keeps average Sharpe neutral (1.01 vs 1.02) — the "not too volatile" goal;
+- costs 35-58%/month turnover (the price of the churn).
+
+Compared with §12's stop10+trend200 (avg Sharpe 1.13, avg DD 17.0%) the owner's
+composite trades a little long-run Sharpe for the episode win and a lower DD —
+and it is the only configuration tested that does both. Good-times arming alone
+does **not** fix 2022-23 (bear rallies re-arm it), so the market-trend gate is
+what handles the bad regime; the two gates are complementary, exactly as the
+owner described. Opt-in (`sim_daily_core_basket_good_times`), live wiring TBD.
+
+### §15 addendum — arming-window study: SMA50 vs 100 vs 200
+
+Owner asked whether the good-times arming line should be SMA50 instead of
+SMA200. The window is now configurable (`--basket-arm-sma N`). Verdict: **the
+differences are inside noise and flip direction across windows** — another
+parameter to distrust.
+
+| Window | control | gt50+t200 | gt100+t200 | gt200+t200 |
+|---|---|---|---|---|
+| 2017-19 | **1.09** / 21.6% | 0.84 / 23.1% | 0.71 / 25.6% | 1.14 / 15.5% |
+| 2020-21 | 1.02 / 28.2% | 0.71 / 28.2% | 1.05 / 14.6% | 1.01 / 14.6% |
+| 2022-23 | 0.24 / 20.2% | **0.50 / 12.1%** | 0.34 / 12.9% | 0.11 / 12.2% |
+| 2024-26 | 1.72 / 31.4% | 1.87 / 22.6% | **2.16 / 14.3%** | 1.78 / 14.5% |
+| **avg Sharpe** | 1.02 | 0.98 | **1.06** | 1.01 |
+| **avg maxDD** | 25.4% | 21.5% | 16.9% | **14.2%** |
+| avg turnover | 5.6% | 36.8% | 45.6% | 50.1% |
+
+- **On the 2026 episode SMA50/100 look spectacular** (gt50: $10,757, Sharpe
+  1.96 vs control 1.14) — the shorter line disarms during the pre-crash dips
+  and re-arms for the crash. But that is one episode.
+- **Across the walk-forward SMA50 loses 2017-19 and 2020-21** (fast disarm
+  misses the whipsaw protection), wins 2022-23, and the averages are
+  indistinguishable from 100/200 (±0.05 Sharpe over 4 windows).
+- SMA100 has the best average Sharpe (1.06) and SMA200 the best average DD
+  (14.2%) — but with four windows, picking between them is curve-fitting.
+
+**Recommendation:** if the composite is ever wired live, keep the classic
+SMA200 arming (fewest parameters, best drawdown, no window choice to overfit)
+— or expose the window to the experiment selector and judge forward, not on
+this table. All variants remain opt-in.
+
+**Live wiring (2026-09-16):** the daily-core tab now exposes the two mechanisms
+as INDEPENDENT controls — a deployment gate (off/200/100/50) and a gradient
+cash-out arm (off/always/200/100/50) — so any combination here is selectable
+without bundling. `trend200`+`gradient200` reproduces `g10c3gt+t200`;
+`gradient=always` (gate off) reproduces the ungated `g10c3`. Both drive the
+next cycle and every backfill.

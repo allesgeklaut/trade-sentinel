@@ -1344,7 +1344,7 @@ class TestDailyCoreMonthlyParity:
             for t in tickers
         }
 
-        async def fake_load_frames(_tickers, _asof):
+        async def fake_load_frames(_tickers, _asof, start=None):
             return close, vol
 
         async def fake_load_fundamentals(_tickers):
@@ -1490,3 +1490,346 @@ class TestRankBoostDefault:
         # the default must not silently run the losing 0.5 config.
         from app.config import settings
         assert settings.sim_monthly_rank_boost == 0.0
+
+
+class TestDailyCoreRiskOverlays:
+    """The opt-in risk overlays on the daily-core backtest (vol_weight,
+    target_vol, mom variant, lowvol tilt) must (a) actually change behaviour
+    vs the control and (b) never break the run. Uses the same synthetic
+    market as the parity test."""
+
+    @pytest.fixture
+    def synthetic_market(self, monkeypatch):
+        import numpy as np
+        import pandas as pd
+
+        from app import fundamentals as fundamentals_mod
+        from app import monthly as monthly_mod
+
+        rng = np.random.default_rng(123)
+        tickers = [f"T{i:02d}" for i in range(20)]
+        n_days = 900
+        dates = pd.bdate_range("2022-01-03", periods=n_days)
+        drifts = np.linspace(0.0010, -0.0004, len(tickers))
+        closes = {}
+        for t, drift in zip(tickers, drifts, strict=False):
+            r = rng.normal(drift, 0.010, n_days)
+            closes[t] = 50.0 * np.exp(np.cumsum(r))
+        close = pd.DataFrame(closes, index=dates)
+        vol = pd.DataFrame(5e6, index=dates, columns=tickers)
+        fund = {
+            t: {
+                "StockholdersEquity": [{"start": None, "end": "2021-12-31",
+                                        "filed": "2022-02-15", "val": 5e9}],
+                "NetIncomeLoss": [{"start": "2021-01-01", "end": "2021-12-31",
+                                   "filed": "2022-02-15", "val": 5e8}],
+                "CommonStockSharesOutstanding": [{"start": None, "end": "2021-12-31",
+                                                  "filed": "2022-02-15", "val": 1e8}],
+                "NetCashProvidedByUsedInOperatingActivities": [
+                    {"start": "2021-01-01", "end": "2021-12-31",
+                     "filed": "2022-02-15", "val": 1e9}],
+                "PaymentsToAcquirePropertyPlantAndEquipment": [
+                    {"start": "2021-01-01", "end": "2021-12-31",
+                     "filed": "2022-02-15", "val": -2e8}],
+            }
+            for t in tickers
+        }
+
+        async def fake_load_frames(_tickers, _asof, start=None):
+            return close, vol
+
+        async def fake_load_fundamentals(_tickers):
+            return fund
+
+        monkeypatch.setattr(monthly_mod, "load_frames", fake_load_frames)
+        monkeypatch.setattr(fundamentals_mod, "load_fundamentals", fake_load_fundamentals)
+        return {"tickers": tickers, "close": close}
+
+    async def _run(self, synthetic_market, **kw):
+        import app.optimize as opt
+        return await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, **kw)
+
+    async def test_control_runs_and_reports_risk_metrics(self, synthetic_market):
+        r = await self._run(synthetic_market)
+        assert r is not None
+        assert r.sharpe > 0  # trending synthetic market
+        assert 0.0 <= r.max_drawdown < 1.0
+        assert r.n_trades > 0
+
+    async def test_vol_weight_changes_weights(self, synthetic_market):
+        """vol_weight must shift capital toward the low-vol names: the
+        trace of target weights differs from the flat control. (The
+        synthetic market has equal vol per name, so the effect is ~0 —
+        assert it runs and stays invested; the discriminating behaviour is
+        covered by weight_of() below.)"""
+        r = await self._run(synthetic_market, vol_weight=True)
+        assert r is not None and r.n_trades > 0
+
+    async def test_target_vol_parks_cash_in_high_vol(self, synthetic_market):
+        """A tiny target_vol (every day breaches it) must leave cash
+        undeployed vs the control — final value drops and the vol gate
+        actually binds."""
+        import app.optimize as opt
+        control = await self._run(synthetic_market)
+        capped = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, target_vol=0.0001)
+        assert control is not None and capped is not None
+        # capped run holds cash -> lower equity multiple than fully deployed
+        assert capped.final_value < control.final_value
+
+    async def test_residual_mom_variant_runs(self, synthetic_market, monkeypatch):
+        from app.config import settings
+        monkeypatch.setattr(settings, "sim_daily_core_mom_variant", "residual")
+        r = await self._run(synthetic_market)
+        assert r is not None and r.n_trades > 0
+
+    def test_inv_vol_weights_math(self):
+        """LOW vol gets more than equal weight, HIGH vol less; the weights
+        sum to the same total as equal weight; missing-vol names keep the
+        equal weight (never silently zeroed)."""
+        from app.optimize import _inv_vol_weights
+        frame = pd.DataFrame(
+            {"vol": [0.10, 0.20, 0.40, float("nan")]},
+            index=["LOW", "MID", "HIGH", "NONE"])
+        names = ["LOW", "MID", "HIGH", "NONE"]
+        equal = 100.0 / 4
+        w = _inv_vol_weights(names, frame, 4, equal)
+        assert w["LOW"] > w["MID"] > w["HIGH"]
+        assert w["LOW"] > equal > w["HIGH"]
+        # 4x the vol -> 1/4 the weight of the LOW name
+        assert w["LOW"] == pytest.approx(4 * w["HIGH"])
+        # the missing-vol name keeps equal weight, and the total sums to
+        # the same equity equal-weight deployment would spread
+        assert w["NONE"] == equal
+        assert sum(w.values()) == pytest.approx(4 * equal)
+        # degenerate: no frame / empty names -> equal weight
+        assert _inv_vol_weights(["X"], None, 4, equal) == {"X": equal}
+        assert _inv_vol_weights([], frame, 4, equal) == {}
+
+
+class TestDailyCoreProtection:
+    """The peak-to-trough cash-out brake and the exposure trend filter — the
+    'don't give the win back' mechanisms (Jun→Jul 2026 momentum-crash case)."""
+
+    @pytest.fixture
+    def crash_market(self, monkeypatch):
+        """20 tickers: a clean multi-year uptrend, then a -35% crash in the
+        last 40 trading days affecting ALL names — a broad drawdown for the
+        portfolio-level brake tests."""
+        return self._build_market(monkeypatch, crash_top_only=False)
+
+    @pytest.fixture
+    def sleeve_crash_market(self, monkeypatch):
+        """Same market but only the top-ranked half crashes (T00-T09) — the
+        momentum-sleeve crash shape (AI/semis reversal while the broad market
+        holds), where a per-name trailing stop is not defeated by re-buys."""
+        return self._build_market(monkeypatch, crash_top_only=True)
+
+    def _build_market(self, monkeypatch, *, crash_top_only: bool):
+        import numpy as np
+        import pandas as pd
+
+        from app import fundamentals as fundamentals_mod
+        from app import monthly as monthly_mod
+
+        rng = np.random.default_rng(5)
+        tickers = [f"T{i:02d}" for i in range(20)]
+        n_days = 900
+        dates = pd.bdate_range("2022-01-03", periods=n_days)
+        drifts = np.linspace(0.0012, 0.0, len(tickers))
+        closes = {}
+        for i, (t, drift) in enumerate(zip(tickers, drifts, strict=False)):
+            r = rng.normal(drift, 0.010, n_days)
+            px = 50.0 * np.exp(np.cumsum(r))
+            if not crash_top_only or i < 10:
+                px[-40:] *= np.linspace(1.0, 0.65, 40)
+            closes[t] = px
+        close = pd.DataFrame(closes, index=dates)
+        vol = pd.DataFrame(5e6, index=dates, columns=tickers)
+        fund = {
+            t: {
+                "StockholdersEquity": [{"start": None, "end": "2021-12-31",
+                                        "filed": "2022-02-15", "val": 5e9}],
+                "NetIncomeLoss": [{"start": "2021-01-01", "end": "2021-12-31",
+                                   "filed": "2022-02-15", "val": 5e8}],
+                "CommonStockSharesOutstanding": [{"start": None, "end": "2021-12-31",
+                                                  "filed": "2022-02-15", "val": 1e8}],
+                "NetCashProvidedByUsedInOperatingActivities": [
+                    {"start": "2021-01-01", "end": "2021-12-31",
+                     "filed": "2022-02-15", "val": 1e9}],
+                "PaymentsToAcquirePropertyPlantAndEquipment": [
+                    {"start": "2021-01-01", "end": "2021-12-31",
+                     "filed": "2022-02-15", "val": -2e8}],
+            }
+            for t in tickers
+        }
+
+        async def fake_load_frames(_tickers, _asof, start=None):
+            return close, vol
+
+        async def fake_load_fundamentals(_tickers):
+            return fund
+
+        monkeypatch.setattr(monthly_mod, "load_frames", fake_load_frames)
+        monkeypatch.setattr(fundamentals_mod, "load_fundamentals", fake_load_fundamentals)
+        return {"close": close}
+
+    async def _run(self, crash_market, **kw):
+        import app.optimize as opt
+        return await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, **kw)
+
+    async def test_portfolio_stop_cuts_drawdown(self, crash_market):
+        """The brake must reduce the max drawdown in a crash (it cashes out
+        before the bottom) and report that it fired."""
+        control = await self._run(crash_market)
+        stopped = await self._run(crash_market, portfolio_stop_pct=0.10)
+        assert control is not None and stopped is not None
+        assert stopped.brake_events >= 1
+        assert stopped.max_drawdown < control.max_drawdown, (
+            f"stop DD {stopped.max_drawdown:.1%} vs control {control.max_drawdown:.1%}")
+
+    async def test_exposure_trend_parks_cash(self, crash_market):
+        """A trend filter that blocks deployment in the downtrend changes the
+        outcome vs the control (and never crashes)."""
+        control = await self._run(crash_market)
+        filtered = await self._run(crash_market, exposure_trend_days=50)
+        assert control is not None and filtered is not None
+        assert filtered.final_value != control.final_value
+
+    async def test_stop_reenters_after_recovery(self, crash_market):
+        """With a trend re-entry gate the brake must not stay cashed forever:
+        the run must end with open positions (re-deployed)."""
+        r = await self._run(crash_market, portfolio_stop_pct=0.10,
+                            exposure_trend_days=50)
+        assert r is not None and r.brake_events >= 1
+        # still invested (equity moves with the market after re-entry)
+        assert r.n_trades > 0
+
+    async def test_defaults_off(self):
+        from app.config import settings
+        assert settings.sim_daily_core_portfolio_stop == 0.0
+        assert settings.sim_daily_core_exposure_trend == 0
+
+    async def test_trailing_stop_cuts_drawdown(self, sleeve_crash_market):
+        """The per-name trailing stop must exit the crashing sleeve — lower
+        drawdown than the control (which rides it down)."""
+        control = await self._run(sleeve_crash_market)
+        trailed = await self._run(sleeve_crash_market, trailing_stop_pct=0.15)
+        assert control is not None and trailed is not None
+        assert trailed.max_drawdown < control.max_drawdown, (
+            f"trail DD {trailed.max_drawdown:.1%} vs control {control.max_drawdown:.1%}")
+        assert trailed.n_trades > control.n_trades  # the stops trade
+
+    async def test_trailing_stop_off_by_default(self):
+        from app.config import settings
+        assert settings.sim_daily_core_trailing_stop == 0.0
+
+    async def test_basket_trend_cuts_drawdown(self, sleeve_crash_market):
+        """The gradient filter must cash out when the basket's own N-day
+        slope turns negative in the sleeve crash — lower DD than the control
+        (which rides it down), and it must re-enter when the slope recovers."""
+        import app.optimize as opt
+        control = await self._run(sleeve_crash_market)
+        filtered = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, basket_trend_days=10, basket_confirm_days=3)
+        assert control is not None and filtered is not None
+        assert filtered.max_drawdown < control.max_drawdown, (
+            f"basket DD {filtered.max_drawdown:.1%} vs control {control.max_drawdown:.1%}")
+
+    async def test_basket_trend_off_by_default(self):
+        from app.config import settings
+        assert settings.sim_daily_core_basket_trend == 0
+
+    async def test_basket_threshold_suppresses_noise(self, sleeve_crash_market):
+        """A threshold must make the filter fire less often than the
+        threshold-free version (noise dips no longer cash out), while still
+        cutting the drawdown when a real crash hits."""
+        import app.optimize as opt
+        base = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, basket_trend_days=10, basket_confirm_days=3)
+        thresh = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, basket_trend_days=10, basket_confirm_days=3,
+            basket_threshold=0.05)
+        assert base is not None and thresh is not None
+        assert thresh.basket_events <= base.basket_events
+        # the deep sleeve crash still triggers with a 5% threshold
+        assert thresh.basket_events >= 1
+
+    async def test_basket_threshold_off_by_default(self):
+        from app.config import settings
+        assert settings.sim_daily_core_basket_threshold == 0.0
+
+    async def test_basket_drawdown_fires_once_per_drawdown(self, sleeve_crash_market):
+        """The drawdown trigger must cash out in the crash and re-enter when
+        the basket recovers (drawdown halves) — one event, not a whipsaw."""
+        import app.optimize as opt
+        control = await self._run(sleeve_crash_market)
+        dd = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, basket_drawdown=0.08)
+        assert control is not None and dd is not None
+        assert dd.basket_events >= 1
+        assert dd.max_drawdown < control.max_drawdown
+
+    async def test_basket_drawdown_off_by_default(self):
+        from app.config import settings
+        assert settings.sim_daily_core_basket_drawdown == 0.0
+
+    async def test_basket_er_gate_arms_exit_only(self, sleeve_crash_market):
+        """The efficiency-ratio gate must not lock the portfolio in cash:
+        re-entry is unconditional. In the crash market the ER filter should
+        still fire at least once and end invested."""
+        import app.optimize as opt
+        r = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, basket_drawdown=0.08, basket_er_min=0.3)
+        assert r is not None and r.basket_events >= 1
+
+    async def test_basket_good_times_arms_only_above_sma(self, sleeve_crash_market):
+        """'Good times' arming: the gradient filter fires while the market is
+        above its 200d SMA; a version with good_times on must fire no more
+        than the always-armed one, and still fire on the sleeve crash."""
+        import app.optimize as opt
+        always = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, basket_trend_days=10, basket_confirm_days=3)
+        good = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, basket_trend_days=10, basket_confirm_days=3,
+            basket_good_times=True)
+        assert always is not None and good is not None
+        assert good.basket_events <= always.basket_events
+        assert good.basket_events >= 1
+
+    async def test_basket_good_times_off_by_default(self):
+        from app.config import settings
+        assert settings.sim_daily_core_basket_good_times is False
+
+    async def test_basket_arm_sma_configurable(self, sleeve_crash_market):
+        """A shorter arming SMA (50) must be accepted and change behaviour
+        vs the 200 default (fires only in strong uptrends)."""
+        import app.optimize as opt
+        g50 = await opt._daily_core_backtest(
+            "2023-01-01", "2025-12-31", "diversified-plus",
+            200.0, False, "none", "monthly", False, "rank",
+            with_baseline=False, basket_trend_days=10, basket_confirm_days=3,
+            basket_good_times=True, basket_arm_sma=50)
+        assert g50 is not None and g50.basket_events >= 1

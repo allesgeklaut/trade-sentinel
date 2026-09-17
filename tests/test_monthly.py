@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import urllib.error
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -264,6 +264,17 @@ def test_month_last_trading_day():
     tz = UTC
     out = monthly.month_last_trading_day(datetime(2026, 8, 15, tzinfo=tz))
     assert out.date() == datetime(2026, 8, 31).date() and out.weekday() == 0
+
+
+def test_rebalance_day_skips_holiday_month_end():
+    """A month whose last weekday is a NYSE holiday (2024-03-29 Good Friday)
+    must rebalance on the prior trading day, not be skipped entirely by the
+    scheduler's trading-day guard."""
+    tz = UTC
+    assert monthly.month_last_trading_day(datetime(2024, 3, 15, tzinfo=tz)).date() \
+        == datetime(2024, 3, 28).date()
+    assert monthly.is_rebalance_day(datetime(2024, 3, 28, 22, 0, tzinfo=tz))
+    assert not monthly.is_rebalance_day(datetime(2024, 3, 29, 22, 0, tzinfo=tz))
 
 
 # ---------------------------------------------------------------------------
@@ -772,7 +783,7 @@ async def test_price_usd_converts_foreign_listings(mem_db):
     raw local-currency close as USD would misstate exposure ~1/FX."""
     from app.db import Candle
 
-    dates = pd.bdate_range("2024-06-03", periods=5)
+    dates = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=5)
     async with mem_db() as s:
         for d in dates[:-1]:  # EURUSD pair stops updating one day before...
             s.add(Candle(ticker="EURUSD=X", timestamp=d.to_pydatetime(),
@@ -820,3 +831,283 @@ async def test_run_rebalance_lock_serializes(mem_db, monkeypatch):
     release.set()
     r1 = await t1
     assert r1.get("rebalanced") is True or r1.get("skipped") is True
+
+
+# ---------------------------------------------------------------------------
+# Risk overlays: residual momentum + low-vol tilt
+# ---------------------------------------------------------------------------
+
+def _trend_close(n_days: int = 400) -> pd.DataFrame:
+    """Deterministic 5-ticker frame: LEAD (strong smooth uptrend), CHOP (same
+    endpoint as LEAD but 5x the noise), WEAK (flat), LAG (downtrend), CRASH
+    (uptrend with a mid-window -30% crash). Residual momentum must rank the
+    smooth trend above the choppy one even at identical drift."""
+    rng = np.random.default_rng(7)
+    dates = pd.bdate_range("2024-06-03", periods=n_days)
+    drift = 0.0009
+    lead = 100.0 * np.exp(np.cumsum(rng.normal(drift, 0.003, n_days)))
+    # CHOP: same drift but much noisier path
+    chop = 100.0 * np.exp(np.cumsum(rng.normal(drift, 0.018, n_days)))
+    weak = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.006, n_days)))
+    lag = 100.0 * np.exp(np.cumsum(rng.normal(-drift, 0.006, n_days)))
+    crash = 100.0 * np.exp(np.cumsum(rng.normal(drift, 0.004, n_days)))
+    crash[n_days // 2] = crash[n_days // 2] * 0.70  # one-day -30% idio crash
+    return pd.DataFrame({"LEAD": lead, "CHOP": chop, "WEAK": weak,
+                         "LAG": lag, "CRASH": crash}, index=dates)
+
+
+def test_residual_momentum_rewards_smooth_uptrend():
+    """Blitz-Huij-Martens: momentum per unit of idiosyncratic vol. LEAD and
+    CHOP share the same drift, but LEAD's path is cleaner, so its
+    residual-momentum score must be higher. The crashed name is penalized;
+    the downtrending name is last."""
+    close = _trend_close()
+    rm = monthly.residual_momentum(close, close.index[-1])
+    assert rm["LEAD"] > rm["CHOP"]
+    assert rm["LEAD"] > 0
+    assert rm["LAG"] == rm.min()
+
+
+def test_residual_momentum_short_history_nan():
+    close = _trend_close(n_days=100)  # < 252+21 warmup
+    rm = monthly.residual_momentum(close, close.index[-1])
+    assert rm.isna().all()
+
+
+def test_eligible_frame_residual_variant(monkeypatch):
+    """The residual variant fills the same `mom` column so downstream
+    scoring/eligibility work unchanged; the -0.99 raw-mom floor must not
+    kick in (residual mom is a t-stat, not a return)."""
+    monkeypatch.setattr(settings, "sim_daily_core_mom_variant", "residual")
+    close = _trend_close()
+    vol = pd.DataFrame(5e6, index=close.index, columns=close.columns)
+    fund = _fund_all_positive(close.columns)
+    frame = monthly.eligible_frame(close.index[-1], close, vol, fund)
+    monkeypatch.setattr(settings, "sim_daily_core_mom_variant", "raw")
+    assert frame is not None
+    assert np.isfinite(frame["mom"]).all()
+    assert float(frame["mom"]["LEAD"]) > float(frame["mom"]["CHOP"])
+
+
+def test_qv_order_lowvol_tilt():
+    """With the tilt on, the low-vol name gains one full rank point; the
+    explicit tie-breakers still resolve identical scores."""
+    rows = {
+        "HIVOL": {"roe": 0.10, "p_fcf": 20.0, "mcap": 1e10, "dollar_vol": 5e7,
+                  "mom": 0.10, "price": 100, "vol": 0.60},
+        "LOVOL": {"roe": 0.10, "p_fcf": 20.0, "mcap": 1e10, "dollar_vol": 5e7,
+                  "mom": 0.10, "price": 100, "vol": 0.15},
+    }
+    frame = pd.DataFrame(rows).T
+    frame["eligible"] = True
+    _e, order_plain = monthly._qv_order(frame, lowvol_tilt=False)
+    _e2, order_tilt = monthly._qv_order(frame, lowvol_tilt=True)
+    # identical fundamentals: the tilt is the only difference and must
+    # promote the low-vol name from the ticker-asc fallback.
+    assert order_plain == ["HIVOL", "LOVOL"]  # tie -> ticker asc
+    assert order_tilt == ["LOVOL", "HIVOL"]
+
+
+# ---------------------------------------------------------------------------
+# Backfill (synthetic history)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fake_market(monkeypatch):
+    """Patch monthly's market/fundamentals loaders so backfill replays a tiny
+    deterministic two-ticker market (no network, no real DB rows)."""
+    dates = pd.bdate_range("2026-07-01", "2026-08-28")
+    close = pd.DataFrame({"AAA": 100.0, "BBB": 50.0}, index=dates)
+    vol = pd.DataFrame(1e6, index=dates, columns=["AAA", "BBB"])
+
+    def fake_frame(m, c, v, f):
+        return pd.DataFrame({
+            "roe": [0.1, 0.2], "p_fcf": [20.0, 15.0], "mcap": [1e10, 1e10],
+            "dollar_vol": [5e7, 5e7], "mom": [0.1, 0.2], "price": [100.0, 50.0],
+            "vol": [0.2, 0.25], "eligible": [True, True],
+        }, index=pd.Index(["AAA", "BBB"], name="ticker"))
+
+    async def fake_load_frames(_tickers, _asof, start=None):
+        return close, vol
+
+    async def fake_load_fundamentals(_tickers):
+        return {"AAA": {"x": []}, "BBB": {"x": []}}
+
+    monkeypatch.setattr(monthly, "universe_tickers", lambda _u: ["AAA", "BBB"])
+    monkeypatch.setattr(monthly.fundamentals_mod, "load_fundamentals",
+                        fake_load_fundamentals)
+    monkeypatch.setattr(monthly, "load_frames", fake_load_frames)
+    monkeypatch.setattr(monthly, "eligible_frame", fake_frame)
+    return {"close": close}
+
+
+class TestBackfill:
+    def test_replaces_state_and_persists_rows(self, mem_db, fake_market, monkeypatch):
+        """The replay wipes the portfolio and persists allowance/trade/
+        rebalance/snapshot rows with historical stamps, converging to the
+        picks the strategy would hold today."""
+        from app.db import MonthlyAllowance as Al
+        from app.db import MonthlyPosition as Pos
+        from app.db import MonthlyRebalance as Rb
+        from app.db import MonthlySnapshot as Sn
+        from app.db import MonthlyTrade as Tr
+
+        monkeypatch.setattr(monthly, "_current_month", lambda: "2026-08")
+        r = asyncio.run(monthly.backfill(start="2026-07-01"))
+        assert r["ok"] is True
+        assert r["contributed"] == pytest.approx(2 * settings.sim_monthly_contribution)
+
+        async def check():
+            async with mem_db() as s:
+                snaps = (await s.scalars(select(Sn))).all()
+                assert len(snaps) == r["snapshots"] > 0
+                # one snapshot per trading day, dated by the replay day
+                days = sorted(x.created_at.strftime("%Y-%m-%d") for x in snaps)
+                assert days[0] == "2026-07-01" and days[-1] == "2026-08-28"
+                # allowance rows: exactly the deposited months
+                months = sorted(x.month for x in (await s.scalars(select(Al))).all())
+                assert months == ["2026-07", "2026-08"]
+                # the end state holds the strategy's picks
+                pos = (await s.scalars(select(Pos))).all()
+                assert len(pos) == 2
+                for p in pos:
+                    assert p.shares > 0 and p.avg_cost > 0
+                # rebalance audit rows: one per replayed month (the live engine
+                # rebalances monthly, no-op months included)
+                rbs = (await s.scalars(select(Rb))).all()
+                assert sorted(x.rebal_month for x in rbs) == ["2026-07", "2026-08"]
+                assert all(x.picked for x in rbs)
+                # trades carry the replay day
+                trs = (await s.scalars(select(Tr))).all()
+                for t in trs:
+                    assert t.created_at.strftime("%Y-%m") in ("2026-07", "2026-08")
+                    assert t.shares > 0 and t.price > 0
+        asyncio.run(check())
+
+    def test_funds_months_without_an_eligible_frame(self, mem_db, fake_market,
+                                                    monkeypatch):
+        """A window month with no eligible ranking is still funded (the live
+        engine deposits before the frame check); only its rebalance is skipped."""
+        import pandas as pd
+
+        from app.db import MonthlyAllowance as Al
+        from app.db import MonthlyRebalance as Rb
+
+        real = monthly.eligible_frame
+
+        def frame_with_gap(m, c, v, f):
+            fr = real(m, c, v, f)
+            if fr is not None and pd.Timestamp(m).month == 8:
+                fr = fr.assign(eligible=False)
+            return fr
+        monkeypatch.setattr(monthly, "eligible_frame", frame_with_gap)
+        monkeypatch.setattr(monthly, "_current_month", lambda: "2026-09")
+
+        r = asyncio.run(monthly.backfill(start="2026-07-01"))
+        assert r["ok"] is True
+        # Jul + Aug (Aug has no ranking but is still funded)
+        assert r["contributed"] == pytest.approx(2 * settings.sim_monthly_contribution)
+
+        async def check():
+            async with mem_db() as s:
+                months = sorted(x.month for x in (await s.scalars(select(Al))).all())
+                assert months == ["2026-07", "2026-08"]
+                rows = (await s.scalars(select(Rb))).all()
+                assert sorted(x.rebal_month for x in rows) == ["2026-07"]
+        asyncio.run(check())
+
+    def test_uncovered_current_month_keeps_its_contribution(self, mem_db, fake_market,
+                                                            monkeypatch):
+        """A backfill run before the current month has candles must not lose
+        the live deposit (same rule as daily_core.backfill)."""
+        from app.db import MonthlyAllowance as Al
+
+        monkeypatch.setattr(monthly, "_current_month", lambda: "2026-09")
+
+        async def seed():
+            async with mem_db() as s:
+                acc = await s.get(MonthlyAccount, 1)
+                acc.last_allowance_month = "2026-09"
+                await s.commit()
+        asyncio.run(seed())
+
+        r = asyncio.run(monthly.backfill(start="2026-07-01"))
+        assert r["ok"] is True
+        # Jul + Aug replayed + Sep (live, uncovered) = 3 contributions
+        assert r["contributed"] == pytest.approx(3 * settings.sim_monthly_contribution)
+
+        async def check():
+            async with mem_db() as s:
+                acc = await s.get(MonthlyAccount, 1)
+                assert acc.last_allowance_month == "2026-09"
+                rows = (await s.scalars(select(Al))).all()
+                assert sorted(x.month for x in rows) == \
+                    ["2026-07", "2026-08", "2026-09"]
+        asyncio.run(check())
+
+
+async def test_load_frames_filters_tickers_and_bounds_history(mem_db):
+    """load_frames must query ONLY the requested tickers (the unfiltered
+    full-table scan made every call O(all candles) once the broad universes
+    were added) and honor the optional history bound."""
+    from app.db import Candle
+
+    old = datetime(2020, 1, 2)
+    recent = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=5)
+    async with mem_db() as s:
+        for i in range(3):
+            s.add(Candle(ticker="AAA", timestamp=old + timedelta(days=i),
+                         open=1, high=1, low=1, close=10, volume=1))
+            s.add(Candle(ticker="UNRELATED", timestamp=old + timedelta(days=i),
+                         open=1, high=1, low=1, close=99, volume=1))
+        s.add(Candle(ticker="AAA", timestamp=recent, open=1, high=1, low=1, close=20, volume=1))
+        await s.commit()
+
+    close, _vol = await monthly.load_frames(["AAA"], None)
+    assert list(close.columns) == ["AAA"]  # UNRELATED never loaded
+    assert len(close) == 4
+
+    # history bound drops the 2020 rows, keeping only the recent bar
+    close2, _ = await monthly.load_frames(["AAA"], None, start=recent - timedelta(days=1))
+    assert len(close2) == 1
+    assert float(close2["AAA"].iloc[-1]) == 20
+
+
+async def test_first_snapshot_is_parked_contribution(mem_db, monkeypatch):
+    """The monthly engine parks the contribution until month-end, so the FIRST
+    snapshot must equal what has been contributed (100%) — not the value of the
+    month-end picks marked at the month's earlier (lower) prices. Regression:
+    the replay used to build the month-end portfolio and then snapshot the
+    whole month, so a 2025 backfill's first point read 91% instead of 100%."""
+    from app.db import MonthlySnapshot as Sn
+
+    dates = pd.bdate_range("2026-07-01", "2026-08-31")
+    rising = [100.0 * (1.01 ** i) for i in range(len(dates))]
+    close = pd.DataFrame({"AAA": rising, "BBB": [x / 2 for x in rising]}, index=dates)
+    vol = pd.DataFrame(1e6, index=dates, columns=["AAA", "BBB"])
+
+    def fake_frame(m, c, v, f):
+        return pd.DataFrame({
+            "roe": [0.1, 0.2], "p_fcf": [20.0, 15.0], "mcap": [1e10, 1e10],
+            "dollar_vol": [5e7, 5e7], "mom": [0.1, 0.2], "price": [100.0, 50.0],
+            "vol": [0.2, 0.25], "eligible": [True, True],
+        }, index=pd.Index(["AAA", "BBB"], name="ticker"))
+
+    async def fake_load_frames(_t, _a, start=None):
+        return close, vol
+
+    async def fake_load_fundamentals(_t):
+        return {"AAA": {"x": []}, "BBB": {"x": []}}
+
+    monkeypatch.setattr(monthly, "universe_tickers", lambda _u: ["AAA", "BBB"])
+    monkeypatch.setattr(monthly, "load_frames", fake_load_frames)
+    monkeypatch.setattr(monthly.fundamentals_mod, "load_fundamentals", fake_load_fundamentals)
+    monkeypatch.setattr(monthly, "eligible_frame", fake_frame)
+
+    await monthly.backfill("2026-07-01")
+
+    async with mem_db() as s:
+        rows = (await s.scalars(select(Sn).order_by(Sn.created_at))).all()
+    assert rows, "backfill produced snapshots"
+    assert rows[0].total_equity == pytest.approx(1000.0)      # parked, 100%
+    assert rows[0].allowance_total == pytest.approx(1000.0)

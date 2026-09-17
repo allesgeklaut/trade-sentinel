@@ -26,9 +26,15 @@ portfolios' "contributed" figures stay comparable), refreshes data, runs one
 deployment pass, and writes the daily equity snapshot.
 """
 import asyncio
+import json
 import logging
 import math
+import os
+import threading
+
+import numpy as np
 from datetime import datetime, timedelta, UTC
+from pathlib import Path
 
 import pandas as pd
 from sqlalchemy import func, select
@@ -39,11 +45,295 @@ from . import monthly as monthly_mod
 from .config import settings
 from .db import (DailyCoreAccount, DailyCoreAllowance, DailyCorePosition,
                  DailyCoreSnapshot, DailyCoreTrade, Session)
-from .screener import tickers as universe_tickers
+from .screener import tickers as universe_tickers, universe_names
 
 logger = logging.getLogger("trade_sentinel.daily_core")
 
 _TZ = monthly_mod._TZ  # same operator-local month anchor as sim/monthly
+
+# ---------------------------------------------------------------------------
+# Strategy selection (runtime, persisted — the LLM-backend pattern)
+# ---------------------------------------------------------------------------
+
+# The selectable momentum variants. `raw` = classic 12-1 close/close return;
+# `residual` = Blitz-Huij-Martens alpha t-stat (§11 walk-forward winner).
+STRATEGY_VARIANTS: dict[str, str] = {
+    "raw": "Raw 12-1 momentum (classic qv-mom)",
+    "residual": "Residual momentum (Blitz-Huij-Martens, §11 winner)",
+}
+
+_STATE_FILE = Path("/data/daily_core_state.json")
+# Serialises read-modify-write of the state file: the runtime setters and the
+# protection decision all read the file, change one key, and write it back, so
+# two concurrent writers could drop each other's field. The critical sections
+# are tiny, so a plain threading lock is fine (they run in the event loop).
+_state_lock = threading.Lock()
+
+
+def _load_state() -> dict:
+    try:
+        return json.loads(_STATE_FILE.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning("Could not read daily-core state file: %s", e)
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    try:
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic replace so a concurrent reader never sees a half-written file.
+        tmp = _STATE_FILE.with_suffix(_STATE_FILE.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        os.replace(tmp, _STATE_FILE)
+    except Exception as e:
+        logger.warning("Could not write daily-core state file %s: %s", _STATE_FILE, e)
+
+
+def _reset_basket_state(state: dict) -> None:
+    """Drop the gradient basket chain. It is chained from a specific
+    universe/variant's target band, so a switch must not splice the old price
+    series into the new one (the protection overlay reads it next cycle)."""
+    for k in ("basket_hist", "basket_day", "basket_neg_streak",
+              "basket_pos_streak", "basket_out"):
+        state.pop(k, None)
+
+
+def current_variant() -> str:
+    """The effective momentum variant: the persisted runtime choice if valid,
+    else the env/config default. Reads the file per call (tiny JSON, called
+    from the scheduler path once per day and the status endpoint) so a
+    hand-edited state file takes effect immediately."""
+    state = _load_state()
+    v = state.get("mom_variant")
+    return v if v in STRATEGY_VARIANTS else settings.sim_daily_core_mom_variant
+
+
+def set_variant(variant: str) -> None:
+    if variant not in STRATEGY_VARIANTS:
+        raise ValueError(f"unknown mom variant: {variant!r}")
+    with _state_lock:
+        state = _load_state()
+        state["mom_variant"] = variant
+        _reset_basket_state(state)  # the band (thus the basket) changes with variant
+        _save_state(state)
+
+
+# ---------------------------------------------------------------------------
+# Strategy universe selection (runtime, persisted, same pattern as the variant)
+# ---------------------------------------------------------------------------
+
+def persisted_universe() -> str | None:
+    """The runtime-selected universe if it names a real universe file, else
+    None. Shared by every sim (daily sim, monthly, daily-core) so the one
+    Dashboard control sets the universe everywhere."""
+    u = _load_state().get("universe")
+    return u if u in universe_names() else None
+
+
+def current_universe() -> str:
+    """The effective qv-mom universe (monthly + daily-core rankings, and thus
+    backfills): the persisted runtime choice if valid, else the config default."""
+    return persisted_universe() or settings.sim_monthly_universe
+
+
+def set_universe(name: str) -> None:
+    if name not in universe_names():
+        raise ValueError(f"unknown universe: {name!r}")
+    with _state_lock:
+        state = _load_state()
+        state["universe"] = name
+        _reset_basket_state(state)  # the basket chain belongs to the old universe
+        _save_state(state)
+
+
+# ---------------------------------------------------------------------------
+# Protection selection (runtime, persisted, same pattern as the variant)
+# ---------------------------------------------------------------------------
+
+# Protection overlays for the live engine: TWO independent switches, mirroring
+# the §12-15 backtest parameters (`--exposure-trend` gate + the gradient arm).
+# Defaults are OFF (the live engine is unchanged unless the operator picks one).
+#   gate     — the deployment gate: park new buys while the market index is
+#              below its N-day SMA (off / 200 / 100 / 50).
+#   gradient — the basket-slope cash-out. "always" fires ungated (the §13
+#              behaviour); an SMA value arms it only in "good times" (market
+#              above its N-day SMA, the §14/§15 arm). Re-entry is always
+#              unconditional; the gradient's own 10-day/3-close window is fixed.
+GATE_MODES: dict[str, str] = {
+    "off": "No deployment gate — deploy normally",
+    "200": "Park buys while below SMA200",
+    "100": "Park buys while below SMA100",
+    "50": "Park buys while below SMA50",
+}
+GRADIENT_MODES: dict[str, str] = {
+    "off": "No gradient cash-out",
+    "always": "Cash out on a negative basket slope (always armed)",
+    "200": "Cash out in good times only (above SMA200)",
+    "100": "Cash out in good times only (above SMA100)",
+    "50": "Cash out in good times only (above SMA50)",
+}
+
+# Legacy single-mode selection -> (gate, gradient). Used to migrate an existing
+# state file written before the two switches were split.
+_LEGACY_PROTECTION = {
+    "none": ("off", "off"),
+    "trend200": ("200", "off"),
+    "gradient200": ("200", "200"),
+    "gradient100": ("100", "100"),
+    "gradient50": ("50", "50"),
+}
+
+# Gradient window/confirmation for the live signal (the §15 backtest values:
+# 10-day slope, 3 consecutive closes).
+_GRADIENT_DAYS = 10
+_GRADIENT_CONFIRM = 3
+
+
+def _protection_settings(state: dict) -> tuple[str, str]:
+    """(gate, gradient) modes: the persisted pair, else migrated from the
+    legacy single `protection` key, else both off."""
+    gate = state.get("gate")
+    gradient = state.get("gradient_arm")
+    if gate in GATE_MODES and gradient in GRADIENT_MODES:
+        return gate, gradient
+    legacy = state.get("protection")
+    return _LEGACY_PROTECTION.get(legacy, ("off", "off")) if isinstance(legacy, str) \
+        else ("off", "off")
+
+
+def current_gate() -> str:
+    return _protection_settings(_load_state())[0]
+
+
+def current_gradient() -> str:
+    return _protection_settings(_load_state())[1]
+
+
+def current_protection_config() -> tuple[int | None, bool, int | None]:
+    """Resolved overlays: ``(gate_sma, gradient_active, arm_sma)``.
+
+    ``gate_sma``/``arm_sma`` are None when off; ``arm_sma`` is also None for
+    the ungated ("always") gradient. ``gradient_active`` is False when the
+    cash-out is disabled."""
+    gate, gradient = _protection_settings(_load_state())
+    gate_sma = None if gate == "off" else int(gate)
+    arm_sma = None if gradient in ("off", "always") else int(gradient)
+    return gate_sma, gradient != "off", arm_sma
+
+
+def set_gate(mode: str) -> None:
+    if mode not in GATE_MODES:
+        raise ValueError(f"unknown gate mode: {mode!r}")
+    with _state_lock:
+        state = _load_state()
+        _, gradient = _protection_settings(state)  # read under the lock
+        state["gate"] = mode
+        state["gradient_arm"] = gradient
+        state.pop("protection", None)  # drop the legacy key once migrated
+        _save_state(state)
+
+
+def set_gradient(mode: str) -> None:
+    if mode not in GRADIENT_MODES:
+        raise ValueError(f"unknown gradient mode: {mode!r}")
+    with _state_lock:
+        state = _load_state()
+        gate, _ = _protection_settings(state)  # read under the lock
+        state["gate"] = gate
+        state["gradient_arm"] = mode
+        state.pop("protection", None)  # drop the legacy key once migrated
+        _save_state(state)
+
+
+# ---------------------------------------------------------------------------
+# Target-volatility exposure control (runtime, persisted, same pattern)
+# ---------------------------------------------------------------------------
+
+# Barroso-Santa-Clara vol management — the broad-universe comparison winner:
+# when the portfolio's OWN 21-day realized vol exceeds the target, new
+# contributions are parked in cash instead of deployed. It only scales
+# deployment DOWN (a calm portfolio stays fully invested); it never sells an
+# existing position and never leverages. Measured on the broad S&P 500
+# universe: target 0.15 cut max drawdown 33.6% -> 28.0% for ~3pp of IRR and a
+# slightly BETTER Sharpe (0.90 -> 0.92) — unlike the binary §12-15 cash-out
+# overlays, which destroy value on a broad universe.
+TARGET_VOL_MODES: dict[str, str] = {
+    "off": "Off (deploy all cash — no vol control)",
+    "0.10": "Target 10% volatility",
+    "0.15": "Target 15% volatility",
+    "0.20": "Target 20% volatility",
+    "0.25": "Target 25% volatility",
+}
+
+# Realized-vol lookback (trading days), matching the backtest's window.
+_VOL_WINDOW = 21
+
+# Candle-history bounds. The strategy only needs a momentum-warmup window
+# (>=253 trading days) before its decision date; broad universes were fetched
+# with full history, so loading everything made every call slow.
+_BACKFILL_WARMUP_DAYS = 600   # ~400 trading days of warmup before the replay start
+_LIVE_HISTORY_DAYS = 1460     # ~4y: ample for the 253d momentum + 200d market SMA
+
+
+def current_target_vol() -> float:
+    """The effective annualized target vol (0.0 = off): the persisted runtime
+    choice if valid, else the config default."""
+    mode = _load_state().get("target_vol")
+    if mode == "off":
+        return 0.0
+    if mode in TARGET_VOL_MODES:
+        return float(mode)
+    return settings.sim_daily_core_target_vol
+
+
+def set_target_vol(mode: str) -> None:
+    if mode not in TARGET_VOL_MODES:
+        raise ValueError(f"unknown target-vol mode: {mode!r}")
+    with _state_lock:
+        state = _load_state()
+        state["target_vol"] = mode
+        _save_state(state)
+
+
+def _vol_deploy_room(equity: float, cash: float, port_rets: list[float],
+                     target_vol: float) -> float:
+    """How much NEW cash may be deployed before the portfolio's projected vol
+    exceeds the target. ``inf`` when vol is calm or not yet measurable (never
+    blocks deployment on missing history)."""
+    if not target_vol or len(port_rets) < _VOL_WINDOW:
+        return float("inf")
+    rv = float(np.std(port_rets[-_VOL_WINDOW:]) * math.sqrt(252.0))
+    if rv <= target_vol or rv <= 0.0:
+        return float("inf")
+    return max(equity * (target_vol / rv) - (equity - cash), 0.0)
+
+
+def _port_return(prev_equity: float, equity: float, contrib_today: float) -> float:
+    """Contribution-adjusted log return for the realized-vol tracker (same
+    definition as the backtest's per-day ``port_rets``)."""
+    base = prev_equity + contrib_today
+    return float(math.log(equity / base)) if base > 0 and equity > 0 else 0.0
+
+
+async def _recent_port_returns(days: int) -> list[float]:
+    """Contribution-adjusted daily log returns from stored snapshots — the
+    live twin of the backtest's ``port_rets``. Deduped to the last snapshot
+    per calendar day (manual cycles can add extras)."""
+    async with Session() as s:
+        rows = (await s.scalars(select(DailyCoreSnapshot)
+                                .order_by(DailyCoreSnapshot.created_at.desc())
+                                .limit(days * 3 + 5))).all()
+    by_day: dict[str, DailyCoreSnapshot] = {}
+    for r in rows:
+        # rows are newest-first: keep the first seen per day = the latest
+        # snapshot that day (a plain assignment would keep the oldest).
+        by_day.setdefault(r.created_at.strftime("%Y-%m-%d"), r)
+    seq = [by_day[k] for k in sorted(by_day)][-(days + 1):]
+    return [_port_return(p.total_equity, c.total_equity,
+                         max(c.allowance_total - p.allowance_total, 0.0))
+            for p, c in zip(seq, seq[1:], strict=False)]
 
 
 def _local_now() -> datetime:
@@ -52,6 +342,109 @@ def _local_now() -> datetime:
 
 def _current_month() -> str:
     return _local_now().strftime("%Y-%m")
+
+
+def _live_history_start() -> datetime:
+    """Naive-UTC lower bound for the live ranking's candle load (~4y). Candle
+    timestamps are stored naive, so the bound must be naive too."""
+    return datetime.now(UTC).replace(tzinfo=None) - timedelta(days=_LIVE_HISTORY_DAYS)
+
+
+# ---------------------------------------------------------------------------
+# Protection overlay: live market gate + target-basket gradient
+# ---------------------------------------------------------------------------
+
+def _above_sma(mkt: pd.Series, days: int) -> bool:
+    """True when the index's latest close is at/above its `days`-day SMA
+    (warmup / non-finite -> True, i.e. don't block)."""
+    sma = mkt.rolling(days).mean()
+    cur, s = mkt.iloc[-1], sma.iloc[-1]
+    return not (np.isfinite(s) and np.isfinite(cur) and float(cur) < float(s))
+
+
+async def _protection_decision(band: list[str],
+                               gate_sma: int | None,
+                               gradient_active: bool,
+                               arm_sma: int | None) -> tuple[bool, bool]:
+    """Evaluate the two independent protection overlays: ``(market_ok, basket_out)``.
+
+    Market gate: the equal-weight universe index vs its `gate_sma`-day SMA.
+    ``market_ok`` is False below it, so contributions park. ``gate_sma`` None
+    (gate off) -> always True.
+
+    Gradient: the target basket (the day's top-N band names) is chained one
+    day at a time from stored closes; a confirmed negative N-day slope
+    (`_GRADIENT_DAYS`, `_GRADIENT_CONFIRM`) sets ``basket_out``. It is armed
+    only in good times when `arm_sma` is set (market above that SMA) and always
+    armed when `arm_sma` is None; re-entry is unconditional. Evaluated (and
+    persisted) only when ``gradient_active`` so the cash-out is skipped while
+    disabled. Streaks and the basket history persist in the daily-core state
+    file so the signal is stable across cycles (the scheduler runs once a day).
+    """
+    tickers = universe_tickers(current_universe())
+    close, _vol = await monthly_mod.load_frames(
+        tickers, None, start=_live_history_start())
+    if close.empty or not band:
+        return True, False
+
+    mkt = close.ffill().mean(axis=1)
+    # Deployment gate (independent of the gradient arm).
+    market_ok = _above_sma(mkt, gate_sma) if gate_sma and gate_sma > 1 else True
+
+    # Basket chain: day-over-day mean log return of the band's top-N names.
+    cv = close.ffill()
+    hist = _load_state().get("basket_hist") or []
+    if not isinstance(hist, list) or not hist:
+        hist = [100.0]
+    last_day = _load_state().get("basket_day")
+    idx = cv.index
+    start_i = 0
+    if last_day:
+        # First UNprocessed day: `after` holds the days past the last one
+        # already folded into `hist`, so the next append must start there.
+        # (Starting one earlier re-appended the last stored day every call,
+        # roughly doubling the chained basket growth and the slope.)
+        after = idx[idx > pd.Timestamp(last_day)]
+        start_i = len(idx) - len(after)
+    top = band[:settings.sim_monthly_target_n]
+    for i in range(max(start_i, 1), len(idx)):
+        d_prev, d_cur = idx[i - 1], idx[i]
+        rets = []
+        for t in top:
+            p0, p1 = monthly_mod.px_at(cv, d_prev, t), monthly_mod.px_at(cv, d_cur, t)
+            if p0 and p1 and p0 > 0 and p1 > 0:
+                rets.append(float(np.log(p1 / p0)))
+        if rets:
+            hist.append(hist[-1] * float(np.exp(float(np.mean(rets)))))
+    hist = hist[-260:]  # bounded history
+
+    out = False
+    neg = 0
+    pos = 0
+    if gradient_active and len(hist) > _GRADIENT_DAYS:
+        armed = _above_sma(mkt, arm_sma) if arm_sma and arm_sma > 1 else True
+        slope = hist[-1] / hist[-1 - _GRADIENT_DAYS] - 1.0
+        state = _load_state()
+        neg = int(state.get("basket_neg_streak") or 0)
+        pos = int(state.get("basket_pos_streak") or 0)
+        was_out = bool(state.get("basket_out") or False)
+        if slope < 0:
+            neg, pos = neg + 1, 0
+        elif slope > 0:
+            pos, neg = pos + 1, 0
+        if not was_out and armed and neg >= _GRADIENT_CONFIRM:
+            was_out = True
+        elif was_out and pos >= _GRADIENT_CONFIRM:
+            was_out = False
+        out = was_out
+    with _state_lock:
+        state = _load_state()
+        state.update({"basket_hist": hist, "basket_day": str(idx[-1].date()),
+                      "basket_neg_streak": neg if gradient_active else 0,
+                      "basket_pos_streak": pos if gradient_active else 0,
+                      "basket_out": out})
+        _save_state(state)
+    return market_ok, out
 
 
 # Serialises cycles: the allowance check runs before the (potentially
@@ -182,6 +575,10 @@ async def _exec_buy(ticker: str, price: float, budget: float, reason: str) -> di
 
 
 async def _exec_sell(ticker: str, price: float, reason: str) -> dict | None:
+    if price <= 0:
+        # No usable price (e.g. a backfilled avg_cost of 0): booking $0
+        # proceeds would delete the position for nothing. Mirror _exec_buy.
+        return None
     async with Session() as s:
         pos = await s.scalar(select(DailyCorePosition).where(DailyCorePosition.ticker == ticker))
         if pos is None:
@@ -276,15 +673,19 @@ async def compute_targets(force: bool = False) -> tuple[list[str], list[str], pd
             if stored is not None:
                 band, picks = stored
                 return band, picks, None
-        tickers = universe_tickers(settings.sim_monthly_universe)
+        tickers = universe_tickers(current_universe())
         fund = await fundamentals_mod.load_fundamentals(tickers)
         if not fund:
             return [], [], None
-        close, vol = await monthly_mod.load_frames(tickers, None)
+        close, vol = await monthly_mod.load_frames(
+            tickers, None, start=_live_history_start())
         if close.empty:
             return [], [], None
         iso = datetime.now(UTC).strftime("%Y-%m-%d")
         d: pd.Timestamp = pd.Timestamp(iso)  # type: ignore[assignment]
+        # The runtime-selected momentum variant (UI dropdown, persisted)
+        # drives the frame math — eligible_frame reads this setting.
+        settings.sim_daily_core_mom_variant = current_variant()
         frame = await asyncio.to_thread(monthly_mod.eligible_frame, d, close, vol, fund)
         if frame is None or not bool(frame["eligible"].any()):
             return [], [], frame
@@ -309,18 +710,57 @@ async def run_deployment() -> dict:
        targets are exhausted. This is the backtest-winning "rank deploy,
        boost=0" rule: fresh cash reinforces the top of the ranking, never
        spreads pro-rata, never waits for month-end.
+
+    Optional protection overlays (`gate` + `gradient_arm` in the daily-core
+    state file, the §12-15 mechanisms), independent: the deployment gate parks
+    buys while the market index is below its SMA; the gradient cash-out sells
+    the whole book on a confirmed negative slope of the target basket, armed
+    only in good times (or ungated). The engine re-enters on its own rule — no
+    cooldown.
     """
-    band, picks, _frame = await compute_targets(force=True)
+    band, picks, frame = await compute_targets(force=True)
     if not band:
         return {"skipped": True, "reason": "no eligible ranking (fundamentals too thin?)"}
 
     async with Session() as s:
         held_rows = (await s.scalars(select(DailyCorePosition))).all()
     held_before = sorted(p.ticker for p in held_rows)
-
-    # SELLs first: held names out of the band release their slot.
     trades: list[dict] = []
     px_map = await monthly_mod._price_usd_map(sorted(set(band) | set(held_before)))
+
+    # --- protection overlays: independent deployment gate + gradient (§12-15) ---
+    gate_sma, gradient_active, arm_sma = current_protection_config()
+
+    block_buys = False
+    protection_note = None
+    if (gate_sma is not None or gradient_active) and frame is not None:
+        gate_ok, basket_out = await _protection_decision(
+            band, gate_sma, gradient_active, arm_sma)
+        if not gate_ok:
+            block_buys = True
+            protection_note = "market below SMA — contributions parked"
+        # The cash-out is independent of the gate (matching the backtest: the
+        # gate only parks buys). Arming is what decides whether it can fire.
+        if gradient_active and basket_out:
+            # Confirmed negative basket slope (armed): CASH OUT the book at the
+            # latest prices and park contributions until the signal clears (then
+            # the normal deployment re-enters — no cooldown; the signal IS the
+            # gate).
+            for t in held_before:
+                price = px_map.get(t)
+                if not price:
+                    async with Session() as s:
+                        pos = await s.scalar(select(DailyCorePosition)
+                                             .where(DailyCorePosition.ticker == t))
+                    price = pos.avg_cost if pos else 0.0
+                r = await _exec_sell(t, price, "daily-core: gradient cash-out")
+                if r:
+                    trades.append(r)
+            held_before = []
+            block_buys = True
+            protection_note = "gradient cash-out — book moved to cash"
+
+    # SELLs: held names out of the band release their slot.
     for t in held_before:
         if t not in band:
             price = px_map.get(t) or 0.0
@@ -339,25 +779,43 @@ async def run_deployment() -> dict:
     # boost=0" rule — fresh cash reinforces the top of the ranking, never
     # spreads pro-rata, never waits for month-end).
     valuation = await valuate()
+    if block_buys:
+        return {"deployed": True, "band": band, "picks": picks,
+                "held_before": held_before, "trades": trades,
+                "gate": current_gate(), "gradient": current_gradient(),
+                "blocked": protection_note,
+                "valuation": valuation}
     weight = valuation["total_equity"] / max(settings.sim_monthly_target_n, 1)
+    # Target-vol control: cap the cash deployed this pass when the portfolio's
+    # own 21d realized vol is above target (excess parks in cash; never sells).
+    target_vol = current_target_vol()
+    room = float("inf")
+    if target_vol:
+        room = _vol_deploy_room(valuation["total_equity"], valuation["cash"],
+                                await _recent_port_returns(_VOL_WINDOW), target_vol)
     for t in band[:settings.sim_monthly_target_n]:
+        if room < 1:
+            break
         price = px_map.get(t)
         if not price:
             continue
         held_pos = next((p for p in valuation["positions"] if p["ticker"] == t), None)
         current_value = held_pos["value"] if held_pos else 0.0
-        budget = min(weight - current_value, valuation["cash"])
+        budget = min(weight - current_value, valuation["cash"], room)
         if budget < 1:
             continue
         r = await _exec_buy(t, price, budget,
                             f"daily-core deploy: rank target {settings.sim_monthly_target_n}")
         if r:
             trades.append(r)
+            room -= r["cost"]
             # refresh cash so successive buys see the balance
             valuation = await valuate()
 
     return {"deployed": True, "band": band, "picks": picks,
             "held_before": held_before, "trades": trades,
+            "gate": current_gate(), "gradient": current_gradient(),
+            "target_vol": target_vol,
             "valuation": await valuate()}
 
 
@@ -392,8 +850,11 @@ async def refresh_data() -> tuple[list[str], list[str]]:
     if _local_now().weekday() >= 5:  # Sat/Sun
         tickers = held
     else:
-        tickers = list(dict.fromkeys(universe_tickers(settings.sim_monthly_universe) + held))
-    return await refresh_many(tickers, "2y")
+        tickers = list(dict.fromkeys(universe_tickers(current_universe()) + held))
+    # Reuse the nightly universe prefetch: tickers fetched within the freshness
+    # window are skipped, so daily-core reads the DB instead of re-pulling.
+    return await refresh_many(tickers, "2y",
+                              max_age_seconds=settings.market_fresh_seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +883,8 @@ async def _sync_start_date() -> str | None:
     return earliest.strftime("%Y-%m-%d") if earliest else None
 
 
-async def backfill(start: str | None = None) -> dict:
+async def backfill(start: str | None = None,
+                   *, preload: monthly_mod.BackfillPreload | None = None) -> dict:
     """Replay the winning daily-core strategy over historical data and
     REPLACE the portfolio state with the replay's end state.
 
@@ -457,11 +919,24 @@ async def backfill(start: str | None = None) -> dict:
             start = None  # full stored history
         start_note = start or "first eligible month"
 
-        tickers = universe_tickers(settings.sim_monthly_universe)
-        fund = await fundamentals_mod.load_fundamentals(tickers)
+        # `preload` (built once by backfill-all) carries the shared
+        # fundamentals + frames; otherwise load them here. Bound the candle
+        # load to the replay window + a momentum warmup (`start=None` means
+        # full stored history — start=all or before the data begins).
+        shared_frames: dict = {}
+        if preload is not None:
+            tickers = preload.tickers
+            fund = preload.fund
+            close, vol = preload.close, preload.vol
+            shared_frames = preload.frames
+        else:
+            tickers = universe_tickers(current_universe())
+            fund = await fundamentals_mod.load_fundamentals(tickers)
+            load_start = ((pd.Timestamp(start) - timedelta(days=_BACKFILL_WARMUP_DAYS)).to_pydatetime()
+                          if start else None)
+            close, vol = await monthly_mod.load_frames(tickers, None, start=load_start)
         if not fund:
             return {"ok": False, "error": "no fundamentals loaded"}
-        close, vol = await monthly_mod.load_frames(tickers, None)
         if close.empty:
             return {"ok": False, "error": "no candle data"}
 
@@ -482,6 +957,9 @@ async def backfill(start: str | None = None) -> dict:
         # replay June 1-29 against May's month-end ranking (facts public by
         # then), not sit idle until June's month-end. Point-in-time safe:
         # the prior frame only uses facts public by its own date.
+        # The frames honor the runtime-selected momentum variant (the UI
+        # dropdown) — the replay always models the strategy as configured.
+        settings.sim_daily_core_mom_variant = current_variant()
         prior_month_ends: list[pd.Timestamp] = []
         if months:
             prev = months[0] - pd.offsets.MonthEnd(1)
@@ -490,8 +968,12 @@ async def backfill(start: str | None = None) -> dict:
                 prior_month_ends.append(prev_idx[-1])
         frame_cache: dict[pd.Timestamp, pd.DataFrame | None] = {}
         for m in prior_month_ends + months:
+            if m in shared_frames:
+                frame_cache[m] = shared_frames[m]
+                continue
             frame_cache[m] = await asyncio.to_thread(
                 monthly_mod.eligible_frame, m, close, vol, fund)
+            shared_frames[m] = frame_cache[m]
         def _has_eligible(m: pd.Timestamp) -> bool:
             f = frame_cache[m]
             return f is not None and bool(f["eligible"].any())
@@ -550,8 +1032,45 @@ async def backfill(start: str | None = None) -> dict:
         def px_of(t: str, d: pd.Timestamp) -> float | None:
             return monthly_mod.px_at(close_val, d, t)
 
+        # Protection replay state (same §12-15 mechanisms as the live engine
+        # and the optimize backtest): independent deployment gate + gradient.
+        gate_sma, gradient_active, arm_sma = current_protection_config()
+        mkt_index = close_val.mean(axis=1)
+        mkt_gate_map = (mkt_index.rolling(max(gate_sma, 2)).mean()
+                        if gate_sma else None)
+        mkt_arm_map = (mkt_index.rolling(max(arm_sma, 2)).mean()
+                       if (gradient_active and arm_sma) else None)
+        prev_day_r: pd.Timestamp | None = None
+        grad_hist: list[float] = []
+        grad_neg = 0
+        grad_pos = 0
+        grad_out = False
+        # Target-vol control replay state: the portfolio's own
+        # contribution-adjusted daily returns, exactly as the live engine
+        # derives them from the snapshot history.
+        target_vol = current_target_vol()
+        port_rets: list[float] = []
+        prev_equity_close: float | None = None
+
+        def _above_map(sma_map: pd.Series | None, d: pd.Timestamp) -> bool:
+            if sma_map is None:
+                return True
+            sm = sma_map.get(d)
+            cu = mkt_index.get(d)
+            if sm is None or cu is None or not np.isfinite(sm) or not np.isfinite(cu):
+                return True
+            return bool(float(cu) >= float(sm))
+
+        def _market_ok_r(d: pd.Timestamp) -> bool:
+            return _above_map(mkt_gate_map, d)
+
+        def _market_armed_r(d: pd.Timestamp) -> bool:
+            return _above_map(mkt_arm_map, d)
+
         cur_month: int | None = None
+        deposited_months: set[str] = set()  # months the replay actually funded
         for d in idx:
+            contrib_today = 0.0
             # Point-in-time discipline: each day uses the ranking of the most
             # recent month-end AT OR BEFORE d (the frame computed from facts
             # public by then). Using a future month-end's frame would leak
@@ -567,12 +1086,18 @@ async def backfill(start: str | None = None) -> dict:
             band = set(order[:hold_band])
 
             # allowance: deposit on the first trading day of a new month
-            # (same timing as the live deposit_allowance)
+            # (same timing as the live deposit_allowance). Tracked so the
+            # persisted allowance rows match the deposits exactly — the old
+            # code derived them from ALL window months (1980+ for start=all),
+            # creating ~440 phantom $1k rows that inflated allowance_total
+            # to $550k and broke every contributed-normalized UI metric.
             if cur_month is None or d.month != cur_month:
                 cur_month = d.month
                 cash += settings.sim_monthly_contribution
                 contributed += settings.sim_monthly_contribution
+                contrib_today = settings.sim_monthly_contribution
                 n_contribs += 1
+                deposited_months.add(d.strftime("%Y-%m"))
 
             def do_buy(t: str, budget: float, day=d) -> None:
                 nonlocal cash
@@ -601,11 +1126,46 @@ async def backfill(start: str | None = None) -> dict:
                 del shares[t]
                 trades.append((day.strftime("%Y-%m-%d"), "SELL", t, notional, sh, p))
 
+            # --- protection overlays: independent gate + gradient arm ---
+            # The deployment gate (park buys) and the gradient arm (allow the
+            # cash-out only in good times) are separate, matching the backtest.
+            protect_ok = _market_ok_r(d) if gate_sma else True
+            # The chain is built every day regardless of the arm; only the
+            # TRIGGER is gated, and re-entry stays unconditional (as §15).
+            if gradient_active:
+                armed = _market_armed_r(d)
+                rets = []
+                for t in order[:target_n]:
+                    p0 = px_of(t, prev_day_r) if prev_day_r is not None else None
+                    p1 = px_of(t, d)
+                    if p0 and p1 and p0 > 0 and p1 > 0:
+                        rets.append(float(np.log(p1 / p0)))
+                day_ret = float(np.mean(rets)) if rets else 0.0
+                if not grad_hist:
+                    grad_hist.append(100.0)
+                grad_hist.append(grad_hist[-1] * float(np.exp(day_ret)))
+                if len(grad_hist) > _GRADIENT_DAYS:
+                    slope = grad_hist[-1] / grad_hist[-1 - _GRADIENT_DAYS] - 1.0
+                    if slope < 0:
+                        grad_neg, grad_pos = grad_neg + 1, 0
+                    elif slope > 0:
+                        grad_pos, grad_neg = grad_pos + 1, 0
+                    if not grad_out and armed and grad_neg >= _GRADIENT_CONFIRM:
+                        grad_out = True
+                    elif grad_out and grad_pos >= _GRADIENT_CONFIRM:
+                        grad_out = False
+                prev_day_r = d
+
             # SELL band releases (month-end rebuild only, as in the backtest)
             if d in months:
                 for t in list(shares):
                     if t not in band:
                         do_sell(t)
+
+            # gradient cash-out (confirmed negative slope in good times)
+            if gradient_active and grad_out and shares:
+                for t in list(shares):
+                    do_sell(t)
 
             equity = cash + sum((shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0)
                                 for t in shares)
@@ -614,15 +1174,24 @@ async def backfill(start: str | None = None) -> dict:
             # rank-deployment (boost=0): top up top-ranked names toward the
             # equal-weight target, best rank first. On month-end days the
             # full equal-weight rebuild also fills NEW names to weight.
-            if order:
+            # Blocked while the market gate says "bad times" (contributions
+            # park) — the gradient cash-out already emptied the book.
+            if order and protect_ok and not grad_out:
+                room = (_vol_deploy_room(equity, cash, port_rets, target_vol)
+                        if target_vol else float("inf"))
                 for t in order[:target_n]:
+                    if room < 1:
+                        break
                     p = px_of(t, d)
                     if p is None:
                         continue
                     cur = shares.get(t, 0.0) * p
                     gap = weight - cur
-                    if gap > 1 and cash > 1:
-                        do_buy(t, gap)
+                    budget = min(gap, room)
+                    if budget > 1 and cash > 1:
+                        cash_before = cash
+                        do_buy(t, budget)
+                        room -= max(cash_before - cash, 0.0)
 
             # daily snapshot (one point per day). The snapshot carries the
             # contributed total AS OF that day — persisting the final total
@@ -630,13 +1199,18 @@ async def backfill(start: str | None = None) -> dict:
             # (999/2000 on day 1 instead of 999/1000).
             equity_close = cash + sum((shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0)
                                       for t in shares)
+            if prev_equity_close is not None:
+                port_rets.append(_port_return(prev_equity_close, equity_close, contrib_today))
+            prev_equity_close = equity_close
             snaps.append((d.strftime("%Y-%m-%d"), equity_close, contributed))
 
         # --- persist the end state ---
-        # Allowance rows: one per month the replay actually deposited,
-        # derived from the replay's own month sequence (safer than a
-        # DateOffset sweep, which can drift across the trimmed start).
-        replay_months = sorted({d.strftime("%Y-%m") for d in idx})
+        # Allowance rows: one per month the replay ACTUALLY deposited (the
+        # in-loop tracked set). The old code used every month in the window
+        # — for start=all that included ~440 months before the first
+        # eligible ranking (1980+), creating phantom $1k rows that inflated
+        # allowance_total and broke every contributed-normalized metric.
+        replay_months = sorted(deposited_months)
         # The live engine deposits at the START of the month, so it may
         # already have deposited the CURRENT month while the replay window
         # has no candle for it yet (e.g. backfill on the 1st before the
@@ -667,8 +1241,11 @@ async def backfill(start: str | None = None) -> dict:
             for m in replay_months:
                 s.add(Al(amount=settings.sim_monthly_contribution, month=m))
             # Keep the account marker consistent so deposit_allowance() stays
-            # a no-op for the live month.
-            acc.last_allowance_month = live_allowance_month or replay_months[-1]
+            # a no-op for the live month. Never let it lag the newest inserted
+            # row, or the next live deposit would duplicate that month.
+            last_month = max(live_allowance_month or "",
+                             replay_months[-1] if replay_months else "")
+            acc.last_allowance_month = last_month or None
             for sd, eq, contrib_at_day in snaps:
                 # created_at = the replay day: the UI groups snapshots by
                 # this column's date, so synthetic history must carry the
@@ -683,7 +1260,7 @@ async def backfill(start: str | None = None) -> dict:
                 "end": str(idx[-1].date()), "requested_start": start_note,
                 "contributed": round(contributed, 2),
                 "final_equity": round(snaps[-1][1], 2), "trades": len(trades),
-                "snapshots": len(snaps)}
+                "snapshots": len(snaps), "mom_variant": current_variant()}
 
 
 async def run_daily_cycle(force: bool = False) -> dict:
@@ -723,6 +1300,15 @@ async def get_trades(limit: int = 100) -> list[dict]:
     return [{"ticker": r.ticker, "side": r.side, "shares": r.shares, "price": r.price,
              "cash_after": round(r.cash_after, 2), "reason": r.reason,
              "date": r.created_at.isoformat()} for r in rows]
+
+
+async def get_ranking_date() -> str | None:
+    """The stored ranking's date (YYYY-MM-DD), None before the first cycle —
+    lets the UI flag a stale band instead of presenting it as today's."""
+    from .db import DailyCoreRanking
+    async with Session() as s:
+        row = await s.get(DailyCoreRanking, 1)
+    return row.ranking_date.strftime("%Y-%m-%d") if row else None
 
 
 async def get_equity_curve(limit: int = 365) -> list[dict]:

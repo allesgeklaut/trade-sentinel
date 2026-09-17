@@ -1,6 +1,6 @@
-import json, logging, re
+import asyncio, json, logging, re
 from contextlib import asynccontextmanager
-from datetime import datetime, UTC
+from datetime import date, datetime, timedelta, UTC
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
@@ -9,15 +9,34 @@ from sqlalchemy import select
 from pydantic import BaseModel
 from .config import settings
 from .db import Watchlist, Session, init_db
-from .market import refresh, refresh_many, candles, search, info, provider, PERIOD_COUNTS
+from .market import refresh, refresh_many, refresh_yfinance, candles, search, info, provider, PERIOD_COUNTS
 from .analysis import compute, persist, history, MIN_CANDLES
-from .screener import universe_names, run, results, refresh_incremental, load_deep_history, get_screener_progress
+from .screener import universe_names, run, results, refresh_incremental, load_deep_history, get_screener_progress, ScreenerBusy
 from . import sim
 from . import news as news_mod
 from . import llm as llm_mod
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 logger = logging.getLogger("trade_sentinel.main")
+_WATCHLIST_REFRESH_PERIOD = "2y"
+_watchlist_prefetch_task: asyncio.Task | None = None
+_universe_prefetch_task: asyncio.Task | None = None
+
+# Serialises the four-portfolio backfill: concurrent clicks (or a click plus a
+# retry) would otherwise each queue all four multi-minute replays.
+_backfill_all_lock = asyncio.Lock()
+
+
+def _validated_start(start: str | None) -> str | None:
+    """Backfill ``start``: None, "all", or an ISO date. Reject anything else
+    with 422 here rather than a raw 500 from the backfill's pd.Timestamp."""
+    if start is None or start == "all":
+        return start
+    try:
+        date.fromisoformat(start)
+    except ValueError as e:
+        raise HTTPException(422, f"invalid start: {start!r} (use YYYY-MM-DD or 'all')") from e
+    return start
 
 # Uvicorn installs no handlers for the root logger, so app loggers
 # ("trade_sentinel.*") emit nothing at INFO: scheduler runs, allowance
@@ -28,9 +47,105 @@ logger = logging.getLogger("trade_sentinel.main")
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # httpx logs every request URL at INFO, which would echo provider API keys
+    # (and other query params) into the container logs. We use header auth, but
+    # keep this muted as defense-in-depth.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+async def _watchlist_tickers() -> list[str]:
+    async with Session() as s:
+        return [x.ticker for x in (await s.scalars(select(Watchlist).order_by(Watchlist.ticker))).all()]
+
+
+async def prefetch_watchlist() -> dict:
+    """Fetch the watchlist's candles into the cache via the configured provider.
+
+    App-level and nightly: the Dashboard then opens straight from the DB with no
+    network fetch. Shares the Twelve Data limiter/budget with the universe
+    prefetch, and skips tickers fetched within ``market_fresh_seconds`` — so the
+    usual overlap (mega-caps also in the S&P 500) costs nothing extra.
+    """
+    tickers = await _watchlist_tickers()
+    if not tickers:
+        return {"ok": True, "total": 0, "refreshed": 0, "errors": []}
+    refreshed, errors = await refresh_many(
+        tickers, _WATCHLIST_REFRESH_PERIOD, use_provider=True,
+        max_age_seconds=settings.market_fresh_seconds)
+    logger.info("Watchlist prefetch: %d/%d fetched, %d errors",
+                len(refreshed), len(tickers), len(errors))
+    return {"ok": True, "total": len(tickers), "refreshed": len(refreshed), "errors": errors}
+
+
+async def _watchlist_prefetch_loop() -> None:
+    """Run :func:`prefetch_watchlist` nightly at ``sim_run_hour`` (UTC).
+
+    Deliberately independent of ``SIM_ENABLED`` / ``SIM_UNIVERSE_PREFETCH``: the
+    watchlist is a Dashboard feature, not a sim feature. Scheduled after the
+    universe prefetch window so the two don't contend for the rate limiter.
+    Skipped on weekends/NYSE holidays (EOD data doesn't change then).
+    """
+    while True:
+        now = datetime.now(UTC)
+        target = now.replace(hour=settings.sim_run_hour, minute=settings.sim_run_minute,
+                             second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        logger.info("Watchlist prefetch: next run at %s (in %.0f seconds)", target, wait_seconds)
+        await asyncio.sleep(wait_seconds)
+        if not sim.is_trading_day(datetime.now(UTC)):
+            logger.info("Watchlist prefetch: %s is not a trading day — skipping",
+                        datetime.now(UTC).date())
+            continue
+        try:
+            await prefetch_watchlist()
+        except Exception as e:
+            logger.error("Watchlist prefetch failed: %s", e, exc_info=True)
+
+
+async def _universe_prefetch_loop() -> None:
+    """Prefetch the shared universe ``sim_prefetch_lead_minutes`` before the sim
+    run, then rescore the screener from those fresh candles.
+
+    App-level, NOT inside the sim scheduler: the Dashboard's screener table and
+    charts need fresh candles even when ``SIM_ENABLED`` is false. Gated by
+    ``sim_universe_prefetch``; the screener rescore only runs after a successful
+    prefetch (never re-stamps a stale cache as fresh).
+    """
+    while True:
+        now = datetime.now(UTC)
+        lead = max(0, settings.sim_prefetch_lead_minutes)
+        target = now.replace(hour=settings.sim_run_hour, minute=settings.sim_run_minute,
+                             second=0, microsecond=0) - timedelta(minutes=lead)
+        if target <= now:
+            target += timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        logger.info("Universe prefetch: next run at %s (in %.0f seconds)", target, wait_seconds)
+        await asyncio.sleep(wait_seconds)
+        if not sim.is_trading_day(datetime.now(UTC)):
+            logger.info("Universe prefetch: %s is not a trading day — skipping",
+                        datetime.now(UTC).date())
+            continue
+        try:
+            r = await sim.prefetch_universe()
+        except Exception as e:
+            logger.error("Universe prefetch failed: %s", e, exc_info=True)
+            continue  # don't rescore stale candles
+        if not r.get("ok"):
+            logger.warning("Universe prefetch: %s", r.get("reason"))
+            continue
+        if settings.screener_auto_rescore:
+            try:
+                from . import screener
+                res = await screener.rescore(r["universe"])
+                logger.info("Screener auto-rescore: %s", res)
+            except Exception as e:
+                logger.error("Screener auto-rescore failed: %s", e, exc_info=True)
+
 
 @asynccontextmanager
 async def lifespan(app):
+    global _watchlist_prefetch_task, _universe_prefetch_task
     await init_db()
     async with Session() as s:
         for t in settings.watchlist.split(','):
@@ -40,9 +155,19 @@ async def lifespan(app):
             if not await s.get(Watchlist, ticker):
                 s.add(Watchlist(ticker=ticker))
         await s.commit()
+    if settings.watchlist_prefetch:
+        _watchlist_prefetch_task = asyncio.create_task(_watchlist_prefetch_loop())
+    if settings.sim_universe_prefetch:
+        _universe_prefetch_task = asyncio.create_task(_universe_prefetch_loop())
     if settings.sim_enabled:
         sim.start_scheduler()
     yield
+    if _watchlist_prefetch_task and not _watchlist_prefetch_task.done():
+        _watchlist_prefetch_task.cancel()
+    _watchlist_prefetch_task = None
+    if _universe_prefetch_task and not _universe_prefetch_task.done():
+        _universe_prefetch_task.cancel()
+    _universe_prefetch_task = None
     if settings.sim_enabled:
         sim.stop_scheduler()
 app=FastAPI(title="Trade Sentinel",lifespan=lifespan)
@@ -60,7 +185,7 @@ async def security_headers(request, call_next):
 async def health(): return {"ok":True,"paper_trading":settings.paper_trading,"market_data_provider":provider()}
 @app.get('/api/watchlist')
 async def watchlist():
-    async with Session() as s: return [x.ticker for x in (await s.scalars(select(Watchlist).order_by(Watchlist.ticker))).all()]
+    return await _watchlist_tickers()
 @app.post('/api/watchlist/{ticker}')
 async def add(ticker:str):
     ticker=ticker.upper()
@@ -68,7 +193,15 @@ async def add(ticker:str):
         raise HTTPException(422, f"Invalid ticker symbol: {ticker!r}")
     async with Session() as s:
         if not await s.get(Watchlist,ticker): s.add(Watchlist(ticker=ticker)); await s.commit()
-    return {"ticker":ticker}
+    # Best-effort initial fetch so the new ticker charts immediately instead of
+    # waiting for a pull-to-refresh or the nightly prefetch. One Yahoo call.
+    try:
+        await refresh_yfinance(ticker, _WATCHLIST_REFRESH_PERIOD)
+        fetched = True
+    except Exception as e:
+        fetched = False
+        logger.warning("watchlist add: initial fetch failed for %s: %s", ticker, e)
+    return {"ticker":ticker,"fetched":fetched}
 @app.delete('/api/watchlist/{ticker}')
 async def remove(ticker:str):
     ticker=ticker.upper()
@@ -97,15 +230,23 @@ async def fetch(ticker:str, period:str|None=None):
 
 @app.post('/api/refresh-watchlist')
 async def refresh_watchlist(period: str = "2y"):
-    """Refresh candle data for every watchlist ticker. Returns per-ticker status."""
-    async with Session() as s:
-        tickers = [x.ticker for x in (await s.scalars(select(Watchlist).order_by(Watchlist.ticker))).all()]
+    """Refresh candle data for every watchlist ticker. Returns per-ticker status.
+
+    Uses the bulk Yahoo path (``refresh_many`` default), NOT the metered
+    provider: pull-to-refresh must be fast and free.
+    """
+    tickers = await _watchlist_tickers()
     refreshed, errors = await refresh_many(tickers, period)
     return {"refreshed": refreshed, "errors": errors, "total": len(tickers)}
 
 @app.post('/api/sim/refresh')
 async def sim_refresh(period: str = "2y"):
-    """Refresh candle data for all sim holdings + benchmark so valuations use live prices."""
+    """Refresh candle data for all sim holdings + benchmark so valuations use live prices.
+
+    Pull-to-refresh is a user gesture and must feel fast: this uses the free
+    Yahoo bulk path (unmetered), NOT the rate-limited provider. With the 8/min
+    Twelve Data plan, >8 holdings made one pull take a full minute.
+    """
     tickers = await sim.held_tickers()
     refreshed, errors = await refresh_many(tickers, period)
     return {"refreshed": refreshed, "errors": errors, "total": len(tickers)}
@@ -139,16 +280,19 @@ async def list_universes(): return universe_names()
 @app.post('/api/screener/run/{universe}')
 async def screen_run(universe:str):
     try: return await run(universe)
+    except ScreenerBusy as e: raise HTTPException(409, str(e)) from e
     except ValueError as e: raise HTTPException(404,str(e)) from e
 @app.post('/api/screener/refresh/{universe}')
 async def screen_refresh(universe: str):
     """Incrementally refresh candle data — only fetches tickers with missing or stale data."""
     try: return await refresh_incremental(universe)
+    except ScreenerBusy as e: raise HTTPException(409, str(e)) from e
     except ValueError as e: raise HTTPException(404, str(e)) from e
 @app.post('/api/screener/load_deep/{universe}')
 async def screen_load_deep(universe: str, period: str = '10y'):
     """Fetch deep history (default 10y) for all tickers — for optimization/backtest."""
     try: return await load_deep_history(universe, period)
+    except ScreenerBusy as e: raise HTTPException(409, str(e)) from e
     except ValueError as e: raise HTTPException(404, str(e)) from e
 @app.get('/api/screener/status')
 async def screener_status():
@@ -317,7 +461,7 @@ async def sim_status():
     val = await sim.valuate()
     await sim.deposit_allowance()  # ensures account exists
     return {**val, "sim_enabled": settings.sim_enabled, "sim_strategy": settings.sim_strategy,
-            "sim_universe": settings.sim_universe,
+            "sim_universe": sim._universe(),
             "benchmark_enabled": settings.sim_benchmark_enabled,
             "benchmark_ticker": settings.sim_benchmark_ticker}
 
@@ -327,7 +471,7 @@ async def sim_trades(limit: int = Query(default=100, ge=1, le=500)):
     return await sim.get_trades(limit)
 
 @app.get('/api/sim/equity')
-async def sim_equity(limit: int = Query(default=365, ge=1, le=1000)):
+async def sim_equity(limit: int = Query(default=365, ge=1, le=12000)):
     """Equity-curve snapshots for charting (oldest-first)."""
     return await sim.get_equity_curve(limit)
 
@@ -337,10 +481,10 @@ async def sim_allowances():
     return await sim.get_allowances()
 
 @app.get('/api/sim/benchmark')
-async def sim_benchmark():
+async def sim_benchmark(limit: int = Query(default=365, ge=1, le=12000)):
     """DCA benchmark portfolio status + equity curve."""
     val = await sim.benchmark_valuate()
-    curve = await sim.get_benchmark_equity_curve(365)
+    curve = await sim.get_benchmark_equity_curve(limit)
     return {**val, "equity_curve": curve}
 
 @app.post('/api/sim/run')
@@ -366,6 +510,120 @@ async def sim_run_status():
     """
     return sim.get_run_progress()
 
+@app.post('/api/sim/backfill')
+async def sim_backfill(start: str | None = Query(default=None)):
+    """Backfill the daily sim with a DETERMINISTIC synthetic history.
+
+    Replays the engine's own rules (no LLM calls — the hybrid live strategy's
+    LLM overlay cannot be replayed) over stored candles/fundamentals and
+    REPLACES the portfolio state with the replay's end state. An
+    approximation by design; the response carries approximation: true.
+    """
+    from . import sim
+    r = await sim.backfill(_validated_start(start))
+    if r.get("skipped"):
+        raise HTTPException(409, r.get("reason", "skipped"))
+    if not r.get("ok"):
+        raise HTTPException(400, r.get("error", "backfill failed"))
+    return r
+
+@app.post('/api/sim/backfill-benchmark')
+async def sim_backfill_benchmark(start: str | None = Query(default=None)):
+    """Backfill the DCA benchmark curve (URTH $1000/month) over historical
+    candles. The twin of the other backfills so all four curves can cover
+    the same window. ``start``: date | "all" | default = synced."""
+    from . import sim
+    r = await sim.backfill_benchmark(_validated_start(start))
+    if not r.get("ok"):
+        raise HTTPException(400, r.get("error", "backfill failed"))
+    return r
+
+@app.post('/api/backfill-all')
+async def backfill_all(start: str | None = Query(default=None)):
+    """Backfill ALL FOUR portfolios over the SAME window — the shared-range
+    button. Resolves the start ONCE (explicit "YYYY-MM-DD", "all" for the
+    full history, or default = the earliest snapshot across the other
+    portfolios so the curves stay synced), then runs every backfill with
+    that same window:
+
+      daily sim (deterministic approximation) · monthly qv-mom ·
+      daily-core (selected variant) · DCA benchmark (URTH).
+
+    Each backfill replaces its portfolio's state. Runs the slowest first
+    (daily sim ~minutes) so an early failure doesn't leave the others
+    wiped-then-unfilled; results are reported per portfolio. This is a
+    long operation (several minutes) — the caller gets everything in one
+    response when it finishes.
+    """
+    start = _validated_start(start)
+    if _backfill_all_lock.locked():
+        raise HTTPException(409, "a backfill-all is already running")
+    async with _backfill_all_lock:
+        return await _backfill_all_locked(start)
+
+
+async def _backfill_all_locked(start: str | None) -> dict:
+    from . import daily_core, monthly, sim
+
+    # Resolve the shared window ONCE. The per-backfill defaults would each
+    # pick their own sync date (and wipe their own snapshots mid-run), so
+    # the coordinator pins one start for everyone.
+    #
+    # "all" is passed through as the literal "all" — each backfill maps it to
+    # ITS own full stored history (None internally). Passing None here would
+    # mean "synced window" to every backfill, so the full-history button would
+    # silently replay the short synced range instead (the bug this fixes).
+    if start == "all":
+        effective = "all"
+        start_note = "full stored history"
+    elif start is None:
+        resolved = await daily_core._sync_start_date()
+        effective = resolved
+        start_note = resolved or "first eligible window"
+    else:
+        effective = start
+        start_note = start
+
+    # The monthly and daily-core replays run on the same universe, window and
+    # momentum variant, so they share one preload: the fundamentals and the
+    # per-month-end eligibility frames (the expensive part) are built once and
+    # reused. daily_sim runs first (slowest, and it doesn't use qv-mom frames).
+    # Each replay holds its own cycle lock while it runs, so a scheduled cycle
+    # can't interleave *within* a replay; the four run sequentially and this
+    # coordinator holds no lock across them, so a nightly tick can still fire
+    # between two replays.
+    out: dict[str, dict] = {}
+    errors: dict[str, str] = {}
+    preload: dict = {}
+
+    async def _monthly_backfill():
+        # preload_backfill takes a real date or None (= load everything);
+        # backfill() takes "all" as its full-history sentinel.
+        preload_start = None if effective == "all" else effective
+        preload["v"] = await monthly.preload_backfill(preload_start)
+        return await monthly.backfill(effective, preload=preload["v"])
+
+    async def _daily_core_backfill():
+        return await daily_core.backfill(effective, preload=preload.get("v"))
+
+    for name, fn in (
+        ("daily_sim", lambda: sim.backfill(effective)),
+        ("monthly", _monthly_backfill),
+        ("daily_core", _daily_core_backfill),
+        ("benchmark", lambda: sim.backfill_benchmark(effective)),
+    ):
+        try:
+            out[name] = await fn()
+        except Exception:
+            logger.exception("backfill-all: %s failed", name)
+            # Don't return internal exception text to the client; the detail
+            # is in the server log.
+            errors[name] = f"{name} backfill failed (see server logs)"
+
+    return {"ok": not errors, "start": start_note,
+            "requested_start": start or "synced (earliest of the other sims)",
+            "results": out, "errors": errors}
+
 @app.get('/api/sim/reasoning')
 async def sim_reasoning():
     """Return structured LLM reasoning summary from the most recent sim cycle."""
@@ -384,6 +642,7 @@ async def sim_raw_reasoning():
 async def monthly_status():
     """Monthly portfolio snapshot: cash, positions, equity, config."""
     from . import monthly
+    from . import daily_core
     # Deposit the allowance when a new month has begun (start-of-month, same
     # timing as the sim portfolio) so viewing the tab reflects the deposit
     # immediately instead of waiting for the nightly scheduler pass. Skipped
@@ -393,7 +652,7 @@ async def monthly_status():
     val = await monthly.monthly_valuate()
     return {**val,
             "sim_monthly_enabled": settings.sim_monthly_enabled,
-            "sim_monthly_universe": settings.sim_monthly_universe,
+            "sim_monthly_universe": daily_core.current_universe(),
             "sim_monthly_contribution": settings.sim_monthly_contribution,
             "sim_monthly_target_n": settings.sim_monthly_target_n,
             "next_rebalance": monthly.month_last_trading_day(datetime.now(UTC)).strftime("%Y-%m-%d")}
@@ -405,10 +664,27 @@ async def monthly_trades(limit: int = Query(default=100, ge=1, le=500)):
     return await monthly.get_trades(limit)
 
 @app.get('/api/monthly/equity')
-async def monthly_equity(limit: int = Query(default=365, ge=1, le=1000)):
+async def monthly_equity(limit: int = Query(default=365, ge=1, le=12000)):
     """Monthly portfolio equity-curve snapshots (oldest-first)."""
     from . import monthly
     return await monthly.get_equity_curve(limit)
+
+@app.post('/api/monthly/backfill')
+async def monthly_backfill(start: str | None = Query(default=None)):
+    """Backfill the monthly portfolio with synthetic history.
+
+    Replays the qv-mom strategy over stored candles/fundamentals to today
+    and REPLACES the portfolio state with the replay's end state — the
+    monthly twin of /api/dailycore/backfill, so all three equity curves can
+    cover the same (full) window for comparison.
+
+    ``start``: "YYYY-MM-DD" to replay from that date, "all" for the full
+    stored history, or omit (default) to synch with the daily sim's
+    earliest snapshot.
+    """
+    from . import monthly
+    return await monthly.backfill(_validated_start(start))
+
 
 @app.get('/api/monthly/rebalances')
 async def monthly_rebalances(limit: int = Query(default=24, ge=1, le=120)):
@@ -434,6 +710,8 @@ async def monthly_refresh():
     async with monthly.Session() as s:
         held = [p.ticker for p in (await s.scalars(select(monthly.MonthlyPosition))).all()]
     pairs = sorted({pm[0] for t in held if (pm := monthly.fundamentals_mod._suffix_fx(t))})
+    # Held-only pull-to-refresh: free Yahoo bulk path (fast, unmetered). FX pairs
+    # are Yahoo symbols (EURUSD=X) anyway, so the provider path just 404'd them.
     refreshed, errors = await refresh_many(held + pairs, "2y")
     return {"refreshed": refreshed, "errors": errors}
 
@@ -455,7 +733,126 @@ async def daily_core_status():
         "sim_daily_core_enabled": settings.sim_daily_core_enabled,
         "band": band,
         "picks": picks,
+        "ranking_date": await daily_core.get_ranking_date(),
+        # rank map {ticker: 1-based rank} so the UI can show each holding's
+        # position in the ranking, not just the bare band list.
+        "rank_map": {t: i + 1 for i, t in enumerate(band)},
+        # runtime-selectable momentum variant + the options (UI dropdown)
+        "mom_variant": daily_core.current_variant(),
+        "mom_variants": daily_core.STRATEGY_VARIANTS,
+        "gate": daily_core.current_gate(),
+        "gates": daily_core.GATE_MODES,
+        "gradient": daily_core.current_gradient(),
+        "gradients": daily_core.GRADIENT_MODES,
+        "target_vol": daily_core.current_target_vol(),
+        "target_vols": daily_core.TARGET_VOL_MODES,
+        # runtime-selectable qv-mom universe + the options (UI dropdown)
+        "universe": daily_core.current_universe(),
+        "universes": universe_names(),
     }
+
+@app.post('/api/dailycore/strategy')
+async def daily_core_strategy(req: dict):
+    """Select the daily-core momentum variant at runtime (persisted across
+    restarts). Body: {"variant": "raw" | "residual"}.
+
+    The choice drives the NEXT ranking recompute (nightly cycle or a manual
+    "Run Cycle Now") and every future backfill. It does NOT rewrite stored
+    history: re-run the backfill after switching to see the new variant's
+    synthetic track record.
+    """
+    from . import daily_core
+    variant = (req or {}).get("variant", "")
+    try:
+        daily_core.set_variant(variant)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    # Invalidate the stored ranking: it was computed under the previous
+    # variant, and the next cycle must recompute under the new one.
+    from .db import DailyCoreRanking
+    from sqlalchemy import delete as sa_delete
+    async with Session() as s:
+        await s.execute(sa_delete(DailyCoreRanking))
+        await s.commit()
+    return {"ok": True, "variant": variant,
+            "label": daily_core.STRATEGY_VARIANTS[variant]}
+
+@app.post('/api/dailycore/gate')
+async def daily_core_gate(req: dict):
+    """Set the daily-core DEPLOYMENT GATE at runtime (persisted).
+    Body: {"mode": "off" | "200" | "100" | "50"}.
+
+    While the market index is below its N-day SMA the gate parks new buys
+    (contributions stay in cash). It does NOT sell. Drives the next cycle and
+    every future backfill.
+    """
+    from . import daily_core
+    mode = (req or {}).get("mode", "")
+    try:
+        daily_core.set_gate(mode)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    return {"ok": True, "mode": mode, "label": daily_core.GATE_MODES[mode]}
+
+@app.post('/api/dailycore/gradient')
+async def daily_core_gradient(req: dict):
+    """Set the daily-core GRADIENT CASH-OUT arm at runtime (persisted).
+    Body: {"mode": "off" | "always" | "200" | "100" | "50"}.
+
+    On a confirmed negative slope of the target basket the book is sold to
+    cash; "always" fires ungated, an SMA value arms it only in good times
+    (market above that SMA). Re-entry is unconditional (no cooldown). Drives
+    the next cycle and every future backfill.
+    """
+    from . import daily_core
+    mode = (req or {}).get("mode", "")
+    try:
+        daily_core.set_gradient(mode)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    return {"ok": True, "mode": mode, "label": daily_core.GRADIENT_MODES[mode]}
+
+@app.post('/api/dailycore/targetvol')
+async def daily_core_targetvol(req: dict):
+    """Set the daily-core target-volatility control at runtime (persisted).
+    Body: {"mode": "off" | "0.10" | "0.15" | "0.20" | "0.25"}.
+
+    When the portfolio's own 21d realized vol exceeds the target, new cash is
+    parked instead of deployed (never sells, never leverages). Drives the next
+    deployment pass and every future backfill.
+    """
+    from . import daily_core
+    mode = (req or {}).get("mode", "")
+    try:
+        daily_core.set_target_vol(mode)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    return {"ok": True, "mode": mode, "label": daily_core.TARGET_VOL_MODES[mode]}
+
+@app.post('/api/sim/universe')
+async def sim_universe(req: dict):
+    """Set the universe for ALL sims at runtime (persisted).
+    Body: {"universe": "<name from /api/screener/universes>"}.
+
+    The single Dashboard control writes this. It drives the daily sim, the
+    monthly qv-mom portfolio and the daily-core portfolio, plus every future
+    backfill. It does NOT rewrite stored history — re-run a backfill after
+    switching to see the new universe's track record.
+    """
+    from . import daily_core
+    name = (req or {}).get("universe", "")
+    try:
+        daily_core.set_universe(name)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    # The stored daily-core ranking was computed on the previous universe;
+    # drop it so the next cycle recomputes on the new one.
+    from .db import DailyCoreRanking
+    from sqlalchemy import delete as sa_delete
+    async with Session() as s:
+        await s.execute(sa_delete(DailyCoreRanking))
+        await s.commit()
+    return {"ok": True, "universe": name}
 
 @app.get('/api/dailycore/trades')
 async def daily_core_trades(limit: int = Query(default=100, ge=1, le=500)):
@@ -463,7 +860,7 @@ async def daily_core_trades(limit: int = Query(default=100, ge=1, le=500)):
     return await daily_core.get_trades(limit)
 
 @app.get('/api/dailycore/equity')
-async def daily_core_equity(limit: int = Query(default=365, ge=1, le=1000)):
+async def daily_core_equity(limit: int = Query(default=365, ge=1, le=12000)):
     from . import daily_core
     return await daily_core.get_equity_curve(limit)
 
@@ -486,6 +883,8 @@ async def daily_core_refresh():
         held = [p.ticker for p in (await s.scalars(select(DailyCorePosition))).all()]
     pairs = sorted({pm[0] for t in held
                     if (pm := daily_core.monthly_mod.fundamentals_mod._suffix_fx(t))})
+    # Held-only pull-to-refresh: free Yahoo bulk path (fast, unmetered). FX pairs
+    # are Yahoo symbols (EURUSD=X) anyway, so the provider path just 404'd them.
     refreshed, errors = await refresh_many(held + pairs, "2y")
     return {"refreshed": refreshed, "errors": errors, "total": len(refreshed) + len(errors)}
 
@@ -503,7 +902,7 @@ async def daily_core_backfill(start: str | None = Query(default=None)):
     portfolios so all three equity curves cover the same window.
     """
     from . import daily_core
-    r = await daily_core.backfill(start)
+    r = await daily_core.backfill(_validated_start(start))
     if not r.get("ok"):
         raise HTTPException(400, r.get("error", "backfill failed"))
     return r

@@ -1,6 +1,9 @@
-from datetime import datetime
+from datetime import datetime, UTC
 import asyncio
 import logging
+from collections import deque
+from pathlib import Path
+import time
 import httpx
 import numpy as np
 import pandas as pd
@@ -13,11 +16,107 @@ from .config import settings
 logger = logging.getLogger("trade_sentinel.market")
 
 
+def _twelve_key() -> str:
+    """Twelve Data API key: TWELVE_DATA_API_KEY, else the file named by
+    TWELVE_DATA_API_KEY_FILE (a read-only secret mount — the preferred source,
+    so the key is never committed to the repo or duplicated in .env)."""
+    key=(settings.twelve_data_api_key or "").strip()
+    if key: return key
+    path=(settings.twelve_data_api_key_file or "").strip()
+    if not path: return ""
+    try:
+        return Path(path).read_text().strip()
+    except OSError as e:
+        logger.warning("Could not read Twelve Data key file %s: %s",path,e)
+        return ""
+
+def _twelve_headers() -> dict[str, str]:
+    """Auth header for Twelve Data. The key goes in ``Authorization: apikey
+    <key>`` rather than the query string so it never lands in request logs
+    (httpx logs the URL at INFO)."""
+    return {"Authorization": f"apikey {_twelve_key()}"}
+
+
+class _TwelveLimiter:
+    """Per-minute rate limiter + daily budget for Twelve Data.
+
+    The Basic plan allows 8 credits/min and 800/day; exceeding either returns
+    429. ``acquire()`` waits for a per-minute slot and returns False once the
+    day's budget is spent, so callers fall back to yfinance instead of
+    hammering a limited endpoint. One instance guards every Twelve Data call.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._calls: deque[float] = deque()
+        self._day = None
+        self._used = 0
+
+    async def acquire(self) -> bool:
+        # Wait for a per-minute slot WITHOUT holding the lock while sleeping:
+        # callers may arrive concurrently (refresh_many runs 4 workers), and
+        # blocking them all behind one sleeper turned a 60s throttle into an
+        # unbounded stall for unrelated callers. Loop and re-check the slot.
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                today = datetime.now(UTC).date()
+                if self._day != today:
+                    self._day, self._used = today, 0
+                    self._calls.clear()
+                if self._used >= max(1, settings.twelve_data_daily_budget):
+                    return False
+                limit = max(1, settings.twelve_data_max_per_min)
+                while self._calls and now - self._calls[0] >= 60:
+                    self._calls.popleft()
+                if len(self._calls) < limit:
+                    self._calls.append(now)
+                    self._used += 1
+                    return True
+                wait = 60 - (now - self._calls[0]) + 0.05
+            await asyncio.sleep(max(wait, 0.01))
+
+
+_twelve_limiter = _TwelveLimiter()
+
+# Ticker → time.monotonic() of the last successful candle store. Lets a nightly
+# universe prefetch be reused: the sim/day-core cycles skip tickers fetched
+# within `market_fresh_seconds` instead of pulling them again. Process-local
+# (the scheduler and the cycles share one event loop); a restart just refetches.
+_fresh_at: dict[str, float] = {}
+
+
+def _mark_fresh(ticker: str) -> None:
+    _fresh_at[ticker] = time.monotonic()
+
+
+def fresh_count() -> int:
+    return len(_fresh_at)
+
+
+def _is_fresh(ticker: str, max_age_seconds: float, now: float) -> bool:
+    return (now - _fresh_at.get(ticker, float("-inf"))) < max_age_seconds
+
+
 def provider():
-    value=settings.market_data_provider.lower().strip()
-    if value not in {"yfinance","twelvedata"}: raise ValueError("MARKET_DATA_PROVIDER must be yfinance or twelvedata")
-    if value=="twelvedata" and not settings.twelve_data_api_key: raise ValueError("TWELVE_DATA_API_KEY is required when MARKET_DATA_PROVIDER=twelvedata")
-    return value
+    """Primary market-data source.
+
+    ``MARKET_DATA_PROVIDER``:
+      - ``yfinance``  → always Yahoo Finance (no key needed)
+      - ``twelvedata``→ Twelve Data (a key is required)
+      - ``auto`` (default) → Twelve Data when a key is configured, else yfinance
+
+    When Twelve Data is primary, :func:`refresh`/:func:`info`/:func:`search`
+    fall back to yfinance per request if Twelve Data has no data for that
+    ticker (unknown symbol, rate/plan limit, network error).
+    """
+    value=settings.market_data_provider.lower().strip() or "auto"
+    if value not in {"auto","yfinance","twelvedata"}: raise ValueError("MARKET_DATA_PROVIDER must be auto, yfinance or twelvedata")
+    if value=="yfinance": return "yfinance"
+    if not _twelve_key():
+        if value=="twelvedata": raise ValueError("TWELVE_DATA_API_KEY is required when MARKET_DATA_PROVIDER=twelvedata")
+        return "yfinance"
+    return "twelvedata"
 
 # Range presets: key → (yfinance period, twelvedata outputsize)
 RANGES = {
@@ -70,25 +169,69 @@ def yahoo_info(ticker):
 def yahoo_search(q):
     quotes=yf.Search(q,max_results=8,news_count=0,lists_count=0,enable_fuzzy_query=True,raise_errors=True).quotes
     return [{"symbol":x.get("symbol"),"name":x.get("shortname") or x.get("longname") or x.get("symbol"),"exchange":x.get("exchDisp") or x.get("exchange",""),"country":x.get("region", ""),"type":x.get("quoteType","")} for x in quotes if x.get("symbol")]
+async def _twelve_history(ticker: str, outputsize: int) -> list[dict]:
+    """Twelve Data daily OHLCV, split+dividend adjusted.
+
+    ``adjust=all`` matches yfinance's ``auto_adjust=True`` so the 12-1
+    momentum (which assumes adjusted closes) stays consistent across sources.
+    Raises ValueError on an API error, missing candles or malformed payloads
+    so callers can fall back to yfinance.
+    """
+    async with httpx.AsyncClient(timeout=20) as c:
+        data=(await c.get("https://api.twelvedata.com/time_series",params={
+            "symbol":ticker,"interval":"1day","outputsize":outputsize,
+            "adjust":"all"},headers=_twelve_headers())).json()
+    if not isinstance(data, dict) or data.get("status")=="error" or "values" not in data:
+        msg = data.get("message","market-data response had no candles") if isinstance(data, dict) else "malformed market-data response"
+        raise ValueError(msg)
+    values=[{"timestamp":datetime.fromisoformat(x["datetime"]),"open":float(x["open"]),"high":float(x["high"]),"low":float(x["low"]),"close":float(x["close"]),"volume":float(x.get("volume") or 0)} for x in data["values"]]
+    if not values: raise ValueError(f"No Twelve Data daily data for {ticker}")
+    return values
+
 async def info(ticker):
-    if provider()=="yfinance": return await asyncio.to_thread(yahoo_info,ticker)
-    async with httpx.AsyncClient(timeout=10) as c:
-        data=(await c.get("https://api.twelvedata.com/profile",params={"symbol":ticker,"apikey":settings.twelve_data_api_key})).json()
-    return data.get("name","") if data.get("status")!="error" else ""
+    """Human-readable company name for a ticker.
+
+    Always Yahoo Finance, regardless of the candle provider — same rationale as
+    :func:`search`. A display name is cosmetic, so it must never consume the
+    metered provider's per-minute/day budget (8/min, shared with the nightly
+    universe prefetch and the sims). Doing so made the watchlist render wait on
+    a 60s rate-limit slot for every 9th ticker. Yahoo serves names for free and
+    uses the app's canonical symbol form (e.g. ``IFX.DE``).
+    """
+    return await asyncio.to_thread(yahoo_info,ticker)
 
 async def search(q):
-    if provider()=="yfinance": return await asyncio.to_thread(yahoo_search,q)
-    async with httpx.AsyncClient(timeout=10) as c: data=(await c.get("https://api.twelvedata.com/symbol_search",params={"symbol":q,"outputsize":8,"apikey":settings.twelve_data_api_key})).json()
-    if data.get("status")=="error": raise ValueError(data.get("message","Symbol search failed"))
-    return [{"symbol":x.get("symbol"),"name":x.get("instrument_name",x.get("symbol")),"exchange":x.get("exchange",""),"country":x.get("country",""),"type":x.get("instrument_type","")} for x in data.get("data",[])]
+    """Ticker/company autocomplete.
+
+    Always Yahoo Finance, regardless of the candle provider. Yahoo symbols are
+    this app's canonical ticker form (universes, watchlist, EDGAR, cached
+    candles all use them, e.g. ``IFX.DE``), and yf.Search is fuzzy and returns
+    one row per symbol. Twelve Data's symbol_search returns its OWN
+    exchange-scoped symbols (``IFX`` repeated per exchange, with no match for
+    ``ifx.de``) that would not resolve elsewhere in the app, so it is not used
+    here even when it is the primary candle source.
+    """
+    return await asyncio.to_thread(yahoo_search,q)
+
 async def refresh(ticker, period="2y"):
     if period not in RANGES: raise ValueError(f"Unsupported range: {period}")
     yf_period, td_output = RANGES[period]
-    if provider()=="yfinance": values=await asyncio.to_thread(yahoo_history,ticker,yf_period)
+    if provider()=="yfinance":
+        values=await asyncio.to_thread(yahoo_history,ticker,yf_period)
+    elif await _twelve_limiter.acquire():
+        try:
+            values=await _twelve_history(ticker,td_output)
+        except Exception as e:
+            logger.warning("twelvedata refresh failed for %s (%s) — falling back to yfinance",ticker,e)
+            values=await asyncio.to_thread(yahoo_history,ticker,yf_period)
     else:
-        async with httpx.AsyncClient(timeout=20) as c: data=(await c.get("https://api.twelvedata.com/time_series",params={"symbol":ticker,"interval":"1day","outputsize":td_output,"apikey":settings.twelve_data_api_key})).json()
-        if data.get("status")=="error" or "values" not in data: raise ValueError(data.get("message","market-data response had no candles"))
-        values=[{"timestamp":datetime.fromisoformat(x["datetime"]),"open":float(x["open"]),"high":float(x["high"]),"low":float(x["low"]),"close":float(x["close"]),"volume":float(x.get("volume") or 0)} for x in data["values"]]
+        # Daily budget spent — yfinance for the rest of the day.
+        values=await asyncio.to_thread(yahoo_history,ticker,yf_period)
+    await _store_candles(ticker, values)
+    _mark_fresh(ticker)
+
+async def _store_candles(ticker, values):
+    """Upsert normalized candles for one ticker."""
     async with Session() as s:
         if values:
             stmt = sqlite_insert(Candle).values(
@@ -106,6 +249,19 @@ async def refresh(ticker, period="2y"):
             )
             await s.execute(stmt)
         await s.commit()
+
+async def refresh_yfinance(ticker, period="2y"):
+    """Always Yahoo Finance, ignoring the configured provider.
+
+    Used by the bulk paths that must NOT touch the metered provider (the
+    screener's universe update/refresh/deep-load, and the daily sim/day-core
+    universe refreshes when they don't reuse the nightly prefetch). One S&P 500
+    pass is ~500 requests; Yahoo is free and unmetered for this.
+    """
+    if period not in RANGES: raise ValueError(f"Unsupported range: {period}")
+    yf_period, _ = RANGES[period]
+    await _store_candles(ticker, await asyncio.to_thread(yahoo_history,ticker,yf_period))
+    _mark_fresh(ticker)
 async def candles(ticker, period=None):
     async with Session() as s:
         rows=(await s.scalars(select(Candle).where(Candle.ticker==ticker).order_by(Candle.timestamp))).all()
@@ -121,19 +277,47 @@ async def candles(ticker, period=None):
 PERIOD_COUNTS = {"6m":126,"2y":504,"5y":1260,"10y":2520,"max":5000}
 
 
-async def refresh_many(tickers, period="2y", *, concurrency: int = 4, on_result=None, work=None):
+async def latest_close(ticker: str) -> float | None:
+    """Most recent cached close for a ticker, or None.
+
+    A single-row query: valuation only needs the last bar, and loading a
+    broad-universe ticker's entire history (decades) to read its final value
+    was what made /api/sim/status slow.
+    """
+    async with Session() as s:
+        row = await s.scalar(select(Candle.close).where(Candle.ticker == ticker)
+                             .order_by(Candle.timestamp.desc()).limit(1))
+    return float(row) if row is not None else None
+
+
+async def refresh_many(tickers, period="2y", *, concurrency: int = 4, on_result=None, work=None,
+                       use_provider: bool = False, max_age_seconds: float | None = None):
     """Refresh candle data for many tickers with bounded concurrency.
 
     Input is deduplicated while preserving order. Returns ``(refreshed,
     errors)`` where errors are "TICKER: message" strings and ``refreshed``
-    lists the tickers that completed without error, in input order (not
-    completion order). ``on_result(ticker, ok, error_or_None)`` fires after
-    each ticker completes — success or failure — so callers can update
-    progress UI while the batch is still running. Pass ``work`` to run a
-    custom per-ticker coroutine instead of :func:`refresh` (used by the
-    screener to bundle per-symbol scoring with the fetch).
+    lists the tickers that are usable afterwards (fetched OK, or skipped as
+    fresh), in input order — not completion order. ``on_result(ticker, ok,
+    error_or_None)`` fires after each ticker is handled.
+
+    The default per-ticker fetch is :func:`refresh_yfinance` (Yahoo), NOT the
+    configured provider: this primitive is for universe-sized batches. Pass
+    ``use_provider=True`` to use the configured provider (``refresh``) instead —
+    the nightly prefetch does this so Twelve Data serves where it has data, and
+    the limiter paces/falls back so it can't overrun the quota.
+
+    ``max_age_seconds`` skips tickers already fetched within that window (see
+    the fresh map), so the sim/day-core cycles reuse the nightly prefetch
+    instead of re-pulling the whole universe. Pass ``work`` to run a custom
+    per-ticker coroutine (the screener bundles per-symbol scoring with the
+    fetch).
     """
     ordered = list(dict.fromkeys(tickers))
+    skipped: set[str] = set()
+    if max_age_seconds is not None:
+        now = time.monotonic()
+        skipped = {t for t in ordered if _is_fresh(t, max_age_seconds, now)}
+    pending = [t for t in ordered if t not in skipped]
     semaphore = asyncio.Semaphore(max(1, concurrency))
     errors: list[str] = []
     ok_flags: dict[str, bool] = {}
@@ -144,8 +328,10 @@ async def refresh_many(tickers, period="2y", *, concurrency: int = 4, on_result=
             try:
                 if work is not None:
                     await work(ticker)
-                else:
+                elif use_provider:
                     await refresh(ticker, period)
+                else:
+                    await refresh_yfinance(ticker, period)
             except Exception as e:
                 err = str(e)
                 errors.append(f"{ticker}: {e}")
@@ -154,6 +340,6 @@ async def refresh_many(tickers, period="2y", *, concurrency: int = 4, on_result=
         if on_result is not None:
             on_result(ticker, err is None, err)
 
-    await asyncio.gather(*(_one(t) for t in ordered))
-    refreshed = [t for t in ordered if ok_flags.get(t)]
+    await asyncio.gather(*(_one(t) for t in pending))
+    refreshed = [t for t in ordered if t in skipped or ok_flags.get(t)]
     return refreshed, errors

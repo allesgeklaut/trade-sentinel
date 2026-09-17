@@ -1,19 +1,60 @@
 # Trade Sentinel MVP
 
-A self-hosted, paper-only stock research dashboard. Market data is switched globally with **one environment variable**; all providers normalize historical daily OHLCV data into the same local SQLite cache, so charts, signals, autocomplete, and screening use the selected backend consistently.
+A self-hosted, paper-only stock research dashboard. Market data is switched globally with **one environment variable**; all providers normalize historical daily OHLCV data into the same local SQLite cache, so charts, signals, and screening use the selected backend consistently (ticker autocomplete always uses Yahoo symbols — see below).
 
 ![Desktop screenshot: AAPL chart with BUY signal, key metric chips and local screener](docs/screenshot-desktop.jpg)
 
 ## Choose a provider
 
 ```dotenv
-# Default: free/best-effort US + international coverage, including Yahoo symbols such as IFX.DE and OMV.VI
-MARKET_DATA_PROVIDER=yfinance
+# auto (default): Twelve Data when TWELVE_DATA_API_KEY is set, else yfinance
+MARKET_DATA_PROVIDER=auto
 
-# Alternative: requires an API key; Basic coverage is mainly US equities/ETFs, forex and crypto
+# Add a key to make Twelve Data the primary source. Tickers it cannot serve
+# (unknown symbol, rate/plan limit, outage) automatically fall back to yfinance.
+# Prefer a secret file over the inline env var (see below).
+TWELVE_DATA_API_KEY=your_key
+TWELVE_DATA_API_KEY_FILE=/run/secrets/twelvedata.key
+
+# Force a single source instead:
+# MARKET_DATA_PROVIDER=yfinance
 # MARKET_DATA_PROVIDER=twelvedata
-# TWELVE_DATA_API_KEY=your_key
 ```
+
+**Keeping the key out of the repo.** The key is read from
+`TWELVE_DATA_API_KEY_FILE` when `TWELVE_DATA_API_KEY` is empty. The provided
+`docker-compose.yml` mounts `/opt/secrets/twelvedata.key` (chmod `600`) read-only
+into the container, exactly like the LiteLLM key, so the secret never lives in
+`.env` or in git:
+
+```bash
+printf '%s\n' 'your_key' > /opt/secrets/twelvedata.key && chmod 600 /opt/secrets/twelvedata.key
+```
+
+With `auto`, `yfinance` is used until a `TWELVE_DATA_API_KEY` is present; then
+Twelve Data becomes primary and each request that it cannot satisfy (unknown
+symbol or unavailable ticker) is served by yfinance for that ticker. Both
+sources are normalized to the same adjusted-close OHLCV cache, so switching
+between them does not change the indicators.
+
+**Bulk vs single-ticker.** Only single-ticker lookups (charts, adding to the
+watchlist, live valuations) use the configured provider. Every **multi-ticker
+batch** — the screener's Update/Refresh/Load-10y, and the sim / monthly /
+daily-core universe refreshes — always uses yfinance. A single S&P 500 pass is
+~500 requests, which would exceed the Twelve Data Basic plan's 800/day cap
+(8/min) on its own; Yahoo is free and unmetered for that. Ticker autocomplete
+also always uses Yahoo symbols (see below), regardless of provider.
+
+**Nightly shared universe prefetch.** All three sims share one universe, so it
+is fetched **once**, `SIM_PREFETCH_LEAD_MINUTES` (default 90) before the
+scheduled run, and the cycles then read the DB and skip anything fetched within
+`MARKET_FRESH_SECONDS`. The prefetch uses the configured provider, so with
+`auto` Twelve Data serves the tickers it has — **paced to
+`TWELVE_DATA_MAX_PER_MIN` (8) and capped at `TWELVE_DATA_DAILY_BUDGET` (750)**
+to stay inside the Basic plan — and every miss (e.g. `IFX.DE`) falls back to
+yfinance per ticker. Once the daily budget is spent, the rest of the day uses
+yfinance. The manual per-portfolio refresh buttons fetch only the held tickers.
+Set `SIM_UNIVERSE_PREFETCH=false` to disable it (cycles then fetch via Yahoo).
 
 `yfinance` uses Yahoo Finance's public endpoints through the `yfinance` library. It enables global ticker search and mixed US/EU screeners without a data key, but it is not an official market-data API: cache aggressively, throttle manual screener runs, and treat it as EOD/best-effort research data. Do not use it for execution.
 
@@ -53,7 +94,7 @@ Paste the output into the `integrity="sha384-<hash>"` attribute on the correspon
 
 ## Autocomplete and screener
 
-Autocomplete uses the selected provider. With `yfinance`, it supports fuzzy company/ticker lookup and returns canonical Yahoo symbols such as `IFX.DE`, `ASML.AS`, and `OMV.VI`. The `global-large-cap` universe mixes US, German, Dutch, French, Swiss, and Vienna listings. Press **Update** manually after markets close; it downloads and caches about two years of daily candles for each symbol, then ranks trend alignment, 20/60-day momentum, RSI, and relative volume.
+Autocomplete always uses Yahoo Finance (fuzzy company/ticker lookup, canonical Yahoo symbols such as `IFX.DE`, `ASML.AS`, and `OMV.VI`), regardless of the candle provider — Yahoo symbols are the app's canonical ticker form and are what the universes/watchlist/EDGAR use. Candle data still comes from the selected provider, with a per-ticker yfinance fallback. The `global-large-cap` universe mixes US, German, Dutch, French, Swiss, and Vienna listings. Press **Update** manually after markets close; it downloads and caches about two years of daily candles for each symbol, then ranks trend alignment, 20/60-day momentum, RSI, and relative volume.
 
 No live broker or order API exists. Signals and rankings are research tools, not financial advice.
 
@@ -88,6 +129,28 @@ Common flags: `--start`/`--end` (YYYY-MM-DD, inclusive) bound the window; `backt
 
 **Caveats:** this is a no-fees, no-slippage, fractional-share paper backtest — treat absolute returns/drawdowns skeptically. The walk-forward *relative* comparison across windows is the more meaningful signal.
 
+### Daily-core backtest + risk-overlay sweep
+
+`app.optimize daily-core` replays the fundamentals-first daily engine (§10-11 of `docs/llm-strategy-experiments.md`): the monthly qv-mom ranking as the core, candles only deploy cash. Beyond the deployment knobs it accepts risk-overlay flags, each backed by a measured walk-forward verdict:
+
+```bash
+# Momentum variant: raw 12-1 (default) vs residual momentum (Blitz-Huij-Martens;
+# walk-forward winner — see the doc's §11)
+docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize daily-core --start 2022-01-01 --dca rank --mom residual
+
+# Volatility overlays: target-vol cap, inverse-vol weights, low-vol score tilt
+docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize daily-core --dca rank --target-vol 0.25
+docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize daily-core --dca rank --vol-weight
+docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize daily-core --dca rank --lowvol-tilt
+
+# Stage 3: in-sample risk-overlay sweep on the stage-1 winner (reports IRR + Sharpe + max-DD)
+# Stage 4: walk-forward A/B of the risk overlays on the live config
+docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize daily-core-sweep --stage 3
+docker compose exec trade-sentinel /app/.venv/bin/python -m app.optimize daily-core-sweep --stage 4
+```
+
+Every backtest now reports an annualized Sharpe (contribution-adjusted daily returns) and max drawdown alongside the money-weighted IRR, so arms can be compared on risk-adjusted return — not just return.
+
 ### LLM benchmark (`llm-benchmark`)
 
 Probes whether the configured LLM would have turned the deterministic model's worst decisions. It replays the deterministic strategy over stored history, scores every trade by its 20-trading-day forward outcome (a BUY is bad when the price then fell; a SELL/stop-out is bad when the price then rallied), picks the 8 worst mistakes plus 2 control cases where the model was clearly right, reconstructs the exact indicator snapshot and portfolio state at each decision point, and sends each to the LLM using the *same* hybrid-sim system prompt and JSON format — then reports whether the LLM agreed, turned to HOLD, or flipped the call.
@@ -118,4 +181,32 @@ LLM_BACKENDS=[{"name":"llama-server","type":"openai","url":"http://your-server-i
 
 ## Timezone convention
 
-All `created_at` / `updated_at` timestamps are stored as tz-aware UTC in SQLite. The autonomous paper-trading scheduler runs at `SIM_RUN_HOUR`:`SIM_RUN_MINUTE` **UTC** (set `22 30` to run at 22:30 UTC). The monthly allowance deposits for BOTH paper portfolios (sim + monthly qv-mom) are anchored to the operator's local timezone (`ALLOWANCE_TZ`, `Europe/Vienna` by default) so the deposits land on the local calendar month boundary — and at the *start* of the month, so the two portfolios' cumulative "contributed" figures step in lockstep and their equity curves are directly comparable. The monthly qv-mom portfolio additionally takes a daily equity snapshot (right before the main nightly cycle), so its curve moves every day instead of only at month-end rebalances. The frontend displays the sim chart axis labels and trade log times in the operator's local timezone (`Europe/Vienna`), converting the stored UTC ISO strings on the client.
+All `created_at` / `updated_at` timestamps are stored as tz-aware UTC in SQLite. The autonomous paper-trading scheduler runs at `SIM_RUN_HOUR`:`SIM_RUN_MINUTE` **UTC** (set `22 30` to run at 22:30 UTC). The monthly allowance deposits for the three paper portfolios (sim + monthly qv-mom + daily-core) are anchored to the operator's local timezone (`ALLOWANCE_TZ`, `Europe/Vienna` by default) so the deposits land on the local calendar month boundary — and at the *start* of the month, so the portfolios' cumulative "contributed" figures step in lockstep and their equity curves are directly comparable. The monthly qv-mom portfolio additionally takes a daily equity snapshot (right before the main nightly cycle), so its curve moves every day instead of only at month-end rebalances. The frontend displays the sim chart axis labels and trade log times in the operator's local timezone (`Europe/Vienna`), converting the stored UTC ISO strings on the client.
+
+## Paper portfolios
+
+Three paper portfolios run side by side on the same $1000/month allowance:
+
+- **Daily Sim** — the technical engine (trend/RSI/MACD signals, stops, optional LLM review; §1-9 of the experiments doc).
+- **Monthly Sim** — qv-mom (quality-value-momentum) top-10, monthly rebalance with hysteresis.
+- **Daily-Core** — the strongest of the three: the Monthly sim's qv-mom ranking decides WHAT to own, but fresh cash deploys EVERY day into the top-ranked names (no month-end parking, no cash drag). Since 2026-09-14 the ranking uses **residual momentum** (Blitz-Huij-Martens alpha t-stat instead of raw 12-1 return), which won the walk-forward on Sharpe in all four OOS windows while cutting max drawdown in every stress regime (doc §11). Live switch via `SIM_DAILY_CORE_MOM_VARIANT=residual`.
+
+The Daily-Core tab shows Max DD, live alpha vs the Monthly sim and the DCA benchmark, per-position rank + weight, the full hold-band with held-name markers, and chart range controls (6M/1Y/2Y/5Y/MAX) over the backfilled 2017+ history.
+
+## Disclaimer
+
+This project is for **research and education only**. It is a self-hosted, paper-only
+simulation: it places no real orders and connects to no brokerage.
+
+- **Not investment advice.** Nothing here is a recommendation to buy or sell any
+  security. The backtests, signals and LLM output are experimental and may be
+  wrong, look-ahead-biased, or overfit to the past.
+- **No warranty.** Provided "as is" under the MIT license; there is no liability
+  for any use of, or decisions made with, this software.
+- **Data is not redistributed.** Market data is fetched at runtime from third-party
+  providers (Yahoo Finance via yfinance, Twelve Data, SEC EDGAR) into a local cache
+  that is *not* part of this repository. Your use of those providers is governed by
+  their own terms of service.
+- **Not affiliated.** Not affiliated with, or endorsed by, Yahoo, S&P Dow Jones
+  Indices, MSCI, or any data provider. "S&P 500", "MSCI World" and similar marks
+  belong to their respective owners and are used here descriptively.

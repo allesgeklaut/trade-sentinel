@@ -1065,6 +1065,14 @@ class TestYearLongSimulation:
 
         monkeypatch.setattr(sim, "candles", mock_candles)
 
+        # _latest_close now reads the last bar via market.latest_close
+        # (single-row query); mock it to the same progressive synthetic series.
+        async def mock_latest_close(ticker):
+            data = synthetic.get(ticker, [])[: reveal["day"]]
+            return float(data[-1]["close"]) if data else None
+
+        monkeypatch.setattr(sim, "latest_close", mock_latest_close)
+
         # --- mock refresh to no-op (no yfinance calls) ---
         async def mock_refresh(ticker, period="2y"):
             pass
@@ -2374,3 +2382,291 @@ class TestSchedulerTick:
 
         await sim._scheduler_tick()
         assert called["daily_core"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Backfill (deterministic approximation, no LLM calls)
+# ---------------------------------------------------------------------------
+
+class TestSimBackfill:
+    @pytest.fixture
+    def fake_series(self, monkeypatch):
+        """Patch optimize._load_series with a tiny deterministic market:
+        one strong uptrender + one downtrender so the engine has signals."""
+        from app import optimize as opt
+        from app.analysis import signal_series
+        from tests.test_optimize import _gen_candles
+
+        up = signal_series(_gen_candles(100.0, 0.01, n=300, seed=1))
+        dn = signal_series(_gen_candles(100.0, -0.01, n=300, seed=2))
+
+        async def fake_load_series(_tickers, start=None):
+            return {"UP": up, "DN": dn}
+
+        monkeypatch.setattr(opt, "_load_series", fake_load_series)
+        return {"UP": up, "DN": dn}
+
+    async def test_backfill_replaces_state(self, mem_db, fake_series, monkeypatch):
+        """The replay persists trade/snapshot rows with historical stamps,
+        converges to the replay's end state, and flags approximation."""
+        from sqlalchemy import select
+
+        from app.db import SimAllowance as Al
+
+        r = await sim.backfill(start="2025-03-01")
+        assert r["ok"] is True
+        assert r["approximation"] is True
+        assert r["days"] > 0 and r["snapshots"] == r["days"]
+
+        async def check():
+            async with mem_db() as s:
+                snaps = (await s.scalars(select(SimSnapshot))).all()
+                assert len(snaps) == r["snapshots"]
+                days = sorted(x.created_at.strftime("%Y-%m-%d") for x in snaps)
+                assert days[0] == "2025-03-01"
+                # allowance rows: one per replayed month (+ current month)
+                months = sorted(x.month for x in (await s.scalars(
+                    select(Al))).all())
+                assert months[0] == "2025-03"
+                # positions converge to the replay's holdings
+                pos = (await s.scalars(select(SimPosition))).all()
+                assert len(pos) >= 1
+                for p in pos:
+                    assert p.shares > 0
+                # trades carry the replay day
+                trs = (await s.scalars(select(SimTrade))).all()
+                for t in trs:
+                    assert t.created_at.strftime("%Y-%m") >= "2025-03"
+                    assert t.shares > 0 and t.price > 0
+                    assert t.reason.startswith("backfill:")
+        await check()
+
+    async def test_uncovered_current_month_keeps_its_contribution(
+            self, mem_db, fake_series, monkeypatch):
+        """A backfill run before the current month has candles must restore the
+        live deposit (marker + row + cash), not just the row — otherwise the
+        account is permanently one contribution short and the next live
+        deposit would hit the unique allowance constraint."""
+        from sqlalchemy import select
+
+        from app.db import SimAccount
+        from app.db import SimAllowance as Al
+
+        monkeypatch.setattr(sim, "_current_month", lambda: "2026-09")
+
+        # Control: no live marker -> the current month is not replayed at all.
+        await sim.backfill(start="2025-03-01")
+        async with mem_db() as s:
+            base_cash = (await s.get(SimAccount, 1)).cash
+
+        # Seed the live deposit marker, then re-run from the same window.
+        async def seed():
+            async with mem_db() as s:
+                acc = await s.get(SimAccount, 1)
+                acc.cash = 0.0
+                acc.last_allowance_month = "2026-09"
+                await s.commit()
+        await seed()
+
+        r = await sim.backfill(start="2025-03-01")
+        assert r["ok"] is True
+
+        async with mem_db() as s:
+            acc = await s.get(SimAccount, 1)
+            assert acc.last_allowance_month == "2026-09"
+            months = sorted(x.month for x in (await s.scalars(select(Al))).all())
+            assert "2026-09" in months
+            # the September contribution is actually funded, not just logged
+            assert acc.cash == pytest.approx(
+                base_cash + settings.sim_monthly_allowance, abs=0.5)
+
+    async def test_backfill_zero_equity_days_not_persisted_negatively(
+            self, mem_db, fake_series):
+        """The replay starts flat (no cash until the first deposit): early
+        snapshots carry 0 equity — the curve must still start at the window
+        start, not the first deposit."""
+        r = await sim.backfill(start="2025-03-01")
+        assert r["ok"] is True
+        assert r["start"] == "2025-03-01"
+
+    async def test_no_llm_calls(self, mem_db, fake_series, monkeypatch):
+        """The deterministic backfill must never touch the LLM client."""
+        from app import llm as llm_mod
+
+        def _explode(*a, **k):
+            raise AssertionError("LLM called during deterministic backfill")
+
+        monkeypatch.setattr(llm_mod, "chat", _explode, raising=False)
+        monkeypatch.setattr(llm_mod, "chat_stream", _explode, raising=False)
+        r = await sim.backfill(start="2025-03-01")
+        assert r["ok"] is True
+
+    async def test_benchmark_backfill_replaces_state(self, mem_db, monkeypatch):
+        """The DCA replay deposits on each month's first candle, buys at that
+        close, and persists daily snapshots + the end-state account."""
+        from unittest.mock import patch
+
+        import pandas as pd
+        from sqlalchemy import select as sa_select
+
+        from app.db import Candle, SimBenchmarkAccount, SimBenchmarkSnapshot
+
+        dates = pd.bdate_range("2025-03-01", "2025-04-30")
+        candles = [
+            Candle(ticker="URTH", timestamp=ts.to_pydatetime(), open=100.0,
+                   high=101.0, low=99.0, close=float(100 + i * 0.1), volume=1e6)
+            for i, ts in enumerate(dates)
+        ]
+
+        async def fake_refresh(ticker, period):
+            return None
+
+        async def fake_sync_start():
+            return None
+
+        # _load candles come from the mem_db (Candle rows inserted above)
+        async def seed():
+            async with mem_db() as s:
+                for c in candles:
+                    s.add(c)
+                await s.commit()
+        await seed()
+
+        monkeypatch.setattr(sim, "_current_month", lambda: "2025-04")
+        with patch("app.market.refresh", fake_refresh), \
+             patch.object(sim, "_sync_start_date", fake_sync_start):
+            r = await sim.backfill_benchmark(start="2025-03-01")
+        assert r["ok"] is True
+        assert r["n_buys"] == 2  # March + April
+        assert r["contributed"] == 2 * settings.sim_monthly_allowance
+
+        async def check():
+            async with mem_db() as s:
+                acc = await s.get(SimBenchmarkAccount, 1)
+                assert acc is not None
+                # 2 deposits fully invested; price rose -> equity > contributed
+                assert acc.shares > 0
+                assert r["final_equity"] > r["contributed"] * 0.99
+                snaps = (await s.scalars(sa_select(SimBenchmarkSnapshot))).all()
+                assert len(snaps) == r["days"]
+                # contributed steps at the first trading day of each month
+                by_day = {x.created_at.strftime("%Y-%m-%d"): x.allowance_total for x in snaps}
+                assert by_day["2025-03-03"] == settings.sim_monthly_allowance  # first bday
+                assert by_day["2025-04-01"] == 2 * settings.sim_monthly_allowance
+        await check()
+
+    async def test_benchmark_backfill_marker_not_ahead_of_funded_months(
+            self, mem_db, monkeypatch):
+        """If the current month has no candle, the marker must stay at the last
+        FUNDED month — writing the current month would suppress its next live
+        deposit forever (the benchmark ends a contribution behind)."""
+        from unittest.mock import patch
+
+        import pandas as pd
+
+        from app.db import Candle, SimBenchmarkAccount
+
+        dates = pd.bdate_range("2025-03-01", "2025-03-31")
+        candles = [Candle(ticker="URTH", timestamp=ts.to_pydatetime(), open=100.0,
+                          high=101.0, low=99.0, close=100.0, volume=1e6) for ts in dates]
+
+        async def fake_refresh(ticker, period):
+            return None
+
+        async def fake_sync_start():
+            return None
+
+        async def seed():
+            async with mem_db() as s:
+                for c in candles:
+                    s.add(c)
+                await s.commit()
+        await seed()
+
+        monkeypatch.setattr(sim, "_current_month", lambda: "2025-04")
+        with patch("app.market.refresh", fake_refresh), \
+             patch.object(sim, "_sync_start_date", fake_sync_start):
+            r = await sim.backfill_benchmark(start="2025-03-01")
+        assert r["ok"] is True
+
+        async with mem_db() as s:
+            acc = await s.get(SimBenchmarkAccount, 1)
+            # March was the last funded month; April had no candle.
+            assert acc.last_allowance_month == "2025-03"
+
+
+# ---------------------------------------------------------------------------
+# Nightly shared universe prefetch
+# ---------------------------------------------------------------------------
+
+class TestUniversePrefetch:
+    async def test_prefetch_uses_configured_provider(self, monkeypatch):
+        """The shared prefetch must route through the configured provider
+        (auto → Twelve Data), not the bulk Yahoo path."""
+        async def fake_candidates():
+            return ["AAA", "BBB"]
+
+        captured: dict = {}
+
+        async def fake_refresh_many(tickers, period, **kwargs):
+            captured["tickers"] = list(tickers)
+            captured["kwargs"] = kwargs
+            return list(tickers), []
+
+        monkeypatch.setattr(sim, "_candidate_tickers", fake_candidates)
+        monkeypatch.setattr(sim, "refresh_many", fake_refresh_many)
+
+        r = await sim.prefetch_universe()
+        assert r["ok"] is True and r["total"] == 2 and r["refreshed"] == 2
+        assert captured["tickers"] == ["AAA", "BBB"]
+        assert captured["kwargs"].get("use_provider") is True
+
+    async def test_empty_universe_is_a_noop(self, monkeypatch):
+        async def empty_candidates():
+            return []
+
+        monkeypatch.setattr(sim, "_candidate_tickers", empty_candidates)
+        r = await sim.prefetch_universe()
+        assert r["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# Trading-day calendar (US NYSE)
+# ---------------------------------------------------------------------------
+
+class TestTradingDayCalendar:
+    def test_weekends_are_not_trading_days(self):
+        assert sim.is_trading_day(datetime(2026, 9, 19, 22, 30)) is False  # Sat
+        assert sim.is_trading_day(datetime(2026, 9, 20, 22, 30)) is False  # Sun
+
+    def test_nyse_holidays_2026(self):
+        for d in (
+            datetime(2026, 1, 1),   # New Year's Day
+            datetime(2026, 1, 19),  # MLK
+            datetime(2026, 2, 16),  # Washington's Birthday
+            datetime(2026, 4, 3),   # Good Friday
+            datetime(2026, 5, 25),  # Memorial Day
+            datetime(2026, 6, 19),  # Juneteenth
+            datetime(2026, 7, 3),   # July 4 (Sat) observed Friday
+            datetime(2026, 9, 7),   # Labor Day
+            datetime(2026, 11, 26),  # Thanksgiving
+            datetime(2026, 12, 25),  # Christmas
+        ):
+            assert sim.is_trading_day(d) is False, d
+
+    def test_normal_weekdays_are_trading_days(self):
+        assert sim.is_trading_day(datetime(2026, 9, 21)) is True   # Mon
+        assert sim.is_trading_day(datetime(2026, 1, 2)) is True    # Fri after NY
+        assert sim.is_trading_day(datetime(2026, 7, 6)) is True    # Mon after Jul 4
+
+    async def test_scheduler_tick_skips_a_weekend(self, monkeypatch):
+        from app import daily_core, monthly
+
+        monkeypatch.setattr(sim, "_utcnow", lambda: datetime(2026, 9, 19, 22, 30))  # Sat
+
+        async def boom(*a, **k):
+            raise AssertionError("a cycle ran on a non-trading day")
+
+        monkeypatch.setattr(monthly, "run_monthly_cycle", boom)
+        monkeypatch.setattr(daily_core, "run_daily_cycle", boom)
+        await sim._scheduler_tick()  # must return without running anything
