@@ -2643,7 +2643,6 @@ async def backfill_benchmark(start: str | None = None) -> dict[str, Any]:
 
 _scheduler_task: asyncio.Task | None = None
 _daily_snapshot_task: asyncio.Task | None = None
-_prefetch_task: asyncio.Task | None = None
 
 
 # --- Trading-day calendar (US NYSE) ---------------------------------------
@@ -2730,39 +2729,6 @@ async def prefetch_universe() -> dict[str, Any]:
                 _universe(), len(refreshed), len(tickers), len(errors))
     return {"ok": True, "universe": _universe(), "total": len(tickers),
             "refreshed": len(refreshed), "errors": errors}
-
-
-async def _prefetch_loop() -> None:
-    """Background loop: prefetch the shared universe ``sim_prefetch_lead_minutes``
-    before the scheduled sim run so the cycles can reuse it. Disabled by
-    ``sim_universe_prefetch``; the cycles fall back to a Yahoo fetch when it
-    hasn't run. After the prefetch, optionally rescore the screener from the
-    freshly cached candles (no provider calls) so the dashboard table is fresh."""
-    while True:
-        now = _utcnow()
-        lead = max(0, settings.sim_prefetch_lead_minutes)
-        target = now.replace(hour=settings.sim_run_hour, minute=settings.sim_run_minute,
-                             second=0, microsecond=0) - timedelta(minutes=lead)
-        if target <= now:
-            target = target + timedelta(days=1)
-        wait_seconds = (target - now).total_seconds()
-        logger.info("Universe prefetch: next run at %s (in %.0f seconds)", target, wait_seconds)
-        await asyncio.sleep(wait_seconds)
-        if not is_trading_day(_utcnow()):
-            logger.info("Universe prefetch: %s is not a trading day — skipping", _utcnow().date())
-            continue
-        if settings.sim_universe_prefetch:
-            try:
-                await prefetch_universe()
-            except Exception as e:
-                logger.error("Universe prefetch failed: %s", e, exc_info=True)
-        if settings.screener_auto_rescore:
-            try:
-                from . import screener
-                r = await screener.rescore(_universe())
-                logger.info("Screener auto-rescore: %s", r)
-            except Exception as e:
-                logger.error("Screener auto-rescore failed: %s", e, exc_info=True)
 
 
 async def _scheduler_tick() -> None:
@@ -2907,28 +2873,27 @@ async def _daily_monthly_snapshot_loop():
 
 
 def start_scheduler():
-    """Start the background scheduler task (called from main.py lifespan)."""
-    global _scheduler_task, _daily_snapshot_task, _prefetch_task
+    """Start the sim scheduler tasks (called from main.py lifespan).
+
+    The universe prefetch is NOT here: it lives in main.py as an app-level task
+    so the Dashboard keeps fresh candles / a fresh screener even when the sim
+    is disabled."""
+    global _scheduler_task, _daily_snapshot_task
     if _scheduler_task is None or _scheduler_task.done():
         _scheduler_task = asyncio.create_task(_scheduler_loop())
     if _daily_snapshot_task is None or _daily_snapshot_task.done():
         _daily_snapshot_task = asyncio.create_task(_daily_monthly_snapshot_loop())
-    if _prefetch_task is None or _prefetch_task.done():
-        _prefetch_task = asyncio.create_task(_prefetch_loop())
 
 
 def stop_scheduler():
     """Stop the background scheduler task."""
-    global _scheduler_task, _daily_snapshot_task, _prefetch_task
+    global _scheduler_task, _daily_snapshot_task
     if _scheduler_task and not _scheduler_task.done():
         _scheduler_task.cancel()
     _scheduler_task = None
     if _daily_snapshot_task and not _daily_snapshot_task.done():
         _daily_snapshot_task.cancel()
     _daily_snapshot_task = None
-    if _prefetch_task and not _prefetch_task.done():
-        _prefetch_task.cancel()
-    _prefetch_task = None
 
 
 # ---------------------------------------------------------------------------

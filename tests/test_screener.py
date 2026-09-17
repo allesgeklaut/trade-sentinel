@@ -150,6 +150,9 @@ class TestRescore:
 
         r = await screener.rescore("u")
         assert r["ranked"] == 2
+        # progress is cleared after the run (no stale bar on the dashboard)
+        assert screener.get_screener_progress()["op"] == ""
+        assert screener.get_screener_progress()["running"] is False
 
         async with mem_db() as s:
             rows = (await s.scalars(select(ScreenerResult).where(
@@ -168,6 +171,14 @@ class TestRescore:
         monkeypatch.setattr(screener, "candles", mock_candles)
         r = await screener.rescore("empty")
         assert r.get("skipped") is True and r["ranked"] == 0
+
+
+    async def test_rescore_skips_non_screener_universe(self, tmp_path, monkeypatch):
+        # `watchlist` is a valid SIM_UNIVERSE but has no universes/*.txt file,
+        # so rescore must no-op instead of raising ("Unknown universe").
+        monkeypatch.setattr(screener, "_UNIVERSES_DIR", tmp_path)
+        r = await screener.rescore("watchlist")
+        assert r["skipped"] is True and "not a screener universe" in r["reason"]
 
 
 # ---------------------------------------------------------------------------

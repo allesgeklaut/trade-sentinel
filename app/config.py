@@ -173,9 +173,11 @@ class Settings(BaseSettings):
     # `market_fresh_seconds`.
     sim_universe_prefetch: bool = True
     sim_prefetch_lead_minutes: int = 90
-    # After the nightly prefetch stores fresh candles, recompute the screener
-    # ranking + signals from the CACHE (no provider calls) so the dashboard
-    # table is current each morning instead of only after a manual Update.
+    # After the nightly universe prefetch stores fresh candles, recompute the
+    # screener ranking + signals from the CACHE (no provider calls) so the
+    # dashboard table is current each morning instead of only after a manual
+    # Update. Runs only when SIM_UNIVERSE_PREFETCH succeeded (never re-stamps a
+    # stale cache as fresh). App-level: independent of SIM_ENABLED.
     screener_auto_rescore: bool = True
     market_fresh_seconds: int = 21600  # 6h: "already fetched, skip the re-pull"
     # Nightly watchlist prefetch (app-level, NOT sim-level): fetch the watchlist

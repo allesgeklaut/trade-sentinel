@@ -20,6 +20,7 @@ _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 logger = logging.getLogger("trade_sentinel.main")
 _WATCHLIST_REFRESH_PERIOD = "2y"
 _watchlist_prefetch_task: asyncio.Task | None = None
+_universe_prefetch_task: asyncio.Task | None = None
 
 # Serialises the four-portfolio backfill: concurrent clicks (or a click plus a
 # retry) would otherwise each queue all four multi-minute replays.
@@ -102,9 +103,49 @@ async def _watchlist_prefetch_loop() -> None:
             logger.error("Watchlist prefetch failed: %s", e, exc_info=True)
 
 
+async def _universe_prefetch_loop() -> None:
+    """Prefetch the shared universe ``sim_prefetch_lead_minutes`` before the sim
+    run, then rescore the screener from those fresh candles.
+
+    App-level, NOT inside the sim scheduler: the Dashboard's screener table and
+    charts need fresh candles even when ``SIM_ENABLED`` is false. Gated by
+    ``sim_universe_prefetch``; the screener rescore only runs after a successful
+    prefetch (never re-stamps a stale cache as fresh).
+    """
+    while True:
+        now = datetime.now(UTC)
+        lead = max(0, settings.sim_prefetch_lead_minutes)
+        target = now.replace(hour=settings.sim_run_hour, minute=settings.sim_run_minute,
+                             second=0, microsecond=0) - timedelta(minutes=lead)
+        if target <= now:
+            target += timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        logger.info("Universe prefetch: next run at %s (in %.0f seconds)", target, wait_seconds)
+        await asyncio.sleep(wait_seconds)
+        if not sim.is_trading_day(datetime.now(UTC)):
+            logger.info("Universe prefetch: %s is not a trading day — skipping",
+                        datetime.now(UTC).date())
+            continue
+        try:
+            r = await sim.prefetch_universe()
+        except Exception as e:
+            logger.error("Universe prefetch failed: %s", e, exc_info=True)
+            continue  # don't rescore stale candles
+        if not r.get("ok"):
+            logger.warning("Universe prefetch: %s", r.get("reason"))
+            continue
+        if settings.screener_auto_rescore:
+            try:
+                from . import screener
+                res = await screener.rescore(r["universe"])
+                logger.info("Screener auto-rescore: %s", res)
+            except Exception as e:
+                logger.error("Screener auto-rescore failed: %s", e, exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app):
-    global _watchlist_prefetch_task
+    global _watchlist_prefetch_task, _universe_prefetch_task
     await init_db()
     async with Session() as s:
         for t in settings.watchlist.split(','):
@@ -116,12 +157,17 @@ async def lifespan(app):
         await s.commit()
     if settings.watchlist_prefetch:
         _watchlist_prefetch_task = asyncio.create_task(_watchlist_prefetch_loop())
+    if settings.sim_universe_prefetch:
+        _universe_prefetch_task = asyncio.create_task(_universe_prefetch_loop())
     if settings.sim_enabled:
         sim.start_scheduler()
     yield
     if _watchlist_prefetch_task and not _watchlist_prefetch_task.done():
         _watchlist_prefetch_task.cancel()
     _watchlist_prefetch_task = None
+    if _universe_prefetch_task and not _universe_prefetch_task.done():
+        _universe_prefetch_task.cancel()
+    _universe_prefetch_task = None
     if settings.sim_enabled:
         sim.stop_scheduler()
 app=FastAPI(title="Trade Sentinel",lifespan=lifespan)

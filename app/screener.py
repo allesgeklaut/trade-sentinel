@@ -83,6 +83,25 @@ def score(rows):
     trend="BULLISH" if above50 and above200 and aligned else "UPTREND" if above50 else "NEUTRAL"
     value=(35 if trend=="BULLISH" else 18 if trend=="UPTREND" else 0)+min(max(r20,0),20)+min(max(r60,0),20)/2+min(max((rv-1)*10,0),10)+(10 if 50<=rsi<=70 else 3 if 45<=rsi<75 else 0)
     return dict(score=round(value,2),trend=trend,return_20d=round(r20,2),return_60d=round(r60,2),rsi=round(rsi,2),relative_volume=round(rv,2),close=round(float(c.iloc[-1]),2))
+
+
+def _evaluate(rows) -> dict | None:
+    """Score + attach the BUY/SELL/HOLD signal. Shared by the bulk Update
+    (_process) and the cache-only rescore so the two paths can't drift."""
+    out = score(rows)
+    if not out:
+        return None
+    # compute() needs >=206 rows; short-history names (new IPOs) get "N/A".
+    try:
+        r = compute(rows)
+        out["action"] = r["action"]
+        out["strength"] = r["strength"]
+    except ValueError:
+        out["action"] = "N/A"
+        out["strength"] = None
+    return out
+
+
 async def run(name):
     """Bulk screener update. Rejected with :class:`ScreenerBusy` if another
     bulk op (run / refresh / deep) is already in flight."""
@@ -108,7 +127,7 @@ async def _run(name):
                                current=ticker, started_at=started)
 
     async def _process(symbol):
-        """Refresh + score one symbol; append to results or skip with a warning.
+        """Refresh + score one symbol; append to results or skip.
 
         Bulk universe fetches use refresh_yfinance (Yahoo) — ~500 tickers in one
         pass would blow the Twelve Data free-tier daily quota. The functions are
@@ -116,19 +135,9 @@ async def _run(name):
         """
         await refresh_yfinance(symbol)
         rows = await candles(symbol)
-        out = score(rows)
-        if not out: return
-        # Attach BUY/SELL/HOLD signal from the full analysis engine.
-        # refresh_yfinance() above fetched ~2y of daily candles; compute()
-        # needs >=206 rows. New IPOs with insufficient history get "N/A".
-        try:
-            r = compute(rows)
-            out["action"] = r["action"]
-            out["strength"] = r["strength"]
-        except ValueError:
-            out["action"] = "N/A"
-            out["strength"] = None
-        results.append((symbol, out))
+        out = _evaluate(rows)
+        if out:
+            results.append((symbol, out))
 
     try:
         _, _ = await refresh_many(symbols, work=_process, on_result=_on_result)
@@ -154,36 +163,41 @@ async def rescore(name: str) -> dict:
     The nightly prefetch stores each ticker's candles; this recomputes the
     ranking + BUY/SELL/HOLD signal from those and rewrites ScreenerResult so the
     dashboard table is current each morning at zero provider cost. Returns
-    ``skipped`` when another bulk op is in flight or no candles are cached.
+    ``skipped`` when the name is not a screener universe, another bulk op is in
+    flight, or no candles are cached. Reports progress under op ``rescore`` so
+    the Update/Refresh buttons disable while it runs (and don't return an
+    unexplained 409).
     """
+    if name not in universe_names():
+        return {"universe": name, "skipped": True,
+                "reason": "not a screener universe"}
     if _screener_lock.locked():
         return {"universe": name, "skipped": True,
                 "reason": "a screener op is already running"}
     async with _screener_lock:
         symbols = list(dict.fromkeys(tickers(name)))
+        started = datetime.now(UTC).isoformat()
+        _set_screener_progress("rescore", name, done=0, total=len(symbols),
+                               current="", started_at=started)
         scored: list[tuple[str, dict]] = []
-        for symbol in symbols:
-            rows = await candles(symbol)
-            out = score(rows) if rows else None
-            if not out:
-                continue
-            try:
-                r = compute(rows)
-                out["action"] = r["action"]
-                out["strength"] = r["strength"]
-            except ValueError:
-                out["action"] = "N/A"
-                out["strength"] = None
-            scored.append((symbol, out))
-        if not scored:
-            return {"universe": name, "ranked": 0, "skipped": True,
-                    "reason": "no cached candles to score"}
-        async with Session() as s:
-            await s.execute(delete(ScreenerResult).where(ScreenerResult.universe == name))
-            for symbol, x in scored:
-                s.add(ScreenerResult(universe=name, ticker=symbol,
-                                     updated_at=datetime.now(UTC), **x))
-            await s.commit()
+        try:
+            for symbol in symbols:
+                out = _evaluate(await candles(symbol))
+                if out:
+                    scored.append((symbol, out))
+            if not scored:
+                return {"universe": name, "ranked": 0, "skipped": True,
+                        "reason": "no cached candles to score"}
+            async with Session() as s:
+                await s.execute(delete(ScreenerResult).where(ScreenerResult.universe == name))
+                for symbol, x in scored:
+                    s.add(ScreenerResult(universe=name, ticker=symbol,
+                                         updated_at=datetime.now(UTC), **x))
+                await s.commit()
+        finally:
+            # Clear the bar (op="") so the dashboard doesn't keep a stale line.
+            _set_screener_progress("", name, done=len(scored), total=len(symbols),
+                                   running=False, started_at=started)
         logger.info("Screener rescore %s: %d tickers from cache", name, len(scored))
         return {"universe": name, "ranked": len(scored)}
 
