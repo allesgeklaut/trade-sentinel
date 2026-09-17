@@ -1636,6 +1636,14 @@ class TestDailyCoreProtection:
 
         from app import fundamentals as fundamentals_mod
         from app import monthly as monthly_mod
+        from app.config import settings
+
+        # The qv-mom ranking — and therefore which sleeve crashes here — depends
+        # on the momentum variant, which comes from .env in dev but the code
+        # default ("raw") in CI. Pin it so these protection tests are hermetic
+        # and deterministic; they were authored against the production
+        # "residual" variant (README §11, SIM_DAILY_CORE_MOM_VARIANT).
+        monkeypatch.setattr(settings, "sim_daily_core_mom_variant", "residual")
 
         rng = np.random.default_rng(5)
         tickers = [f"T{i:02d}" for i in range(20)]
