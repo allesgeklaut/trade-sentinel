@@ -15,12 +15,14 @@ from .screener import universe_names, run, results, refresh_incremental, load_de
 from . import sim
 from . import news as news_mod
 from . import llm as llm_mod
+from . import universe_sync
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 logger = logging.getLogger("trade_sentinel.main")
 _WATCHLIST_REFRESH_PERIOD = "2y"
 _watchlist_prefetch_task: asyncio.Task | None = None
 _universe_prefetch_task: asyncio.Task | None = None
+_universe_sync_task: asyncio.Task | None = None
 
 # Serialises the four-portfolio backfill: concurrent clicks (or a click plus a
 # retry) would otherwise each queue all four multi-minute replays.
@@ -143,9 +145,31 @@ async def _universe_prefetch_loop() -> None:
                 logger.error("Screener auto-rescore failed: %s", e, exc_info=True)
 
 
+async def _universe_sync_loop() -> None:
+    """Refresh the generated S&P 500 universe weekly at the configured UTC
+    weekday/hour. App-level, independent of ``SIM_ENABLED``; the nightly
+    universe prefetch picks up any membership change on its next run."""
+    while True:
+        now = datetime.now(UTC)
+        days_ahead = (settings.universe_sync_weekday - now.weekday()) % 7
+        target = (now + timedelta(days=days_ahead)).replace(
+            hour=settings.universe_sync_hour, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=7)
+        wait_seconds = (target - now).total_seconds()
+        logger.info("Universe sync: next run at %s (in %.0f seconds)", target, wait_seconds)
+        await asyncio.sleep(wait_seconds)
+        try:
+            r = await universe_sync.sync_sp500()
+            logger.info("Universe sync: %s -> %d tickers (+%d/-%d)",
+                        r["universe"], r["count"], len(r["added"]), len(r["removed"]))
+        except Exception as e:
+            logger.error("Universe sync failed: %s", e, exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app):
-    global _watchlist_prefetch_task, _universe_prefetch_task
+    global _watchlist_prefetch_task, _universe_prefetch_task, _universe_sync_task
     await init_db()
     async with Session() as s:
         for t in settings.watchlist.split(','):
@@ -159,6 +183,8 @@ async def lifespan(app):
         _watchlist_prefetch_task = asyncio.create_task(_watchlist_prefetch_loop())
     if settings.sim_universe_prefetch:
         _universe_prefetch_task = asyncio.create_task(_universe_prefetch_loop())
+    if settings.universe_sync_enabled:
+        _universe_sync_task = asyncio.create_task(_universe_sync_loop())
     if settings.sim_enabled:
         sim.start_scheduler()
     yield
@@ -168,6 +194,9 @@ async def lifespan(app):
     if _universe_prefetch_task and not _universe_prefetch_task.done():
         _universe_prefetch_task.cancel()
     _universe_prefetch_task = None
+    if _universe_sync_task and not _universe_sync_task.done():
+        _universe_sync_task.cancel()
+    _universe_sync_task = None
     if settings.sim_enabled:
         sim.stop_scheduler()
 app=FastAPI(title="Trade Sentinel",lifespan=lifespan)
@@ -294,6 +323,18 @@ async def screen_load_deep(universe: str, period: str = '10y'):
     try: return await load_deep_history(universe, period)
     except ScreenerBusy as e: raise HTTPException(409, str(e)) from e
     except ValueError as e: raise HTTPException(404, str(e)) from e
+@app.post('/api/screener/sync')
+async def screener_sync():
+    """Refresh the generated S&P 500 universe from the IVV holdings CSV.
+
+    Returns the change diff ({count, added, removed, changed, as_of}). One
+    upstream request; no candle fetch. Newly added names appear in the screener
+    after the next Update/Refresh (or the nightly prefetch + auto-rescore).
+    """
+    try:
+        return await universe_sync.sync_sp500()
+    except Exception as e:
+        raise HTTPException(502, f"universe sync failed: {e}") from e
 @app.get('/api/screener/status')
 async def screener_status():
     """Current/last screener operation progress for the frontend poller.

@@ -1408,10 +1408,14 @@
                         title="Only fetch tickers with missing or stale data">Refresh</button>
                     <button id="screen-deep-btn" onclick="loadDeepHistory(this)" title="Fetch 10y of history for optimization/backtest">Load
                         10y</button>
+                    <button id="screen-sync-btn" onclick="syncUniverse(this)"
+                        title="Refresh the S&P 500 constituent list from the IVV holdings CSV (no candles fetched)">Sync
+                        SP500</button>
                 </p><small>Ranks cached
                     daily candles by trend, 20/60d momentum, RSI and relative volume. <b>Update</b> re-downloads ~2y and
                     re-ranks. <b>Refresh</b> only fills gaps. <b>Load 10y</b> fetches deep history for
-                    backtesting.</small>
+                    backtesting. <b>Sync SP500</b> refreshes the S&amp;P 500 membership weekly in the
+                    background too.</small>
                 <div id="screener-status" style="margin-top:6px;font-size:12px;color:#7aaa81;min-height:14px"></div>
                 <div id="screen">No screen run yet.</div>
             </details>
@@ -2716,6 +2720,29 @@
                 btn.disabled = false; btn.textContent = orig;
                 await pollScreenerStatus();
                 if (screenerPollTimer) { clearInterval(screenerPollTimer); screenerPollTimer = null; }
+            }
+        }
+
+        // Refresh the generated S&P 500 universe from the IVV holdings CSV.
+        // One upstream request, no candles: newly added names appear after the
+        // next Update/Refresh (or the nightly prefetch + auto-rescore).
+        async function syncUniverse(btn) {
+            const orig = btn.textContent;
+            btn.disabled = true; btn.textContent = 'Syncing...';
+            try {
+                let x = await api('screener/sync', { method: 'POST' });
+                const parts = [];
+                if (x.added && x.added.length) parts.push('+' + x.added.join(', '));
+                if (x.removed && x.removed.length) parts.push('-' + x.removed.join(', '));
+                const detail = parts.length ? parts.join('  ') : 'no membership change';
+                setStatus(`${x.universe} synced: ${x.count} tickers (as of ${x.as_of || '?'}); ${detail}`, true);
+                await loadUniverses();
+                $('#universe').value = x.universe;
+                showScreen();
+            } catch (e) {
+                setStatus(e.message, false);
+            } finally {
+                btn.disabled = false; btn.textContent = orig;
             }
         }
         $('#universe').onchange = onUniverseChange; loadWatch(); loadUniverses(); loadLLMModels()

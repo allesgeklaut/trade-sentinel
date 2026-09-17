@@ -5,10 +5,15 @@ import logging
 import pandas as pd
 from sqlalchemy import delete, func, select
 from .analysis import compute
+from .config import settings
 from .db import Candle, ScreenerResult, Session
 from .market import candles, refresh_many, refresh_yfinance
 
 _UNIVERSES_DIR = Path(__file__).resolve().parent.parent / "universes"
+# Generated universes (e.g. the auto-synced S&P 500). The container is
+# read_only with only /data writable, so they cannot live in the repo dir.
+# A file here shadows the repo bootstrap list of the same name.
+_EXTRA_UNIVERSES_DIR = Path(settings.universe_extra_dir)
 logger = logging.getLogger("trade_sentinel.screener")
 
 
@@ -67,10 +72,32 @@ def get_screener_progress() -> dict:
     return dict(_screener_progress)
 
 
-def universe_names(): return sorted(p.stem for p in _UNIVERSES_DIR.glob("*.txt"))
+def universe_names():
+    """Every known universe stem, from the generated dir and the repo dir."""
+    names: set[str] = set()
+    for d in (_EXTRA_UNIVERSES_DIR, _UNIVERSES_DIR):
+        if d.is_dir():
+            names.update(p.stem for p in d.glob("*.txt"))
+    return sorted(names)
+
+def extra_universes_dir() -> Path:
+    """The writable directory for generated universes (see universe_sync)."""
+    return _EXTRA_UNIVERSES_DIR
+
+def universe_path(name: str) -> Path | None:
+    """Resolve a universe name to a file, generated dir first (it shadows the
+    repo bootstrap list). Returns None for unsafe or unknown names."""
+    if not name or "/" in name or ".." in name:
+        return None
+    for d in (_EXTRA_UNIVERSES_DIR, _UNIVERSES_DIR):
+        p = d / f"{name}.txt"
+        if p.exists():
+            return p
+    return None
+
 def tickers(name):
-    p=_UNIVERSES_DIR/f"{name}.txt"
-    if not p.exists() or "/" in name or ".." in name: raise ValueError("Unknown universe")
+    p = universe_path(name)
+    if p is None: raise ValueError("Unknown universe")
     return [x.strip().upper() for x in p.read_text().splitlines() if x.strip() and not x.startswith("#")]
 def score(rows):
     if len(rows)<65: return None

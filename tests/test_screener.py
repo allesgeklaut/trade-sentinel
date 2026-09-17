@@ -45,6 +45,13 @@ async def mem_db(monkeypatch):
 # Universe parsing
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _isolate_extra_universes(tmp_path, monkeypatch):
+    """Point the generated-universe dir at a nonexistent path so the real
+    /data/universes (or a developer's dev box) can never leak into a test."""
+    monkeypatch.setattr(screener, "_EXTRA_UNIVERSES_DIR", tmp_path / "_no_extra_universes")
+
+
 class TestUniverseParsing:
     def test_tickers_strips_whitespace_and_uppercases(self, tmp_path, monkeypatch):
         monkeypatch.setattr(screener, "_UNIVERSES_DIR", tmp_path)
@@ -81,6 +88,36 @@ class TestUniverseParsing:
         (tmp_path / "ignore.md").write_text("nope")
         names = screener.universe_names()
         assert names == ["alpha", "beta"]
+
+
+class TestExtraUniverses:
+    """Generated universes live in a second, writable dir and shadow the repo."""
+
+    def test_universe_names_unions_both_dirs(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"; repo.mkdir()
+        extra = tmp_path / "extra"; extra.mkdir()
+        monkeypatch.setattr(screener, "_UNIVERSES_DIR", repo)
+        monkeypatch.setattr(screener, "_EXTRA_UNIVERSES_DIR", extra)
+        (repo / "sp500.txt").write_text("AAPL\n")
+        (repo / "global-large-cap.txt").write_text("NVDA\n")
+        (extra / "sp500.txt").write_text("MSFT\n")
+        assert screener.universe_names() == ["global-large-cap", "sp500"]
+
+    def test_generated_file_shadows_repo_list(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"; repo.mkdir()
+        extra = tmp_path / "extra"; extra.mkdir()
+        monkeypatch.setattr(screener, "_UNIVERSES_DIR", repo)
+        monkeypatch.setattr(screener, "_EXTRA_UNIVERSES_DIR", extra)
+        (repo / "sp500.txt").write_text("AAPL\n")
+        (extra / "sp500.txt").write_text("# generated\nMSFT\nNVDA\n")
+        assert screener.tickers("sp500") == ["MSFT", "NVDA"]
+
+    def test_repo_list_used_when_no_generated(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"; repo.mkdir()
+        monkeypatch.setattr(screener, "_UNIVERSES_DIR", repo)
+        monkeypatch.setattr(screener, "_EXTRA_UNIVERSES_DIR", tmp_path / "missing")
+        (repo / "sp500.txt").write_text("AAPL\n")
+        assert screener.tickers("sp500") == ["AAPL"]
 
 
 class TestDedup:

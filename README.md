@@ -98,6 +98,30 @@ Autocomplete always uses Yahoo Finance (fuzzy company/ticker lookup, canonical Y
 
 No live broker or order API exists. Signals and rankings are research tools, not financial advice.
 
+## Keeping the S&P 500 universe current
+
+`sp500` is auto-refreshed from the **iShares Core S&P 500 ETF (IVV) holdings
+CSV** — IVV fully replicates the index, so its holdings are the current
+constituent list, published daily. A weekly app-level job
+(`UNIVERSE_SYNC_ENABLED`, `UNIVERSE_SYNC_WEEKDAY`/`UNIVERSE_SYNC_HOUR`, UTC)
+writes `/data/universes/sp500.txt`; the **Sync SP500** button beside the
+universe dropdown triggers the same refresh on demand and reports the
+added/removed names. If the fetch or parse fails — or the parsed list is
+implausibly small — the previous file is left untouched.
+
+Generated universes live in `UNIVERSE_EXTRA_DIR` (default `/data/universes`)
+because the container is `read_only` and only `/data` is writable; a generated
+file shadows the repo's `universes/sp500.txt`, which stays as an offline
+bootstrap list. The sync only writes the list: candles for new constituents
+arrive on the next Update/Refresh or the nightly prefetch (which also re-scores
+the screener). A name dropped from the index stays held by the qv-mom
+portfolios until the hold band releases it (the usual hysteresis).
+
+These lists are **current members only, so they are not survivorship-free**: a
+backfill ranks on today's membership, not point-in-time index membership. That
+caveat applies to the repo list too and is written into the generated file's
+header.
+
 ## AI / space universe
 
 `universes/global-large-cap.txt` is now an AI and advanced-technology research universe. It includes semiconductors, AI infrastructure/platforms, application/automation names, space/connectivity companies, selected European listings, and recent IPOs such as CoreWeave (`CRWV`), Figma (`FIG`), Circle (`CRCL`), Chime (`CHYM`) and eToro (`ETOR`). SpaceX is listed as `SPCX`; use provider autocomplete to confirm current symbol availability before a screen run. A company being included only makes it a candidate for a rule-based research screen, not an investment recommendation.
