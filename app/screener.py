@@ -147,6 +147,46 @@ async def _run(name):
                                current="", running=False, started_at=started,
                                error=error)
     return {"universe":name,"processed":len(symbols),"ranked":len(results)}
+
+async def rescore(name: str) -> dict:
+    """Score-only refresh from the CANDLE CACHE — no provider calls.
+
+    The nightly prefetch stores each ticker's candles; this recomputes the
+    ranking + BUY/SELL/HOLD signal from those and rewrites ScreenerResult so the
+    dashboard table is current each morning at zero provider cost. Returns
+    ``skipped`` when another bulk op is in flight or no candles are cached.
+    """
+    if _screener_lock.locked():
+        return {"universe": name, "skipped": True,
+                "reason": "a screener op is already running"}
+    async with _screener_lock:
+        symbols = list(dict.fromkeys(tickers(name)))
+        scored: list[tuple[str, dict]] = []
+        for symbol in symbols:
+            rows = await candles(symbol)
+            out = score(rows) if rows else None
+            if not out:
+                continue
+            try:
+                r = compute(rows)
+                out["action"] = r["action"]
+                out["strength"] = r["strength"]
+            except ValueError:
+                out["action"] = "N/A"
+                out["strength"] = None
+            scored.append((symbol, out))
+        if not scored:
+            return {"universe": name, "ranked": 0, "skipped": True,
+                    "reason": "no cached candles to score"}
+        async with Session() as s:
+            await s.execute(delete(ScreenerResult).where(ScreenerResult.universe == name))
+            for symbol, x in scored:
+                s.add(ScreenerResult(universe=name, ticker=symbol,
+                                     updated_at=datetime.now(UTC), **x))
+            await s.commit()
+        logger.info("Screener rescore %s: %d tickers from cache", name, len(scored))
+        return {"universe": name, "ranked": len(scored)}
+
 async def results(name):
     async with Session() as s:
         rows=(await s.scalars(select(ScreenerResult).where(ScreenerResult.universe==name).order_by(ScreenerResult.score.desc()))).all()

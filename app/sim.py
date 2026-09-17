@@ -2736,7 +2736,8 @@ async def _prefetch_loop() -> None:
     """Background loop: prefetch the shared universe ``sim_prefetch_lead_minutes``
     before the scheduled sim run so the cycles can reuse it. Disabled by
     ``sim_universe_prefetch``; the cycles fall back to a Yahoo fetch when it
-    hasn't run."""
+    hasn't run. After the prefetch, optionally rescore the screener from the
+    freshly cached candles (no provider calls) so the dashboard table is fresh."""
     while True:
         now = _utcnow()
         lead = max(0, settings.sim_prefetch_lead_minutes)
@@ -2747,15 +2748,21 @@ async def _prefetch_loop() -> None:
         wait_seconds = (target - now).total_seconds()
         logger.info("Universe prefetch: next run at %s (in %.0f seconds)", target, wait_seconds)
         await asyncio.sleep(wait_seconds)
-        if not settings.sim_universe_prefetch:
-            continue
         if not is_trading_day(_utcnow()):
             logger.info("Universe prefetch: %s is not a trading day — skipping", _utcnow().date())
             continue
-        try:
-            await prefetch_universe()
-        except Exception as e:
-            logger.error("Universe prefetch failed: %s", e, exc_info=True)
+        if settings.sim_universe_prefetch:
+            try:
+                await prefetch_universe()
+            except Exception as e:
+                logger.error("Universe prefetch failed: %s", e, exc_info=True)
+        if settings.screener_auto_rescore:
+            try:
+                from . import screener
+                r = await screener.rescore(_universe())
+                logger.info("Screener auto-rescore: %s", r)
+            except Exception as e:
+                logger.error("Screener auto-rescore failed: %s", e, exc_info=True)
 
 
 async def _scheduler_tick() -> None:

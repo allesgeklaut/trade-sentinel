@@ -120,6 +120,56 @@ class TestDedup:
             assert sorted(r.ticker for r in rows) == ["AAPL", "MSFT", "NVDA"]
 
 
+class TestRescore:
+    async def test_scores_from_cache_without_network(self, tmp_path, monkeypatch, mem_db):
+        """rescore must recompute from cached candles only — no provider calls."""
+        from sqlalchemy import select
+
+        monkeypatch.setattr(screener, "_UNIVERSES_DIR", tmp_path)
+        (tmp_path / "u.txt").write_text("AAPL\nMSFT\n")
+
+        def _no_network(*a, **k):
+            raise AssertionError("rescore must not touch the network")
+
+        async def mock_candles(ticker, period=None):
+            return [{"close": 100.0, "volume": 1.0}] * 70
+
+        def mock_score(rows):
+            return {"score": 50.0, "trend": "NEUTRAL", "return_20d": 0.0,
+                    "return_60d": 0.0, "rsi": 50.0, "relative_volume": 1.0,
+                    "close": 100.0}
+
+        def mock_compute(rows):
+            return {"action": "HOLD", "strength": 50}
+
+        monkeypatch.setattr(screener, "refresh_yfinance", _no_network)
+        monkeypatch.setattr(screener, "refresh_many", _no_network)
+        monkeypatch.setattr(screener, "candles", mock_candles)
+        monkeypatch.setattr(screener, "score", mock_score)
+        monkeypatch.setattr(screener, "compute", mock_compute)
+
+        r = await screener.rescore("u")
+        assert r["ranked"] == 2
+
+        async with mem_db() as s:
+            rows = (await s.scalars(select(ScreenerResult).where(
+                ScreenerResult.universe == "u"))).all()
+            assert sorted(x.ticker for x in rows) == ["AAPL", "MSFT"]
+            assert all(x.action == "HOLD" for x in rows)
+            assert all(x.updated_at is not None for x in rows)
+
+    async def test_rescore_skips_when_no_cache(self, tmp_path, monkeypatch, mem_db):
+        monkeypatch.setattr(screener, "_UNIVERSES_DIR", tmp_path)
+        (tmp_path / "empty.txt").write_text("NODATA\n")
+
+        async def mock_candles(ticker, period=None):
+            return []
+
+        monkeypatch.setattr(screener, "candles", mock_candles)
+        r = await screener.rescore("empty")
+        assert r.get("skipped") is True and r["ranked"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Scorer thresholds
 # ---------------------------------------------------------------------------
