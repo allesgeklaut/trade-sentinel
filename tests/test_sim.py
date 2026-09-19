@@ -2304,6 +2304,13 @@ class TestSchedulerTick:
     stage (sim lock held, monthly skip) must not prevent the daily-core
     deployment from running."""
 
+    @pytest.fixture(autouse=True)
+    def _trading_day(self, monkeypatch):
+        # Pin the clock to a normal weekday: _scheduler_tick returns early on
+        # weekends/NYSE holidays, so without this the tests only pass Mon-Fri
+        # (CI failed on a weekend run). 2026-09-21 is a Monday.
+        monkeypatch.setattr(sim, "_utcnow", lambda: datetime(2026, 9, 21, 22, 30))
+
     async def test_daily_core_runs_when_sim_lock_held(self, monkeypatch):
         from app import daily_core, monthly
 

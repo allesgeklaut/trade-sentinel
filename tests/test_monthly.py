@@ -532,6 +532,10 @@ async def test_daily_snapshot_loop_disabled_funds_nothing(mem_db, monkeypatch):
 
     calls: list[str] = []
 
+    # Pin the clock to a normal weekday: the loop skips weekends/NYSE holidays,
+    # so without this the test only passes Mon-Fri (CI failed on a weekend run).
+    monkeypatch.setattr(sim_mod, "_utcnow", lambda: datetime(2026, 9, 21, 22, 30))
+
     async def fake_deposit():
         calls.append("deposit")
         return {"deposited": False}
