@@ -3486,7 +3486,7 @@
             const btn = document.getElementById('monthly-run-btn');
             const status = document.getElementById('monthly-run-status');
             btn.disabled = true;
-            status.textContent = 'Rebalancing… (refreshes 10y candles + fundamentals for the whole universe — can take a few minutes)';
+            status.textContent = 'Rebalancing… (tops up candles from the nightly cache + refreshes fundamentals — can take a few minutes)';
             try {
                 const r = await api('monthly/run', { method: 'POST' });
                 if (r.skipped) {
