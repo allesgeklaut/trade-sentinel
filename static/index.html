@@ -1653,6 +1653,8 @@
                 </label>
                 <button id="backfill-all-btn" onclick="backfillAll()"
                     title="Backfill ALL FOUR portfolios (daily sim, monthly, daily-core, DCA benchmark) over the same window — the date/full-history inputs apply to all">Backfill All 4 (synced)</button>
+                <button id="reset-all-btn" onclick="resetAllSims()"
+                    title="Wipe ALL FOUR portfolios (daily sim, monthly, daily-core, DCA benchmark) back to their start cash — trades, positions and equity history are cleared, market data is kept">Reset All Sims</button>
             </div>
             <div id="dailycore-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
             <div style="margin-top:6px;font-size:11px;color:#7aaa81">
@@ -3231,6 +3233,25 @@
                 dcRange = 'MAX';
                 for (const b of document.querySelectorAll('#dc-range-bar .range-btn'))
                     b.classList.toggle('range-active', b.dataset.range === 'MAX');
+                await loadDailyCoreAll();
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
+            btn.disabled = false;
+        }
+
+        async function resetAllSims() {
+            // Wipe all four paper portfolios back to start cash. Destructive
+            // (clears trades/positions/equity history) but keeps market data.
+            if (!confirm('Reset ALL FOUR portfolios (daily sim, monthly, daily-core, DCA benchmark)?\n\n' +
+                'This clears every trade, position, allowance and equity point and restarts each at its start cash. ' +
+                'Market data is kept. This cannot be undone.'))
+                return;
+            const btn = document.getElementById('reset-all-btn');
+            const status = document.getElementById('dailycore-run-status');
+            btn.disabled = true;
+            status.textContent = 'Resetting all portfolios…';
+            try {
+                await api('sim/reset-all', { method: 'POST' });
+                status.textContent = 'All portfolios reset to start cash.';
                 await loadDailyCoreAll();
             } catch (e) { status.textContent = 'Error: ' + e.message; }
             btn.disabled = false;

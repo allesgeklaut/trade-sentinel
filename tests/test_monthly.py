@@ -1045,6 +1045,68 @@ class TestBackfill:
                     ["2026-07", "2026-08", "2026-09"]
         asyncio.run(check())
 
+    def test_backfill_is_fee_free_like_the_live_engine(self, mem_db, fake_market,
+                                                       monkeypatch):
+        """The replay mirrors the live fee-free engine: with constant fixture
+        prices the end state's value equals the contributed total, with no
+        phantom 10 bps cost drag. Regression guard for the daily-core 999."""
+        from app.db import MonthlyPosition as Pos
+
+        monkeypatch.setattr(monthly, "_current_month", lambda: "2026-08")
+        r = asyncio.run(monthly.backfill(start="2026-07-01"))
+        assert r["ok"] is True
+
+        async def check():
+            async with mem_db() as s:
+                acc = await s.get(MonthlyAccount, 1)
+                pos = (await s.scalars(select(Pos))).all()
+                value = acc.cash + sum(p.shares * p.avg_cost for p in pos)
+                assert value == pytest.approx(r["contributed"], abs=1e-6)
+        asyncio.run(check())
+
+
+class TestReset:
+    def test_reset_clears_state_and_restores_start_cash(self, mem_db):
+        from app.db import MonthlyAllowance as Al
+        from app.db import MonthlyPosition as Pos
+        from app.db import MonthlyRebalance as Rb
+        from app.db import MonthlySnapshot as Sn
+        from app.db import MonthlyTrade as Tr
+
+        async def seed():
+            async with mem_db() as s:
+                acc = await s.get(MonthlyAccount, 1)
+                if acc is None:
+                    acc = MonthlyAccount(id=1, cash=0.0)
+                    s.add(acc)
+                acc.cash = 123.45
+                acc.last_allowance_month = "2026-09"
+                acc.last_rebalance_month = "2026-09"
+                s.add(Pos(ticker="AAA", shares=1.0, avg_cost=10.0))
+                s.add(Tr(ticker="AAA", side="BUY", shares=1.0, price=10.0,
+                         cash_after=0.0, reason="x"))
+                s.add(Al(amount=1000.0, month="2026-09"))
+                s.add(Sn(cash=0.0, positions_value=1.0, total_equity=1.0,
+                         allowance_total=1000.0))
+                s.add(Rb(rebal_month="2026-09", rebal_date=datetime(2026, 9, 30),
+                         held_before="", picked="AAA", n_new=1, snapshot=""))
+                await s.commit()
+        asyncio.run(seed())
+
+        r = asyncio.run(monthly.reset_monthly())
+        assert r["ok"] is True
+        assert r["cash"] == settings.sim_monthly_start_cash
+
+        async def check():
+            async with mem_db() as s:
+                for model in (Pos, Tr, Al, Sn, Rb):
+                    assert (await s.scalars(select(model))).all() == []
+                acc = await s.get(MonthlyAccount, 1)
+                assert acc.cash == settings.sim_monthly_start_cash
+                assert acc.last_allowance_month is None
+                assert acc.last_rebalance_month is None
+        asyncio.run(check())
+
 
 async def test_load_frames_filters_tickers_and_bounds_history(mem_db):
     """load_frames must query ONLY the requested tickers (the unfiltered

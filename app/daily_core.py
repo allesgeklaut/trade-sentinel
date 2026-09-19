@@ -890,9 +890,11 @@ async def backfill(start: str | None = None,
 
     Wipes account/positions/trades/allowances/snapshots, then walks every
     stored trading day from `start` to today, depositing the monthly
-    allowance and applying the rank-deployment rule at each day's close
-    with 10 bps one-way paper costs — the same simulation as
-    `optimize daily-core --dca rank` with boost=0.
+    allowance and applying the rank-deployment rule at each day's close.
+    No fees: the replay mirrors the LIVE engine, whose `_exec_buy`/`_exec_sell`
+    charge no commission (the paper portfolios are fee-free by design — see
+    docs/brokers.md), so a backfill's end state matches what the live engine
+    would hold.
 
     ``start`` semantics:
       - explicit "YYYY-MM-DD": replay from that day (the UI's optional date)
@@ -1008,7 +1010,6 @@ async def backfill(start: str | None = None,
             acc.last_allowance_month = None
             await s.commit()
 
-        cost = settings.sim_monthly_cost_oneway
         target_n = settings.sim_monthly_target_n
         hold_band = settings.sim_monthly_hold_band
 
@@ -1104,14 +1105,13 @@ async def backfill(start: str | None = None,
                 p = px_of(t, day)
                 if p is None or p <= 0:
                     return
-                # Reserve the one-way fee inside the spend so cash can never
-                # go negative (a full-cash spend plus fee would).
-                notional = min(budget, max(cash, 0.0) / (1.0 + cost))
+                # Fee-free (mirrors the live _exec_buy): spend up to the
+                # budget from available cash, no commission reserved.
+                notional = min(budget, max(cash, 0.0))
                 if notional < 1:
                     return
                 sh = notional / p
                 cash -= notional
-                cash -= notional * cost
                 shares[t] = shares.get(t, 0.0) + sh
                 trades.append((day.strftime("%Y-%m-%d"), "BUY", t, notional, sh, p))
 
@@ -1122,7 +1122,7 @@ async def backfill(start: str | None = None,
                 if p is None or p <= 0 or sh <= 0:
                     return
                 notional = sh * p
-                cash += notional * (1.0 - cost)
+                cash += notional
                 del shares[t]
                 trades.append((day.strftime("%Y-%m-%d"), "SELL", t, notional, sh, p))
 
@@ -1325,3 +1325,37 @@ async def get_allowances() -> list[dict]:
         rows = (await s.scalars(select(DailyCoreAllowance)
                                 .order_by(DailyCoreAllowance.month.desc()))).all()
     return [{"amount": r.amount, "month": r.month} for r in rows]
+
+
+async def reset_daily_core() -> dict:
+    """Wipe the daily-core portfolio and re-initialize it at start cash.
+
+    Clears trades, positions, allowances and snapshots, and resets the account
+    markers so the next deposit/deployment starts clean. The persisted gradient
+    basket chain is dropped too (it belongs to the old holdings). Market data,
+    fundamentals, the screener, the stored ranking and the universe/variant
+    selections are left intact — only portfolio *state* is cleared."""
+    from sqlalchemy import delete as sa_delete
+    from .db import (DailyCoreAccount as Acc, DailyCorePosition as Pos,
+                     DailyCoreTrade as Tr, DailyCoreAllowance as Al,
+                     DailyCoreSnapshot as Sn)
+
+    async with _cycle_lock:
+        async with Session() as s:
+            for tbl in (Tr, Pos, Al, Sn):
+                await s.execute(sa_delete(tbl))
+            acc = await s.get(Acc, 1)
+            if acc is None:
+                acc = Acc(id=1, cash=settings.sim_monthly_start_cash,
+                          last_allowance_month=None)
+                s.add(acc)
+            else:
+                acc.cash = settings.sim_monthly_start_cash
+                acc.last_allowance_month = None
+            await s.commit()
+        with _state_lock:
+            state = _load_state()
+            _reset_basket_state(state)
+            _save_state(state)
+    logger.info("Daily-core reset: cash=%.2f", settings.sim_monthly_start_cash)
+    return {"ok": True, "cash": settings.sim_monthly_start_cash}

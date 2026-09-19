@@ -1029,6 +1029,31 @@ async def sim_reset():
     """Wipe all sim tables and restart with start cash."""
     return await sim.reset_sim()
 
+
+@app.post('/api/sim/reset-all')
+async def sim_reset_all():
+    """Wipe ALL FOUR paper portfolios and restart each at its start cash.
+
+    Clears trades, positions, allowances and equity history for the daily sim,
+    monthly, daily-core and DCA benchmark portfolios. Market data,
+    fundamentals, the screener and the stored rankings/universe selection are
+    left intact — only portfolio state is cleared. Refused while a backfill is
+    running so the reset can't race the multi-minute replays.
+    """
+    from . import daily_core, monthly
+    if _backfill_all_lock.locked():
+        raise HTTPException(409, "a backfill is already running — wait for it to finish")
+    async with _backfill_all_lock:
+        return {
+            "ok": True,
+            "results": {
+                # reset_sim also clears the DCA benchmark tables.
+                "daily_sim": await sim.reset_sim(),
+                "monthly": await monthly.reset_monthly(),
+                "daily_core": await daily_core.reset_daily_core(),
+            },
+        }
+
 @app.get('/', include_in_schema=False)
 async def index() -> FileResponse:
     """Serve the SPA entry with no-cache so browsers revalidate on each
