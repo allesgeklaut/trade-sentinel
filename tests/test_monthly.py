@@ -677,15 +677,35 @@ async def test_ensure_cik_map_uses_cache_and_handles_unknown(mem_db, monkeypatch
         s.add(SecCik(ticker="AAA", cik=123456))
         s.add(SecCik(ticker="BBB", cik=0))
         await s.commit()
-    # CCC unknown: would trigger a download; monkeypatch it out
-    def fail_get(url):
-        raise AssertionError("network hit for already-cached tickers")
-    monkeypatch.setattr(edgar, "_http_get", fail_get)
-    with pytest.raises(AssertionError):
-        await edgar.ensure_cik_map(["CCC"])
-    # cached tickers resolve without network
+    calls = {"n": 0}
+
+    def blocked(url):
+        calls["n"] += 1
+        raise urllib.error.HTTPError(url, 403, "Forbidden", None, None)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(edgar, "_http_get", blocked)
+
+    # cached tickers resolve with no network hit
     m = await edgar.ensure_cik_map(["AAA", "BBB"])
     assert m == {"AAA": 123456, "BBB": 0}
+    assert calls["n"] == 0
+
+    # no contact email: the map download is skipped entirely, unknown → 0
+    monkeypatch.setattr(settings, "sec_contact_email", "")
+    m2 = await edgar.ensure_cik_map(["AAA", "CCC"])
+    assert m2 == {"AAA": 123456, "CCC": 0}
+    assert calls["n"] == 0
+
+    # with a contact email one attempt is made; a blocked download degrades
+    monkeypatch.setattr(settings, "sec_contact_email", "ops@example.com")
+    m3 = await edgar.ensure_cik_map(["AAA", "DDD"])
+    assert m3 == {"AAA": 123456, "DDD": 0}
+    assert calls["n"] == 1
+
+    # unknown tickers are never persisted as a bogus no-CIK 0 row
+    async with mem_db() as s:
+        rows = (await s.scalars(select(SecCik))).all()
+        assert sorted(r.ticker for r in rows) == ["AAA", "BBB"]
 
 
 # ---------------------------------------------------------------------------
@@ -734,6 +754,20 @@ async def test_fetch_companyfacts_404_vs_timeout(mem_db, monkeypatch):
     monkeypatch.setattr(edgar, "_http_get", get_timeout)
     with pytest.raises(TimeoutError):  # not swallowed as no-companyfacts
         edgar.fetch_companyfacts(4040)
+
+
+def test_edgar_user_agent_includes_optional_contact(monkeypatch):
+    """The configured SEC_CONTACT_EMAIL appears in the UA; with none set the UA
+    still identifies the app (no empty parentheses). The CIK-map download then
+    403s and degrades to the cached map — see ensure_cik_map."""
+    from app import edgar
+
+    monkeypatch.setattr(settings, "sec_contact_email", "ops@example.com")
+    assert "ops@example.com" in edgar._user_agent()
+
+    monkeypatch.setattr(settings, "sec_contact_email", "")
+    ua = edgar._user_agent()
+    assert "trade-sentinel" in ua and "()" not in ua
 
 
 async def test_refresh_edgar_staleness_gate(mem_db, monkeypatch):
@@ -831,6 +865,36 @@ async def test_run_rebalance_lock_serializes(mem_db, monkeypatch):
     release.set()
     r1 = await t1
     assert r1.get("rebalanced") is True or r1.get("skipped") is True
+
+
+async def test_refresh_data_reuses_the_nightly_prefetch(monkeypatch):
+    """The rebalance must go through refresh_many with the shared freshness
+    window, so it reuses the nightly prefetch/DB instead of re-pulling 10y of
+    candles per ticker from Yahoo. Regression guard for the reported
+    "monthly rebalance refreshes 10y and ignores the DB"."""
+    from app import edgar, market
+
+    seen: dict = {}
+
+    async def fake_refresh_many(tickers, period, **kwargs):
+        seen["tickers"] = list(tickers)
+        seen["period"] = period
+        seen["kwargs"] = kwargs
+        return list(tickers), []
+
+    async def fake_fundamentals(**_kwargs):
+        return {}
+
+    monkeypatch.setattr(market, "refresh_many", fake_refresh_many)
+    monkeypatch.setattr(edgar, "refresh_universe_mixed", fake_fundamentals)
+    monkeypatch.setattr(settings, "sim_monthly_fundamentals_source", "edgar")
+
+    _, fund_status = await monthly.refresh_data(["AAA", "BBB"])
+
+    assert seen["tickers"] == ["AAA", "BBB"]
+    assert seen["period"] == "2y"
+    assert seen["kwargs"].get("max_age_seconds") == settings.market_fresh_seconds
+    assert fund_status == {}
 
 
 # ---------------------------------------------------------------------------

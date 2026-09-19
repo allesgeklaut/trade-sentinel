@@ -226,6 +226,14 @@ class Settings(BaseSettings):
     sim_monthly_cost_oneway: float = 0.0010  # paper friction, one-way bps on notional swapped
     sim_monthly_fundamentals_source: str = "edgar"  # edgar (US filers) + yfinance fallback | yfinance-only
 
+    # --- SEC EDGAR fair-access contact ------------------------------------
+    # SEC's edge blocks User-Agents without a contact email on www.sec.gov (the
+    # CIK-map host), answering 403 "Undeclared Automated Tool". data.sec.gov
+    # (companyfacts) is unaffected. Set this to the operator's real address to
+    # (re)download the CIK map; leave blank to run without one — the cached
+    # map is used and unknown tickers fall back to yfinance.
+    sec_contact_email: str = ""
+
     # --- Daily-core portfolio (qv-mom core + daily cash deployment) ---------
     # §10 A/B winner: monthly qv-mom ranking decides WHAT to own (same
     # top-N hysteresis, no stops); candles only deploy cash daily into the

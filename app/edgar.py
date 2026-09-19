@@ -13,6 +13,9 @@ to the yfinance fetcher, mirroring stockstrat's split.
 
 SEC fair-access: max ~10 req/s — we fetch companyfacts once per ticker at
 ~8/s with retries, then cache; refreshes are rare (facts accumulate slowly).
+The CIK map on www.sec.gov blocks User-Agents without a contact email, so set
+`SEC_CONTACT_EMAIL` to refresh it; without one the cached map is reused and
+unknown tickers fall back to yfinance (see `ensure_cik_map`).
 """
 import asyncio
 import json
@@ -61,17 +64,26 @@ TAG_FALLBACKS = {
 ALL_TAGS = sorted(set(US_GAAP_TAGS) | set(DEI_TAGS)
                   | {a for alts in TAG_FALLBACKS.values() for a in alts})
 
-UA = {"User-Agent": "trade-sentinel paper-trading research (private deployment)",
-      "Accept": "*/*"}
-
 STALE_AFTER_DAYS = 90
+
+
+def _user_agent() -> str:
+    """SEC fair-access wants a User-Agent that names the app AND carries a
+    contact email (https://www.sec.gov/os/webmaster-faq#developers). Without a
+    contact, www.sec.gov (the CIK map) answers 403 — data.sec.gov does not. The
+    contact is optional here: set ``SEC_CONTACT_EMAIL`` to enable the CIK-map
+    download, leave it blank and the cached map is used instead."""
+    name = "trade-sentinel paper-trading research"
+    contact = settings.sec_contact_email.strip()
+    return f"{name} ({contact})" if contact else name
 
 
 def _http_get(url: str, retries: int = 4, backoff: float = 2.0) -> bytes:
     last = None
     for i in range(retries):
         try:
-            req = urllib.request.Request(url, headers=UA)
+            req = urllib.request.Request(
+                url, headers={"User-Agent": _user_agent(), "Accept": "*/*"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 return r.read()
         except urllib.error.HTTPError as e:
@@ -99,6 +111,15 @@ async def ensure_cik_map(tickers: list[str], force: bool = False) -> dict[str, i
             select(SecCik).where(SecCik.ticker.in_(want)))).all()
     have = {r.ticker: r.cik for r in rows}
     missing = sorted(want - set(have))
+    if missing and not force and not settings.sec_contact_email.strip():
+        # SEC's edge blocks contact-less User-Agents on www.sec.gov (the map
+        # host), so a download attempt would 403 after 4 retries (~20s). Skip
+        # it: use the cached map and let the unknown tickers use yfinance.
+        # Set SEC_CONTACT_EMAIL to enable the download (data.sec.gov does not
+        # need it — only this map does).
+        logger.info("SEC_CONTACT_EMAIL not set — skipping CIK-map download "
+                    "(%d unknown ticker(s) → yfinance)", len(missing))
+        missing = []
     if missing and not force:
         # fill from the official map (single ~1MB download)
         def _sync() -> dict[str, int]:
@@ -120,15 +141,27 @@ async def ensure_cik_map(tickers: list[str], force: bool = False) -> dict[str, i
                     out[t] = 0  # known no-CIK
             return out
 
-        resolved = await asyncio.to_thread(_sync)
-        async with Session() as s:
-            for t, cik in resolved.items():
-                stmt = sqlite_insert(SecCik).values(ticker=t, cik=cik, name="")
-                stmt = stmt.on_conflict_do_update(index_elements=["ticker"],
-                                                  set_={"cik": cik})
-                await s.execute(stmt)
-            await s.commit()
-        have.update(resolved)
+        resolved: dict[str, int] | None = None
+        try:
+            resolved = await asyncio.to_thread(_sync)
+        except Exception as e:  # noqa: BLE001
+            # www.sec.gov (the CIK-map host) blocks User-Agents without a
+            # contact email; data.sec.gov does not. A failed map download must
+            # not sink the whole fundamentals refresh — fall back to the cached
+            # map and let the unknown tickers use yfinance this pass. Retried
+            # on the next refresh (and fixed for good by SEC_CONTACT_EMAIL).
+            # Persisting 0 here would wrongly mark them "no CIK" forever.
+            logger.warning("SEC CIK map download failed (%s) — using cached CIKs "
+                           "(%d unknown ticker(s) → yfinance)", e, len(missing))
+        if resolved is not None:
+            async with Session() as s:
+                for t, cik in resolved.items():
+                    stmt = sqlite_insert(SecCik).values(ticker=t, cik=cik, name="")
+                    stmt = stmt.on_conflict_do_update(index_elements=["ticker"],
+                                                      set_={"cik": cik})
+                    await s.execute(stmt)
+                await s.commit()
+            have.update(resolved)
     return {t: have.get(t, 0) for t in want}
 
 
