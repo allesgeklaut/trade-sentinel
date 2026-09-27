@@ -161,7 +161,8 @@ async def _daily_core_picks(max_age_days: float = 4.0) -> list[str] | None:
 async def _mirror_allocate(amount: float, source_ticker: str = "") -> dict | None:
     """Spread `amount` € equally over the current daily-core picks, buying
     each at its latest EUR price. Returns a summary dict, or None when
-    allocation was deferred (no fresh ranking / no prices)."""
+    allocation is impossible right now (no fresh ranking / no prices) —
+    the caller parks the amount as pending instead of dropping it."""
     picks = await _daily_core_picks()
     if not picks or amount <= 0:
         return None
@@ -197,6 +198,47 @@ async def _mirror_allocate(amount: float, source_ticker: str = "") -> dict | Non
     return {"amount": amount, "pick_count": len(priced), "bought": bought}
 
 
+async def _mirror_or_defer(amount: float, source_ticker: str = "") -> dict | None:
+    """Allocate `amount` into the mirror, or PARK it as pending when no
+    fresh ranking/prices exist. A deferral must never silently drop the €:
+    with SIM_ENABLED=false (no daily-core cycles) nothing would ever mirror
+    while Sparpläne keep buying, permanently understating the comparison."""
+    r = await _mirror_allocate(amount, source_ticker)
+    if r is not None:
+        return r
+    async with Session() as s:
+        acc = await _account(s)
+        if acc is None:
+            return None
+        acc.mirror_pending += amount
+        await s.commit()
+    logger.info("Savings mirror: %.2f € deferred (no fresh ranking) — pending total %.2f",
+                amount, acc.mirror_pending)
+    return None
+
+
+async def flush_pending_mirror() -> dict:
+    """Try to allocate any pending mirror €; returns what remains."""
+    async with Session() as s:
+        acc = await _account(s)
+        if acc is None:
+            return {"flushed": 0.0, "pending": 0.0}
+        pending = acc.mirror_pending
+    if pending <= 0:
+        return {"flushed": 0.0, "pending": 0.0}
+    r = await _mirror_allocate(pending, source_ticker="")
+    if r is None:
+        return {"flushed": 0.0, "pending": round(pending, 2)}
+    async with Session() as s:
+        acc = await _account(s)
+        if acc is None:
+            return {"flushed": 0.0, "pending": round(pending, 2)}
+        acc.mirror_pending = max(0.0, acc.mirror_pending - r["amount"])
+        await s.commit()
+    logger.info("Savings mirror: flushed %.2f € of pending allocations", r["amount"])
+    return {"flushed": r["amount"], "pending": round(acc.mirror_pending, 2)}
+
+
 async def _mirror_valuate() -> dict:
     """Mirror portfolio valuation in EUR."""
     async with Session() as s:
@@ -222,11 +264,16 @@ async def _mirror_valuate() -> dict:
             }
         )
     allocated = sum(e.amount for e in entries)
+    async with Session() as s:
+        acc = await _account(s)
+    pending = round(acc.mirror_pending, 2) if acc else 0.0
     return {
         "positions": pos_list,
         "positions_value": round(positions_value, 2),
         "total_equity": round(positions_value, 2),
         "allocated": round(allocated, 2),
+        # Mirrored € waiting for a fresh ranking (flushed by the next cycle).
+        "pending": pending,
         "entries": len(entries),
     }
 
@@ -249,13 +296,21 @@ async def initialized() -> bool:
 
 async def held_tickers() -> list[str]:
     """All tickers the tracker needs candles for: positions, plans and the
-    mirror book, plus EURUSD=X (EUR pricing of non-EUR names)."""
+    mirror book, plus the FX pairs their EUR pricing needs (EURUSD=X for
+    USD/€ listings, USDCHF=X for .SW, …). Without the pair a .SW/.L/.ST
+    holding cannot be priced and silently falls back to avg_cost."""
+    from .fundamentals import SUFFIX_FX
+
     async with Session() as s:
         pos = (await s.scalars(select(SavingsPosition))).all()
         plans = (await s.scalars(select(SavingsPlan).where(SavingsPlan.active == 1))).all()
         mirror = (await s.scalars(select(SavingsMirrorPosition))).all()
     out = {p.ticker for p in pos} | {p.ticker for p in plans} | {m.ticker for m in mirror}
     out.add("EURUSD=X")
+    for t in list(out):
+        suffix = t[t.rfind("."):] if "." in t else ""
+        if (pm := SUFFIX_FX.get(suffix)) and not _is_eur_ticker(t):
+            out.add(pm[0])
     return sorted(out)
 
 
@@ -317,6 +372,7 @@ async def initialize(
             s.add(acc)
         acc.cash = max(0.0, float(cash))
         acc.accrued_interest = 0.0
+        acc.mirror_pending = 0.0
         acc.interest_rate = float(
             interest_rate if interest_rate is not None else settings.savings_interest_rate
         )
@@ -331,14 +387,26 @@ async def initialize(
         acc.last_interest_month = month
         acc.last_accrual_day = None
         await _log_event(s, "INIT", acc.cash, note="tracker initialized")
+        # Aggregate by ticker: two lots of the same ETF at different prices
+        # are normal input, and SavingsPosition.ticker is UNIQUE — inserting
+        # both would fail the whole init.
+        lots: dict[str, list[float]] = {}  # ticker -> [shares, cost_total]
         for p in positions:
-            ticker = str(p.get("ticker", "")).strip().upper()
-            shares = float(p.get("shares", 0) or 0)
-            avg_cost = float(p.get("avg_cost", 0) or 0)
+            ticker = str(p.get("ticker", "") or "").strip().upper()
+            try:
+                shares = float(p.get("shares") or 0)
+                avg_cost = float(p.get("avg_cost") or 0)
+            except (TypeError, ValueError):
+                continue
             if not ticker or shares <= 0 or avg_cost <= 0:
                 continue
-            s.add(SavingsPosition(ticker=ticker, shares=shares, avg_cost=avg_cost))
-            invested += shares * avg_cost
+            lot = lots.setdefault(ticker, [0.0, 0.0])
+            lot[0] += shares
+            lot[1] += shares * avg_cost
+        for ticker, (shares, cost_total) in lots.items():
+            s.add(SavingsPosition(
+                ticker=ticker, shares=shares, avg_cost=cost_total / shares))
+            invested += cost_total
         await s.commit()
     result = {
         "ok": True,
@@ -347,7 +415,7 @@ async def initialize(
         "last_transfer_month": month,
     }
     if invested > 0:
-        mirror = await _mirror_allocate(invested, source_ticker="")
+        mirror = await _mirror_or_defer(invested, source_ticker="")
         result["mirror"] = mirror and {"allocated": mirror["amount"], "picks": mirror["pick_count"]}
     return result
 
@@ -396,8 +464,15 @@ async def accrue_interest() -> dict:
 
     TR convention: interest accrues on the END-OF-DAY balance each day at
     rate/365; the accumulated amount is paid into the account monthly. The
-    tracker books accrual per day (no intra-month compounding) and moves
-    the total into cash at the monthly payout — matching TR's statement.
+    tracker pays out monthly and does not compound inside a month (matching
+    TR's statement).
+
+    Catch-up approximation: a multi-day gap is booked as
+    ``gap x daily_rate_on_the_current_balance`` rather than a per-day replay
+    of each day's end balance. Identical to TR in normal operation (cash
+    only moves inside the cycle, which accrues daily); if the balance was
+    true-upped mid-gap, the whole gap is re-based onto the new balance. The
+    next true-up reconciles the tracked figure against TR's actual payout.
     """
     today = _today_local()
     async with Session() as s:
@@ -467,23 +542,25 @@ async def payout_interest() -> dict:
 async def _exec_sparplan(plan: SavingsPlan, price: float, day: str) -> dict | None:
     """Buy `plan.amount` € of `plan.ticker` from the savings cash at
     `price`. Returns a trade dict, or None when skipped (no price, or the
-    cash would go negative — a WARN event points at the true-up)."""
+    cash would go negative — a WARN event points at the true-up). Marks the
+    plan's month so the per-plan dedupe sees it executed."""
     if price is None or price <= 0:
         return None
     async with Session() as s:
         acc = await _account(s)
         if acc is None:
             return None
+        p = await s.get(SavingsPlan, plan.id)
+        if p is None:
+            return None
         if acc.cash < plan.amount:
-            await _log_event(
-                s,
-                "WARN",
-                0,
-                ticker=plan.ticker,
-                note=f"insufficient savings cash ({acc.cash:.2f} < {plan.amount:.2f} €) "
-                f"for sparplan {day} — true-up the balance",
+            # One WARN per (plan, month): a month of daily passes must not
+            # flood the ledger with the same warning.
+            await _warn_once(
+                plan, day[:7],
+                f"insufficient savings cash ({acc.cash:.2f} < {plan.amount:.2f} €) "
+                f"for sparplan — true-up the balance",
             )
-            await s.commit()
             return None
         shares = plan.amount / price
         acc.cash -= plan.amount
@@ -499,11 +576,13 @@ async def _exec_sparplan(plan: SavingsPlan, price: float, day: str) -> dict | No
             "SPARPLAN_BUY",
             -plan.amount,
             ticker=plan.ticker,
-            note=f"sparplan buy {day}: {shares:.6f} sh @ {price:.4f} €",
+            note=f"sparplan buy {day} (day {plan.day_of_month}): "
+                 f"{shares:.6f} sh @ {price:.4f} €",
         )
+        p.last_executed_month = day[:7]
         await s.commit()
         logger.info("Savings sparplan buy: %s %.2f € @ %.4f", plan.ticker, plan.amount, price)
-        mirror = await _mirror_allocate(plan.amount, source_ticker=plan.ticker)
+        mirror = await _mirror_or_defer(plan.amount, source_ticker=plan.ticker)
         return {
             "ticker": plan.ticker,
             "amount": plan.amount,
@@ -516,12 +595,13 @@ async def _exec_sparplan(plan: SavingsPlan, price: float, day: str) -> dict | No
 async def run_sparplans(day: date | None = None) -> dict:
     """Execute every active plan whose day_of_month has come due.
 
-    Each plan runs at most once per calendar month: the event ledger is the
-    dedupe (a SPARPLAN_BUY for the same ticker+month means it already ran).
-    Catch-up after downtime: ``day`` defaults to today (operator-local), and
-    a plan that MISSED its due day this month (created before it, app down
-    on it) still fires while the month is current. A plan created AFTER its
-    due day first fires NEXT month — mirroring Trade Republic, where a
+    Each PLAN runs at most once per calendar month: the plan row's
+    ``last_executed_month`` marker is the dedupe (the ledger cannot
+    distinguish two plans for the same ticker on different days). Catch-up
+    after downtime: ``day`` defaults to today (operator-local), and a plan
+    that MISSED its due day this month (created before it, app down on it)
+    still fires while the month is current. A plan created AFTER its due
+    day first fires NEXT month — mirroring Trade Republic, where a
     Sparplan set up on the 27th with execution day 2 invests from the 2nd
     of the following month, not retroactively. Day 29-31 plans run on the
     last day of shorter months.
@@ -535,28 +615,15 @@ async def run_sparplans(day: date | None = None) -> dict:
         plans = (await s.scalars(select(SavingsPlan).where(SavingsPlan.active == True))).all()  # noqa: E712
         # created_at is stored tz-aware UTC; the OPERATOR-LOCAL calendar
         # month decides which month a buy belongs to (a buy just after
-        # local midnight on the 1st is still the new month locally, and
-        # dedupe against a UTC month would let it double-run at month
-        # boundaries around the UTC offset).
+        # local midnight on the 1st is still the new month locally).
         created_local = {p.id: p.created_at.astimezone(_TZ).date() for p in plans}
-        await s.commit()
     if not plans:
         return {"executed": 0}
-    # Already-executed (ticker, month) pairs from the ledger, keyed by the
-    # operator-local month of each buy.
-    async with Session() as s:
-        rows = (
-            await s.scalars(select(SavingsEvent).where(SavingsEvent.kind == "SPARPLAN_BUY"))
-        ).all()
-    done: dict[str, set[str]] = {}
-    for r in rows:
-        stamp = r.created_at.astimezone(_TZ).strftime("%Y-%m")
-        done.setdefault(r.ticker or "", set()).add(stamp)
     due: list[SavingsPlan] = []
     for p in plans:
         effective_day = min(p.day_of_month, _days_in_month(today))
-        if month in done.get(p.ticker, set()):
-            continue
+        if p.last_executed_month == month:
+            continue  # this plan already fired this month
         if today.day >= effective_day:
             # Due day reached — but a plan CREATED after the due day this
             # month must not fire retroactively: skip to next month.
@@ -567,14 +634,44 @@ async def run_sparplans(day: date | None = None) -> dict:
         return {"executed": 0}
     prices = await _price_eur_map([p.ticker for p in due])
     executed: list[dict] = []
+    deferred: list[str] = []
     for p in due:
         price = prices.get(p.ticker)
         if price is None or price <= 0:
-            continue  # no candle yet — plan stays due and fires next pass
+            # No candle (or FX pair) yet — stays due, fires next pass. One
+            # WARN per (plan, month) so a permanently unpriceable ticker
+            # doesn't flood the ledger with a month of identical entries.
+            await _warn_once(p, month,
+                             f"no price for {p.ticker} — sparplan deferred; "
+                             f"check the ticker or refresh prices")
+            deferred.append(p.ticker)
+            continue
         r = await _exec_sparplan(p, price, today.isoformat())
         if r:
             executed.append(r)
-    return {"executed": len(executed), "trades": executed}
+    out = {"executed": len(executed), "trades": executed}
+    if deferred:
+        out["deferred"] = deferred
+    return out
+
+
+async def _warn_once(plan: SavingsPlan, month: str, note: str) -> None:
+    """Log a WARN for (plan, month) only if none exists yet this month —
+    the ledger is the per-(plan, month) gate for repeated WARN kinds."""
+    async with Session() as s:
+        rows = (
+            await s.scalars(
+                select(SavingsEvent).where(
+                    SavingsEvent.kind == "WARN",
+                    SavingsEvent.ticker == plan.ticker,
+                    SavingsEvent.note == note,
+                )
+            )
+        ).all()
+        already = any(r.created_at.astimezone(_TZ).strftime("%Y-%m") == month for r in rows)
+        if not already:
+            await _log_event(s, "WARN", 0, ticker=plan.ticker, note=note)
+            await s.commit()
 
 
 def _days_in_month(d: date) -> int:
@@ -624,6 +721,7 @@ async def valuate() -> dict:
         "initialized": True,
         "cash": round(acc.cash, 2),
         "accrued_interest": round(acc.accrued_interest, 2),
+        "mirror_pending": round(acc.mirror_pending, 2),
         "interest_rate": acc.interest_rate,
         "monthly_transfer": acc.monthly_transfer,
         "positions": pos_list,
@@ -718,7 +816,7 @@ async def add_saveback(amount: float, ticker: str) -> dict:
             s, "SAVEBACK", amount, ticker=ticker, note=f"saveback: {shares:.6f} sh @ {price:.4f} €"
         )
         await s.commit()
-    mirror = await _mirror_allocate(amount, source_ticker=ticker)
+    mirror = await _mirror_or_defer(amount, source_ticker=ticker)
     return {
         "ok": True,
         "ticker": ticker,
@@ -852,6 +950,9 @@ async def run_savings_cycle(force: bool = False) -> dict:
         payout = await payout_interest()
         accrual = await accrue_interest()
         sparplans = await run_sparplans()
+        # Deferred mirror € (no fresh ranking when it was invested) lands in
+        # the mirror as soon as a ranking is available again.
+        mirror = await flush_pending_mirror()
         snap = await take_snapshot()
         return {
             "refresh": {"refreshed": len(refresh["refreshed"]),
@@ -860,6 +961,7 @@ async def run_savings_cycle(force: bool = False) -> dict:
             "payout": payout,
             "accrual": accrual,
             "sparplans": sparplans,
+            "mirror": mirror,
             "snapshot": snap,
         }
 

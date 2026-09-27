@@ -1899,7 +1899,12 @@
             return String(s)
                 .replace(/&/g, '&amp;')
                 .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;');
+                .replace(/>/g, '&gt;')
+                // Quotes matter too: user-supplied values (tickers from the
+                // savings API) are interpolated into onclick='...' handlers,
+                // where an unescaped ' would break out of the attribute.
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
         }
 
         let markedRenderer = null;
@@ -3860,9 +3865,14 @@
             const sum = document.getElementById('savings-mirror-summary');
             try {
                 const m = mirror || await api('savings/mirror?limit=12000');
+                const pending = m.pending > 0
+                    ? ` <b style="color:#ff9f43">${fmtEur(m.pending)}</b> waiting for a fresh daily-core ranking — it enters the mirror on the next pass that has one.`
+                    : '';
                 sum.innerHTML = m.allocated > 0
-                    ? `Same € that went into your positions, spread equally over the daily-core picks at each date — <b>${fmtEur(m.allocated)}</b> mirrored, now worth <b>${fmtEur(m.total_equity)}</b> (${(m.total_equity / m.allocated * 100 - 100 >= 0 ? '+' : '') + (m.total_equity / m.allocated * 100 - 100).toFixed(2)}%).`
-                    : 'No mirror entries yet — initialize with positions or add a Sparplan.';
+                    ? `Same € that went into your positions, spread equally over the daily-core picks at each date — <b>${fmtEur(m.allocated)}</b> mirrored, now worth <b>${fmtEur(m.total_equity)}</b> (${(m.total_equity / m.allocated * 100 - 100 >= 0 ? '+' : '') + (m.total_equity / m.allocated * 100 - 100).toFixed(2)}%).${pending}`
+                    : (m.pending > 0
+                        ? `No allocation yet — <b style="color:#ff9f43">${fmtEur(m.pending)}</b> is parked until the daily-core ranking refreshes.${pending}`
+                        : 'No mirror entries yet — initialize with positions or add a Sparplan.');
                 el.innerHTML = (m.positions || []).length ? `<table><tr><th>Ticker</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>P&L%</th></tr>${m.positions.map(p => {
                     const cls = p.pnl_pct > 0 ? 'buy' : p.pnl_pct < 0 ? 'sell' : '';
                     return `<tr><td>${escapeHtml(p.ticker)}</td><td>${p.shares.toFixed(4)}</td><td>${fmtEur(p.avg_cost)}</td><td>${fmtEur(p.current_price)}</td><td>${fmtEur(p.value)}</td><td class="${cls}">${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(2)}%</td></tr>`;

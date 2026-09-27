@@ -1044,17 +1044,19 @@ async def savings_initialize(req: SavingsInitRequest):
 
     Destructive for TRACKER data only: wipes previous tracker state (the
     paper sims are untouched). Pass positions as
-    [{ticker, shares, avg_cost}] (EUR).
+    [{ticker, shares, avg_cost}] (EUR); repeated tickers are aggregated
+    into one weighted-average lot.
     """
     from . import savings
     if req.cash < 0:
         raise HTTPException(422, "cash must be >= 0")
     for p in req.positions:
-        if not p.get("ticker"):
-            raise HTTPException(422, "position needs a ticker")
+        ticker = str(p.get("ticker") or "").strip().upper()
+        if not _TICKER_RE.match(ticker):
+            raise HTTPException(422, f"invalid ticker symbol: {ticker!r}")
         try:
             sh, ac = float(p["shares"]), float(p["avg_cost"])
-        except (KeyError, ValueError) as e:
+        except (KeyError, ValueError, TypeError) as e:
             raise HTTPException(422, "position needs numeric shares/avg_cost") from e
         if sh <= 0 or ac <= 0:
             raise HTTPException(422, "position shares/avg_cost must be > 0")
@@ -1089,7 +1091,10 @@ async def savings_config(req: SavingsConfigRequest):
 async def savings_saveback(req: SavingsSavebackRequest):
     """Book a Saveback payout TR invested into a Sparplan asset."""
     from . import savings
-    r = await savings.add_saveback(req.amount, req.ticker)
+    ticker = req.ticker.strip().upper()
+    if not _TICKER_RE.match(ticker):
+        raise HTTPException(422, f"invalid ticker symbol: {ticker!r}")
+    r = await savings.add_saveback(req.amount, ticker)
     if not r.get("ok"):
         raise HTTPException(422, r.get("reason", "saveback failed"))
     return r
@@ -1102,7 +1107,10 @@ async def savings_plans():
 @app.post('/api/savings/plans')
 async def savings_add_plan(req: SavingsPlanRequest):
     from . import savings
-    r = await savings.add_plan(req.ticker, req.amount, req.day_of_month)
+    ticker = req.ticker.strip().upper()
+    if not _TICKER_RE.match(ticker):
+        raise HTTPException(422, f"invalid ticker symbol: {ticker!r}")
+    r = await savings.add_plan(ticker, req.amount, req.day_of_month)
     if not r.get("ok"):
         raise HTTPException(422, r.get("reason", "invalid plan"))
     return r
@@ -1119,7 +1127,7 @@ async def savings_remove_plan(plan_id: int):
 async def savings_remove_position(ticker: str):
     """Remove a position manually (sold in TR — proceeds arrive via true-up)."""
     from . import savings
-    r = await savings.remove_position(ticker)
+    r = await savings.remove_position(ticker.strip().upper())
     if not r.get("ok"):
         raise HTTPException(404, r.get("reason", "no such position"))
     return r

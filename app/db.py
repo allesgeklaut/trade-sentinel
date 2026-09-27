@@ -474,6 +474,10 @@ class SavingsAccount(Base):
     cash: Mapped[float] = mapped_column(Float, default=0)
     # Unpaid interest accrued since the last monthly payout (TR pays monthly).
     accrued_interest: Mapped[float] = mapped_column(Float, default=0)
+    # Mirrored-€ inflows that could not be allocated yet (no fresh ranking
+    # or missing prices) — flushed into the mirror by the next daily pass
+    # that has a fresh ranking, so a deferral is never a silent drop.
+    mirror_pending: Mapped[float] = mapped_column(Float, default=0)
     # Annual interest rate in % (TR: 3% for new customers; enter your NET
     # rate after the ~26.375% German withholding if you want the tracker to
     # match the payout TR actually credits).
@@ -512,6 +516,10 @@ class SavingsPlan(Base):
     amount: Mapped[float] = mapped_column(Float)      # EUR per execution
     day_of_month: Mapped[int] = mapped_column(Integer)  # 1..31
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # YYYY-MM of the last execution (operator-local) — the PER-PLAN dedupe:
+    # multiple plans for the same ticker on different days each fire once
+    # per month (the ledger alone cannot distinguish them by day).
+    last_executed_month: Mapped[str | None] = mapped_column(String(7), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
@@ -648,6 +656,23 @@ async def init_db():
         try:
             await conn.execute(
                 text("ALTER TABLE savings_mirror_entries ADD COLUMN breakdown TEXT DEFAULT ''")
+            )
+        except Exception:
+            pass  # column (or table) already exists
+        # Migration for savings_plans: per-plan execution marker (the dedupe
+        # used to be ledger-derived and ticker-keyed, which silently skipped
+        # a second plan for the same ticker within a month).
+        try:
+            await conn.execute(
+                text("ALTER TABLE savings_plans ADD COLUMN last_executed_month VARCHAR(7)")
+            )
+        except Exception:
+            pass  # column (or table) already exists
+        # Migration for savings_account: pending mirror € (deferred mirror
+        # allocations used to be dropped silently).
+        try:
+            await conn.execute(
+                text("ALTER TABLE savings_account ADD COLUMN mirror_pending FLOAT DEFAULT 0")
             )
         except Exception:
             pass  # column (or table) already exists

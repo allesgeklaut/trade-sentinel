@@ -106,17 +106,18 @@ async def _seed_ranking(session_factory, picks: list[str], age_hours: float = 1.
 
 
 async def _backdate_plan(session_factory, ticker: str, created: date) -> None:
-    """Set a plan's created_at (tz-aware UTC) — the created-after-due-day
-    rule keys off it, and tests with synthetic calendar dates need plans
-    that 'existed' before those dates."""
+    """Set every plan row for `ticker` created_at (tz-aware UTC) — the
+    created-after-due-day rule keys off it, and tests with synthetic
+    calendar dates need plans that 'existed' before those dates."""
     async with session_factory() as s:
-        plan = await s.scalar(
-            select(SavingsPlan).where(SavingsPlan.ticker == ticker)
-        )
-        assert plan is not None, f"no plan for {ticker}"
-        plan.created_at = datetime(
-            created.year, created.month, created.day, 12, 0, tzinfo=UTC
-        )
+        plans = (
+            await s.scalars(select(SavingsPlan).where(SavingsPlan.ticker == ticker))
+        ).all()
+        assert plans, f"no plan for {ticker}"
+        for plan in plans:
+            plan.created_at = datetime(
+                created.year, created.month, created.day, 12, 0, tzinfo=UTC
+            )
         await s.commit()
 
 
@@ -757,3 +758,160 @@ async def test_held_tickers_includes_fx_and_plans(mem_db):
     await savings._mirror_allocate(100.0, "AAPL")
     tickers = await savings.held_tickers()
     assert set(tickers) == {"AAPL", "URTH", "MSFT", "EURUSD=X"}
+
+
+async def test_held_tickers_includes_suffix_fx_pairs(mem_db):
+    """A .SW/.L holding can't be priced without its suffix FX pair — without
+    it the position silently falls back to avg_cost (review finding #4)."""
+    await savings.initialize(
+        100.0, positions=[{"ticker": "NESN.SW", "shares": 1.0, "avg_cost": 100.0}]
+    )
+    tickers = await savings.held_tickers()
+    assert "NESN.SW" in tickers
+    assert "USDCHF=X" in tickers  # .SW -> CHF -> USD -> EUR
+    assert "EURUSD=X" in tickers
+
+
+# ---------------------------------------------------------------------------
+# Review findings: two plans per ticker, pending mirror, deduped WARNs
+# ---------------------------------------------------------------------------
+
+async def test_two_plans_same_ticker_both_execute(mem_db):
+    """Review finding #1: the dedupe used to be ticker+month keyed, so a
+    second plan for the same ticker (day 15) was silently skipped for the
+    rest of the month after the first plan (day 1) bought."""
+    await savings.initialize(1000.0)
+    await _seed_candle(mem_db, "URTH", 100.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await savings.add_plan("URTH", 100.0, 1)
+    await savings.add_plan("URTH", 200.0, 15)
+    await _backdate_plan(mem_db, "URTH", date(2026, 9, 1))
+
+    r = await savings.run_sparplans(day=date(2026, 9, 1))
+    assert r["executed"] == 1
+    assert r["trades"][0]["amount"] == 100.0
+    r = await savings.run_sparplans(day=date(2026, 9, 15))
+    assert r["executed"] == 1, "day-15 plan must still fire after the day-1 plan"
+    assert r["trades"][0]["amount"] == 200.0
+    val = await savings.valuate()
+    assert val["cash"] == pytest.approx(700.0)
+
+
+async def test_plan_marker_blocks_same_month_reexecution(mem_db):
+    """The per-plan month marker is the dedupe — a third pass in the same
+    month does nothing even though two plans share the ticker."""
+    await savings.initialize(1000.0)
+    await _seed_candle(mem_db, "URTH", 100.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await savings.add_plan("URTH", 100.0, 1)
+    await savings.add_plan("URTH", 200.0, 15)
+    await _backdate_plan(mem_db, "URTH", date(2026, 9, 1))
+    await savings.run_sparplans(day=date(2026, 9, 15))
+    r = await savings.run_sparplans(day=date(2026, 9, 20))
+    assert r["executed"] == 0
+    # Next month, both fire again.
+    r = await savings.run_sparplans(day=date(2026, 10, 15))
+    assert r["executed"] == 2
+
+
+async def test_missing_price_warns_once_per_month(mem_db):
+    """Review finding #6: a permanently unpriceable plan used to log a WARN
+    on every daily pass (up to ~30 identical ledger rows)."""
+    await savings.initialize(1000.0)
+    await savings.add_plan("NOPE.DE", 100.0, 1)
+    await _backdate_plan(mem_db, "NOPE.DE", date(2026, 9, 1))
+    for d in (1, 2, 3, 4):
+        r = await savings.run_sparplans(day=date(2026, 9, d))
+        assert r["executed"] == 0
+        assert r.get("deferred") == ["NOPE.DE"]
+    warns = await _events(mem_db, "WARN")
+    assert len(warns) == 1
+    assert "no price" in warns[0].note
+
+
+async def test_insufficient_cash_warns_once_per_month(mem_db):
+    await savings.initialize(50.0)
+    await _seed_candle(mem_db, "URTH", 100.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await savings.add_plan("URTH", 100.0, 1)
+    await _backdate_plan(mem_db, "URTH", date(2026, 9, 1))
+    for d in (1, 2, 3):
+        r = await savings.run_sparplans(day=date(2026, 9, d))
+        assert r["executed"] == 0
+    warns = await _events(mem_db, "WARN")
+    assert len(warns) == 1, "one WARN per plan per month"
+    assert "insufficient" in warns[0].note
+
+
+async def test_mirror_deferral_is_pending_not_dropped(mem_db):
+    """Review finding #2: with no fresh daily-core ranking the mirror
+    allocation used to be dropped silently, permanently understating the
+    comparison. Deferred € is parked and flushed on a later pass."""
+    await savings.initialize(1000.0)
+    await _seed_candle(mem_db, "URTH", 100.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await savings.add_plan("URTH", 100.0, 1)
+    await _backdate_plan(mem_db, "URTH", date(2026, 9, 1))
+
+    # No ranking at all -> the buy happens but the mirror defers.
+    r = await savings.run_sparplans(day=date(2026, 9, 1))
+    assert r["executed"] == 1
+    assert r["trades"][0]["mirror_allocated"] is False
+    val = await savings.valuate()
+    assert val["mirror_pending"] == pytest.approx(100.0)
+    mirror = await savings._mirror_valuate()
+    assert mirror["allocated"] == 0
+    assert mirror["pending"] == pytest.approx(100.0)
+
+    # Still nothing: a flush attempt leaves it parked.
+    f = await savings.flush_pending_mirror()
+    assert f["flushed"] == 0.0
+    assert f["pending"] == pytest.approx(100.0)
+
+    # A fresh ranking arrives -> the next cycle flushes it into the picks.
+    await _seed_ranking(mem_db, ["AAPL", "MSFT"])
+    await _seed_candle(mem_db, "AAPL", 100.0)
+    await _seed_candle(mem_db, "MSFT", 100.0)
+    f = await savings.flush_pending_mirror()
+    assert f["flushed"] == pytest.approx(100.0)
+    assert f["pending"] == 0.0
+    mirror = await savings._mirror_valuate()
+    assert mirror["allocated"] == pytest.approx(100.0)
+    assert mirror["pending"] == 0.0
+    by_ticker = {p["ticker"]: p for p in mirror["positions"]}
+    assert by_ticker["AAPL"]["shares"] == pytest.approx(0.5)
+    assert by_ticker["MSFT"]["shares"] == pytest.approx(0.5)
+
+
+async def test_initialize_aggregates_duplicate_positions(mem_db):
+    """Review finding #3: SavingsPosition.ticker is UNIQUE, so two lots of
+    the same ETF used to blow up the whole init with an IntegrityError."""
+    r = await savings.initialize(
+        1000.0,
+        positions=[
+            {"ticker": "URTH", "shares": 1.0, "avg_cost": 100.0},
+            {"ticker": "URTH", "shares": 3.0, "avg_cost": 140.0},
+        ],
+    )
+    assert r["invested"] == pytest.approx(520.0)  # 100 + 420
+    val = await savings.valuate()
+    assert len(val["positions"]) == 1
+    pos = val["positions"][0]
+    assert pos["shares"] == pytest.approx(4.0)
+    assert pos["avg_cost"] == pytest.approx(130.0)  # weighted average
+
+
+async def test_initialize_rejects_non_numeric_positions(mem_db):
+    """Review finding #8: float(None) raised TypeError -> raw 500. Rows with
+    unusable values are skipped, the rest still initialize."""
+    r = await savings.initialize(
+        500.0,
+        positions=[
+            {"ticker": "URTH", "shares": None, "avg_cost": None},
+            {"ticker": "URTH", "shares": 2.0, "avg_cost": 50.0},
+        ],
+    )
+    assert r["ok"] is True
+    assert r["invested"] == pytest.approx(100.0)
+    val = await savings.valuate()
+    assert val["positions"][0]["shares"] == pytest.approx(2.0)
