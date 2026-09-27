@@ -242,6 +242,18 @@ class Settings(BaseSettings):
     # out-of-sample on all four walk-forward windows (see §10).
     sim_daily_core_enabled: bool = True
 
+    # --- Savings tracker (real-money Trade Republic account, EUR) -----------
+    # Tracks the operator's REAL cash account + Sparpläne — no connection to
+    # Trade Republic; values are manual/derived. App-level loop independent
+    # of SIM_ENABLED (the savings account must keep accruing even when the
+    # paper sims are off). Seed defaults only: the interest rate and monthly
+    # transfer are editable at runtime in the UI (persisted in the DB).
+    savings_enabled: bool = True
+    savings_interest_rate: float = 3.0   # % p.a., GROSS (set your net rate in the UI)
+    savings_monthly_transfer: float = 0.0  # € per month (seed; editable in UI)
+    savings_snapshot_hour: int = 23      # UTC hour of the daily accrual+snapshot pass
+    savings_snapshot_minute: int = 40    # 10 min after the sims (avoid DB contention)
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

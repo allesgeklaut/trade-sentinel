@@ -1,6 +1,6 @@
 from datetime import datetime, UTC
 
-from sqlalchemy import String, Float, Integer, UniqueConstraint, Text, event
+from sqlalchemy import String, Float, Integer, UniqueConstraint, Text, Boolean, event
 from sqlalchemy import DateTime as _DateTime
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -455,6 +455,127 @@ class DailyCoreRanking(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
+# =====================================================================
+# Savings tracker (real-money Trade Republic cash account + Sparpläne)
+#
+# Deliberately separate from the paper sims above: this tracks the
+# operator's REAL money (EUR), so no backfill or "reset all sims" may ever
+# touch these tables. The engine (app/savings.py) mirrors deposits,
+# interest accrual and Sparplan buys; a forward mirror portfolio replays
+# the same € into the daily-core suggestion for comparison.
+# =====================================================================
+
+class SavingsAccount(Base):
+    """Singleton row (id=1) tracking the real TR cash account."""
+
+    __tablename__ = "savings_account"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cash: Mapped[float] = mapped_column(Float, default=0)
+    # Unpaid interest accrued since the last monthly payout (TR pays monthly).
+    accrued_interest: Mapped[float] = mapped_column(Float, default=0)
+    # Annual interest rate in % (TR: 3% for new customers; enter your NET
+    # rate after the ~26.375% German withholding if you want the tracker to
+    # match the payout TR actually credits).
+    interest_rate: Mapped[float] = mapped_column(Float, default=3.0)
+    # Recurring transfer into the savings account at each month start (€).
+    monthly_transfer: Mapped[float] = mapped_column(Float, default=0)
+    # YYYY-MM markers so monthly actions are idempotent (allowance_tz anchor).
+    last_transfer_month: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    last_interest_month: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    # YYYY-MM-DD marker of the last day interest was accrued for (catch-up
+    # after downtime accrues each missed day once).
+    last_accrual_day: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class SavingsPosition(Base):
+    """Open positions bought via Sparpläne (or seeded at initialization)."""
+
+    __tablename__ = "savings_positions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(32), unique=True)
+    shares: Mapped[float] = mapped_column(Float)
+    avg_cost: Mapped[float] = mapped_column(Float)  # EUR per share
+    opened_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class SavingsPlan(Base):
+    """Configured Sparplan: buy `amount` € of `ticker` on `day_of_month`."""
+
+    __tablename__ = "savings_plans"
+    __table_args__ = (UniqueConstraint("ticker", "day_of_month"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(32), index=True)
+    amount: Mapped[float] = mapped_column(Float)      # EUR per execution
+    day_of_month: Mapped[int] = mapped_column(Integer)  # 1..31
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class SavingsEvent(Base):
+    """Immutable ledger of everything that moved money in the tracker.
+
+    kind: INIT | TRANSFER | INTEREST_PAYOUT | SPARPLAN_BUY | SAVEBACK |
+          TRUEUP | WARN
+    """
+
+    __tablename__ = "savings_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16), index=True)
+    amount: Mapped[float] = mapped_column(Float, default=0)  # € (signed)
+    ticker: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+
+class SavingsSnapshot(Base):
+    """Equity-curve point (one per day): cash + positions, EUR."""
+
+    __tablename__ = "savings_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    cash: Mapped[float] = mapped_column(Float)
+    positions_value: Mapped[float] = mapped_column(Float)
+    accrued_interest: Mapped[float] = mapped_column(Float, default=0)
+    total_equity: Mapped[float] = mapped_column(Float)
+    contributed: Mapped[float] = mapped_column(Float, default=0)
+
+
+class SavingsMirrorEntry(Base):
+    """One mirrored € inflow: the same money that went into positions
+    (seed holdings, Sparplan buys) is also allocated to the daily-core
+    suggestion as of that date — the forward mirror comparison."""
+
+    __tablename__ = "savings_mirror_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    amount: Mapped[float] = mapped_column(Float)  # EUR allocated
+    # What the money actually went into ("" for the seed lump into cash).
+    source_ticker: Mapped[str] = mapped_column(String(32), default="")
+    # JSON [[ticker, shares, price], ...] — the picks bought with this entry,
+    # so the mirror curve can be replayed as a true time series (cumulative
+    # shares as of each date, valued at that date's close).
+    breakdown: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+
+class SavingsMirrorPosition(Base):
+    """Mirror portfolio holdings: daily-core picks bought with mirrored €."""
+
+    __tablename__ = "savings_mirror_positions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(32), index=True)
+    shares: Mapped[float] = mapped_column(Float)
+    avg_cost: Mapped[float] = mapped_column(Float)  # EUR per share
+    opened_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
 
 def _configure_sqlite_pragmas(dbapi_conn, _record) -> None:
     """Set durability/concurrency pragmas on every new SQLite connection."""
@@ -521,6 +642,15 @@ async def init_db():
             )
         except Exception:
             pass  # column already exists
+        # Migration for savings_mirror_entries: the per-pick breakdown JSON
+        # (added with the true time-series mirror curve). Pre-release dev
+        # builds of the savings tracker created the table without it.
+        try:
+            await conn.execute(
+                text("ALTER TABLE savings_mirror_entries ADD COLUMN breakdown TEXT DEFAULT ''")
+            )
+        except Exception:
+            pass  # column (or table) already exists
         # Migration for fundamentals: add the `source` column (edgar|yfinance)
         # and rebuild the unique constraint to (ticker, tag, start, end, filed,
         # source) — EDGAR re-reports spans in later filings and point-in-time

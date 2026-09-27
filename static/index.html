@@ -1121,6 +1121,53 @@
             height: 320px
         }
 
+        #savings-view {
+            display: none;
+            max-width: 1400px;
+            margin: auto;
+            padding: 18px
+        }
+
+        #savings-chart {
+            height: 320px
+        }
+
+        .savings-form input,
+        .savings-form select {
+            background: #0a1a10;
+            color: #b7ffc0;
+            border: 1px solid #1d4d29;
+            border-radius: 4px;
+            padding: 6px 8px;
+            font-size: 13px;
+            min-width: 0
+        }
+
+        .savings-form .row {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 8px;
+            flex-wrap: wrap;
+            align-items: center
+        }
+
+        .savings-form label {
+            font-size: 12px;
+            color: #7aaa81;
+            display: flex;
+            flex-direction: column;
+            gap: 3px
+        }
+
+        #savings-positions-table table thead th,
+        #savings-mirror-positions table thead th,
+        #savings-events table thead th {
+            position: sticky;
+            top: 0;
+            background: #071009;
+            z-index: 1
+        }
+
         #dailycore-trades table thead th,
         #dailycore-positions table thead th,
         #dailycore-band table thead th {
@@ -1359,7 +1406,8 @@
         <div class="nav-toggle"><button id="nav-dashboard" class="nav-active"
                 onclick="showView('dashboard')">Dashboard</button><button id="nav-sim" onclick="showView('sim')">Daily
                 Sim</button><button id="nav-monthly" onclick="showView('monthly')">Monthly Sim</button><button
-                id="nav-dailycore" onclick="showView('dailycore')">Daily-Core</button></div><span
+                id="nav-dailycore" onclick="showView('dailycore')">Daily-Core</button><button id="nav-savings"
+                onclick="showView('savings')">Savings</button></div><span
             id="status">loading</span>
         <select id="llm-model" title="Active LLM backend / model" onchange="switchLLMModel()">
             <option value="">loading models…</option>
@@ -1662,6 +1710,110 @@
                 synthetic trades, not a live track record. Default: starts where the other sims start so
                 all three equity curves cover the same window. Pick a date or tick "full history" (2017+)
                 for the long-view replay.
+            </div>
+        </div>
+    </section>
+    <section id="savings-view">
+        <div class="sim-section">
+            <div id="savings-summary"></div>
+        </div>
+        <div class="sim-section savings-form" id="savings-setup" style="display:none">
+            <div class="sim-section-title">Set up the Savings tracker</div>
+            <p style="font-size:12px;color:#7aaa81;margin:4px 0 10px">
+                Tracks your real Trade Republic account in EUR — savings cash with daily interest accrual
+                (paid monthly like TR) and Sparplan buys executed virtually from that cash. No connection
+                to TR: seed the balance, then true it up when it drifts. Your held positions and every
+                future Sparplan € are mirrored into the current daily-core suggestion for comparison.
+            </p>
+            <div class="row">
+                <label>Cash balance (€)
+                    <input type="number" id="sv-init-cash" min="0" step="0.01" placeholder="e.g. 5000">
+                </label>
+                <label>Monthly transfer (€)
+                    <input type="number" id="sv-init-transfer" min="0" step="1" value="0">
+                </label>
+                <label>Interest rate (% p.a., net)
+                    <input type="number" id="sv-init-rate" min="0" max="20" step="0.01" value="3.0">
+                </label>
+            </div>
+            <div id="sv-init-positions"></div>
+            <div class="row">
+                <button type="button" onclick="svAddInitPosition()">+ Add position</button>
+                <button type="button" onclick="svInitialize()">Initialize tracker</button>
+                <span id="sv-init-status" style="font-size:12px;color:#7aaa81"></span>
+            </div>
+        </div>
+        <div class="sim-section" id="savings-main" style="display:none">
+            <div class="sim-section-title">Equity Curve (cash + positions vs contributed, EUR)</div>
+            <div style="display:flex;gap:16px;margin-bottom:8px;flex-wrap:wrap">
+                <span style="color:#42ff72;font-size:12px">● Total (cash + positions + accrued interest)</span>
+                <span style="color:#4d9fff;font-size:12px">● Positions value</span>
+                <span style="color:#b48cff;font-size:12px">● Daily-core mirror (same €, their picks)</span>
+                <span style="color:#7aaa81;font-size:12px">● Contributed (seed + transfers)</span>
+                <span style="flex:1"></span>
+                <span id="sv-range-bar" style="display:inline-flex;gap:4px;margin-left:10px">
+                    <button class="range-btn" data-range="6M" onclick="setSavingsRange('6M')">6M</button>
+                    <button class="range-btn range-active" data-range="1Y" onclick="setSavingsRange('1Y')">1Y</button>
+                    <button class="range-btn" data-range="MAX" onclick="setSavingsRange('MAX')">MAX</button>
+                </span>
+            </div>
+            <div id="savings-chart"></div>
+            <div id="savings-asof" style="font-size:10px;color:#7aaa81;text-align:right;margin-top:2px"></div>
+        </div>
+        <div class="sim-grid2" id="savings-grid-1" style="display:none">
+            <div class="sim-section">
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">POSITIONS (SPARPLÄNE)</h3>
+                <div id="savings-positions-table"></div>
+            </div>
+            <div class="sim-section">
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">DAILY-CORE MIRROR</h3>
+                <div id="savings-mirror-summary" style="margin-bottom:8px"></div>
+                <div id="savings-mirror-positions"></div>
+            </div>
+        </div>
+        <div class="sim-grid2" id="savings-grid-2" style="display:none">
+            <div class="sim-section">
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">SPARPLÄNE (CONFIG)</h3>
+                <div id="savings-plans"></div>
+                <div class="row" style="margin-top:10px">
+                    <span style="position:relative">
+                        <input type="text" id="sv-plan-ticker" placeholder="Ticker" style="max-width:110px">
+                        <div id="sv-plan-matches" class="matches" style="width:240px"></div>
+                    </span>
+                    <input type="number" id="sv-plan-amount" placeholder="€ / month" min="1" step="1" style="max-width:110px">
+                    <input type="number" id="sv-plan-day" placeholder="Day" min="1" max="31" step="1" style="max-width:70px">
+                    <button type="button" onclick="svAddPlan()">Add plan</button>
+                </div>
+            </div>
+            <div class="sim-section">
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">EVENT LEDGER</h3>
+                <div id="savings-events"></div>
+            </div>
+        </div>
+        <div class="sim-section" id="savings-actions-row" style="display:none">
+            <div class="bench-label">ACTIONS</div>
+            <div class="sim-actions">
+                <button id="savings-refresh-btn" onclick="svRefreshData(this)">Refresh prices</button>
+                <button onclick="svRunNow(this)">Run pass now</button>
+                <button onclick="svTrueupPrompt(this)">True-up balance</button>
+                <button onclick="svSavebackPrompt(this)">Add Saveback</button>
+                <label style="font-size:12px;color:#7aaa81;display:flex;align-items:center;gap:4px">
+                    Transfer €<input type="number" id="sv-cfg-transfer" min="0" step="1"
+                        style="max-width:90px;background:#0a1a10;color:#b7ffc0;border:1px solid #1d4d29;border-radius:4px;padding:4px">
+                </label>
+                <label style="font-size:12px;color:#7aaa81;display:flex;align-items:center;gap:4px">
+                    Rate %<input type="number" id="sv-cfg-rate" min="0" max="20" step="0.01"
+                        style="max-width:80px;background:#0a1a10;color:#b7ffc0;border:1px solid #1d4d29;border-radius:4px;padding:4px">
+                </label>
+                <button onclick="svSaveConfig(this)">Save config</button>
+                <button onclick="svReinitConfirm()" title="Back to the setup form (wipes the TRACKER, not the sims)">Re-initialize</button>
+            </div>
+            <div id="savings-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
+            <div style="margin-top:6px;font-size:11px;color:#7aaa81">
+                Real money — never touched by "Reset All Sims" or any backfill. Interest accrues daily at
+                rate/365 on the cash balance and pays out monthly, like Trade Republic. Sparplan buys run
+                on their day-of-month (catch-up after downtime) and deduct from the tracked cash; a
+                missing price defers the buy to the next pass.
             </div>
         </div>
     </section>
@@ -2102,6 +2254,14 @@
                     const n = r.refreshed.length, errs = r.errors.length;
                     ptrShowResult(errs === 0,
                         errs ? `${n} updated, ${errs} failed` : `Daily-core updated (${n} tickers)`);
+                } else if (view === 'savings') {
+                    // Savings view: refresh held tickers + EURUSD=X, then
+                    // re-read the tab (valuations are EUR-converted).
+                    const r = await api('savings/refresh', { method: 'POST' });
+                    await loadSavingsAll();
+                    const n = r.refreshed.length, errs = r.errors.length;
+                    ptrShowResult(errs === 0,
+                        errs ? `${n} updated, ${errs} failed` : `Savings updated (${n} tickers)`);
                 }
                 await new Promise(r => setTimeout(r, 1200));
                 ptrReset();
@@ -2536,6 +2696,64 @@
             $('#universe').value = current;
             showScreen();
         }
+
+        // Reusable ticker autocomplete for any single-line text input:
+        // debounces /api/symbols (the same Yahoo-backed endpoint the
+        // Dashboard's watchlist add uses), renders a .matches dropdown and
+        // handles ArrowUp/Down/Enter/Escape navigation. The caller passes
+        // the input and the dropdown element (a sibling .matches div).
+        function attachTickerAutocomplete(input, dropdown, onPick) {
+            let timer = null;
+            let matchIdx = -1;
+            const renderMatches = a => {
+                dropdown.classList.toggle('open', a.length > 0);
+                dropdown.innerHTML = a.map((x, i) =>
+                    `<div class=match data-idx=${i} onclick='this._pick(${JSON.stringify(x.symbol).replace(/"/g, "&quot;")})'>` +
+                    `<span>${escapeHtml(x.symbol)}<br><small>${escapeHtml(x.name)}</small></span>` +
+                    `<small>${escapeHtml(x.exchange)}</small></div>`).join('');
+                // Stash the pick handler on each row (inline onclick above
+                // calls it with the chosen symbol).
+                dropdown.querySelectorAll('.match').forEach((el, i) => {
+                    el._pick = sym => {
+                        input.value = sym;
+                        dropdown.innerHTML = '';
+                        dropdown.classList.remove('open');
+                        if (onPick) onPick(sym);
+                    };
+                });
+                matchIdx = -1;
+            };
+            input.addEventListener('input', () => {
+                clearTimeout(timer);
+                const q = input.value.trim();
+                if (q.length < 2) { dropdown.innerHTML = ''; dropdown.classList.remove('open'); return; }
+                timer = setTimeout(async () => {
+                    try { renderMatches(await api('symbols?q=' + encodeURIComponent(q))); }
+                    catch (e) { dropdown.innerHTML = ''; dropdown.classList.remove('open'); }
+                }, 300);
+            });
+            input.addEventListener('keydown', e => {
+                const items = dropdown.querySelectorAll('.match');
+                if (!items.length) return;
+                if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    matchIdx = (matchIdx + 1) % items.length;
+                    items.forEach((el, i) => el.classList.toggle('match-active', i === matchIdx));
+                    items[matchIdx].scrollIntoView({ block: 'nearest' });
+                } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    matchIdx = (matchIdx - 1 + items.length) % items.length;
+                    items.forEach((el, i) => el.classList.toggle('match-active', i === matchIdx));
+                    items[matchIdx].scrollIntoView({ block: 'nearest' });
+                } else if (e.key === 'Enter' && matchIdx >= 0) {
+                    e.preventDefault();
+                    items[matchIdx].click();
+                } else if (e.key === 'Escape') {
+                    dropdown.innerHTML = '';
+                    dropdown.classList.remove('open');
+                }
+            });
+        }
         // The Dashboard universe dropdown is the single control for the
         // universe of EVERY sim (daily sim, monthly, daily-core). Changing it
         // persists the choice app-wide and re-runs the local screener.
@@ -2753,7 +2971,7 @@
         // Deep link: open the tab the URL points at (#/dailycore, #/monthly,
         // #/sim). Default dashboard. showView writes the hash on every
         // switch, so a reload restores the tab the user was on.
-        const initialView = (location.hash.match(/^#\/(sim|monthly|dailycore)$/) || [])[1];
+        const initialView = (location.hash.match(/^#\/(sim|monthly|dailycore|savings)$/) || [])[1];
         if (initialView) setTimeout(() => showView(initialView), 0);
 
         // --- Simulation view ---
@@ -2775,17 +2993,21 @@
             const sim = document.getElementById('sim-view');
             const monthly = document.getElementById('monthly-view');
             const dailycore = document.getElementById('dailycore-view');
+            const savings = document.getElementById('savings-view');
             const navDash = document.getElementById('nav-dashboard');
             const navSim = document.getElementById('nav-sim');
             const navMonthly = document.getElementById('nav-monthly');
             const navDailyCore = document.getElementById('nav-dailycore');
+            const navSavings = document.getElementById('nav-savings');
             navDash.classList.remove('nav-active');
             navSim.classList.remove('nav-active');
             navMonthly.classList.remove('nav-active');
             navDailyCore.classList.remove('nav-active');
+            navSavings.classList.remove('nav-active');
             sim.classList.remove('active');
             monthly.style.display = 'none';
             dailycore.style.display = 'none';
+            savings.style.display = 'none';
             if (view === 'sim') {
                 dash.style.display = 'none';
                 sim.classList.add('active');
@@ -2805,6 +3027,11 @@
                 dailycore.style.display = 'block';
                 navDailyCore.classList.add('nav-active');
                 if (!dailyCoreLoaded) { dailyCoreLoaded = true; loadDailyCoreAll(); }
+            } else if (view === 'savings') {
+                dash.style.display = 'none';
+                savings.style.display = 'block';
+                navSavings.classList.add('nav-active');
+                if (!savingsLoaded) { savingsLoaded = true; loadSavingsAll(); }
             } else {
                 dash.style.display = 'grid';
                 navDash.classList.add('nav-active');
@@ -2841,6 +3068,7 @@
         // ===================== Daily-core portfolio =====================
         let dailyCoreChart = null;
         let dailyCoreLoaded = false;
+        let savingsLoaded = false;
         let dcCompareMode = 'pct';
         let dcRange = '1Y';
         let dailyCoreChartReq = 0;
@@ -3303,6 +3531,350 @@
                 loadDailyCoreEquity({ status, snaps, monthlyStatus, simStatus }),
             ]);
         }
+
+        // ===================== Savings tracker (real money, EUR) =====================
+        let savingsChart = null;
+        let savingsRange = '1Y';
+        const SAVINGS_RANGE_LIMIT = { '6M': 190, '1Y': 380, 'MAX': 12000 };
+
+        function fmtEur(x, digits = 2) {
+            return '€' + (x == null ? '—' : x.toFixed(digits));
+        }
+
+        async function loadSavingsAll() {
+            const limit = SAVINGS_RANGE_LIMIT[savingsRange] || 380;
+            const [status, snaps, mirror] = await Promise.all([
+                api('savings/status').catch(() => null),
+                api(`savings/equity?limit=${limit}`).catch(() => null),
+                api(`savings/mirror?limit=${limit}`).catch(() => null),
+            ]);
+            if (!status) {
+                document.getElementById('savings-summary').innerHTML =
+                    '<div class="sim-empty">Error loading savings status.</div>';
+                return;
+            }
+            renderSavingsSetupVsMain(status);
+            renderSavingsSummary(status);
+            renderSavingsPositions(status);
+            renderSavingsPlans(status);
+            renderSavingsEvents(status);
+            await Promise.all([
+                renderSavingsChart(snaps, status, mirror),
+                status.initialized ? loadSavingsMirrorTable(mirror) : Promise.resolve(),
+            ]);
+        }
+
+        function renderSavingsSetupVsMain(status) {
+            const initialized = !!status.initialized;
+            document.getElementById('savings-setup').style.display = initialized ? 'none' : 'block';
+            document.getElementById('savings-main').style.display = initialized ? 'block' : 'none';
+            document.getElementById('savings-grid-1').style.display = initialized ? 'grid' : 'none';
+            document.getElementById('savings-grid-2').style.display = initialized ? 'grid' : 'none';
+            document.getElementById('savings-actions-row').style.display = initialized ? 'block' : 'none';
+            if (initialized) {
+                const tr = document.getElementById('sv-cfg-transfer');
+                const rt = document.getElementById('sv-cfg-rate');
+                if (tr && document.activeElement !== tr) tr.value = status.monthly_transfer;
+                if (rt && document.activeElement !== rt) rt.value = status.interest_rate;
+            }
+        }
+
+        function renderSavingsSummary(status) {
+            if (!status.initialized) {
+                document.getElementById('savings-summary').innerHTML =
+                    '<span class="metric">Tracker<b>not set up</b></span>';
+                return;
+            }
+            const gain = status.contributed > 0
+                ? status.total_equity / status.contributed * 100 - 100 : null;
+            const m = [
+                ['Total Equity', fmtEur(status.total_equity)],
+                ['Cash', fmtEur(status.cash)],
+                ['Accrued Interest', fmtEur(status.accrued_interest)],
+                ['Positions', fmtEur(status.positions_value)],
+                ['Contributed', fmtEur(status.contributed)],
+                ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(2) + '%' : '—'],
+                ['Rate', status.interest_rate.toFixed(2) + '% p.a.'],
+                ['Transfer', fmtEur(status.monthly_transfer, 0) + '/mo'],
+            ];
+            document.getElementById('savings-summary').innerHTML =
+                m.map(([k, x]) => `<span class="metric">${k}<br><b>${x}</b></span>`).join('');
+        }
+
+        function renderSavingsPositions(status) {
+            const el = document.getElementById('savings-positions-table');
+            const pos = status.positions || [];
+            el.innerHTML = pos.length ? `<table><tr><th>Ticker</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>P&L%</th><th></th></tr>${pos.map(p => {
+                const cls = p.pnl_pct > 0 ? 'buy' : p.pnl_pct < 0 ? 'sell' : '';
+                return `<tr><td>${escapeHtml(p.ticker)}</td><td>${p.shares.toFixed(4)}</td><td>${fmtEur(p.avg_cost)}</td><td>${fmtEur(p.current_price)}</td><td>${fmtEur(p.value)}</td><td class="${cls}">${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(2)}%</td>` +
+                    `<td><button style="padding:2px 8px;font-size:11px" onclick="svRemovePosition('${escapeHtml(p.ticker)}')" title="Sold in TR — remove from tracker; the money arrives via true-up">✕</button></td></tr>`;
+            }).join('')}</table>` : '<div class="sim-empty">No positions yet — add a Sparplan or book a Saveback.</div>';
+        }
+
+        function renderSavingsPlans(status) {
+            const el = document.getElementById('savings-plans');
+            const plans = status.plans || [];
+            el.innerHTML = plans.length ? `<table><tr><th>Ticker</th><th>€/month</th><th>Day</th><th>Active</th><th></th></tr>${plans.map(p => {
+                return `<tr><td>${escapeHtml(p.ticker)}</td><td>${fmtEur(p.amount, 0)}</td><td>${p.day_of_month}</td><td>${p.active ? 'yes' : 'no'}</td>` +
+                    `<td><button style="padding:2px 8px;font-size:11px" onclick="svRemovePlan(${p.id})">✕</button></td></tr>`;
+            }).join('')}</table>` : '<div class="sim-empty">No Sparplan configured.</div>';
+        }
+
+        function renderSavingsEvents(status) {
+            const el = document.getElementById('savings-events');
+            const ev = status.events || [];
+            el.innerHTML = ev.length ? `<table><tr><th>Date</th><th>Kind</th><th>€</th><th>Ticker</th><th>Note</th></tr>${ev.map(e => {
+                const cls = e.amount > 0 ? 'buy' : e.amount < 0 ? 'sell' : '';
+                return `<tr><td>${(e.date || '').slice(0, 10)}</td><td>${escapeHtml(e.kind)}</td><td class="${cls}">${e.amount ? (e.amount > 0 ? '+' : '') + fmtEur(e.amount) : '—'}</td><td>${escapeHtml(e.ticker || '')}</td><td style="font-size:11px;color:#7aaa81">${escapeHtml(e.note || '')}</td></tr>`;
+            }).join('')}</table>` : '<div class="sim-empty">No events yet.</div>';
+        }
+
+        async function renderSavingsChart(snaps, status, mirror) {
+            if (savingsChart) { savingsChart.remove(); savingsChart = null; }
+            if (!snaps || !snaps.length || !status || !status.initialized) {
+                document.getElementById('savings-chart').innerHTML =
+                    '<div class="sim-empty">The equity curve appears after the first daily pass (or press "Run pass now").</div>';
+                return;
+            }
+            // One point per day, the LAST snapshot winning (same convention
+            // as the daily-core chart). The API returns oldest-first, so a
+            // plain overwrite leaves the last entry of each day.
+            const byDay = new Map();
+            for (const s of snaps) {
+                byDay.set(s.date, { value: s.total_equity, contributed: s.contributed, positions: s.positions_value });
+            }
+            const pts = [...byDay.entries()]
+                .map(([time, p]) => ({ time, value: p.value, contributed: p.contributed, positions: p.positions }))
+                .sort((a, b) => a.time < b.time ? -1 : 1);
+            document.getElementById('savings-chart').innerHTML = '';
+            savingsChart = LightweightCharts.createChart(document.getElementById('savings-chart'), {
+                autoSize: true,
+                height: 320, layout: { background: { color: '#071009' }, textColor: '#b7ffc0' },
+                grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } },
+                timeScale: { timeVisible: false, secondsVisible: false },
+            });
+            savingsChart.addLineSeries({
+                color: '#42ff72', lineWidth: 2,
+                priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+            }).setData(pts.map(p => ({ time: p.time, value: p.value })));
+            savingsChart.addLineSeries({
+                color: '#4d9fff', lineWidth: 1,
+                priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+            }).setData(pts.map(p => ({ time: p.time, value: p.positions })));
+            savingsChart.addLineSeries({
+                color: '#7aaa81', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted,
+                priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+            }).setData(pts.map(p => ({ time: p.time, value: p.contributed })));
+            // Daily-core mirror overlay: the same position-€ spread over the
+            // daily-core picks at each date (violet, matching the Daily-Core
+            // tab's color). Only spans dates where mirror data exists.
+            const mirrorPts = ((mirror && mirror.curve) || [])
+                .filter(c => c.value > 0 || c.allocated > 0)
+                .map(c => ({ time: c.date, value: c.value }));
+            if (mirrorPts.length) {
+                savingsChart.addLineSeries({
+                    color: '#b48cff', lineWidth: 2,
+                    priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+                }).setData(mirrorPts);
+            }
+            savingsChart.timeScale().fitContent();
+            const asof = document.getElementById('savings-asof');
+            if (asof) asof.textContent = 'as of ' + pts[pts.length - 1].time;
+        }
+
+        function setSavingsRange(range) {
+            savingsRange = range;
+            for (const b of document.querySelectorAll('#sv-range-bar .range-btn'))
+                b.classList.toggle('range-active', b.dataset.range === range);
+            loadSavingsAll();
+        }
+
+        function svAddInitPosition() {
+            const holder = document.getElementById('sv-init-positions');
+            const div = document.createElement('div');
+            div.className = 'row';
+            div.innerHTML = `<span style="position:relative">
+                    <input class="svp-ticker" placeholder="Ticker" style="max-width:110px">
+                    <div class="matches svp-matches" style="width:240px"></div>
+                </span>
+                <input class="svp-shares" type="number" placeholder="Shares" min="0" step="0.0001" style="max-width:110px">
+                <input class="svp-cost" type="number" placeholder="Avg cost €" min="0" step="0.01" style="max-width:110px">
+                <button type="button" style="padding:4px 10px" onclick="this.parentElement.remove()">✕</button>`;
+            holder.appendChild(div);
+            attachTickerAutocomplete(
+                div.querySelector('.svp-ticker'), div.querySelector('.svp-matches'));
+        }
+
+        async function svInitialize() {
+            const status = document.getElementById('sv-init-status');
+            const cash = parseFloat(document.getElementById('sv-init-cash').value || '0');
+            const transfer = parseFloat(document.getElementById('sv-init-transfer').value || '0');
+            const rate = parseFloat(document.getElementById('sv-init-rate').value || '0');
+            const positions = [];
+            for (const row of document.querySelectorAll('#sv-init-positions .row')) {
+                const t = row.querySelector('.svp-ticker').value.trim().toUpperCase();
+                const sh = parseFloat(row.querySelector('.svp-shares').value || '0');
+                const ac = parseFloat(row.querySelector('.svp-cost').value || '0');
+                if (t && sh > 0 && ac > 0) positions.push({ ticker: t, shares: sh, avg_cost: ac });
+            }
+            status.textContent = 'Initializing…';
+            try {
+                const r = await api('savings/initialize', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ cash, positions, monthly_transfer: transfer, interest_rate: rate }),
+                });
+                status.textContent = `Initialized: ${fmtEur(r.cash)} cash` +
+                    (r.invested ? `, ${fmtEur(r.invested)} positions` : '') +
+                    (r.mirror ? `, mirror seeded into ${r.mirror.picks} daily-core picks` : '') + '.';
+                await loadSavingsAll();
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
+        }
+
+        async function svReinitConfirm() {
+            if (!confirm('Re-initialize the SAVINGS TRACKER?\n\nThis wipes the tracked cash, positions, plans, events, snapshots and the mirror — not the paper sims. Your real TR account is unaffected.'))
+                return;
+            await api('savings/reset', { method: 'POST' }).catch(() => { });
+            savingsLoaded = true;
+            await loadSavingsAll();
+        }
+
+        async function svRemovePosition(ticker) {
+            if (!confirm(`Remove ${ticker} from the tracker?\n(The position was sold in TR — the proceeds arrive via the next true-up.)`))
+                return;
+            try {
+                await api('savings/positions/' + encodeURIComponent(ticker), { method: 'DELETE' });
+                await loadSavingsAll();
+            } catch (e) { alert('Error: ' + e.message); }
+        }
+
+        async function svAddPlan() {
+            const t = document.getElementById('sv-plan-ticker').value.trim().toUpperCase();
+            const amount = parseFloat(document.getElementById('sv-plan-amount').value || '0');
+            const day = parseInt(document.getElementById('sv-plan-day').value || '0', 10);
+            const status = document.getElementById('savings-run-status');
+            if (!t || amount <= 0 || !(day >= 1 && day <= 31)) {
+                status.textContent = 'Plan needs a ticker, amount > 0 and a day 1..31.';
+                return;
+            }
+            try {
+                await api('savings/plans', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ticker: t, amount, day_of_month: day }),
+                });
+                document.getElementById('sv-plan-ticker').value = '';
+                document.getElementById('sv-plan-amount').value = '';
+                document.getElementById('sv-plan-day').value = '';
+                status.textContent = `Sparplan added: ${t} ${fmtEur(amount, 0)} on day ${day}.`;
+                await loadSavingsAll();
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
+        }
+
+        async function svRemovePlan(id) {
+            try {
+                await api('savings/plans/' + id, { method: 'DELETE' });
+                await loadSavingsAll();
+            } catch (e) { alert('Error: ' + e.message); }
+        }
+
+        async function svRefreshData(btn) {
+            btn.disabled = true;
+            const status = document.getElementById('savings-run-status');
+            status.textContent = 'Refreshing prices…';
+            try {
+                const r = await api('savings/refresh', { method: 'POST' });
+                status.textContent = `Refreshed ${r.refreshed}/${r.total} tickers` +
+                    (r.errors.length ? ` (${r.errors.length} errors)` : '') + '.';
+                await loadSavingsAll();
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
+            btn.disabled = false;
+        }
+
+        async function svRunNow(btn) {
+            btn.disabled = true;
+            const status = document.getElementById('savings-run-status');
+            status.textContent = 'Running pass…';
+            try {
+                const r = await api('savings/run', { method: 'POST' });
+                const sp = r.sparplans ? r.sparplans.executed : 0;
+                status.textContent = `Pass complete — prices: ${r.refresh ? r.refresh.refreshed : '?'} fetched, ` +
+                    `transfer: ${r.transfer.deposited ? '+' + fmtEur(r.transfer.amount) : 'no'}, ` +
+                    `payout: ${r.payout.paid ? fmtEur(r.payout.amount) : 'no'}, ` +
+                    `accrued: ${r.accrual.accrued ? `${r.accrual.days}d ${fmtEur(r.accrual.amount)}` : 'no'}, sparplans: ${sp}.`;
+                await loadSavingsAll();
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
+            btn.disabled = false;
+        }
+
+        async function svTrueupPrompt(btn) {
+            const input = prompt('True-up: enter your CURRENT TR cash total in € (as shown in TR, incl. unpaid interest, excluding positions/Saveback):');
+            if (input === null) return;
+            const actual = parseFloat(input.replace(',', '.'));
+            if (isNaN(actual)) { alert('Not a number.'); return; }
+            const status = document.getElementById('savings-run-status');
+            try {
+                const r = await api('savings/trueup', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ actual_cash: actual }),
+                });
+                status.textContent = r.delta === 0
+                    ? 'True-up: matches — no adjustment needed.'
+                    : `True-up: ${r.delta > 0 ? '+' : ''}${fmtEur(r.delta)} booked.`;
+                await loadSavingsAll();
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
+        }
+
+        async function svSavebackPrompt(btn) {
+            const amountStr = prompt('Saveback: how much € did TR invest on the 2nd of this month?');
+            if (amountStr === null) return;
+            const amount = parseFloat(amountStr.replace(',', '.'));
+            if (isNaN(amount) || amount <= 0) { alert('Enter an amount > 0.'); return; }
+            const ticker = prompt('Into which Sparplan asset (ticker)? (e.g. the ETF your Saveback flows into)');
+            if (!ticker) return;
+            const status = document.getElementById('savings-run-status');
+            try {
+                const r = await api('savings/saveback', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ amount, ticker }),
+                });
+                status.textContent = `Saveback booked: ${r.shares.toFixed(4)} ${r.ticker} @ ${fmtEur(r.price)}.`;
+                await loadSavingsAll();
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
+        }
+
+        async function svSaveConfig(btn) {
+            const transfer = parseFloat(document.getElementById('sv-cfg-transfer').value || '0');
+            const rate = parseFloat(document.getElementById('sv-cfg-rate').value || '0');
+            const status = document.getElementById('savings-run-status');
+            try {
+                await api('savings/config', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ monthly_transfer: transfer, interest_rate: rate }),
+                });
+                status.textContent = `Config saved: transfer ${fmtEur(transfer, 0)}/mo, rate ${rate}%.`;
+                await loadSavingsAll();
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
+        }
+
+        async function loadSavingsMirrorTable(mirror) {
+            const el = document.getElementById('savings-mirror-positions');
+            const sum = document.getElementById('savings-mirror-summary');
+            try {
+                const m = mirror || await api('savings/mirror?limit=12000');
+                sum.innerHTML = m.allocated > 0
+                    ? `Same € that went into your positions, spread equally over the daily-core picks at each date — <b>${fmtEur(m.allocated)}</b> mirrored, now worth <b>${fmtEur(m.total_equity)}</b> (${(m.total_equity / m.allocated * 100 - 100 >= 0 ? '+' : '') + (m.total_equity / m.allocated * 100 - 100).toFixed(2)}%).`
+                    : 'No mirror entries yet — initialize with positions or add a Sparplan.';
+                el.innerHTML = (m.positions || []).length ? `<table><tr><th>Ticker</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>P&L%</th></tr>${m.positions.map(p => {
+                    const cls = p.pnl_pct > 0 ? 'buy' : p.pnl_pct < 0 ? 'sell' : '';
+                    return `<tr><td>${escapeHtml(p.ticker)}</td><td>${p.shares.toFixed(4)}</td><td>${fmtEur(p.avg_cost)}</td><td>${fmtEur(p.current_price)}</td><td>${fmtEur(p.value)}</td><td class="${cls}">${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(2)}%</td></tr>`;
+                }).join('')}</table>` : '<div class="sim-empty">Mirror is empty.</div>';
+            } catch (e) { sum.innerHTML = 'Error: ' + escapeHtml(e.message); }
+        }
+
+        // Sparplan ticker input: same Yahoo symbol autocomplete as the
+        // Dashboard's watchlist add (debounced /api/symbols + keyboard nav).
+        attachTickerAutocomplete(
+            document.getElementById('sv-plan-ticker'),
+            document.getElementById('sv-plan-matches'));
 
         // ===================== Monthly qv-mom portfolio =====================
         let monthlyChart = null;
