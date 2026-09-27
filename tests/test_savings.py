@@ -105,6 +105,20 @@ async def _seed_ranking(session_factory, picks: list[str], age_hours: float = 1.
         await s.commit()
 
 
+async def _backdate_plan(session_factory, ticker: str, created: date) -> None:
+    """Set a plan's created_at (tz-aware UTC) — the created-after-due-day
+    rule keys off it, and tests with synthetic calendar dates need plans
+    that 'existed' before those dates."""
+    async with session_factory() as s:
+        plan = await s.scalar(
+            select(SavingsPlan).where(SavingsPlan.ticker == ticker)
+        )
+        assert plan is not None, f"no plan for {ticker}"
+        plan.created_at = datetime(
+            created.year, created.month, created.day, 12, 0, tzinfo=UTC
+        )
+        await s.commit()
+
 
 async def _events(mem_db, kind: str | None = None) -> list[SavingsEvent]:
     async with mem_db() as s:
@@ -244,6 +258,7 @@ async def test_interest_accrues_on_cash_only(mem_db):
     await _seed_candle(mem_db, "URTH", 100.0)
     await _seed_candle(mem_db, "EURUSD=X", 1.0)
     await savings.add_plan("URTH", 800.0, 1)
+    await _backdate_plan(mem_db, "URTH", date.today().replace(day=1))
     r = await savings.run_sparplans()
     assert r["executed"] == 1
     # Backdate + accrue: 200 € cash at 3.65% = 0.02/day.
@@ -330,6 +345,7 @@ async def test_sparplan_executes_on_due_day_only(mem_db):
     await _seed_candle(mem_db, "EURUSD=X", 1.0)
     await savings.add_plan("URTH", 100.0, 15)
     # The plan "existed" before its due day this month.
+    await _backdate_plan(mem_db, "URTH", date(2026, 9, 1))
 
     # Day 10: not yet due.
     r = await savings.run_sparplans(day=date(2026, 9, 10))
@@ -350,11 +366,52 @@ async def test_sparplan_executes_on_due_day_only(mem_db):
     assert val["positions"][0]["shares"] == pytest.approx(2.0)
 
 
+async def test_sparplan_created_after_due_day_fires_next_month(mem_db):
+    """The exact regression the live box hit: a plan added on the 27th with
+    day_of_month=2 must NOT fire retroactively in September — first buy is
+    02.10 (mirroring Trade Republic's own Sparplan semantics)."""
+    await savings.initialize(1000.0)
+    await _seed_candle(mem_db, "URTH", 100.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    # Created 27.09. — after the 2nd of the current month.
+    await savings.add_plan("URTH", 100.0, 2)
+    await _backdate_plan(mem_db, "URTH", date(2026, 9, 27))
+
+    # Same month, after the due day: NOT due (created after the 2nd).
+    r = await savings.run_sparplans(day=date(2026, 9, 27))
+    assert r["executed"] == 0
+    r = await savings.run_sparplans(day=date(2026, 9, 30))
+    assert r["executed"] == 0
+    # Next month on the due day: fires.
+    r = await savings.run_sparplans(day=date(2026, 10, 2))
+    assert r["executed"] == 1
+    # Only one buy total.
+    val = await savings.valuate()
+    assert val["cash"] == pytest.approx(900.0)
+
+
+async def test_sparplan_created_before_due_day_catches_up(mem_db):
+    """A plan that existed before its due day but was missed (app down on
+    the 2nd) still catches up later in the SAME month."""
+    await savings.initialize(1000.0)
+    await _seed_candle(mem_db, "URTH", 100.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await savings.add_plan("URTH", 100.0, 2)
+    await _backdate_plan(mem_db, "URTH", date(2026, 9, 1))
+
+    r = await savings.run_sparplans(day=date(2026, 9, 27))
+    assert r["executed"] == 1
+    # Dedupe still applies within the month.
+    r = await savings.run_sparplans(day=date(2026, 9, 28))
+    assert r["executed"] == 0
+
+
 async def test_sparplan_day31_clamps_in_short_month(mem_db):
     await savings.initialize(1000.0)
     await _seed_candle(mem_db, "URTH", 100.0)
     await _seed_candle(mem_db, "EURUSD=X", 1.0)
     await savings.add_plan("URTH", 100.0, 31)
+    await _backdate_plan(mem_db, "URTH", date(2026, 2, 1))
 
     # Feb 28: the day-31 plan is due (clamped to month end).
     r = await savings.run_sparplans(day=date(2026, 2, 28))
@@ -366,6 +423,7 @@ async def test_sparplan_insufficient_cash_warns(mem_db):
     await _seed_candle(mem_db, "URTH", 100.0)
     await _seed_candle(mem_db, "EURUSD=X", 1.0)
     await savings.add_plan("URTH", 100.0, 1)
+    await _backdate_plan(mem_db, "URTH", date(2026, 9, 1))
 
     r = await savings.run_sparplans(day=date(2026, 9, 1))
     assert r["executed"] == 0
@@ -380,6 +438,7 @@ async def test_sparplan_insufficient_cash_warns(mem_db):
 async def test_sparplan_deferred_without_price(mem_db):
     await savings.initialize(1000.0)
     await savings.add_plan("NOPE.DE", 100.0, 1)  # no candle
+    await _backdate_plan(mem_db, "NOPE.DE", date(2026, 9, 1))
 
     r = await savings.run_sparplans(day=date(2026, 9, 1))
     assert r["executed"] == 0
@@ -608,6 +667,7 @@ async def test_run_cycle_full_pass(mem_db):
         acc.last_interest_month = "2000-01"
         await s.commit()
     await savings.add_plan("URTH", 100.0, 1)
+    await _backdate_plan(mem_db, "URTH", date.today().replace(day=1))
     r = await savings.run_savings_cycle()
     assert r["transfer"]["deposited"] is True
     assert r["payout"]["paid"] is True  # 0 € but marks the month
@@ -640,6 +700,7 @@ async def test_cycle_refreshes_candles_before_acting(mem_db, monkeypatch):
     await savings.initialize(100.0, positions=[
         {"ticker": "URTH", "shares": 1.0, "avg_cost": 100.0}])
     await savings.add_plan("URTH", 50.0, 1)
+    await _backdate_plan(mem_db, "URTH", date.today().replace(day=1))
     r = await savings.run_savings_cycle()
     # The refresh ran and covered the held ticker + EURUSD=X.
     assert r["refresh"]["refreshed"] >= 2

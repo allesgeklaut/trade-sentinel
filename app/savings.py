@@ -519,8 +519,12 @@ async def run_sparplans(day: date | None = None) -> dict:
     Each plan runs at most once per calendar month: the event ledger is the
     dedupe (a SPARPLAN_BUY for the same ticker+month means it already ran).
     Catch-up after downtime: ``day`` defaults to today (operator-local), and
-    a missed earlier-in-month execution still fires while the month is
-    current. Day 29-31 plans run on the last day of shorter months.
+    a plan that MISSED its due day this month (created before it, app down
+    on it) still fires while the month is current. A plan created AFTER its
+    due day first fires NEXT month — mirroring Trade Republic, where a
+    Sparplan set up on the 27th with execution day 2 invests from the 2nd
+    of the following month, not retroactively. Day 29-31 plans run on the
+    last day of shorter months.
     """
     today = day or _today_local()
     month = today.strftime("%Y-%m")
@@ -529,20 +533,35 @@ async def run_sparplans(day: date | None = None) -> dict:
         if acc is None:
             return {"executed": 0, "reason": "not initialized"}
         plans = (await s.scalars(select(SavingsPlan).where(SavingsPlan.active == True))).all()  # noqa: E712
+        # created_at is stored tz-aware UTC; the OPERATOR-LOCAL calendar
+        # month decides which month a buy belongs to (a buy just after
+        # local midnight on the 1st is still the new month locally, and
+        # dedupe against a UTC month would let it double-run at month
+        # boundaries around the UTC offset).
+        created_local = {p.id: p.created_at.astimezone(_TZ).date() for p in plans}
+        await s.commit()
     if not plans:
         return {"executed": 0}
-    # Already-executed (ticker, month) pairs from the ledger.
+    # Already-executed (ticker, month) pairs from the ledger, keyed by the
+    # operator-local month of each buy.
     async with Session() as s:
         rows = (
             await s.scalars(select(SavingsEvent).where(SavingsEvent.kind == "SPARPLAN_BUY"))
         ).all()
     done: dict[str, set[str]] = {}
     for r in rows:
-        done.setdefault(r.ticker or "", set()).add(r.created_at.strftime("%Y-%m"))
+        stamp = r.created_at.astimezone(_TZ).strftime("%Y-%m")
+        done.setdefault(r.ticker or "", set()).add(stamp)
     due: list[SavingsPlan] = []
     for p in plans:
         effective_day = min(p.day_of_month, _days_in_month(today))
-        if today.day >= effective_day and month not in done.get(p.ticker, set()):
+        if month in done.get(p.ticker, set()):
+            continue
+        if today.day >= effective_day:
+            # Due day reached — but a plan CREATED after the due day this
+            # month must not fire retroactively: skip to next month.
+            if created_local[p.id] > today.replace(day=effective_day):
+                continue
             due.append(p)
     if not due:
         return {"executed": 0}
