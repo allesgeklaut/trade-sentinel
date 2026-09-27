@@ -893,19 +893,22 @@ async def take_snapshot() -> dict[str, Any]:
 async def refresh_data(tickers: list[str]) -> tuple[list[str], dict[str, str]]:
     """Refresh candles (+ FX pairs) and fundamentals for the universe.
 
+    Candles go through the bounded-concurrency ``refresh_many`` batch with the
+    same freshness window as the daily sim / daily-core, so a rebalance reuses
+    the nightly universe prefetch (and any recent fetch) instead of re-pulling
+    the whole ~500-name universe from Yahoo one ticker at a time. The deep
+    (10y) candle cache is populated separately by the screener's deep-load and
+    kept in the DB; this only tops up the ~2y the live ranking reads.
+
     Fundamentals source priority: SEC EDGAR for US filers (real filed dates,
     history to ~2009), yfinance fallback for CIK-less listings (ETFs, European
     exchanges). Same split as the stockstrat research pipeline."""
     from . import edgar
-    from .market import refresh_yfinance
-    refresh_errors: list[str] = []
+    from .market import refresh_many
     wanted = list(tickers) + sorted({pm[0] for t in tickers if (pm := fundamentals_mod._suffix_fx(t))})
-    for t in wanted:
-        try:
-            # Universe-sized batch → Yahoo only (see market.refresh_many).
-            await refresh_yfinance(t, "10y")
-        except Exception as e:
-            refresh_errors.append(f"{t}: {e}")
+    # Yahoo only (not the metered provider): the universe-sized batch path.
+    _, refresh_errors = await refresh_many(
+        wanted, "2y", max_age_seconds=settings.market_fresh_seconds)
     fund_status: dict[str, str]
     if settings.sim_monthly_fundamentals_source == "edgar":
         fund_status = await edgar.refresh_universe_mixed(tickers=tickers)
@@ -1055,8 +1058,10 @@ async def backfill(start: str | None = None,
     allowance on each month's FIRST trading day (same timing as the live
     deposit_allowance so the contributed figures step in lockstep with the
     other portfolios), picks the top-N with hysteresis at the month-end and
-    trades at that day's close with 10 bps one-way paper costs — the same
-    simulation as `optimize monthly-backtest`, but materialized as real
+    trades at that day's close. No fees: the replay mirrors the LIVE engine,
+    whose `_exec_buy`/`_exec_sell` charge no commission (the paper portfolios
+    are fee-free by design — see docs/brokers.md), so a backfill's end state
+    matches what the live engine would hold. Materialized as real
     trade/rebalance/snapshot rows the UI can render.
 
     ``start`` semantics (mirrors daily_core.backfill):
@@ -1157,8 +1162,6 @@ async def backfill(start: str | None = None,
         def px_of(t: str, d: pd.Timestamp) -> float | None:
             return px_at(close_val, d, t)
 
-        cost = settings.sim_monthly_cost_oneway
-
         # --- wipe + reset (preserve the live month markers like daily-core) ---
         live_allowance_month: str | None = None
         live_rebalance_month: str | None = None
@@ -1244,7 +1247,7 @@ async def backfill(start: str | None = None,
                     if p is None or p <= 0 or sh <= 0:
                         continue
                     notional = sh * p
-                    cash += notional * (1.0 - cost)
+                    cash += notional
                     del shares[t]
                     trade_rows.append((m.strftime("%Y-%m-%d"), "SELL", t, notional, sh, p))
                 equity_now = cash + sum(sh * (px_of(t, m) or 0.0)
@@ -1256,12 +1259,12 @@ async def backfill(start: str | None = None,
                         continue
                     gap = weight - shares.get(t, 0.0) * p
                     if gap > 1 and cash > 1:
-                        notional = min(gap, max(cash, 0.0) / (1.0 + cost))
+                        # Fee-free (mirrors the live _exec_buy).
+                        notional = min(gap, max(cash, 0.0))
                         if notional < 1:
                             continue
                         sh = notional / p
                         cash -= notional
-                        cash -= notional * cost
                         shares[t] = shares.get(t, 0.0) + sh
                         trade_rows.append((m.strftime("%Y-%m-%d"), "BUY", t, notional, sh, p))
 
@@ -1355,3 +1358,33 @@ async def get_allowances() -> list[dict]:
     async with Session() as s:
         rows = (await s.scalars(select(MonthlyAllowance).order_by(MonthlyAllowance.month.desc()))).all()
     return [{"amount": r.amount, "month": r.month} for r in rows]
+
+
+async def reset_monthly() -> dict[str, Any]:
+    """Wipe the monthly portfolio and re-initialize it at start cash.
+
+    Clears trades, positions, allowances, snapshots and rebalances, and resets
+    the account markers so the next deposit/rebalance starts clean. Market
+    data, fundamentals, the screener and the universe selection are left
+    intact (only portfolio *state* is cleared)."""
+    from sqlalchemy import delete as sa_delete
+    from .db import (MonthlyAccount as Acc, MonthlyPosition as Pos,
+                     MonthlyTrade as Tr, MonthlyAllowance as Al,
+                     MonthlySnapshot as Sn, MonthlyRebalance as Rb)
+
+    async with _rebalance_lock:
+        async with Session() as s:
+            for tbl in (Tr, Pos, Al, Sn, Rb):
+                await s.execute(sa_delete(tbl))
+            acc = await s.get(Acc, 1)
+            if acc is None:
+                acc = Acc(id=1, cash=settings.sim_monthly_start_cash,
+                          last_allowance_month=None)
+                s.add(acc)
+            else:
+                acc.cash = settings.sim_monthly_start_cash
+                acc.last_allowance_month = None
+                acc.last_rebalance_month = None
+            await s.commit()
+    logger.info("Monthly reset: cash=%.2f", settings.sim_monthly_start_cash)
+    return {"ok": True, "cash": settings.sim_monthly_start_cash}

@@ -453,6 +453,58 @@ class TestBackfill:
                 assert sorted(x.month for x in rows) == ["2026-08", "2026-09"]
         asyncio.run(check())
 
+    def test_backfill_is_fee_free_like_the_live_engine(self, mem_db, fake_market,
+                                                       monkeypatch):
+        """A single-day replay deploys the whole contribution. The live engine
+        charges no commission, so the replay must not either: final equity ==
+        contributed ($1000), not $999 after a phantom 10 bps fee. Regression
+        guard for the "daily core ends up with 999" report."""
+        monkeypatch.setattr(daily_core, "_current_month", lambda: "2026-08")
+
+        r = asyncio.run(daily_core.backfill(start="2026-08-28"))
+        assert r["ok"] is True
+        assert r["days"] == 1
+        assert r["contributed"] == pytest.approx(settings.sim_monthly_contribution)
+        # With a 10 bps fee this would be ~999.8; fee-free it is exactly the
+        # contribution (2 fixture names at the target weight leave cash too).
+        assert r["final_equity"] == pytest.approx(settings.sim_monthly_contribution)
+
+
+class TestReset:
+    def test_reset_clears_state_and_restores_start_cash(self, mem_db):
+        from app.db import DailyCoreAccount as Acc
+        from app.db import DailyCoreAllowance as Al
+        from app.db import DailyCorePosition as Pos
+        from app.db import DailyCoreSnapshot as Sn
+        from app.db import DailyCoreTrade as Tr
+
+        async def seed():
+            async with mem_db() as s:
+                acc = await daily_core._account(s)
+                acc.cash = 123.45
+                acc.last_allowance_month = "2026-09"
+                s.add(Pos(ticker="AAA", shares=1.0, avg_cost=10.0))
+                s.add(Tr(ticker="AAA", side="BUY", shares=1.0, price=10.0,
+                         cash_after=0.0, reason="x"))
+                s.add(Al(amount=1000.0, month="2026-09"))
+                s.add(Sn(cash=0.0, positions_value=1.0, total_equity=1.0,
+                         allowance_total=1000.0))
+                await s.commit()
+        asyncio.run(seed())
+
+        r = asyncio.run(daily_core.reset_daily_core())
+        assert r["ok"] is True
+        assert r["cash"] == settings.sim_monthly_start_cash
+
+        async def check():
+            async with mem_db() as s:
+                for model in (Pos, Tr, Al, Sn):
+                    assert (await s.scalars(select(model))).all() == []
+                acc = await s.get(Acc, 1)
+                assert acc.cash == settings.sim_monthly_start_cash
+                assert acc.last_allowance_month is None
+        asyncio.run(check())
+
 
 # ---------------------------------------------------------------------------
 # Data refresh

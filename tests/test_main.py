@@ -9,6 +9,7 @@ full-history button silently replay the short synced range.
 from __future__ import annotations
 
 import pytest
+from fastapi import HTTPException
 
 from app import daily_core, main, monthly, sim
 
@@ -82,10 +83,49 @@ class TestBackfillAllWindow:
         assert r["requested_start"] == "synced (earliest of the other sims)"
 
 
+class TestResetAll:
+    async def test_resets_all_four_portfolios(self, monkeypatch):
+        called: dict[str, bool] = {}
+
+        async def rec_sim():
+            called["sim"] = True
+            return {"ok": True, "cash": 0.0}
+
+        async def rec_monthly():
+            called["monthly"] = True
+            return {"ok": True, "cash": 0.0}
+
+        async def rec_daily_core():
+            called["daily_core"] = True
+            return {"ok": True, "cash": 0.0}
+
+        monkeypatch.setattr(sim, "reset_sim", rec_sim)
+        monkeypatch.setattr(monthly, "reset_monthly", rec_monthly)
+        monkeypatch.setattr(daily_core, "reset_daily_core", rec_daily_core)
+
+        r = await main.sim_reset_all()
+        assert r["ok"] is True
+        # sim.reset_sim also clears the DCA benchmark tables.
+        assert set(r["results"]) == {"daily_sim", "monthly", "daily_core"}
+        assert called == {"sim": True, "monthly": True, "daily_core": True}
+
+    async def test_refused_while_a_backfill_is_running(self, monkeypatch):
+        async def boom():
+            raise AssertionError("must not reset while a backfill runs")
+
+        monkeypatch.setattr(sim, "reset_sim", boom)
+        await main._backfill_all_lock.acquire()
+        try:
+            with pytest.raises(HTTPException) as ei:
+                await main.sim_reset_all()
+            assert ei.value.status_code == 409
+        finally:
+            main._backfill_all_lock.release()
+
+
 # ---------------------------------------------------------------------------
 # Watchlist: nightly prefetch (app-level, independent of the sims)
 # ---------------------------------------------------------------------------
-
 class TestWatchlistPrefetch:
     async def test_uses_provider_and_skips_fresh(self, monkeypatch):
         async def fake_tickers():

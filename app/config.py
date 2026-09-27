@@ -187,6 +187,23 @@ class Settings(BaseSettings):
     # MARKET_FRESH_SECONDS; the Twelve Data limiter paces/falls back.
     watchlist_prefetch: bool = True
 
+    # --- Universe files (repo bootstrap + generated) ----------------------
+    # Universes live in two places: the repo's read-only ``universes/*.txt``
+    # (bootstrap) and a writable directory for generated lists. The container
+    # is read_only with only /data mounted, so generated universes must live
+    # there. A generated file shadows the repo one of the same name.
+    universe_extra_dir: str = "/data/universes"
+    # Weekly auto-refresh of the S&P 500 constituent list from the iShares IVV
+    # holdings CSV (index membership changes are rare; weekly is ample). App-
+    # level: runs independently of SIM_ENABLED. 0=Monday .. 6=Sunday, UTC.
+    universe_sync_enabled: bool = True
+    universe_sync_weekday: int = 6
+    universe_sync_hour: int = 6
+    sp500_holdings_url: str = (
+        "https://www.ishares.com/us/products/239726/"
+        "ishares-core-sp-500-etf/latest-holdings.csv"
+    )
+
     # --- Benchmark (DCA control portfolio) --------------------------------
     sim_benchmark_enabled: bool = True
     sim_benchmark_ticker: str = "URTH"  # iShares MSCI World ETF
@@ -208,6 +225,14 @@ class Settings(BaseSettings):
     sim_monthly_min_history_days: int = 253  # trading days of valid closes required
     sim_monthly_cost_oneway: float = 0.0010  # paper friction, one-way bps on notional swapped
     sim_monthly_fundamentals_source: str = "edgar"  # edgar (US filers) + yfinance fallback | yfinance-only
+
+    # --- SEC EDGAR fair-access contact ------------------------------------
+    # SEC's edge blocks User-Agents without a contact email on www.sec.gov (the
+    # CIK-map host), answering 403 "Undeclared Automated Tool". data.sec.gov
+    # (companyfacts) is unaffected. Set this to the operator's real address to
+    # (re)download the CIK map; leave blank to run without one — the cached
+    # map is used and unknown tickers fall back to yfinance.
+    sec_contact_email: str = ""
 
     # --- Daily-core portfolio (qv-mom core + daily cash deployment) ---------
     # §10 A/B winner: monthly qv-mom ranking decides WHAT to own (same
