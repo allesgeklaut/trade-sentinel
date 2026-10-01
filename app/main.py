@@ -8,7 +8,8 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from pydantic import BaseModel
 from .config import settings
-from .db import Watchlist, Session, init_db
+from .db import (Watchlist, Session, init_db, current_db, use_db, engine_dev,
+                 dev_db_exists, prod_db_exists, clone_prod_to_dev)
 from .market import refresh, refresh_many, refresh_yfinance, candles, search, info, provider, PERIOD_COUNTS
 from .analysis import compute, persist, history, MIN_CANDLES
 from .screener import universe_names, run, results, refresh_incremental, load_deep_history, get_screener_progress, ScreenerBusy
@@ -40,6 +41,21 @@ def _validated_start(start: str | None) -> str | None:
     except ValueError as e:
         raise HTTPException(422, f"invalid start: {start!r} (use YYYY-MM-DD or 'all')") from e
     return start
+
+
+def _require_dev_db(action: str) -> None:
+    """403 history-rewriting actions on PROD: the live portfolios' history is
+    the product; experiments belong on the DEV sandbox."""
+    if current_db() != "dev":
+        raise HTTPException(403, f"{action} is disabled on the PROD database — switch to DEV")
+
+
+def _require_prod_db(action: str) -> None:
+    """403 real-money (savings) actions on DEV: the sandbox holds a stale clone
+    of the savings data, so writes there would only mislead."""
+    if current_db() != "prod":
+        raise HTTPException(403, f"{action} is only available on the PROD database")
+
 
 # Uvicorn installs no handlers for the root logger, so app loggers
 # ("trade_sentinel.*") emit nothing at INFO: scheduler runs, allowance
@@ -216,6 +232,15 @@ async def _savings_loop() -> None:
 async def lifespan(app):
     global _watchlist_prefetch_task, _universe_prefetch_task, _universe_sync_task
     global _savings_loop_task
+    # First boot with the dev engine configured: seed DEV with a full copy of
+    # PROD (candles + portfolio state) so the sandbox is immediately usable.
+    # Runs before init_db so the dev engine never creates an empty file first.
+    if engine_dev is not None and not dev_db_exists() and prod_db_exists():
+        try:
+            logger.info("DEV database missing — seeding it from PROD")
+            await clone_prod_to_dev()
+        except Exception as e:  # noqa: BLE001 — startup must survive a failed seed
+            logger.error("DEV auto-seed failed (continuing with an empty DEV db): %s", e)
     await init_db()
     async with Session() as s:
         for t in settings.watchlist.split(','):
@@ -252,6 +277,19 @@ async def lifespan(app):
         sim.stop_scheduler()
 app=FastAPI(title="Trade Sentinel",lifespan=lifespan)
 _TICKER_RE = re.compile(r"^[A-Z0-9.\-^=]{1,32}$")
+
+@app.middleware("http")
+async def db_select_middleware(request, call_next):
+    """Route this request to the PROD or DEV database via the ts_db cookie.
+
+    Unknown/missing values fall through to PROD (the ContextVar default), and
+    DEV is only honoured when the dev engine is configured — so disabling
+    DATABASE_URL_DEV instantly pins every client back to PROD.
+    """
+    if engine_dev is not None and request.cookies.get("ts_db") == "dev":
+        with use_db("dev"):
+            return await call_next(request)
+    return await call_next(request)
 
 @app.middleware("http")
 async def security_headers(request, call_next):
@@ -611,6 +649,7 @@ async def sim_backfill(start: str | None = Query(default=None)):
     REPLACES the portfolio state with the replay's end state. An
     approximation by design; the response carries approximation: true.
     """
+    _require_dev_db("Backfill")
     from . import sim
     r = await sim.backfill(_validated_start(start))
     if r.get("skipped"):
@@ -624,6 +663,7 @@ async def sim_backfill_benchmark(start: str | None = Query(default=None)):
     """Backfill the DCA benchmark curve (URTH $1000/month) over historical
     candles. The twin of the other backfills so all four curves can cover
     the same window. ``start``: date | "all" | default = synced."""
+    _require_dev_db("Benchmark backfill")
     from . import sim
     r = await sim.backfill_benchmark(_validated_start(start))
     if not r.get("ok"):
@@ -647,6 +687,7 @@ async def backfill_all(start: str | None = Query(default=None)):
     long operation (several minutes) — the caller gets everything in one
     response when it finishes.
     """
+    _require_dev_db("Backfill-all")
     start = _validated_start(start)
     if _backfill_all_lock.locked():
         raise HTTPException(409, "a backfill-all is already running")
@@ -774,6 +815,7 @@ async def monthly_backfill(start: str | None = Query(default=None)):
     stored history, or omit (default) to synch with the daily sim's
     earliest snapshot.
     """
+    _require_dev_db("Monthly backfill")
     from . import monthly
     return await monthly.backfill(_validated_start(start))
 
@@ -993,6 +1035,7 @@ async def daily_core_backfill(start: str | None = Query(default=None)):
     replay starts on the earliest snapshot date of the daily sim / monthly
     portfolios so all three equity curves cover the same window.
     """
+    _require_dev_db("Daily-core backfill")
     from . import daily_core
     r = await daily_core.backfill(_validated_start(start))
     if not r.get("ok"):
@@ -1060,6 +1103,7 @@ async def savings_initialize(req: SavingsInitRequest):
     [{ticker, shares, avg_cost}] (EUR); repeated tickers are aggregated
     into one weighted-average lot.
     """
+    _require_prod_db("Savings initialize")
     from . import savings
     if req.cash < 0:
         raise HTTPException(422, "cash must be >= 0")
@@ -1080,6 +1124,7 @@ async def savings_initialize(req: SavingsInitRequest):
 @app.post('/api/savings/reset')
 async def savings_reset():
     """Wipe the tracker back to uninitialized (setup form). Sims untouched."""
+    _require_prod_db("Savings reset")
     from . import savings
     async with savings.account_lock:
         return await savings.reset()
@@ -1087,6 +1132,7 @@ async def savings_reset():
 @app.post('/api/savings/trueup')
 async def savings_trueup(req: SavingsTrueupRequest):
     """Reconcile the savings cash with the real TR balance (delta booked)."""
+    _require_prod_db("Savings true-up")
     from . import savings
     async with savings.account_lock:
         r = await savings.trueup(req.actual_cash)
@@ -1097,6 +1143,7 @@ async def savings_trueup(req: SavingsTrueupRequest):
 @app.post('/api/savings/config')
 async def savings_config(req: SavingsConfigRequest):
     """Update interest rate / monthly transfer (persisted, runtime-editable)."""
+    _require_prod_db("Savings config")
     from . import savings
     async with savings.account_lock:
         r = await savings.set_config(req.monthly_transfer, req.interest_rate)
@@ -1109,6 +1156,7 @@ async def savings_deposit(req: SavingsDepositRequest):
     """Book a one-off cash deposit: fresh money moved into the TR cash —
     a contribution (counted in Contributed). True-up stays the
     reconciliation tool for drift."""
+    _require_prod_db("Savings deposit")
     from . import savings
     async with savings.account_lock:
         r = await savings.add_deposit(req.amount)
@@ -1119,6 +1167,7 @@ async def savings_deposit(req: SavingsDepositRequest):
 @app.post('/api/savings/saveback')
 async def savings_saveback(req: SavingsSavebackRequest):
     """Book a Saveback payout TR invested into a Sparplan asset."""
+    _require_prod_db("Savings saveback")
     from . import savings
     ticker = req.ticker.strip().upper()
     if not _TICKER_RE.match(ticker):
@@ -1134,6 +1183,7 @@ async def savings_manual_buy(req: SavingsBuyRequest):
     """Record a one-off buy paid from the tracked savings cash (deducts
     cash, mirrors into daily-core). For TR's actual Saveback bonus use
     /api/savings/saveback — that money comes from nowhere."""
+    _require_prod_db("Savings buy")
     from . import savings
     ticker = req.ticker.strip().upper()
     if not _TICKER_RE.match(ticker):
@@ -1151,6 +1201,7 @@ async def savings_plans():
 
 @app.post('/api/savings/plans')
 async def savings_add_plan(req: SavingsPlanRequest):
+    _require_prod_db("Savings plan")
     from . import savings
     ticker = req.ticker.strip().upper()
     if not _TICKER_RE.match(ticker):
@@ -1163,6 +1214,7 @@ async def savings_add_plan(req: SavingsPlanRequest):
 
 @app.delete('/api/savings/plans/{plan_id}')
 async def savings_remove_plan(plan_id: int):
+    _require_prod_db("Savings plan removal")
     from . import savings
     async with savings.account_lock:
         r = await savings.remove_plan(plan_id)
@@ -1173,6 +1225,7 @@ async def savings_remove_plan(plan_id: int):
 @app.delete('/api/savings/positions/{ticker}')
 async def savings_remove_position(ticker: str):
     """Remove a position manually (sold in TR — proceeds arrive via true-up)."""
+    _require_prod_db("Savings position removal")
     from . import savings
     async with savings.account_lock:
         r = await savings.remove_position(ticker.strip().upper())
@@ -1185,6 +1238,7 @@ async def savings_refresh():
     """Pull-to-refresh: fetch candles for held tickers + EURUSD=X so the
     tab valuates on the most recent close (on weekends: Friday's). Free
     Yahoo bulk path; skips tickers within the freshness window."""
+    _require_prod_db("Savings refresh")
     from . import savings
     r = await savings.refresh_data()
     return {"refreshed": r["refreshed"], "errors": r["errors"],
@@ -1194,6 +1248,7 @@ async def savings_refresh():
 async def savings_run():
     """Manually trigger one savings pass (transfer/payout/accrue/sparplans/
     snapshot — all idempotent)."""
+    _require_prod_db("Savings run")
     from . import savings
     return await savings.run_savings_cycle()
 
@@ -1274,6 +1329,7 @@ async def sim_chat_history_clear():
 @app.post('/api/sim/reset')
 async def sim_reset():
     """Wipe all sim tables and restart with start cash."""
+    _require_dev_db("Reset")
     return await sim.reset_sim()
 
 
@@ -1287,6 +1343,7 @@ async def sim_reset_all():
     left intact — only portfolio state is cleared. Refused while a backfill is
     running so the reset can't race the multi-minute replays.
     """
+    _require_dev_db("Reset-all")
     from . import daily_core, monthly
     if _backfill_all_lock.locked():
         raise HTTPException(409, "a backfill is already running — wait for it to finish")
@@ -1300,6 +1357,37 @@ async def sim_reset_all():
                 "daily_core": await daily_core.reset_daily_core(),
             },
         }
+
+# Set while /api/db/clone runs; surfaced by /api/db/status so the UI can show
+# "cloning…". The clone holds _backfill_all_lock, so backfill-all/reset-all
+# 409 while it runs and vice versa.
+_db_cloning = False
+
+@app.get('/api/db/status')
+async def db_status():
+    """Which database this request is talking to, and the DEV sandbox state."""
+    return {"active": current_db(), "dev_enabled": engine_dev is not None,
+            "dev_seeded": dev_db_exists(), "cloning": _db_cloning}
+
+@app.post('/api/db/clone')
+async def db_clone():
+    """Overwrite DEV with a fresh copy of PROD. Serialized with
+    backfill-all/reset-all (shared lock) so the dev file can't be swapped
+    while those are mid-run."""
+    global _db_cloning
+    if _backfill_all_lock.locked():
+        raise HTTPException(409, "a backfill or reset is already running — wait for it to finish")
+    if engine_dev is None:
+        raise HTTPException(409, "the DEV database is disabled (DATABASE_URL_DEV is unset)")
+    async with _backfill_all_lock:
+        _db_cloning = True
+        try:
+            logger.info("DB clone: copying PROD onto DEV")
+            r = await clone_prod_to_dev()
+            logger.info("DB clone: DEV refreshed (%d bytes)", r["size_bytes"])
+            return r
+        finally:
+            _db_cloning = False
 
 @app.get('/', include_in_schema=False)
 async def index() -> FileResponse:

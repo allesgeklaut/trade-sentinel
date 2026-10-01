@@ -44,7 +44,7 @@ from . import fundamentals as fundamentals_mod
 from . import monthly as monthly_mod
 from .config import settings
 from .db import (DailyCoreAccount, DailyCoreAllowance, DailyCorePosition,
-                 DailyCoreSnapshot, DailyCoreTrade, Session)
+                 DailyCoreSnapshot, DailyCoreTrade, Session, current_db)
 from .screener import tickers as universe_tickers, universe_names
 
 logger = logging.getLogger("trade_sentinel.daily_core")
@@ -62,7 +62,16 @@ STRATEGY_VARIANTS: dict[str, str] = {
     "residual": "Residual momentum (Blitz-Huij-Martens, §11 winner)",
 }
 
-_STATE_FILE = Path("/data/daily_core_state.json")
+_STATE_FILE = Path("/data/daily_core_state.json")          # PROD (live book)
+_STATE_FILE_DEV = Path("/data/daily_core_state_dev.json")  # DEV sandbox
+
+
+def _state_file() -> Path:
+    """Per-DB state file: the file is read by BOTH the live scheduler and
+    backfills, so dev experiments must never leak into the live prod book."""
+    return _STATE_FILE_DEV if current_db() == "dev" else _STATE_FILE
+
+
 # Serialises read-modify-write of the state file: the runtime setters and the
 # protection decision all read the file, change one key, and write it back, so
 # two concurrent writers could drop each other's field. The critical sections
@@ -71,8 +80,9 @@ _state_lock = threading.Lock()
 
 
 def _load_state() -> dict:
+    path = _state_file()
     try:
-        return json.loads(_STATE_FILE.read_text())
+        return json.loads(path.read_text())
     except FileNotFoundError:
         return {}
     except Exception as e:
@@ -81,14 +91,15 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict) -> None:
+    path = _state_file()
     try:
-        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         # Atomic replace so a concurrent reader never sees a half-written file.
-        tmp = _STATE_FILE.with_suffix(_STATE_FILE.suffix + ".tmp")
+        tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(state, indent=2))
-        os.replace(tmp, _STATE_FILE)
+        os.replace(tmp, path)
     except Exception as e:
-        logger.warning("Could not write daily-core state file %s: %s", _STATE_FILE, e)
+        logger.warning("Could not write daily-core state file %s: %s", path, e)
 
 
 def _reset_basket_state(state: dict) -> None:

@@ -1,4 +1,10 @@
+import asyncio
+import os
+import sqlite3
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, UTC
+from pathlib import Path
 
 from sqlalchemy import String, Float, Integer, UniqueConstraint, Text, Boolean, event
 from sqlalchemy import DateTime as _DateTime
@@ -629,11 +635,54 @@ def create_db_engine(database_url: str):
 # Note: WAL mode persists in the DB file itself, so it only needs setting
 # once per database — but re-applying it per connection is harmless.
 engine = create_db_engine(settings.database_url)
-Session = async_sessionmaker(engine, expire_on_commit=False)
+engine_dev = create_db_engine(settings.database_url_dev) if settings.database_url_dev else None
+DB_NAMES = ("prod", "dev")
+
+
+def _make_sessionmaker(eng): return async_sessionmaker(eng, expire_on_commit=False)
+
+
+_sessionmakers: dict[str, async_sessionmaker] = {"prod": _make_sessionmaker(engine)}
+if engine_dev is not None:
+    _sessionmakers["dev"] = _make_sessionmaker(engine_dev)
+
+# Per-request DB selection (the ts_db cookie middleware wraps requests in
+# use_db). ContextVars are task-local, so background scheduler tasks keep the
+# default "prod" and never see a request's selection.
+_active_db: ContextVar[str] = ContextVar("trade_sentinel_active_db", default="prod")
+
+
+def current_db() -> str: return _active_db.get()
+
+
+@contextmanager
+def use_db(name: str):
+    """Pin the active DB for a block (request middleware, tests). Resets on exit."""
+    if name not in DB_NAMES:
+        raise ValueError(f"unknown db name {name!r} (choose from {DB_NAMES})")
+    token = _active_db.set(name)
+    try:
+        yield
+    finally:
+        _active_db.reset(token)
+
+
+def Session():
+    """Session factory bound to the caller's active DB (prod by default).
+
+    Modules do `from .db import Session` and call `Session()`; this function
+    keeps that contract while dispatching on the per-request contextvar, so
+    background tasks (no contextvar set) always talk to PROD and API requests
+    talk to whichever DB the ts_db cookie selected.
+    """
+    sm = _sessionmakers.get(_active_db.get())
+    if sm is None:
+        raise RuntimeError(f"no session factory for db {_active_db.get()!r}")
+    return sm()
 
 
 async def init_db():
-    async with engine.begin() as conn:
+    async def _migrate(conn):
         await conn.run_sync(Base.metadata.create_all)
         # Manual migration for screener_results: add action/strength columns
         # for existing DBs created before these columns existed. SQLAlchemy's
@@ -819,3 +868,63 @@ async def init_db():
                 "CREATE INDEX ix_fundamentals_ticker ON fundamentals (ticker)"))
             await conn.execute(text(
                 "CREATE INDEX ix_fundamentals_tag ON fundamentals (tag)"))
+    # Read the module globals AT CALL TIME: tests monkeypatch `engine` and
+    # call init_db() against an in-memory engine.
+    for eng in [e for e in (engine, engine_dev) if e is not None]:
+        async with eng.begin() as conn:
+            await _migrate(conn)
+
+
+def _sqlite_path(eng) -> Path:
+    """Filesystem path of a SQLite engine's database (from its URL)."""
+    db = eng.sync_engine.url.database
+    if not db or db == ":memory:":
+        raise RuntimeError("expected a file-backed SQLite engine")
+    return Path(db)
+
+
+def dev_db_exists() -> bool:
+    return engine_dev is not None and _sqlite_path(engine_dev).exists()
+
+
+def prod_db_exists() -> bool:
+    return _sqlite_path(engine).exists()
+
+
+async def clone_prod_to_dev() -> dict:
+    """Overwrite the DEV database with a fresh copy of PROD (SQLite backup API).
+
+    The backup API snapshots committed pages while PROD is live (WAL), so it
+    is safe to run any time. The copy lands in a temp file and is swapped in
+    atomically; the dev engine is disposed around the swap so no pooled
+    connection keeps pointing at the replaced inode. Stale -wal/-shm sidecars
+    of the OLD dev file are removed (SQLite on a clean close removes them, but
+    a crashed process could leave them behind and they must never pair with
+    the new file).
+    """
+    if engine is None or engine_dev is None:
+        raise RuntimeError("DATABASE_URL_DEV is not configured — no dev engine to clone into")
+    prod_path, dev_path = _sqlite_path(engine), _sqlite_path(engine_dev)
+    tmp_path = dev_path.with_suffix(dev_path.suffix + ".tmp")
+    dev_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _backup() -> None:
+        # closing(): `with sqlite3.connect(...)` commits but does NOT close.
+        with closing(sqlite3.connect(str(prod_path), timeout=30)) as src, \
+                closing(sqlite3.connect(str(tmp_path))) as dst:
+            src.backup(dst)
+
+    try:
+        await asyncio.to_thread(_backup)
+        await engine_dev.dispose()  # no pooled connection may hold the old inode
+        os.replace(tmp_path, dev_path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)  # never leave a half-written copy behind
+        except OSError:
+            pass
+        raise
+    for sidecar in (f"{dev_path}-wal", f"{dev_path}-shm"):
+        Path(sidecar).unlink(missing_ok=True)
+    return {"ok": True, "path": str(dev_path), "size_bytes": dev_path.stat().st_size,
+            "cloned_at": datetime.now(UTC).isoformat()}

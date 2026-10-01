@@ -2,6 +2,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:////data/trading.db"
+    # Second SQLite DB used as a disposable sandbox (backfills/resets are
+    # DEV-only; the UI hides them on PROD). Empty = feature disabled: no dev
+    # engine, no switch. Selected per-request via the ts_db cookie.
+    database_url_dev: str = ""
     # auto = Twelve Data when TWELVE_DATA_API_KEY is set, else yfinance.
     # yfinance / twelvedata force one source (twelvedata requires a key).
     market_data_provider: str = "auto"

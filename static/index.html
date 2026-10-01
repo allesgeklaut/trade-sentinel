@@ -278,6 +278,68 @@
             padding: 8px 12px
         }
 
+        /* --- PROD/DEV database switch --- */
+        /* DEV-only controls (backfills, resets, clone) are hidden while PROD
+           is selected; PROD-only notes are hidden while DEV is. The cookie
+           ts_db decides — see fetchDbStatus()/switchDb() in the script. */
+        body.db-prod .dev-only {
+            display: none !important
+        }
+
+        /* Until the status fetch answers (body has neither class) err on the
+           PROD side: destructive controls and the amber banner stay hidden
+           instead of flashing on every reload. */
+        body:not(.db-dev) .dev-only {
+            display: none !important
+        }
+
+        body.db-dev .prod-only {
+            display: none !important
+        }
+
+        /* Real-money savings data on DEV would be a stale clone — hide the tab. */
+        body.db-dev #nav-savings {
+            display: none !important
+        }
+
+        .db-switch {
+            display: inline-flex;
+            gap: 4px;
+            align-items: center
+        }
+
+        .db-switch button {
+            border-color: #1d6030;
+            padding: 6px 12px;
+            font-size: 12px
+        }
+
+        .db-switch button.nav-active {
+            background: #1d6030;
+            color: #b7ffc0;
+            border-color: #42ff72
+        }
+
+        /* DEV sandbox banner: amber on purpose — it must read as "not the
+           normal terminal". Slim full-width strip under the header. */
+        .db-banner {
+            background: #ffb000;
+            color: #1a1200;
+            font-size: 12px;
+            line-height: 1.4;
+            padding: 6px 12px;
+            text-align: center
+        }
+
+        .db-banner button {
+            background: #1a1200;
+            color: #ffd77a;
+            border: 1px solid #7a5200;
+            padding: 3px 10px;
+            font-size: 12px;
+            margin-left: 8px
+        }
+
         @media (max-width: 900px) {
             #chart-toggle {
                 display: none !important
@@ -1425,7 +1487,15 @@
         <select id="llm-model" title="Active LLM backend / model" onchange="switchLLMModel()">
             <option value="">loading models…</option>
         </select>
+        <div id="db-switch" class="db-switch"
+            title="PROD keeps the live history (backfills/resets disabled); DEV is a disposable sandbox cloned from PROD">
+            <button id="db-btn-prod" onclick="switchDb('prod')">PROD</button>
+            <button id="db-btn-dev" onclick="switchDb('dev')">DEV</button>
+        </div>
     </header>
+    <div id="db-banner" class="db-banner dev-only">DEV SANDBOX — disposable clone of PROD; backfills &amp; resets
+        allowed here. The live PROD portfolios keep running in the background. <button id="db-clone-btn"
+            onclick="cloneProdToDev()">Clone PROD → DEV</button></div>
     <main id="dashboard-view">
         <aside class="panel">
             <form id="add"><input id="new" autocomplete="off" placeholder="Ticker or company"><button>Add</button>
@@ -1532,9 +1602,10 @@
             <div class="bench-label">ACTIONS</div>
             <div class="sim-actions">
                 <button id="sim-run-btn" onclick="runSim()">Run Bot Now</button>
-                <button id="sim-backfill-btn" onclick="backfillSim()">Backfill (deterministic, no LLM)</button>
-                <button id="sim-backfill-bench-btn" onclick="backfillBenchmark()">Backfill DCA Benchmark</button>
-                <button onclick="resetSim()">Reset Sim</button>
+                <button id="sim-backfill-btn" class="dev-only" onclick="backfillSim()">Backfill (deterministic, no LLM)</button>
+                <button id="sim-backfill-bench-btn" class="dev-only" onclick="backfillBenchmark()">Backfill DCA Benchmark</button>
+                <button id="sim-reset-btn" class="dev-only" onclick="resetSim()">Reset Sim</button>
+                <span class="prod-only" style="opacity:.7">Backfills &amp; resets are disabled on PROD — switch to DEV.</span>
             </div>
             <div id="sim-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
         </div>
@@ -1625,13 +1696,14 @@
             <div class="bench-label">ACTIONS</div>
             <div class="sim-actions">
                 <button id="monthly-run-btn" onclick="runMonthly()">Rebalance Now</button>
-                <button id="monthly-backfill-btn" onclick="backfillMonthly()">Backfill (sync with other sims)</button>
-                <input type="date" id="monthly-backfill-date" title="Optional: replay from this date instead"
+                <button id="monthly-backfill-btn" class="dev-only" onclick="backfillMonthly()">Backfill (sync with other sims)</button>
+                <input type="date" id="monthly-backfill-date" class="dev-only" title="Optional: replay from this date instead"
                     onchange="if(this.value) document.getElementById('monthly-backfill-all').checked = false">
-                <label style="font-size:12px;color:#7aaa81;display:flex;align-items:center;gap:4px">
+                <label class="dev-only" style="font-size:12px;color:#7aaa81;display:flex;align-items:center;gap:4px">
                     <input type="checkbox" id="monthly-backfill-all"
                         onchange="if(this.checked) document.getElementById('monthly-backfill-date').value = ''"> full history
                 </label>
+                <span class="prod-only" style="opacity:.7">Backfills &amp; resets are disabled on PROD — switch to DEV.</span>
             </div>
             <div id="monthly-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
         </div>
@@ -1705,20 +1777,21 @@
                     onchange="setDCGradient(this.value)" style="max-width:300px"></select>
                 <select id="dailycore-targetvol" title="Target-vol control — park new cash when the portfolio's own 21d vol exceeds the target"
                     onchange="setDCTargetVol(this.value)" style="max-width:220px"></select>
-                <button id="dailycore-backfill-btn" onclick="backfillDailyCore()">Backfill (daily-core only)</button>
-                <input type="date" id="dailycore-backfill-date" title="Optional: replay from this date instead"
+                <button id="dailycore-backfill-btn" class="dev-only" onclick="backfillDailyCore()">Backfill (daily-core only)</button>
+                <input type="date" id="dailycore-backfill-date" class="dev-only" title="Optional: replay from this date instead"
                     onchange="if(this.value) document.getElementById('dailycore-backfill-all').checked = false">
-                <label style="font-size:12px;color:#7aaa81;display:flex;align-items:center;gap:4px">
+                <label class="dev-only" style="font-size:12px;color:#7aaa81;display:flex;align-items:center;gap:4px">
                     <input type="checkbox" id="dailycore-backfill-all"
                         onchange="if(this.checked) document.getElementById('dailycore-backfill-date').value = ''"> full history
                 </label>
-                <button id="backfill-all-btn" onclick="backfillAll()"
+                <button id="backfill-all-btn" class="dev-only" onclick="backfillAll()"
                     title="Backfill ALL FOUR portfolios (daily sim, monthly, daily-core, DCA benchmark) over the same window — the date/full-history inputs apply to all">Backfill All 4 (synced)</button>
-                <button id="reset-all-btn" onclick="resetAllSims()"
+                <button id="reset-all-btn" class="dev-only" onclick="resetAllSims()"
                     title="Wipe ALL FOUR portfolios (daily sim, monthly, daily-core, DCA benchmark) back to their start cash — trades, positions and equity history are cleared, market data is kept">Reset All Sims</button>
+                <span class="prod-only" style="opacity:.7">Backfills &amp; resets are disabled on PROD — switch to DEV.</span>
             </div>
             <div id="dailycore-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
-            <div style="margin-top:6px;font-size:11px;color:#7aaa81">
+            <div class="dev-only" style="margin-top:6px;font-size:11px;color:#7aaa81">
                 Backfill replays the strategy over stored history and replaces this portfolio's state —
                 synthetic trades, not a live track record. Default: starts where the other sims start so
                 all three equity curves cover the same window. Pick a date or tick "full history" (2017+)
@@ -2409,6 +2482,28 @@
             return r.json();
         }
 
+        // --- PROD/DEV database switch ---
+        // The ts_db cookie routes every API call to PROD or DEV server-side;
+        // the body class hides whichever controls don't apply. Invalid/absent
+        // cookie → the server answers prod, and so do we.
+        let ACTIVE_DB = 'prod';
+
+        async function fetchDbStatus() {
+            try {
+                const r = await api('db/status');
+                ACTIVE_DB = r.active || 'prod';
+            } catch (e) { ACTIVE_DB = 'prod'; }
+            document.body.classList.remove('db-prod', 'db-dev');
+            document.body.classList.add('db-' + ACTIVE_DB);
+            document.getElementById('db-btn-prod').classList.toggle('nav-active', ACTIVE_DB === 'prod');
+            document.getElementById('db-btn-dev').classList.toggle('nav-active', ACTIVE_DB === 'dev');
+        }
+
+        function switchDb(name) {
+            document.cookie = 'ts_db=' + name + ';path=/;max-age=31536000';
+            location.reload();
+        }
+
         // --- LLM backend / model switcher ---
         let llmBackends = [];
 
@@ -3000,8 +3095,15 @@
         // Deep link: open the tab the URL points at (#/dailycore, #/monthly,
         // #/sim). Default dashboard. showView writes the hash on every
         // switch, so a reload restores the tab the user was on.
+        // The DB status resolves first: on DEV the savings tab is hidden
+        // (real-money data would be a stale clone), so such a deep link
+        // falls back to the dashboard instead of opening a hidden view.
         const initialView = (location.hash.match(/^#\/(sim|monthly|dailycore|savings)$/) || [])[1];
-        if (initialView) setTimeout(() => showView(initialView), 0);
+        fetchDbStatus().then(() => {
+            if (initialView && !(ACTIVE_DB === 'dev' && initialView === 'savings')) {
+                showView(initialView);
+            }
+        });
 
         // --- Simulation view ---
         let simChart = null;
@@ -3512,6 +3614,29 @@
                 await loadDailyCoreAll();
             } catch (e) { status.textContent = 'Error: ' + e.message; }
             btn.disabled = false;
+        }
+
+        async function cloneProdToDev() {
+            // Re-clone PROD into the DEV sandbox: everything DEV currently
+            // holds (backfills, runs, state) is discarded. Reload afterwards —
+            // every view renders data that was fetched from the old DB.
+            if (!confirm('Overwrite EVERYTHING in the DEV sandbox with a fresh copy of PROD?\n\nAny DEV experiments (backfills, runs, state) are discarded.'))
+                return;
+            const btn = document.getElementById('db-clone-btn');
+            const old = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Cloning…';
+            setStatus('Cloning PROD → DEV… (a few seconds)');
+            try {
+                const r = await api('db/clone', { method: 'POST' });
+                setStatus(`DEV re-cloned from PROD (${(r.size_bytes / 1048576).toFixed(0)} MB)`, true);
+                setTimeout(() => location.reload(), 1500);
+            } catch (e) {
+                setStatus('Clone failed: ' + e.message, false);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = old;
+            }
         }
 
         async function backfillDailyCore() {

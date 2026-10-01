@@ -12,6 +12,7 @@ import pytest
 from fastapi import HTTPException
 
 from app import daily_core, main, monthly, sim
+from app.db import use_db
 
 
 @pytest.fixture
@@ -49,7 +50,10 @@ def recorded(monkeypatch):
 
 class TestBackfillAllWindow:
     async def test_all_passes_full_history_to_every_backfill(self, recorded):
-        r = await main.backfill_all(start="all")
+        # backfill-all is guarded by _require_dev_db: run it in DEV context
+        # (fixtures replace the backfills, so no real engine is touched).
+        with use_db("dev"):
+            r = await main.backfill_all(start="all")
         assert r["ok"] is True
         assert r["requested_start"] == "all"
         # Every replay must see the "all" sentinel (full history), NOT None
@@ -63,7 +67,8 @@ class TestBackfillAllWindow:
         assert recorded["monthly_preload"] == [None]
 
     async def test_explicit_date_pins_every_backfill(self, recorded):
-        await main.backfill_all(start="2026-01-02")
+        with use_db("dev"):
+            await main.backfill_all(start="2026-01-02")
         assert recorded["sim"] == ["2026-01-02"]
         assert recorded["bench"] == ["2026-01-02"]
         assert recorded["monthly"] == ["2026-01-02"]
@@ -75,7 +80,8 @@ class TestBackfillAllWindow:
             return "2026-03-04"
 
         monkeypatch.setattr(daily_core, "_sync_start_date", fake_sync)
-        r = await main.backfill_all(start=None)
+        with use_db("dev"):
+            r = await main.backfill_all(start=None)
         assert recorded["sim"] == ["2026-03-04"]
         assert recorded["bench"] == ["2026-03-04"]
         assert recorded["monthly"] == ["2026-03-04"]
@@ -103,7 +109,8 @@ class TestResetAll:
         monkeypatch.setattr(monthly, "reset_monthly", rec_monthly)
         monkeypatch.setattr(daily_core, "reset_daily_core", rec_daily_core)
 
-        r = await main.sim_reset_all()
+        with use_db("dev"):
+            r = await main.sim_reset_all()
         assert r["ok"] is True
         # sim.reset_sim also clears the DCA benchmark tables.
         assert set(r["results"]) == {"daily_sim", "monthly", "daily_core"}
@@ -116,7 +123,9 @@ class TestResetAll:
         monkeypatch.setattr(sim, "reset_sim", boom)
         await main._backfill_all_lock.acquire()
         try:
-            with pytest.raises(HTTPException) as ei:
+            # DEV context so the 403 guard passes and the lock check (409) is
+            # what the test actually exercises.
+            with use_db("dev"), pytest.raises(HTTPException) as ei:
                 await main.sim_reset_all()
             assert ei.value.status_code == 409
         finally:
