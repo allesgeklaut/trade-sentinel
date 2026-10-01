@@ -214,3 +214,37 @@ class TestWatchlistAddFetches:
 
         out = await main.add("ZZZZ")
         assert out == {"ticker": "ZZZZ", "fetched": False}
+
+
+class TestSavingsEndpointLocking:
+    async def test_mutating_endpoints_hold_the_savings_lock(self, monkeypatch):
+        """Savings operator endpoints take the savings cycle lock around
+        the engine call, so clicks serialize with the nightly pass instead
+        of racing its read-modify-writes on the account row (review
+        finding: the lock's stated purpose covered these paths, but the
+        endpoints bypassed it)."""
+        import asyncio
+
+        from app import savings as savings_mod
+
+        lock = asyncio.Lock()
+        monkeypatch.setattr(savings_mod, "account_lock", lock)
+        held: dict[str, bool] = {}
+
+        async def rec_trueup(actual_total):
+            held["trueup"] = lock.locked()
+            return {"ok": True, "delta": 0.0, "cash": 100.0}
+
+        async def rec_buy(amount, ticker):
+            held["buy"] = lock.locked()
+            return {"ok": True, "ticker": ticker, "shares": 1.0, "price": 1.0,
+                    "cash": 99.0, "mirror_allocated": True}
+
+        monkeypatch.setattr(savings_mod, "trueup", rec_trueup)
+        monkeypatch.setattr(savings_mod, "manual_buy", rec_buy)
+
+        await main.savings_trueup(main.SavingsTrueupRequest(actual_cash=100.0))
+        await main.savings_manual_buy(main.SavingsBuyRequest(amount=10.0, ticker="SPY"))
+
+        assert held == {"trueup": True, "buy": True}
+        assert not lock.locked()  # released again after each call

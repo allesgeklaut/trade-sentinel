@@ -23,6 +23,7 @@ _WATCHLIST_REFRESH_PERIOD = "2y"
 _watchlist_prefetch_task: asyncio.Task | None = None
 _universe_prefetch_task: asyncio.Task | None = None
 _universe_sync_task: asyncio.Task | None = None
+_savings_loop_task: asyncio.Task | None = None
 
 # Serialises the four-portfolio backfill: concurrent clicks (or a click plus a
 # retry) would otherwise each queue all four multi-minute replays.
@@ -169,9 +170,52 @@ async def _universe_sync_loop() -> None:
             logger.error("Universe sync failed: %s", e, exc_info=True)
 
 
+async def _savings_loop() -> None:
+    """Daily savings-tracker pass at ``savings_snapshot_hour`` (UTC).
+
+    App-level, independent of ``SIM_ENABLED`` — the real-money account must
+    keep accruing interest even when the paper sims are off. Runs EVERY
+    calendar day (interest accrues on calendar days, not NYSE days; the
+    sims already refreshed candles at ``sim_run_hour``). No-ops until the
+    tracker is initialized; the cycle's stages are all idempotent, so a
+    restart mid-day just catches up.
+    """
+    from . import savings
+    while True:
+        now = datetime.now(UTC)
+        target = now.replace(hour=settings.savings_snapshot_hour % 24,
+                             minute=settings.savings_snapshot_minute % 60,
+                             second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        logger.info("Savings loop: next run at %s (in %.0f seconds)", target, wait_seconds)
+        await asyncio.sleep(wait_seconds)
+        if not settings.savings_enabled:
+            continue
+        try:
+            if not await savings.initialized():
+                logger.info("Savings loop: tracker not initialized — skipping pass")
+                continue
+            r = await savings.run_savings_cycle()
+            if r.get("skipped"):
+                # A manual "Run Now" or an operator action holding
+                # account_lock is mid-pass — every stage is idempotent and
+                # the markers catch up on the next nightly pass.
+                logger.info("Savings cycle skipped: %s", r.get("reason"))
+                continue
+            logger.info("Savings cycle: refresh=%d transfer=%s payout=%s accrual=%s sparplans=%d",
+                        r["refresh"]["refreshed"], r["transfer"].get("deposited"),
+                        r["payout"].get("paid"), r["accrual"].get("accrued"),
+                        r["sparplans"].get("executed", 0))
+        except Exception as e:
+            logger.error("Savings cycle failed: %s", e, exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app):
     global _watchlist_prefetch_task, _universe_prefetch_task, _universe_sync_task
+    global _savings_loop_task
     await init_db()
     async with Session() as s:
         for t in settings.watchlist.split(','):
@@ -187,6 +231,8 @@ async def lifespan(app):
         _universe_prefetch_task = asyncio.create_task(_universe_prefetch_loop())
     if settings.universe_sync_enabled:
         _universe_sync_task = asyncio.create_task(_universe_sync_loop())
+    if settings.savings_enabled:
+        _savings_loop_task = asyncio.create_task(_savings_loop())
     if settings.sim_enabled:
         sim.start_scheduler()
     yield
@@ -199,6 +245,9 @@ async def lifespan(app):
     if _universe_sync_task and not _universe_sync_task.done():
         _universe_sync_task.cancel()
     _universe_sync_task = None
+    if _savings_loop_task and not _savings_loop_task.done():
+        _savings_loop_task.cancel()
+    _savings_loop_task = None
     if settings.sim_enabled:
         sim.stop_scheduler()
 app=FastAPI(title="Trade Sentinel",lifespan=lifespan)
@@ -949,6 +998,204 @@ async def daily_core_backfill(start: str | None = Query(default=None)):
     if not r.get("ok"):
         raise HTTPException(400, r.get("error", "backfill failed"))
     return r
+
+# =====================================================================
+# Savings tracker endpoints (real money, EUR — no backfill, no reset-all)
+# =====================================================================
+
+class SavingsInitRequest(BaseModel):
+    cash: float
+    positions: list[dict] = []
+    monthly_transfer: float | None = None
+    interest_rate: float | None = None
+
+class SavingsTrueupRequest(BaseModel):
+    actual_cash: float  # TR cash total incl. unpaid interest, positions excluded
+
+class SavingsDepositRequest(BaseModel):
+    amount: float
+
+class SavingsSavebackRequest(BaseModel):
+    amount: float
+    ticker: str
+
+class SavingsBuyRequest(BaseModel):
+    amount: float
+    ticker: str
+
+class SavingsConfigRequest(BaseModel):
+    monthly_transfer: float | None = None
+    interest_rate: float | None = None
+
+class SavingsPlanRequest(BaseModel):
+    ticker: str
+    amount: float
+    day_of_month: int
+
+@app.get('/api/savings/status')
+async def savings_status():
+    """Savings tab status: valuation, config, plans, events, mirror."""
+    from . import savings
+    return await savings.status()
+
+@app.get('/api/savings/equity')
+async def savings_equity(limit: int = Query(default=365, ge=1, le=12000)):
+    """Savings equity curve (oldest-first), EUR."""
+    from . import savings
+    return await savings.get_equity_curve(limit)
+
+@app.get('/api/savings/mirror')
+async def savings_mirror(limit: int = Query(default=365, ge=1, le=12000)):
+    """Mirror portfolio: valuation + allocated-over-time curve."""
+    from . import savings
+    return {**await savings._mirror_valuate(),
+            "curve": await savings.get_mirror_curve(limit)}
+
+@app.post('/api/savings/initialize')
+async def savings_initialize(req: SavingsInitRequest):
+    """(Re)initialize the tracker: savings cash + current holdings.
+
+    Destructive for TRACKER data only: wipes previous tracker state (the
+    paper sims are untouched). Pass positions as
+    [{ticker, shares, avg_cost}] (EUR); repeated tickers are aggregated
+    into one weighted-average lot.
+    """
+    from . import savings
+    if req.cash < 0:
+        raise HTTPException(422, "cash must be >= 0")
+    for p in req.positions:
+        ticker = str(p.get("ticker") or "").strip().upper()
+        if not _TICKER_RE.match(ticker):
+            raise HTTPException(422, f"invalid ticker symbol: {ticker!r}")
+        try:
+            sh, ac = float(p["shares"]), float(p["avg_cost"])
+        except (KeyError, ValueError, TypeError) as e:
+            raise HTTPException(422, "position needs numeric shares/avg_cost") from e
+        if sh <= 0 or ac <= 0:
+            raise HTTPException(422, "position shares/avg_cost must be > 0")
+    async with savings.account_lock:
+        return await savings.initialize(
+            req.cash, req.positions, req.monthly_transfer, req.interest_rate)
+
+@app.post('/api/savings/reset')
+async def savings_reset():
+    """Wipe the tracker back to uninitialized (setup form). Sims untouched."""
+    from . import savings
+    async with savings.account_lock:
+        return await savings.reset()
+
+@app.post('/api/savings/trueup')
+async def savings_trueup(req: SavingsTrueupRequest):
+    """Reconcile the savings cash with the real TR balance (delta booked)."""
+    from . import savings
+    async with savings.account_lock:
+        r = await savings.trueup(req.actual_cash)
+    if not r.get("ok"):
+        raise HTTPException(422, r.get("reason", "true-up failed"))
+    return r
+
+@app.post('/api/savings/config')
+async def savings_config(req: SavingsConfigRequest):
+    """Update interest rate / monthly transfer (persisted, runtime-editable)."""
+    from . import savings
+    async with savings.account_lock:
+        r = await savings.set_config(req.monthly_transfer, req.interest_rate)
+    if not r.get("ok"):
+        raise HTTPException(409, r.get("reason", "not initialized"))
+    return r
+
+@app.post('/api/savings/deposit')
+async def savings_deposit(req: SavingsDepositRequest):
+    """Book a one-off cash deposit: fresh money moved into the TR cash —
+    a contribution (counted in Contributed). True-up stays the
+    reconciliation tool for drift."""
+    from . import savings
+    async with savings.account_lock:
+        r = await savings.add_deposit(req.amount)
+    if not r.get("ok"):
+        raise HTTPException(422, r.get("reason", "deposit failed"))
+    return r
+
+@app.post('/api/savings/saveback')
+async def savings_saveback(req: SavingsSavebackRequest):
+    """Book a Saveback payout TR invested into a Sparplan asset."""
+    from . import savings
+    ticker = req.ticker.strip().upper()
+    if not _TICKER_RE.match(ticker):
+        raise HTTPException(422, f"invalid ticker symbol: {ticker!r}")
+    async with savings.account_lock:
+        r = await savings.add_saveback(req.amount, ticker)
+    if not r.get("ok"):
+        raise HTTPException(422, r.get("reason", "saveback failed"))
+    return r
+
+@app.post('/api/savings/buy')
+async def savings_manual_buy(req: SavingsBuyRequest):
+    """Record a one-off buy paid from the tracked savings cash (deducts
+    cash, mirrors into daily-core). For TR's actual Saveback bonus use
+    /api/savings/saveback — that money comes from nowhere."""
+    from . import savings
+    ticker = req.ticker.strip().upper()
+    if not _TICKER_RE.match(ticker):
+        raise HTTPException(422, f"invalid ticker symbol: {ticker!r}")
+    async with savings.account_lock:
+        r = await savings.manual_buy(req.amount, ticker)
+    if not r.get("ok"):
+        raise HTTPException(422, r.get("reason", "buy failed"))
+    return r
+
+@app.get('/api/savings/plans')
+async def savings_plans():
+    from . import savings
+    return await savings.get_plans()
+
+@app.post('/api/savings/plans')
+async def savings_add_plan(req: SavingsPlanRequest):
+    from . import savings
+    ticker = req.ticker.strip().upper()
+    if not _TICKER_RE.match(ticker):
+        raise HTTPException(422, f"invalid ticker symbol: {ticker!r}")
+    async with savings.account_lock:
+        r = await savings.add_plan(ticker, req.amount, req.day_of_month)
+    if not r.get("ok"):
+        raise HTTPException(422, r.get("reason", "invalid plan"))
+    return r
+
+@app.delete('/api/savings/plans/{plan_id}')
+async def savings_remove_plan(plan_id: int):
+    from . import savings
+    async with savings.account_lock:
+        r = await savings.remove_plan(plan_id)
+    if not r.get("ok"):
+        raise HTTPException(404, r.get("reason", "no such plan"))
+    return r
+
+@app.delete('/api/savings/positions/{ticker}')
+async def savings_remove_position(ticker: str):
+    """Remove a position manually (sold in TR — proceeds arrive via true-up)."""
+    from . import savings
+    async with savings.account_lock:
+        r = await savings.remove_position(ticker.strip().upper())
+    if not r.get("ok"):
+        raise HTTPException(404, r.get("reason", "no such position"))
+    return r
+
+@app.post('/api/savings/refresh')
+async def savings_refresh():
+    """Pull-to-refresh: fetch candles for held tickers + EURUSD=X so the
+    tab valuates on the most recent close (on weekends: Friday's). Free
+    Yahoo bulk path; skips tickers within the freshness window."""
+    from . import savings
+    r = await savings.refresh_data()
+    return {"refreshed": r["refreshed"], "errors": r["errors"],
+            "total": len(r["refreshed"]) + len(r["errors"])}
+
+@app.post('/api/savings/run')
+async def savings_run():
+    """Manually trigger one savings pass (transfer/payout/accrue/sparplans/
+    snapshot — all idempotent)."""
+    from . import savings
+    return await savings.run_savings_cycle()
 
 @app.post('/api/sim/chat')
 async def sim_chat_endpoint(req: ChatRequest):

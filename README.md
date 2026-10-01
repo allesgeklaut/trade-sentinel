@@ -217,6 +217,21 @@ Three paper portfolios run side by side on the same $1000/month allowance:
 
 The Daily-Core tab shows Max DD, live alpha vs the Monthly sim and the DCA benchmark, per-position rank + weight, the full hold-band with held-name markers, and chart range controls (6M/1Y/2Y/5Y/MAX) over the backfilled 2017+ history.
 
+## Savings tracker (real money, EUR)
+
+The **Savings** tab tracks a *real* account (e.g. Trade Republic cash + Sparpläne) — deliberately separate from the paper sims: "Reset All Sims" and every backfill never touch it.
+
+- **Cash + interest**: the balance accrues interest daily at `rate/365` (rate configurable, default 3% — set your *net* rate to match TR's actual payouts) and pays out monthly, mirroring Trade Republic's convention. A **True-up** button reconciles the tracked balance with the real account whenever it drifts.
+- **Monthly transfer**: a configurable € amount is deposited at each month start (same `ALLOWANCE_TZ` anchor as the sims).
+- **Deposits**: one-off cash-ins — fresh money moved into the TR cash — via **Add deposit**. Booked as a `TRANSFER` contribution, so Contributed/Gain stay honest; true-up stays the reconciliation tool for drift. (Withdrawals reconcile via true-up.)
+- **Sparpläne**: configure plans (ticker, € amount, day-of-month); the tracker buys virtually from the tracked cash on that day at the cached close, with catch-up after downtime and a WARN event (pointing at a true-up) when the cash is insufficient. EUR pricing is native for EU listings (`.DE` etc.), USD-converted via `EURUSD=X` for US names.
+- **Manual buys**: one-off purchases paid from the tracked cash (an ETF you bought directly in TR, outside any Sparplan) — **Add buy** deducts from the cash, books a `MANUAL_BUY` ledger event and mirrors the € like a Sparplan execution. Refused when the tracked cash can't cover it (true-up first).
+- **Saveback**: TR invests the 1% Saveback into a Sparplan asset on the 2nd of the next month — book what actually landed with the **Add Saveback** button. Saveback is *bonus money TR gives you* (cash untouched, position bought "from nothing") — do **not** use it for buys you paid from your cash; use **Add buy** for those.
+- **Removing a position** (sold in TR) releases the mirror € its buys allocated, so the mirror always tracks the same € as the positions actually held.
+- **Daily-core mirror**: every € that goes into positions (seed holdings, Sparplan buys, manual buys, Saveback) is mirrored into the *then-current* daily-core top-10 suggestion — an honest forward comparison of "your picks vs daily-core's picks" for the same money on the same dates. No backward mirror exists: the ranking history isn't stored, and replaying today's picks over past dates would be look-ahead bias.
+
+No connection to Trade Republic exists — this is a manual ledger with derived valuations, not a broker integration. The daily pass runs at `SAVINGS_SNAPSHOT_HOUR:MINUTE` (default 23:40 UTC) on every calendar day, independently of `SIM_ENABLED`.
+
 ## Disclaimer
 
 This project is for **research and education only**. It is a self-hosted, paper-only
