@@ -1132,6 +1132,18 @@
             height: 320px
         }
 
+        /* Scrollable savings panels — same convention as the sim and
+           daily-core tabs: the section header stays fixed, wide tables
+           scroll left-right instead of bleeding out on narrow viewports. */
+        #savings-positions-table,
+        #savings-mirror-positions,
+        #savings-plans,
+        #savings-events {
+            max-height: 320px;
+            overflow-y: auto;
+            overflow-x: auto
+        }
+
         .savings-form input,
         .savings-form select {
             background: #0a1a10;
@@ -1161,6 +1173,7 @@
 
         #savings-positions-table table thead th,
         #savings-mirror-positions table thead th,
+        #savings-plans table thead th,
         #savings-events table thead th {
             position: sticky;
             top: 0;
