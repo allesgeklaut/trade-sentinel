@@ -1006,6 +1006,9 @@ class SavingsInitRequest(BaseModel):
 class SavingsTrueupRequest(BaseModel):
     actual_cash: float  # TR cash total incl. unpaid interest, positions excluded
 
+class SavingsDepositRequest(BaseModel):
+    amount: float
+
 class SavingsSavebackRequest(BaseModel):
     amount: float
     ticker: str
@@ -1089,6 +1092,17 @@ async def savings_config(req: SavingsConfigRequest):
     r = await savings.set_config(req.monthly_transfer, req.interest_rate)
     if not r.get("ok"):
         raise HTTPException(409, r.get("reason", "not initialized"))
+    return r
+
+@app.post('/api/savings/deposit')
+async def savings_deposit(req: SavingsDepositRequest):
+    """Book a one-off cash deposit: fresh money moved into the TR cash —
+    a contribution (counted in Contributed). True-up stays the
+    reconciliation tool for drift."""
+    from . import savings
+    r = await savings.add_deposit(req.amount)
+    if not r.get("ok"):
+        raise HTTPException(422, r.get("reason", "deposit failed"))
     return r
 
 @app.post('/api/savings/saveback')

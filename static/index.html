@@ -1796,7 +1796,8 @@
             <div class="sim-actions">
                 <button id="savings-refresh-btn" onclick="svRefreshData(this)">Refresh prices</button>
                 <button onclick="svRunNow(this)">Run pass now</button>
-                <button onclick="svTrueupPrompt(this)">True-up balance</button>
+                <button onclick="svTrueupPrompt(this)" title="Reconciliation only: fixes drift between the tracker and your real TR cash (small deltas, interest display differences). Fresh money you moved in goes through 'Add deposit'.">True-up balance</button>
+                <button onclick="svDepositPrompt(this)" title="Fresh money moved into your TR cash — raises the tracked cash and counts as a contribution (Contributed), unlike a true-up delta">Add deposit</button>
                 <button onclick="svBuyPrompt(this)" title="One-off asset purchase paid from your TR cash — deducts from the tracked balance, mirrors into daily-core">Add buy</button>
                 <button onclick="svSavebackPrompt(this)" title="TR's 1% card Saveback that TR invests for you on the 2nd — bonus money from nowhere, NOT from your tracked cash">Add Saveback</button>
                 <label style="font-size:12px;color:#7aaa81;display:flex;align-items:center;gap:4px">
@@ -1813,10 +1814,11 @@
             <div id="savings-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
             <div style="margin-top:6px;font-size:11px;color:#7aaa81">
                 Real money — never touched by "Reset All Sims" or any backfill. Interest accrues daily at
-                rate/365 on the cash balance and pays out monthly, like Trade Republic. Sparplan buys and
-                one-off buys ("Add buy") deduct from the tracked cash and mirror into daily-core; "Add
-                Saveback" books TR's 1% bonus (new money, cash untouched). A missing price defers a
-                Sparplan buy to the next pass.
+                rate/365 on the cash balance and pays out monthly, like Trade Republic. "Add deposit"
+                moves fresh money in (a contribution); Sparplan buys and one-off buys ("Add buy")
+                deduct from the tracked cash and mirror into daily-core; "Add Saveback" books TR's 1%
+                bonus (new money, cash untouched); "True-up" only reconciles drift. A missing price
+                defers a Sparplan buy to the next pass.
             </div>
         </div>
     </section>
@@ -3814,7 +3816,7 @@
         }
 
         async function svTrueupPrompt(btn) {
-            const input = prompt('True-up: enter your CURRENT TR cash total in € (as shown in TR, incl. unpaid interest, excluding positions/Saveback):');
+            const input = prompt('True-up: enter your CURRENT TR cash total in € (as shown in TR, incl. unpaid interest, excluding positions/Saveback).\n(Reconciliation for drift only — money you moved in goes through "Add deposit".)');
             if (input === null) return;
             const actual = parseFloat(input.replace(',', '.'));
             if (isNaN(actual)) { alert('Not a number.'); return; }
@@ -3827,6 +3829,22 @@
                 status.textContent = r.delta === 0
                     ? 'True-up: matches — no adjustment needed.'
                     : `True-up: ${r.delta > 0 ? '+' : ''}${fmtEur(r.delta)} booked.`;
+                await loadSavingsAll();
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
+        }
+
+        async function svDepositPrompt(btn) {
+            const amountStr = prompt('Deposit: how much € did you move INTO your TR cash?\n(Fresh money from outside — raises the tracked cash and counts in Contributed.)');
+            if (amountStr === null) return;
+            const amount = parseFloat(amountStr.replace(',', '.'));
+            if (isNaN(amount) || amount <= 0) { alert('Enter an amount > 0.'); return; }
+            const status = document.getElementById('savings-run-status');
+            try {
+                const r = await api('savings/deposit', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ amount }),
+                });
+                status.textContent = `Deposit booked: ${fmtEur(r.amount)} — ${fmtEur(r.cash)} tracked cash.`;
                 await loadSavingsAll();
             } catch (e) { status.textContent = 'Error: ' + e.message; }
         }

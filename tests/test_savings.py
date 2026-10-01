@@ -12,7 +12,8 @@ data volume. They cover:
 - Sparplan execution (due-day logic, month dedupe via the event ledger,
   insufficient-cash WARN, day-31 clamp in short months, deferred when the
   price is missing)
-- True-up / Saveback / manual buys (paid from cash) / config / plan CRUD
+- True-up / Saveback / manual buys (paid from cash) / deposits (fresh
+  money in, counted as contributions) / config / plan CRUD
 - Position removal unwinds the mirror € that position's buys allocated
 - The daily-core forward mirror (allocation, deferred without a ranking,
   valuation)
@@ -690,6 +691,34 @@ async def test_manual_buy_noop_when_uninitialized(mem_db):
     await _seed_candle(mem_db, "SPY", 50.0)
     await _seed_candle(mem_db, "EURUSD=X", 1.0)
     assert (await savings.manual_buy(10.0, "SPY"))["ok"] is False
+
+
+async def test_deposit_books_cash_and_contribution(mem_db):
+    """A manual deposit is fresh money IN: raises cash and contributed
+    (unlike a true-up delta, which is drift) and touches no position."""
+    await savings.initialize(100.0)
+    r = await savings.add_deposit(50.0)
+    assert r["ok"] is True and r["cash"] == 150.0
+    val = await savings.valuate()
+    assert val["cash"] == 150.0
+    assert val["contributed"] == 150.0  # INIT 100 + deposit 50
+    assert val["positions"] == []  # cash only, nothing mirrored
+    assert (await savings._mirror_valuate())["allocated"] == 0.0
+    evs = await _events(mem_db, "TRANSFER")
+    assert len(evs) == 1 and evs[0].amount == 50.0
+
+
+async def test_deposit_refusals_change_nothing(mem_db):
+    await savings.initialize(100.0)
+    assert (await savings.add_deposit(0.0))["ok"] is False
+    assert (await savings.add_deposit(-5.0))["ok"] is False
+    val = await savings.valuate()
+    assert val["cash"] == 100.0 and val["contributed"] == 100.0
+    assert (await _events(mem_db, "TRANSFER")) == []
+
+
+async def test_deposit_noop_when_uninitialized(mem_db):
+    assert (await savings.add_deposit(10.0))["ok"] is False
 
 
 async def test_config_and_plan_crud(mem_db):

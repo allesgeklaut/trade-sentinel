@@ -788,6 +788,29 @@ async def trueup(actual_total: float) -> dict:
     return {"ok": True, "delta": round(delta, 2), "cash": round(val["cash"] + delta, 2)}
 
 
+async def add_deposit(amount: float) -> dict:
+    """Book a one-off cash deposit: fresh money moved INTO the TR cash
+    from outside (e.g. a bank transfer). Raises the tracked cash and logs
+    a TRANSFER event — a CONTRIBUTION, so contributed/Gain stay honest
+    (unlike a true-up delta, which is reconciliation drift). Cash-only:
+    nothing is mirrored until a Sparplan or manual buy invests it.
+    Withdrawals are not bookable here — contributed counts money in;
+    taking money out reconciles via the next true-up."""
+    amount = float(amount)
+    if amount <= 0:
+        return {"ok": False, "reason": "amount must be > 0"}
+    async with Session() as s:
+        acc = await _account(s)
+        if acc is None:
+            return {"ok": False, "reason": "not initialized"}
+        acc.cash += amount
+        await _log_event(s, "TRANSFER", amount, note="manual deposit")
+        cash_after = round(acc.cash, 2)
+        await s.commit()
+    logger.info("Savings deposit: %.2f € (cash now %.2f)", amount, cash_after)
+    return {"ok": True, "amount": amount, "cash": cash_after}
+
+
 async def add_saveback(amount: float, ticker: str) -> dict:
     """Book a Saveback payout manually (TR invests it into a Sparplan asset
     on the 2nd of the following month; no card-spend math here — the
