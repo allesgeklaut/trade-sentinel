@@ -463,6 +463,10 @@ async def _protection_decision(band: list[str],
 # pass the gate and double-deposit / duplicate trades. Mirrors
 # sim._run_cycle_lock and monthly._rebalance_lock.
 _cycle_lock: asyncio.Lock = asyncio.Lock()
+# Upper bound on how long the scheduler waits for the busy lock before giving
+# up with the old "skipped" semantics (a DEV backfill can hold it for minutes;
+# a wedged holder should not park the scheduler forever).
+_TICK_LOCK_WAIT_SECONDS = 7200
 
 # Serialises the (uncached) target computation. The status endpoint calls
 # compute_targets() unlocked and the UI fires two status requests on first
@@ -1274,30 +1278,55 @@ async def backfill(start: str | None = None,
                 "snapshots": len(snaps), "mom_variant": current_variant()}
 
 
-async def run_daily_cycle(force: bool = False) -> dict:
-    """Scheduler entry: one full daily-core cycle.
+async def run_daily_cycle(force: bool = False, *, wait: bool = True) -> dict:
+    """Daily-core entry: one full daily-core cycle.
 
     deposit allowance (new month) -> refresh data -> deployment pass ->
     daily equity snapshot. Idempotent per day: the allowance gate is
     monthly and the deployment pass is idempotent by construction
     (top-ups stop when targets are met), so a re-run is harmless.
+
+    ``wait`` (default, the scheduler's contract): a busy lock delays the
+    cycle (bounded by ``_TICK_LOCK_WAIT_SECONDS``) instead of dropping it —
+    a skipped day has no catch-up. The manual trigger passes wait=False so
+    an HTTP request never hangs behind a DEV backfill.
     """
     if _cycle_lock.locked() and not force:
+        if not wait:
+            return {"skipped": True, "reason": "already running"}
+        logger.warning("Daily-core cycle: a cycle/backfill holds the lock — waiting up to %ds",
+                       _TICK_LOCK_WAIT_SECONDS)
+    # Bound ONLY the wait for the lock: acquire manually under asyncio.timeout
+    # and hold it through the cycle (wrapping the whole body would bound — and
+    # could cancel — a long-but-legitimate cycle, not just the wait).
+    try:
+        async with asyncio.timeout(_TICK_LOCK_WAIT_SECONDS):
+            await _cycle_lock.acquire()
+    except TimeoutError:
+        logger.error("Daily-core cycle skipped — the cycle lock was still held after %ds",
+                     _TICK_LOCK_WAIT_SECONDS)
         return {"skipped": True, "reason": "already running"}
-    async with _cycle_lock:
-        if not settings.sim_daily_core_enabled:
-            return {"skipped": True, "reason": "daily-core portfolio disabled"}
+    try:
+        return await _run_daily_cycle_locked()
+    finally:
+        _cycle_lock.release()
 
-        allowance = await deposit_allowance()
 
-        refreshed, refresh_errors = await refresh_data()
+async def _run_daily_cycle_locked() -> dict:
+    """Body of :func:`run_daily_cycle`, called with ``_cycle_lock`` held."""
+    if not settings.sim_daily_core_enabled:
+        return {"skipped": True, "reason": "daily-core portfolio disabled"}
 
-        deployment = await run_deployment()
+    allowance = await deposit_allowance()
 
-        snap = await take_snapshot()
+    refreshed, refresh_errors = await refresh_data()
 
-        return {"allowance": allowance, "refresh_errors": refresh_errors,
-                "deployment": deployment, "snapshot": snap}
+    deployment = await run_deployment()
+
+    snap = await take_snapshot()
+
+    return {"allowance": allowance, "refresh_errors": refresh_errors,
+            "deployment": deployment, "snapshot": snap}
 
 
 # ---------------------------------------------------------------------------

@@ -19,9 +19,19 @@ DATABASE_URL_DEV=sqlite+aiosqlite:////data/trading_dev.db
 
 The feature is **disabled by default**: an empty/unset value means no dev
 engine exists at all and every request is served by PROD. With the dev engine
-configured and the dev file missing, the app **auto-seeds DEV from a full copy
-of PROD on startup** (before `init_db()` runs), so the sandbox starts with the
-same candles and portfolio state instead of an empty schema.
+configured, the app **auto-seeds DEV from a full copy of PROD on startup**
+whenever DEV is missing **or still empty** (no watchlist rows) and PROD has
+data. `init_db()` runs first (both schemas exist) and the settings watchlist is
+seeded into PROD before the clone check, so a greenfield first boot creates
+both DBs empty and clones as soon as PROD has the seed tickers — the sandbox
+starts with the same candles, watchlist and portfolio state instead of an
+empty schema.
+
+Misconfiguring `DATABASE_URL_DEV` cannot endanger PROD: a URL that points at
+the PROD file itself (or at a non-file target such as `:memory:`) disables the
+dev engine with an error log at startup — `clone_prod_to_dev()` would otherwise
+`os.replace` PROD with its own backup copy. `GET /api/db/status` then reports
+`dev_enabled: false`, exactly like an unset value.
 
 ## The GUI switch
 
@@ -65,9 +75,15 @@ PROD-only and the DEV copy is read-only; savings GETs are unguarded.
 **Schedulers never follow the cookie.** The background jobs (daily/weekly sim
 cycles, the nightly prefetch and universe sync, the savings interest/Sparplan
 pass) start in the app's lifespan and run outside any request context, so they
-always operate on PROD. A browser selecting DEV cannot starve or redirect
-them. Manual triggers (Run Bot Now, a rebalance, a refresh) run inside the
-request and follow the selected DB.
+always operate on PROD — a browser selecting DEV cannot redirect them. They do
+share the portfolio locks with DEV work, though: when a scheduled tick finds
+`sim._run_cycle_lock`, `monthly._rebalance_lock` or `daily_core._cycle_lock`
+held, it **waits** (bounded by `_TICK_LOCK_WAIT_SECONDS`, ~2 h) for the
+backfill/manual run to finish instead of skipping the tick; only a lock still
+held beyond the bound skips it (error-logged). A DEV experiment can therefore
+delay a scheduled PROD cycle, but never silently drop it. Manual triggers (Run
+Bot Now, a rebalance, a refresh) run inside the request and follow the selected
+DB.
 
 **Daily-core state is per-DB, LLM state is shared.** The persisted daily-core
 strategy choice (momentum variant plus the protection-overlay/gradient chain)
@@ -92,8 +108,19 @@ behind.
   new file.
 - **Serialised**: clone shares the backfill lock with **Backfill All** and
   **Reset All** — it answers **409** while one of those is running, and they
-  answer 409 while a clone is running. It also answers 409 when DEV is
-  disabled entirely.
+  answer 409 while a clone is running. It also answers **409** ("a backfill
+  or run is already running") while any portfolio backfill/manual run holds
+  `sim._run_cycle_lock`, `monthly._rebalance_lock` or
+  `daily_core._cycle_lock`. Conversely, the four individual backfills and the
+  three manual runs answer **409** ("a PROD→DEV clone is running") while the
+  clone flag is set — for DEV-routed requests only: PROD requests are
+  unaffected, because a clone swaps the DEV file and nothing else. It also
+  answers 409 when DEV is disabled entirely.
+- **Residual hole**: an operation that was already in flight when a clone
+  starts can still race the swap. This is single-operator tooling — don't
+  start a clone while a run you care about is mid-flight, and if a DEV result
+  ever looks corrupted, re-clone: DEV is disposable and recoverable from PROD
+  at any time.
 - **Not copied**: the per-DB daily-core state file stays as-is on the DEV
   side (the clone copies the database, not the `*.json` state files).
 - **Observable**: `GET /api/db/status` reports `cloning: true` for the
@@ -109,7 +136,9 @@ behind.
 
 - `active` — the DB that served this request (`prod` or `dev`, from the cookie).
 - `dev_enabled` — whether `DATABASE_URL_DEV` is configured at all.
-- `dev_seeded` — whether the dev database file exists on disk.
+- `dev_seeded` — the DEV file exists **and has data** (watchlist rows). A
+  fresh schema-only DEV file reports `false` until the auto-seed (or a
+  re-clone) fills it.
 - `cloning` — whether a clone is currently running.
 
 ## Rollback / disabling

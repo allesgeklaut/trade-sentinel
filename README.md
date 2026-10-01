@@ -225,15 +225,15 @@ The app can run **two SQLite databases**: PROD (`/data/trading.db`) keeps the li
 DATABASE_URL_DEV=sqlite+aiosqlite:////data/trading_dev.db
 ```
 
-Left empty/unset, every client pins back to PROD — the DEV button still shows, but DEV requests fall through, and `GET /api/db/status` reports `dev_enabled: false`. With it set, the first start (if no dev file exists yet) auto-seeds DEV from a copy of PROD, so the sandbox opens with the same candles and state.
+Left empty/unset, every client pins back to PROD — the DEV button still shows, but DEV requests fall through, and `GET /api/db/status` reports `dev_enabled: false`. With it set, the first start (DEV missing **or still empty**) auto-seeds DEV from a copy of PROD, so the sandbox opens with the same candles and state.
 
 The **PROD/DEV toggle in the header** sets a `ts_db` cookie and reloads, so the choice is per browser. On PROD the backfill/reset controls are hidden with a note; on DEV an amber *DEV SANDBOX* banner appears with a **Clone PROD → DEV** button, backfills/resets become available, and the Savings tab is hidden. The scoping rules:
 
 - **Backfills and resets** (`/api/sim/backfill`, `/api/sim/backfill-benchmark`, `/api/backfill-all`, `/api/monthly/backfill`, `/api/dailycore/backfill`, `/api/sim/reset`, `/api/sim/reset-all`) — DEV only (403 on PROD).
 - **Savings writes** (deposits, buys, Sparpläne, true-up, config, reset) — PROD only; Savings reads are unguarded.
-- **Schedulers** (sim cycles, prefetch/sync, savings interest) always run on PROD regardless of the browser selection; **manual runs/refreshes** follow the selected DB.
+- **Schedulers** (sim cycles, prefetch/sync, savings interest) always run on PROD regardless of the browser selection (a DEV backfill holding a portfolio lock only delays the tick, bounded — details in the doc); **manual runs/refreshes** follow the selected DB.
 - **Daily-core strategy state** is per-DB (`daily_core_state.json` vs `daily_core_state_dev.json`), so DEV experiments never change the live PROD book; `llm_state.json` stays shared.
-- **Cloning** overwrites DEV with a fresh PROD copy incl. candle history when the sandbox went stale; it returns 409 while a Backfill All / Reset All is running.
+- **Cloning** overwrites DEV with a fresh PROD copy incl. candle history when the sandbox went stale; it returns 409 while a Backfill All / Reset All or any individual backfill/run is running, and the DEV backfills/runs return 409 while a clone is running.
 
 Endpoint list, clone locking details and rollback: [docs/dev-prod-db.md](docs/dev-prod-db.md).
 

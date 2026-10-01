@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select
+from sqlalchemy import select, func
 from pydantic import BaseModel
 from .config import settings
 from .db import (Watchlist, Session, init_db, current_db, use_db, engine_dev,
@@ -55,6 +55,15 @@ def _require_prod_db(action: str) -> None:
     of the savings data, so writes there would only mislead."""
     if current_db() != "prod":
         raise HTTPException(403, f"{action} is only available on the PROD database")
+
+
+def _require_no_clone() -> None:
+    """409 history-rewriting DEV actions while a PROD→DEV clone is swapping
+    the dev file: an op racing the swap could read a half-replaced database
+    or write into an orphaned inode. A clone only swaps DEV — PROD requests
+    are unaffected and never see this guard."""
+    if current_db() == "dev" and _db_cloning:
+        raise HTTPException(409, "a PROD→DEV clone is running — try again shortly")
 
 
 # Uvicorn installs no handlers for the root logger, so app loggers
@@ -228,19 +237,22 @@ async def _savings_loop() -> None:
             logger.error("Savings cycle failed: %s", e, exc_info=True)
 
 
+async def _dev_is_empty() -> bool:
+    """True when DEV has no watchlist rows yet (a fresh, schema-only DEV).
+
+    Lifespan/status run outside any request context, where a plain Session()
+    is PROD — the use_db("dev") wrapper is what points this query at DEV."""
+    with use_db("dev"):
+        async with Session() as s:
+            return (await s.scalars(select(func.count()).select_from(Watchlist))).one() == 0
+
+
 @asynccontextmanager
 async def lifespan(app):
     global _watchlist_prefetch_task, _universe_prefetch_task, _universe_sync_task
     global _savings_loop_task
-    # First boot with the dev engine configured: seed DEV with a full copy of
-    # PROD (candles + portfolio state) so the sandbox is immediately usable.
-    # Runs before init_db so the dev engine never creates an empty file first.
-    if engine_dev is not None and not dev_db_exists() and prod_db_exists():
-        try:
-            logger.info("DEV database missing — seeding it from PROD")
-            await clone_prod_to_dev()
-        except Exception as e:  # noqa: BLE001 — startup must survive a failed seed
-            logger.error("DEV auto-seed failed (continuing with an empty DEV db): %s", e)
+    # init_db() FIRST: it creates/validates both schemas, so the queries below
+    # (and _dev_is_empty) always have their tables.
     await init_db()
     async with Session() as s:
         for t in settings.watchlist.split(','):
@@ -250,6 +262,19 @@ async def lifespan(app):
             if not await s.get(Watchlist, ticker):
                 s.add(Watchlist(ticker=ticker))
         await s.commit()
+    # Seed DEV with a full copy of PROD (candles + portfolio state) whenever DEV
+    # is missing OR still empty and PROD has data. A greenfield first boot
+    # creates both schemas empty (no clone); the moment the settings watchlist
+    # lands in PROD the empty DEV is cloned, so the sandbox gets the seed
+    # tickers too instead of staying empty forever. init_db() may have created
+    # an empty dev file first — the clone replaces it (dispose + os.replace
+    # handle that).
+    if engine_dev is not None and prod_db_exists() and (not dev_db_exists() or await _dev_is_empty()):
+        try:
+            logger.info("DEV database missing/empty — seeding it from PROD")
+            await clone_prod_to_dev()
+        except Exception as e:  # noqa: BLE001 — startup must survive a failed seed
+            logger.error("DEV auto-seed failed (continuing with an empty DEV db): %s", e)
     if settings.watchlist_prefetch:
         _watchlist_prefetch_task = asyncio.create_task(_watchlist_prefetch_loop())
     if settings.sim_universe_prefetch:
@@ -626,6 +651,7 @@ async def sim_run():
     survives browser disconnects because it's not tied to the HTTP request.
     Track progress via /api/sim/run-status.
     """
+    _require_no_clone()
     result = sim.start_run_cycle_background()
     if not result.get("started"):
         raise HTTPException(409, result.get("reason", "already running"))
@@ -650,6 +676,7 @@ async def sim_backfill(start: str | None = Query(default=None)):
     approximation by design; the response carries approximation: true.
     """
     _require_dev_db("Backfill")
+    _require_no_clone()
     from . import sim
     r = await sim.backfill(_validated_start(start))
     if r.get("skipped"):
@@ -664,6 +691,7 @@ async def sim_backfill_benchmark(start: str | None = Query(default=None)):
     candles. The twin of the other backfills so all four curves can cover
     the same window. ``start``: date | "all" | default = synced."""
     _require_dev_db("Benchmark backfill")
+    _require_no_clone()
     from . import sim
     r = await sim.backfill_benchmark(_validated_start(start))
     if not r.get("ok"):
@@ -816,6 +844,7 @@ async def monthly_backfill(start: str | None = Query(default=None)):
     earliest snapshot.
     """
     _require_dev_db("Monthly backfill")
+    _require_no_clone()
     from . import monthly
     return await monthly.backfill(_validated_start(start))
 
@@ -829,6 +858,7 @@ async def monthly_rebalances(limit: int = Query(default=24, ge=1, le=120)):
 @app.post('/api/monthly/run')
 async def monthly_run():
     """Manually trigger a monthly rebalance (idempotent per month)."""
+    _require_no_clone()
     from . import monthly
     result = await monthly.run_rebalance()
     if result.get("skipped"):
@@ -1001,8 +1031,11 @@ async def daily_core_equity(limit: int = Query(default=365, ge=1, le=12000)):
 @app.post('/api/dailycore/run')
 async def daily_core_run():
     """Manually trigger one daily-core cycle (idempotent; lock-guarded)."""
+    _require_no_clone()
     from . import daily_core
-    return await daily_core.run_daily_cycle()
+    # wait=False: an HTTP request must not hang behind a running backfill —
+    # the manual path keeps the immediate "already running" answer.
+    return await daily_core.run_daily_cycle(wait=False)
 
 @app.post('/api/dailycore/refresh')
 async def daily_core_refresh():
@@ -1036,6 +1069,7 @@ async def daily_core_backfill(start: str | None = Query(default=None)):
     portfolios so all three equity curves cover the same window.
     """
     _require_dev_db("Daily-core backfill")
+    _require_no_clone()
     from . import daily_core
     r = await daily_core.backfill(_validated_start(start))
     if not r.get("ok"):
@@ -1358,27 +1392,34 @@ async def sim_reset_all():
             },
         }
 
-# Set while /api/db/clone runs; surfaced by /api/db/status so the UI can show
-# "cloning…". The clone holds _backfill_all_lock, so backfill-all/reset-all
-# 409 while it runs and vice versa.
+# Set while /api/db/clone runs; surfaced by /api/db/status for OTHER clients
+# and scripts (the UI's own clone button tracks its own request). The clone
+# holds _backfill_all_lock, so backfill-all/reset-all 409 while it runs, and
+# it 409s itself while a portfolio backfill/run holds its lock.
 _db_cloning = False
 
 @app.get('/api/db/status')
 async def db_status():
     """Which database this request is talking to, and the DEV sandbox state."""
     return {"active": current_db(), "dev_enabled": engine_dev is not None,
-            "dev_seeded": dev_db_exists(), "cloning": _db_cloning}
+            "dev_seeded": engine_dev is not None and dev_db_exists() and not await _dev_is_empty(),
+            "cloning": _db_cloning}
 
 @app.post('/api/db/clone')
 async def db_clone():
     """Overwrite DEV with a fresh copy of PROD. Serialized with
     backfill-all/reset-all (shared lock) so the dev file can't be swapped
-    while those are mid-run."""
+    while those are mid-run, and refused while any portfolio backfill/run
+    holds its lock (the clone would swap the file under it)."""
     global _db_cloning
     if _backfill_all_lock.locked():
-        raise HTTPException(409, "a backfill or reset is already running — wait for it to finish")
+        raise HTTPException(409, "another backfill, reset, or clone is already running — wait for it to finish")
     if engine_dev is None:
         raise HTTPException(409, "the DEV database is disabled (DATABASE_URL_DEV is unset)")
+    from . import sim, monthly, daily_core
+    if (sim._run_cycle_lock.locked() or monthly._rebalance_lock.locked()
+            or daily_core._cycle_lock.locked()):
+        raise HTTPException(409, "a backfill or run is already running — wait for it to finish")
     async with _backfill_all_lock:
         _db_cloning = True
         try:

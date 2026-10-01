@@ -128,6 +128,10 @@ def _current_month() -> str:
 # manual UI run) would both pass the gate and double-deposit the allowance /
 # duplicate trades. Mirrors sim._run_cycle_lock.
 _rebalance_lock: asyncio.Lock = asyncio.Lock()
+# Upper bound on how long the scheduler tick waits for the busy lock before
+# giving up with the old "skipped" semantics (a DEV backfill can hold it for
+# minutes; a wedged holder should not park the scheduler forever).
+_TICK_LOCK_WAIT_SECONDS = 7200
 
 
 # ---------------------------------------------------------------------------
@@ -1030,7 +1034,28 @@ async def run_monthly_cycle() -> dict[str, Any]:
         return {"skipped": True, "reason": "monthly portfolio disabled"}
     if not is_rebalance_day():
         return {"skipped": True, "reason": "not last trading day of month"}
-    return await run_rebalance()
+    # A DEV backfill holding the lock must DELAY the month-end rebalance, not
+    # skip it — a missed month has no catch-up. The free path delegates to
+    # run_rebalance(): asyncio.Lock's uncontended acquire sets the flag
+    # synchronously, so no other task can slip in between this check and
+    # run_rebalance's own acquire (same reasoning as take_snapshot's note).
+    # The busy path waits, bounded, for the real acquisition and holds it
+    # through the rebalance body.
+    if not _rebalance_lock.locked():
+        return await run_rebalance()
+    logger.warning("Monthly scheduler: tick delayed — waiting up to %ds for the rebalance lock "
+                   "(held by a backfill or manual run)", _TICK_LOCK_WAIT_SECONDS)
+    try:
+        async with asyncio.timeout(_TICK_LOCK_WAIT_SECONDS):
+            await _rebalance_lock.acquire()
+    except TimeoutError:
+        logger.error("Monthly scheduler: rebalance lock still held after %ds — skipping this tick",
+                     _TICK_LOCK_WAIT_SECONDS)
+        return {"skipped": True, "reason": "already running"}
+    try:
+        return await _run_rebalance_locked(False)
+    finally:
+        _rebalance_lock.release()
 
 
 # ---------------------------------------------------------------------------

@@ -2327,7 +2327,14 @@ class TestSchedulerTick:
         async def fake_monthly_cycle():
             return {"skipped": True, "reason": "not month end"}
 
-        monkeypatch.setattr(sim, "run_cycle", fake_sim_cycle)
+        # Busy-lock behavior (review M2 fix): the tick calls the REAL run_cycle,
+        # which now WAITS for a held lock (bounded by _TICK_LOCK_WAIT_SECONDS)
+        # and skips only on timeout. Fake the extracted locked body and shrink
+        # the bound so the timeout path fires fast — the invariant asserted is
+        # unchanged: a sim stage that ends up skipped must not suppress
+        # daily-core.
+        monkeypatch.setattr(sim, "_TICK_LOCK_WAIT_SECONDS", 0.05)
+        monkeypatch.setattr(sim, "_run_cycle_locked", fake_sim_cycle)
         monkeypatch.setattr(daily_core, "run_daily_cycle", fake_daily_core_cycle)
         monkeypatch.setattr(monthly, "run_monthly_cycle", fake_monthly_cycle)
 

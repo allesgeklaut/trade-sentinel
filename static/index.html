@@ -2492,7 +2492,13 @@
             try {
                 const r = await api('db/status');
                 ACTIVE_DB = r.active || 'prod';
-            } catch (e) { ACTIVE_DB = 'prod'; }
+            } catch (e) {
+                // PROD-safe fallback: never surface DEV controls when the
+                // selection can't be confirmed — and say so instead of
+                // silently pretending the cookie was read.
+                ACTIVE_DB = 'prod';
+                setStatus('DB status unavailable — showing the PROD view as a precaution', false);
+            }
             document.body.classList.remove('db-prod', 'db-dev');
             document.body.classList.add('db-' + ACTIVE_DB);
             document.getElementById('db-btn-prod').classList.toggle('nav-active', ACTIVE_DB === 'prod');

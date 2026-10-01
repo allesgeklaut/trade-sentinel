@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import sqlite3
 from contextlib import closing, contextmanager
@@ -13,6 +14,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 from .config import settings
+
+logger = logging.getLogger("trade_sentinel.db")
 
 
 def _utcnow() -> datetime:
@@ -632,10 +635,45 @@ def create_db_engine(database_url: str):
     return engine
 
 
+def _sqlite_path(eng) -> Path:
+    """Filesystem path of a SQLite engine's database (from its URL)."""
+    db = eng.sync_engine.url.database
+    if not db or db == ":memory:":
+        raise RuntimeError("expected a file-backed SQLite engine")
+    return Path(db)
+
+
+def _create_dev_engine(prod_engine, dev_url: str):
+    """Create the DEV engine, or return None (error-logged) when DEV is unsafe.
+
+    Refused with an error log:
+    * a non-file-backed URL (``:memory:``) — a clone target must be a real file;
+    * a dev path that resolves to the PROD file — a copy-pasted
+      DATABASE_URL_DEV would otherwise let clone_prod_to_dev()'s os.replace
+      overwrite PROD with the backup copy.
+    An empty URL is the documented "DEV disabled" switch: returns None silently.
+    """
+    if not dev_url:
+        return None
+    dev_engine = create_db_engine(dev_url)
+    try:
+        dev_path = _sqlite_path(dev_engine)
+    except RuntimeError as e:
+        logger.error("DATABASE_URL_DEV %r is not file-backed (%s) — DEV database disabled",
+                     dev_url, e)
+        return None
+    prod_path = _sqlite_path(prod_engine)
+    if dev_path.resolve() == prod_path.resolve():
+        logger.error("DATABASE_URL_DEV resolves to the PROD database (%s) — DEV disabled to protect PROD",
+                     prod_path)
+        return None
+    return dev_engine
+
+
 # Note: WAL mode persists in the DB file itself, so it only needs setting
 # once per database — but re-applying it per connection is harmless.
 engine = create_db_engine(settings.database_url)
-engine_dev = create_db_engine(settings.database_url_dev) if settings.database_url_dev else None
+engine_dev = _create_dev_engine(engine, settings.database_url_dev)
 DB_NAMES = ("prod", "dev")
 
 
@@ -875,14 +913,6 @@ async def init_db():
             await _migrate(conn)
 
 
-def _sqlite_path(eng) -> Path:
-    """Filesystem path of a SQLite engine's database (from its URL)."""
-    db = eng.sync_engine.url.database
-    if not db or db == ":memory:":
-        raise RuntimeError("expected a file-backed SQLite engine")
-    return Path(db)
-
-
 def dev_db_exists() -> bool:
     return engine_dev is not None and _sqlite_path(engine_dev).exists()
 
@@ -905,11 +935,19 @@ async def clone_prod_to_dev() -> dict:
     if engine is None or engine_dev is None:
         raise RuntimeError("DATABASE_URL_DEV is not configured — no dev engine to clone into")
     prod_path, dev_path = _sqlite_path(engine), _sqlite_path(engine_dev)
+    # Defense in depth: _create_dev_engine already refuses a dev URL that
+    # resolves to PROD, but a programmatic engine swap (or a monkeypatched
+    # test) must never let os.replace overwrite PROD with the backup copy.
+    if prod_path.resolve() == dev_path.resolve():
+        raise RuntimeError("DEV database path resolves to the PROD database — refusing to clone over PROD")
     tmp_path = dev_path.with_suffix(dev_path.suffix + ".tmp")
     dev_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _backup() -> None:
         # closing(): `with sqlite3.connect(...)` commits but does NOT close.
+        # A leftover tmp from a crashed clone must never poison this backup
+        # (sqlite3.connect opens it as-is; the backup then writes into it).
+        tmp_path.unlink(missing_ok=True)
         with closing(sqlite3.connect(str(prod_path), timeout=30)) as src, \
                 closing(sqlite3.connect(str(tmp_path))) as dst:
             src.backup(dst)

@@ -76,6 +76,11 @@ _run_progress: dict[str, Any] = {"running": False, "stage": "", "started_at": ""
 # click can't execute simultaneously. If a cycle is already running, a
 # second call returns immediately instead of racing on trades/snapshots.
 _run_cycle_lock: asyncio.Lock = asyncio.Lock()
+# Upper bound on how long a scheduled run waits for the busy lock before
+# giving up with the old "skipped" semantics. A DEV backfill can hold the
+# lock for minutes — the tick must delay rather than drop the day (a missed
+# day has no catch-up); only a wedged holder should ever hit this bound.
+_TICK_LOCK_WAIT_SECONDS = 7200
 # Holds the asyncio.Task for the currently in-flight run_cycle() (whether
 # triggered manually or by the scheduler). Used by the decoupled
 # /api/sim/run endpoint so the cycle survives browser disconnects.
@@ -1771,206 +1776,223 @@ async def run_cycle() -> dict[str, Any]:
 
     This is called by the scheduler or the manual trigger endpoint.
 
-    Concurrency: an asyncio.Lock serialises calls. If a cycle is already
-    running, a second call returns immediately with an "already running"
-    result instead of racing on trades/snapshots/progress state.
+    Concurrency: an asyncio.Lock serialises calls. A busy lock delays the
+    cycle (bounded by ``_TICK_LOCK_WAIT_SECONDS``) instead of skipping it —
+    a DEV backfill holding the lock for minutes must not silently drop the
+    scheduled day (it has no catch-up); a wedged holder still gets the old
+    skip after the bound. The manual trigger keeps its fail-fast in
+    :func:`start_run_cycle_background`.
     """
+    if _run_cycle_lock.locked():
+        logger.warning("run_cycle: a cycle/backfill holds the lock — waiting up to %ds for it",
+                       _TICK_LOCK_WAIT_SECONDS)
+    # Bound ONLY the wait for the lock: acquire manually under asyncio.timeout
+    # and hold it through the cycle. (Wrapping the whole `async with` would put
+    # the bound around the cycle body too and could cancel a long-but-legit
+    # run mid-write.)
+    try:
+        async with asyncio.timeout(_TICK_LOCK_WAIT_SECONDS):
+            await _run_cycle_lock.acquire()
+    except TimeoutError:
+        logger.error("run_cycle() skipped — the run-cycle lock was still held after %ds",
+                     _TICK_LOCK_WAIT_SECONDS)
+        return {"skipped": True, "reason": "already running"}
+    try:
+        return await _run_cycle_locked()
+    finally:
+        _run_cycle_lock.release()
+
+
+async def _run_cycle_locked() -> dict[str, Any]:
+    """Body of :func:`run_cycle`, called with ``_run_cycle_lock`` held."""
     global _last_deterministic_trades, _last_llm_reasoning, _last_llm_summary
     global _last_llm_decisions, _last_llm_vetoes
 
-    # Non-blocking acquire: if another cycle is in flight, bail out
-    # immediately rather than waiting (which would queue a third cycle
-    # behind the current one and double-execute when the lock frees).
-    if _run_cycle_lock.locked():
-        logger.info("run_cycle() skipped — another cycle is already running")
-        return {"skipped": True, "reason": "already running"}
+    # Reset all per-cycle LLM state; the LLM paths set them if they run.
+    # The deterministic path leaves them empty so the frontend can show a
+    # "deterministic mode — no LLM was called" explanation instead of
+    # re-reporting a previous cycle's reasoning as if it belonged here.
+    _last_llm_reasoning = ""
+    _last_llm_summary = ""
+    _last_llm_decisions = []
+    _last_llm_vetoes = []
 
-    async with _run_cycle_lock:
-        # Reset all per-cycle LLM state; the LLM paths set them if they run.
-        # The deterministic path leaves them empty so the frontend can show a
-        # "deterministic mode — no LLM was called" explanation instead of
-        # re-reporting a previous cycle's reasoning as if it belonged here.
-        _last_llm_reasoning = ""
-        _last_llm_summary = ""
-        _last_llm_decisions = []
-        _last_llm_vetoes = []
+    # Progress poller: mark the cycle as running with a start timestamp. Each
+    # stage updates _run_progress so the frontend can show what's happening.
+    _set_progress("starting", "Starting cycle")
+    started_at = _run_progress["started_at"]
 
-        # Progress poller: mark the cycle as running with a start timestamp. Each
-        # stage updates _run_progress so the frontend can show what's happening.
-        _set_progress("starting", "Starting cycle")
-        started_at = _run_progress["started_at"]
+    try:
+        # 1. Deposit allowance (if new month)
+        _set_progress("allowance", "Depositing monthly allowance", started_at=started_at)
+        allowance_result = await deposit_allowance()
 
-        try:
-            # 1. Deposit allowance (if new month)
-            _set_progress("allowance", "Depositing monthly allowance", started_at=started_at)
-            allowance_result = await deposit_allowance()
+        # 2. Refresh candles for the universe (reuse the nightly prefetch:
+        # tickers already fetched within the freshness window are skipped).
+        _set_progress("refresh", "Refreshing candle data", started_at=started_at)
+        tickers = await _candidate_tickers()
+        _, refresh_errors = await refresh_many(
+            tickers, _SIM_REFRESH_PERIOD,
+            max_age_seconds=settings.market_fresh_seconds)
+        detail = f" ({len(refresh_errors)} failed)" if refresh_errors else ""
+        _set_progress("refresh", f"Refreshed {len(tickers)} tickers{detail}", started_at=started_at)
 
-            # 2. Refresh candles for the universe (reuse the nightly prefetch:
-            # tickers already fetched within the freshness window are skipped).
-            _set_progress("refresh", "Refreshing candle data", started_at=started_at)
-            tickers = await _candidate_tickers()
-            _, refresh_errors = await refresh_many(
-                tickers, _SIM_REFRESH_PERIOD,
-                max_age_seconds=settings.market_fresh_seconds)
-            detail = f" ({len(refresh_errors)} failed)" if refresh_errors else ""
-            _set_progress("refresh", f"Refreshed {len(tickers)} tickers{detail}", started_at=started_at)
+        # 2b. Refresh benchmark ticker and run benchmark DCA
+        benchmark_result = {"deposited": False, "skipped": True}
+        if settings.sim_benchmark_enabled:
+            try:
+                await refresh(settings.sim_benchmark_ticker, _SIM_REFRESH_PERIOD)
+            except Exception as e:
+                refresh_errors.append(f"{settings.sim_benchmark_ticker}: {e}")
+            benchmark_result = await _benchmark_deposit_and_buy()
 
-            # 2b. Refresh benchmark ticker and run benchmark DCA
-            benchmark_result = {"deposited": False, "skipped": True}
-            if settings.sim_benchmark_enabled:
-                try:
-                    await refresh(settings.sim_benchmark_ticker, _SIM_REFRESH_PERIOD)
-                except Exception as e:
-                    refresh_errors.append(f"{settings.sim_benchmark_ticker}: {e}")
-                benchmark_result = await _benchmark_deposit_and_buy()
+        # 3. Valuate
+        _set_progress("valuate", "Valuing portfolio", started_at=started_at)
+        valuation = await valuate()
 
-            # 3. Valuate
-            _set_progress("valuate", "Valuing portfolio", started_at=started_at)
-            valuation = await valuate()
-
-            # 4. Decide & trade
-            strategy = settings.sim_strategy.lower()
-            # Fundamentals quality map (SIM_LLM_FUNDAMENTALS_CONTEXT /
-            # SIM_BLOCK_NEGATIVE_ROE): point-in-time ROE + P/FCF per candidate
-            # from the monthly portfolio's EDGAR-first fact store — DB-only,
-            # no new network calls. Empty when both features are off.
-            quality: dict[str, dict[str, float | None]] | None = None
-            if settings.sim_llm_fundamentals_context or settings.sim_block_negative_roe:
-                _set_progress("quality", "Loading fundamentals quality map", started_at=started_at)
-                quality = await _quality_map(tickers)
-            if strategy == "deterministic":
-                _set_progress("decide", "Deterministic engine deciding", started_at=started_at)
+        # 4. Decide & trade
+        strategy = settings.sim_strategy.lower()
+        # Fundamentals quality map (SIM_LLM_FUNDAMENTALS_CONTEXT /
+        # SIM_BLOCK_NEGATIVE_ROE): point-in-time ROE + P/FCF per candidate
+        # from the monthly portfolio's EDGAR-first fact store — DB-only,
+        # no new network calls. Empty when both features are off.
+        quality: dict[str, dict[str, float | None]] | None = None
+        if settings.sim_llm_fundamentals_context or settings.sim_block_negative_roe:
+            _set_progress("quality", "Loading fundamentals quality map", started_at=started_at)
+            quality = await _quality_map(tickers)
+        if strategy == "deterministic":
+            _set_progress("decide", "Deterministic engine deciding", started_at=started_at)
+            trades = await _deterministic_decide(valuation, quality_of=_quality_lookup(quality))
+            _last_deterministic_trades = trades
+        elif strategy == "llm":
+            _set_progress("signals", "Gathering signals", started_at=started_at)
+            signals = await _gather_signals(tickers)
+            news = await _gather_news(signals)
+            # Pure-LLM mode (main-branch parity): the engine makes NO
+            # proposals and NO risk-floor sells — the LLM picks the names,
+            # and the engine's hard sizing limits (min-cash floor,
+            # max-position-%, max-positions cap) size every BUY.
+            _set_progress("decide", "LLM deciding (pure-LLM strategy)", started_at=started_at)
+            trades = await _llm_decide(valuation, [], signals, news, pure_llm=True,
+                                       quality=quality if settings.sim_llm_fundamentals_context else None)
+            _last_deterministic_trades = []
+        elif strategy == "hybrid":
+            # Hybrid with a weekly review: the deterministic engine runs
+            # every cycle; the LLM reviews the proposals on the FIRST
+            # cycle of each calendar week (Europe/Vienna). Manual runs
+            # later in the same week do NOT trigger the LLM again — the
+            # review is anchored to the week, not to a run counter.
+            # On non-review cycles the deterministic proposals execute
+            # as-is — the engine manages daily risk, the LLM adds
+            # judgment once per week.
+            #
+            # Failure-marker mode (SIM_LLM_FAILURE_MARKER=true): the
+            # weekly cadence is replaced by a failure trigger — the LLM
+            # is consulted only when the engine shows signs of failure
+            # (2+ stop-out SELLs in the last 5 trading days, or equity
+            # >7% below its running peak). No cooldown: a fresh failure
+            # triggers a call the same day. This is the validated
+            # configuration (60d chop window: -0.8% vs -4.7% baseline).
+            review_interval = max(1, settings.sim_llm_review_interval)
+            week = _current_week()
+            async with Session() as s:
+                acc = await s.get(SimAccount, 1)
+                if acc is None:
+                    acc = SimAccount(id=1, cash=settings.sim_start_cash,
+                                     last_allowance_month=None)
+                    s.add(acc)
+                    await s.commit()
+                last_review_week = acc.last_review_week
+            if settings.sim_llm_failure_marker:
+                # --- failure marker: stop-out cascade / drawdown ---
+                async with Session() as s:
+                    recent_trades = (await s.scalars(
+                        select(SimTrade).order_by(SimTrade.created_at.desc()).limit(10)
+                    )).all()
+                    peak_equity = (await s.scalar(
+                        select(func.max(SimSnapshot.total_equity))
+                    )) or 0.0
+                # Mirror the replay's 5-trading-day window (optimize.py).
+                cutoff = _utcnow() - timedelta(days=7)
+                stop_outs_5d = sum(
+                    1 for t in recent_trades
+                    if t.side == "SELL" and _is_stop_out(t.reason)
+                    and t.created_at >= cutoff
+                )
+                drawdown = (valuation["total_equity"] / peak_equity - 1) * 100 if peak_equity > 0 else 0.0
+                failure = stop_outs_5d >= 2 or drawdown <= -7.0
+                if failure:
+                    logger.info("failure marker: stop_outs_5d=%d drawdown=%.1f%%",
+                                stop_outs_5d, drawdown)
+                is_review_cycle = failure
+            else:
+                # Fire the review when the last review is more than
+                # (review_interval - 1) weeks ago (or never happened).
+                is_review_cycle = (
+                    last_review_week is None
+                    or _week_diff(week, last_review_week) >= review_interval
+                )
+            if not is_review_cycle:
+                _set_progress("decide", "Deterministic engine deciding (LLM review off-cycle)", started_at=started_at)
                 trades = await _deterministic_decide(valuation, quality_of=_quality_lookup(quality))
                 _last_deterministic_trades = trades
-            elif strategy == "llm":
+                _last_llm_vetoes = []
+            else:
                 _set_progress("signals", "Gathering signals", started_at=started_at)
                 signals = await _gather_signals(tickers)
                 news = await _gather_news(signals)
-                # Pure-LLM mode (main-branch parity): the engine makes NO
-                # proposals and NO risk-floor sells — the LLM picks the names,
-                # and the engine's hard sizing limits (min-cash floor,
-                # max-position-%, max-positions cap) size every BUY.
-                _set_progress("decide", "LLM deciding (pure-LLM strategy)", started_at=started_at)
-                trades = await _llm_decide(valuation, [], signals, news, pure_llm=True,
-                                           quality=quality if settings.sim_llm_fundamentals_context else None)
-                _last_deterministic_trades = []
-            elif strategy == "hybrid":
-                # Hybrid with a weekly review: the deterministic engine runs
-                # every cycle; the LLM reviews the proposals on the FIRST
-                # cycle of each calendar week (Europe/Vienna). Manual runs
-                # later in the same week do NOT trigger the LLM again — the
-                # review is anchored to the week, not to a run counter.
-                # On non-review cycles the deterministic proposals execute
-                # as-is — the engine manages daily risk, the LLM adds
-                # judgment once per week.
-                #
-                # Failure-marker mode (SIM_LLM_FAILURE_MARKER=true): the
-                # weekly cadence is replaced by a failure trigger — the LLM
-                # is consulted only when the engine shows signs of failure
-                # (2+ stop-out SELLs in the last 5 trading days, or equity
-                # >7% below its running peak). No cooldown: a fresh failure
-                # triggers a call the same day. This is the validated
-                # configuration (60d chop window: -0.8% vs -4.7% baseline).
-                review_interval = max(1, settings.sim_llm_review_interval)
-                week = _current_week()
+                _set_progress("propose", "Deterministic engine proposing", started_at=started_at)
+                proposals = await _deterministic_propose(valuation, signals,
+                                                         quality_of=_quality_lookup(quality))
+                _set_progress("decide", "LLM reviewing proposals (hybrid)", started_at=started_at)
+                trades, vetoed = await _llm_review_proposals(valuation, proposals, signals, news,
+                                                             quality=quality if settings.sim_llm_fundamentals_context else None)
+                _last_deterministic_trades = proposals
+                _last_llm_vetoes = vetoed
+                # Mark the week as reviewed — no more LLM calls until the
+                # calendar week changes.
                 async with Session() as s:
                     acc = await s.get(SimAccount, 1)
-                    if acc is None:
-                        acc = SimAccount(id=1, cash=settings.sim_start_cash,
-                                         last_allowance_month=None)
-                        s.add(acc)
+                    if acc is not None:
+                        acc.last_review_week = week
                         await s.commit()
-                    last_review_week = acc.last_review_week
-                if settings.sim_llm_failure_marker:
-                    # --- failure marker: stop-out cascade / drawdown ---
-                    async with Session() as s:
-                        recent_trades = (await s.scalars(
-                            select(SimTrade).order_by(SimTrade.created_at.desc()).limit(10)
-                        )).all()
-                        peak_equity = (await s.scalar(
-                            select(func.max(SimSnapshot.total_equity))
-                        )) or 0.0
-                    # Mirror the replay's 5-trading-day window (optimize.py).
-                    cutoff = _utcnow() - timedelta(days=7)
-                    stop_outs_5d = sum(
-                        1 for t in recent_trades
-                        if t.side == "SELL" and _is_stop_out(t.reason)
-                        and t.created_at >= cutoff
-                    )
-                    drawdown = (valuation["total_equity"] / peak_equity - 1) * 100 if peak_equity > 0 else 0.0
-                    failure = stop_outs_5d >= 2 or drawdown <= -7.0
-                    if failure:
-                        logger.info("failure marker: stop_outs_5d=%d drawdown=%.1f%%",
-                                    stop_outs_5d, drawdown)
-                    is_review_cycle = failure
-                else:
-                    # Fire the review when the last review is more than
-                    # (review_interval - 1) weeks ago (or never happened).
-                    is_review_cycle = (
-                        last_review_week is None
-                        or _week_diff(week, last_review_week) >= review_interval
-                    )
-                if not is_review_cycle:
-                    _set_progress("decide", "Deterministic engine deciding (LLM review off-cycle)", started_at=started_at)
-                    trades = await _deterministic_decide(valuation, quality_of=_quality_lookup(quality))
-                    _last_deterministic_trades = trades
-                    _last_llm_vetoes = []
-                else:
-                    _set_progress("signals", "Gathering signals", started_at=started_at)
-                    signals = await _gather_signals(tickers)
-                    news = await _gather_news(signals)
-                    _set_progress("propose", "Deterministic engine proposing", started_at=started_at)
-                    proposals = await _deterministic_propose(valuation, signals,
-                                                             quality_of=_quality_lookup(quality))
-                    _set_progress("decide", "LLM reviewing proposals (hybrid)", started_at=started_at)
-                    trades, vetoed = await _llm_review_proposals(valuation, proposals, signals, news,
-                                                                 quality=quality if settings.sim_llm_fundamentals_context else None)
-                    _last_deterministic_trades = proposals
-                    _last_llm_vetoes = vetoed
-                    # Mark the week as reviewed — no more LLM calls until the
-                    # calendar week changes.
-                    async with Session() as s:
-                        acc = await s.get(SimAccount, 1)
-                        if acc is not None:
-                            acc.last_review_week = week
-                            await s.commit()
-            else:
-                logger.warning("Unknown strategy '%s', falling back to deterministic", strategy)
-                _set_progress("decide", "Deterministic engine deciding (unknown strategy fallback)", started_at=started_at)
-                trades = await _deterministic_decide(valuation)
-                _last_deterministic_trades = trades
+        else:
+            logger.warning("Unknown strategy '%s', falling back to deterministic", strategy)
+            _set_progress("decide", "Deterministic engine deciding (unknown strategy fallback)", started_at=started_at)
+            trades = await _deterministic_decide(valuation)
+            _last_deterministic_trades = trades
 
-            # 5. Snapshot for equity curve
-            _set_progress("snapshot", "Snapshotting equity curve", started_at=started_at)
-            post_valuation = await valuate()
-            allowance_total = post_valuation["allowance_total"]
-            async with Session() as s:
-                snap = SimSnapshot(
-                    cash=post_valuation["cash"],
-                    positions_value=post_valuation["positions_value"],
-                    total_equity=post_valuation["total_equity"],
-                    allowance_total=allowance_total,
-                )
-                s.add(snap)
-                await s.commit()
+        # 5. Snapshot for equity curve
+        _set_progress("snapshot", "Snapshotting equity curve", started_at=started_at)
+        post_valuation = await valuate()
+        allowance_total = post_valuation["allowance_total"]
+        async with Session() as s:
+            snap = SimSnapshot(
+                cash=post_valuation["cash"],
+                positions_value=post_valuation["positions_value"],
+                total_equity=post_valuation["total_equity"],
+                allowance_total=allowance_total,
+            )
+            s.add(snap)
+            await s.commit()
 
-            # 5b. Benchmark snapshot
-            await _benchmark_snapshot()
+        # 5b. Benchmark snapshot
+        await _benchmark_snapshot()
 
-            _set_progress("done", f"Done — {len(trades)} trade(s)", started_at=started_at, running=False)
-            return {
-                "allowance": allowance_result,
-                "benchmark": benchmark_result,
-                "refresh_errors": refresh_errors,
-                "trades": trades,
-                "valuation": post_valuation,
-                "llm_reasoning": _last_llm_reasoning,
-            }
-        except Exception as e:
-            # Mark the cycle as failed so the frontend can show the error instead
-            # of an indeterminate "Running..." state.
-            _set_progress("error", f"{type(e).__name__}: {e}", started_at=started_at, running=False, error=str(e))
-            raise
+        _set_progress("done", f"Done — {len(trades)} trade(s)", started_at=started_at, running=False)
+        return {
+            "allowance": allowance_result,
+            "benchmark": benchmark_result,
+            "refresh_errors": refresh_errors,
+            "trades": trades,
+            "valuation": post_valuation,
+            "llm_reasoning": _last_llm_reasoning,
+        }
+    except Exception as e:
+        # Mark the cycle as failed so the frontend can show the error instead
+        # of an indeterminate "Running..." state.
+        _set_progress("error", f"{type(e).__name__}: {e}", started_at=started_at, running=False, error=str(e))
+        raise
 
 
 def start_run_cycle_background() -> dict[str, Any]:
@@ -2762,20 +2784,16 @@ async def _scheduler_tick() -> None:
         logger.error("Monthly rebalance failed: %s", e, exc_info=True)
 
     try:
-        # Skip if a manual run is in flight (e.g. the user clicked "Run
-        # Bot Now" shortly before the scheduled time). The lock check in
-        # run_cycle() also guards against this, but checking here too
-        # avoids logging a confusing "skipped — already running" entry
-        # every scheduled night a manual run overlaps. NOTE: this must not
-        # skip the daily-core stage below — it runs regardless.
-        if _run_cycle_lock.locked():
-            logger.info("Sim scheduler: skipping scheduled run — a cycle is already in progress")
+        # A busy lock delays the scheduled run instead of skipping it: a
+        # skipped day has no catch-up, and the lock may be held by a DEV
+        # backfill for minutes. run_cycle() waits (bounded) and only returns
+        # {"skipped": ...} when the holder is wedged past the bound. NOTE:
+        # this must not skip the daily-core stage below — it runs regardless.
+        result = await run_cycle()
+        if result.get("skipped"):
+            logger.info("Sim scheduler: run_cycle skipped — %s", result.get("reason"))
         else:
-            result = await run_cycle()
-            if result.get("skipped"):
-                logger.info("Sim scheduler: run_cycle skipped — %s", result.get("reason"))
-            else:
-                logger.info("Sim cycle complete: %d trades", len(result["trades"]))
+            logger.info("Sim cycle complete: %d trades", len(result["trades"]))
     except Exception as e:
         logger.error("Sim cycle failed: %s", e, exc_info=True)
 
