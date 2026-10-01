@@ -1918,9 +1918,15 @@
                 .replace(/&/g, '&amp;')
                 .replace(/</g, '&lt;')
                 .replace(/>/g, '&gt;')
-                // Quotes matter too: user-supplied values (tickers from the
-                // savings API) are interpolated into onclick='...' handlers,
-                // where an unescaped ' would break out of the attribute.
+                // Quotes too: user-supplied values (tickers from the
+                // savings API) are interpolated into HTML attributes, and
+                // an unescaped quote must never terminate one. NOTE: this
+                // does NOT make a value safe inside a JS string in an
+                // onclick handler — the HTML parser decodes &#39;/&quot;
+                // back to quotes before the JS runs. The onclick handlers
+                // below are safe because the server validates tickers
+                // (_TICKER_RE strips quotes); don't extend that pattern
+                // to free-text fields (e.g. event notes).
                 .replace(/"/g, '&quot;')
                 .replace(/'/g, '&#39;');
         }
@@ -3818,12 +3824,18 @@
             status.textContent = 'Running pass…';
             try {
                 const r = await api('savings/run', { method: 'POST' });
-                const sp = r.sparplans ? r.sparplans.executed : 0;
-                status.textContent = `Pass complete — prices: ${r.refresh ? r.refresh.refreshed : '?'} fetched, ` +
-                    `transfer: ${r.transfer.deposited ? '+' + fmtEur(r.transfer.amount) : 'no'}, ` +
-                    `payout: ${r.payout.paid ? fmtEur(r.payout.amount) : 'no'}, ` +
-                    `accrued: ${r.accrual.accrued ? `${r.accrual.days}d ${fmtEur(r.accrual.amount)}` : 'no'}, sparplans: ${sp}.`;
-                await loadSavingsAll();
+                if (r.skipped) {
+                    // The nightly pass (or another manual run) is in
+                    // flight; the backend skipped this one — not an error.
+                    status.textContent = 'A savings pass is already running — this one was skipped.';
+                } else {
+                    const sp = r.sparplans ? r.sparplans.executed : 0;
+                    status.textContent = `Pass complete — prices: ${r.refresh ? r.refresh.refreshed : '?'} fetched, ` +
+                        `transfer: ${r.transfer.deposited ? '+' + fmtEur(r.transfer.amount) : 'no'}, ` +
+                        `payout: ${r.payout.paid ? fmtEur(r.payout.amount) : 'no'}, ` +
+                        `accrued: ${r.accrual.accrued ? `${r.accrual.days}d ${fmtEur(r.accrual.amount)}` : 'no'}, sparplans: ${sp}.`;
+                    await loadSavingsAll();
+                }
             } catch (e) { status.textContent = 'Error: ' + e.message; }
             btn.disabled = false;
         }

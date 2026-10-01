@@ -474,10 +474,6 @@ class SavingsAccount(Base):
     cash: Mapped[float] = mapped_column(Float, default=0)
     # Unpaid interest accrued since the last monthly payout (TR pays monthly).
     accrued_interest: Mapped[float] = mapped_column(Float, default=0)
-    # Mirrored-€ inflows that could not be allocated yet (no fresh ranking
-    # or missing prices) — flushed into the mirror by the next daily pass
-    # that has a fresh ranking, so a deferral is never a silent drop.
-    mirror_pending: Mapped[float] = mapped_column(Float, default=0)
     # Annual interest rate in % (TR: 3% for new customers; enter your NET
     # rate after the ~26.375% German withholding if you want the tracker to
     # match the payout TR actually credits).
@@ -584,6 +580,22 @@ class SavingsMirrorPosition(Base):
     opened_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
+class SavingsMirrorPending(Base):
+    """Mirrored-€ inflow that could not be allocated yet (no fresh ranking
+    or missing prices), parked PER SOURCE: the row keeps its ticker link,
+    so a later position removal releases the parked € together with the
+    placed mirror entries, and the next pass with a fresh ranking flushes
+    it as a source-tagged entry. A deferral is never a silent drop — and
+    never an orphan the mirror keeps after the position is gone."""
+
+    __tablename__ = "savings_mirror_pending"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    amount: Mapped[float] = mapped_column(Float)  # EUR parked
+    source_ticker: Mapped[str] = mapped_column(String(32), default="")  # "" = seed cash
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+
 
 def _configure_sqlite_pragmas(dbapi_conn, _record) -> None:
     """Set durability/concurrency pragmas on every new SQLite connection."""
@@ -668,14 +680,34 @@ async def init_db():
             )
         except Exception:
             pass  # column (or table) already exists
-        # Migration for savings_account: pending mirror € (deferred mirror
-        # allocations used to be dropped silently).
+        # Migration for deferred mirror €: pre-release dev builds parked it
+        # in a scalar savings_account.mirror_pending column with no source
+        # attribution (a removed position could not release its parked €).
+        # The per-source savings_mirror_pending table replaced the column;
+        # move any legacy amount into the table once. Fresh installs never
+        # had the column — the SELECT errors and is swallowed, same
+        # convention as the ALTER migrations above.
         try:
-            await conn.execute(
-                text("ALTER TABLE savings_account ADD COLUMN mirror_pending FLOAT DEFAULT 0")
-            )
+            legacy_pending = (await conn.execute(
+                text("SELECT mirror_pending FROM savings_account WHERE id = 1")
+            )).scalar()
         except Exception:
-            pass  # column (or table) already exists
+            legacy_pending = None
+        if legacy_pending is not None and float(legacy_pending) > 0:
+            # Source is unknown for legacy € — "" (the seed convention)
+            # keeps it alive and allocated on the next flush.
+            await conn.execute(
+                text("INSERT INTO savings_mirror_pending "
+                     "(amount, source_ticker, created_at) "
+                     "VALUES (:amount, '', :created)"),
+                {
+                    "amount": float(legacy_pending),
+                    "created": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S.%f"),
+                },
+            )
+            await conn.execute(
+                text("UPDATE savings_account SET mirror_pending = 0 WHERE id = 1")
+            )
         # Migration for fundamentals: add the `source` column (edgar|yfinance)
         # and rebuild the unique constraint to (ticker, tag, start, end, filed,
         # source) — EDGAR re-reports spans in later filings and point-in-time

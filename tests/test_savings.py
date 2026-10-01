@@ -16,9 +16,11 @@ data volume. They cover:
   money in, counted as contributions) / config / plan CRUD
 - Position removal unwinds the mirror € that position's buys allocated
 - The daily-core forward mirror (allocation, deferred without a ranking,
-  valuation)
+  parked € per source, per-source flush + release on removal)
 - Reset isolation: savings reset never touches the sim tables and
   reset_sim never touches the savings tables
+- Dev-build migration: the legacy scalar mirror_pending column moves
+  into the per-source savings_mirror_pending table once, idempotently
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
-from sqlalchemy import StaticPool, select
+from sqlalchemy import StaticPool, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app import savings
@@ -38,6 +40,7 @@ from app.db import (
     SavingsAccount,
     SavingsEvent,
     SavingsMirrorEntry,
+    SavingsMirrorPending,
     SavingsMirrorPosition,
     SavingsPlan,
     SavingsPosition,
@@ -1047,6 +1050,92 @@ async def test_mirror_deferral_is_pending_not_dropped(mem_db):
     assert by_ticker["MSFT"]["shares"] == pytest.approx(0.5)
 
 
+async def test_parked_mirror_keeps_source_and_releases_on_removal(mem_db):
+    """Deferred mirror € keeps its source ticker: removing the position
+    releases the parked € too. The old scalar pending column lost the
+    ticker link, so a removed position's deferred € later materialized in
+    the mirror as permanent orphan € — contradicting the documented
+    "removal releases the mirror € its buys allocated" invariant."""
+    await savings.initialize(1000.0)
+    await _seed_candle(mem_db, "URTH", 100.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await savings.add_plan("URTH", 100.0, 1)
+    await _backdate_plan(mem_db, "URTH", date(2026, 9, 1))
+
+    # No ranking → the buy executes, its mirror € parks with source URTH.
+    r = await savings.run_sparplans(day=date(2026, 9, 1))
+    assert r["executed"] == 1
+    assert r["trades"][0]["mirror_allocated"] is False
+    assert (await savings._pending_total()) == pytest.approx(100.0)
+
+    # Position removed before any flush: the parked € is released with it.
+    await savings.remove_position("URTH")
+    assert (await savings._pending_total()) == 0.0
+
+    # A ranking arriving later must not materialize the released €.
+    await _seed_ranking(mem_db, ["AAPL"])
+    await _seed_candle(mem_db, "AAPL", 100.0)
+    f = await savings.flush_pending_mirror()
+    assert f["flushed"] == 0.0 and f["pending"] == 0.0
+    assert (await savings._mirror_valuate())["allocated"] == 0.0
+
+
+async def test_flush_allocates_pending_per_source(mem_db):
+    """A flush allocates each parked row as a source-tagged entry, so the
+    mirror keeps per-position attribution even for deferred €: removing
+    one position unwinds exactly its own €."""
+    await savings.initialize(1000.0)
+    await _seed_candle(mem_db, "SPY", 50.0)
+    await _seed_candle(mem_db, "URTH", 100.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await savings.add_plan("SPY", 50.0, 1)
+    await savings.add_plan("URTH", 100.0, 2)
+    await _backdate_plan(mem_db, "SPY", date(2026, 9, 1))
+    await _backdate_plan(mem_db, "URTH", date(2026, 9, 1))
+
+    r = await savings.run_sparplans(day=date(2026, 9, 1))
+    assert r["executed"] == 1  # SPY due; URTH (day 2) not yet
+    r = await savings.run_sparplans(day=date(2026, 9, 2))
+    assert r["executed"] == 1
+    assert (await savings._pending_total()) == pytest.approx(150.0)
+
+    # A fresh ranking arrives: the flush allocates each parked row with
+    # its source, not as one anonymous lump.
+    await _seed_ranking(mem_db, ["AAPL"])
+    await _seed_candle(mem_db, "AAPL", 100.0)
+    f = await savings.flush_pending_mirror()
+    assert f["flushed"] == pytest.approx(150.0)
+    assert f["pending"] == 0.0
+    async with mem_db() as s:
+        sources = sorted(
+            e.source_ticker
+            for e in (await s.scalars(select(SavingsMirrorEntry))).all()
+        )
+    assert sources == ["SPY", "URTH"]
+
+    # Removing URTH unwinds exactly its 100 €; SPY's 50 € stays.
+    await savings.remove_position("URTH")
+    mirror = await savings._mirror_valuate()
+    assert mirror["allocated"] == pytest.approx(50.0)
+
+
+async def test_parked_seed_eur_survives_position_removal(mem_db):
+    """Seed-derived parked € (source "") behaves like placed seed €: no
+    ticker link, so removing a position must not release it."""
+    await savings.initialize(
+        1000.0, positions=[{"ticker": "URTH", "shares": 1.0, "avg_cost": 40.0}]
+    )
+    await _seed_candle(mem_db, "SPY", 50.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await savings.manual_buy(30.0, "SPY")  # parked, source SPY
+    assert (await savings._pending_total()) == pytest.approx(70.0)
+    await savings.remove_position("SPY")
+    assert (await savings._pending_total()) == pytest.approx(40.0)
+    # The seed's parked € has no ticker link — removing URTH keeps it.
+    await savings.remove_position("URTH")
+    assert (await savings._pending_total()) == pytest.approx(40.0)
+
+
 async def test_initialize_aggregates_duplicate_positions(mem_db):
     """Review finding #3: SavingsPosition.ticker is UNIQUE, so two lots of
     the same ETF used to blow up the whole init with an IntegrityError."""
@@ -1079,3 +1168,75 @@ async def test_initialize_rejects_non_numeric_positions(mem_db):
     assert r["invested"] == pytest.approx(100.0)
     val = await savings.valuate()
     assert val["positions"][0]["shares"] == pytest.approx(2.0)
+
+
+# ---------------------------------------------------------------------------
+# Dev-build migration: legacy scalar mirror_pending → per-source pending
+# ---------------------------------------------------------------------------
+
+async def test_init_db_migrates_legacy_pending_scalar(monkeypatch):
+    """Pre-release dev builds parked deferred mirror € in a scalar
+    savings_account.mirror_pending column with no source attribution. On
+    startup init_db moves any legacy amount into the per-source
+    savings_mirror_pending table (source "", the seed convention), zeroes
+    the scalar so the copy never runs twice, and tolerates fresh DBs where
+    the column never existed."""
+    import app.db as db_mod
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    monkeypatch.setattr(db_mod, "engine", engine)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        # Shape the DB like the pre-release build: scalar column + parked €
+        # (every NOT NULL column has a Python-side default only, so the
+        # row insert must name them explicitly).
+        await conn.execute(text(
+            "ALTER TABLE savings_account ADD COLUMN mirror_pending FLOAT DEFAULT 0"))
+        await conn.execute(text(
+            "INSERT INTO savings_account "
+            "(id, cash, accrued_interest, interest_rate, monthly_transfer, created_at, "
+            "mirror_pending) VALUES (1, 100, 0, 3.0, 0, :created, 75.5)"),
+            {"created": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")})
+
+    await db_mod.init_db()
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as s:
+        parked = (await s.scalars(select(SavingsMirrorPending))).all()
+        raw = (await s.execute(text(
+            "SELECT mirror_pending FROM savings_account WHERE id = 1"))).scalar()
+    assert len(parked) == 1
+    assert parked[0].amount == pytest.approx(75.5)
+    assert parked[0].source_ticker == ""  # legacy € has no known source
+    assert raw == 0  # zeroed — the copy is a one-time move
+
+    # Idempotent: a second startup must not duplicate the moved row.
+    await db_mod.init_db()
+    async with session_factory() as s:
+        parked = (await s.scalars(select(SavingsMirrorPending))).all()
+    assert len(parked) == 1
+    await engine.dispose()
+
+
+async def test_init_db_migration_tolerates_fresh_db(monkeypatch):
+    """A fresh DB never had the legacy column: the migration's SELECT
+    errors and is swallowed — startup still succeeds and parks nothing."""
+    import app.db as db_mod
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    monkeypatch.setattr(db_mod, "engine", engine)
+    await db_mod.init_db()
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as s:
+        parked = (await s.scalars(select(SavingsMirrorPending))).all()
+    assert parked == []
+    await engine.dispose()

@@ -22,7 +22,7 @@ from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from .config import settings
 from .db import (
@@ -30,6 +30,7 @@ from .db import (
     SavingsAccount,
     SavingsEvent,
     SavingsMirrorEntry,
+    SavingsMirrorPending,
     SavingsMirrorPosition,
     SavingsPlan,
     SavingsPosition,
@@ -44,9 +45,21 @@ logger = logging.getLogger("trade_sentinel.savings")
 # local month boundary.
 _TZ = ZoneInfo(settings.allowance_tz)
 
-# One cycle lock: the scheduler pass, a manual "Run Now" and an API-triggered
-# accrual must not interleave writes to the singleton account row.
+# One cycle lock: the scheduler pass, a manual "Run Now" and the operator
+# actions from the API must not interleave writes to the savings state —
+# every path does read-modify-write on the singleton account row (cash)
+# and on position rows (shares/avg_cost), and two concurrent writers can
+# silently lose one update. The cycle SKIPS when the lock is held (its
+# stages are all idempotent, so a skipped nightly pass is recovered by the
+# next one); operator endpoints instead WAIT (see account_lock).
 _cycle_lock = asyncio.Lock()
+
+# The API layer takes this lock around every mutating savings call, so
+# operator clicks serialize with the nightly pass instead of racing it —
+# waiting a few seconds beats silently losing an interest payout's cash
+# bump. Same object as _cycle_lock (the cycle's own reentry check stays
+# skip-based).
+account_lock = _cycle_lock
 
 # Interest accrues on the balance at end of each day (TR's own convention:
 # daily accrual, monthly payout). actual/365 is the savings-account norm.
@@ -199,45 +212,64 @@ async def _mirror_allocate(amount: float, source_ticker: str = "") -> dict | Non
     return {"amount": amount, "pick_count": len(priced), "bought": bought}
 
 
+async def _pending_total() -> float:
+    """Total parked mirror € across all sources."""
+    async with Session() as s:
+        total = await s.scalar(select(func.sum(SavingsMirrorPending.amount)))
+    return float(total or 0.0)
+
+
 async def _mirror_or_defer(amount: float, source_ticker: str = "") -> dict | None:
     """Allocate `amount` into the mirror, or PARK it as pending when no
     fresh ranking/prices exist. A deferral must never silently drop the €:
     with SIM_ENABLED=false (no daily-core cycles) nothing would ever mirror
-    while Sparpläne keep buying, permanently understating the comparison."""
+    while Sparpläne keep buying, permanently understating the comparison.
+    The parked row keeps the SOURCE ticker, so a later position removal
+    releases it (and a flush allocates it as a source-tagged entry that
+    unwinds with the position like any other)."""
     r = await _mirror_allocate(amount, source_ticker)
     if r is not None:
         return r
     async with Session() as s:
-        acc = await _account(s)
-        if acc is None:
-            return None
-        acc.mirror_pending += amount
+        s.add(SavingsMirrorPending(amount=amount, source_ticker=source_ticker))
         await s.commit()
-    logger.info("Savings mirror: %.2f € deferred (no fresh ranking) — pending total %.2f",
-                amount, acc.mirror_pending)
+    logger.info("Savings mirror: %.2f € deferred (no fresh ranking) — source %s",
+                amount, source_ticker or "(seed)")
     return None
 
 
 async def flush_pending_mirror() -> dict:
-    """Try to allocate any pending mirror €; returns what remains."""
+    """Try to allocate any pending mirror €; returns what remains.
+
+    Flushes PER SOURCE ROW: each parked amount becomes a source-tagged
+    mirror entry exactly like a live allocation, so removing a position
+    later unwinds its deferred € too — the mirror book keeps per-position
+    attribution even for money that arrived late.
+    """
     async with Session() as s:
-        acc = await _account(s)
-        if acc is None:
-            return {"flushed": 0.0, "pending": 0.0}
-        pending = acc.mirror_pending
-    if pending <= 0:
+        rows = (
+            await s.scalars(
+                select(SavingsMirrorPending).order_by(SavingsMirrorPending.id)
+            )
+        ).all()
+    if not rows:
         return {"flushed": 0.0, "pending": 0.0}
-    r = await _mirror_allocate(pending, source_ticker="")
-    if r is None:
-        return {"flushed": 0.0, "pending": round(pending, 2)}
-    async with Session() as s:
-        acc = await _account(s)
-        if acc is None:
-            return {"flushed": 0.0, "pending": round(pending, 2)}
-        acc.mirror_pending = max(0.0, acc.mirror_pending - r["amount"])
-        await s.commit()
-    logger.info("Savings mirror: flushed %.2f € of pending allocations", r["amount"])
-    return {"flushed": r["amount"], "pending": round(acc.mirror_pending, 2)}
+    flushed = 0.0
+    for row in rows:
+        r = await _mirror_allocate(row.amount, row.source_ticker)
+        if r is None:
+            continue  # still no fresh ranking/prices — stays parked
+        async with Session() as s:
+            parked = await s.get(SavingsMirrorPending, row.id)
+            if parked is not None:
+                await s.delete(parked)
+                await s.commit()
+        flushed += r["amount"]
+    remaining = await _pending_total()
+    if flushed:
+        logger.info("Savings mirror: flushed %.2f € of pending allocations "
+                    "(%.2f € still parked)", flushed, remaining)
+    return {"flushed": round(flushed, 2), "pending": round(remaining, 2)}
 
 
 async def _mirror_valuate() -> dict:
@@ -265,15 +297,13 @@ async def _mirror_valuate() -> dict:
             }
         )
     allocated = sum(e.amount for e in entries)
-    async with Session() as s:
-        acc = await _account(s)
-    pending = round(acc.mirror_pending, 2) if acc else 0.0
+    # Mirrored € waiting for a fresh ranking (flushed by the next cycle).
+    pending = round(await _pending_total(), 2)
     return {
         "positions": pos_list,
         "positions_value": round(positions_value, 2),
         "total_equity": round(positions_value, 2),
         "allocated": round(allocated, 2),
-        # Mirrored € waiting for a fresh ranking (flushed by the next cycle).
         "pending": pending,
         "entries": len(entries),
     }
@@ -365,6 +395,7 @@ async def initialize(
             SavingsEvent,
             SavingsSnapshot,
             SavingsMirrorEntry,
+            SavingsMirrorPending,
             SavingsMirrorPosition,
         ):
             await s.execute(sa_delete(tbl))
@@ -373,7 +404,6 @@ async def initialize(
             s.add(acc)
         acc.cash = max(0.0, float(cash))
         acc.accrued_interest = 0.0
-        acc.mirror_pending = 0.0
         acc.interest_rate = float(
             interest_rate if interest_rate is not None else settings.savings_interest_rate
         )
@@ -431,6 +461,7 @@ async def reset() -> dict:
             SavingsEvent,
             SavingsSnapshot,
             SavingsMirrorEntry,
+            SavingsMirrorPending,
             SavingsMirrorPosition,
             SavingsAccount,
         ):
@@ -555,8 +586,10 @@ async def _exec_sparplan(plan: SavingsPlan, price: float, day: str) -> dict | No
         if p is None:
             return None
         if acc.cash < plan.amount:
-            # One WARN per (plan, month): a month of daily passes must not
-            # flood the ledger with the same warning.
+            # One WARN per (plan, month, balance): the note embeds the
+            # current cash, so a month of daily passes with an unchanged
+            # balance logs a single row; any balance change (e.g. a
+            # deposit) warns once more — a new situation, not a duplicate.
             await _warn_once(
                 plan, day[:7],
                 f"insufficient savings cash ({acc.cash:.2f} < {plan.amount:.2f} €) "
@@ -657,8 +690,11 @@ async def run_sparplans(day: date | None = None) -> dict:
 
 
 async def _warn_once(plan: SavingsPlan, month: str, note: str) -> None:
-    """Log a WARN for (plan, month) only if none exists yet this month —
-    the ledger is the per-(plan, month) gate for repeated WARN kinds."""
+    """Log a WARN only if no IDENTICAL note (same ticker + text) exists yet
+    in the given month — a month of daily passes must not flood the ledger
+    with the same warning. Callers that embed changing state (the current
+    cash) in the note deliberately re-warn once per state change; callers
+    with a fixed note get a strict once-per-month gate."""
     async with Session() as s:
         rows = (
             await s.scalars(
@@ -694,6 +730,7 @@ async def valuate() -> dict:
             return {"initialized": False}
         positions = (await s.scalars(select(SavingsPosition))).all()
         events = (await s.scalars(select(SavingsEvent))).all()
+        pending = await s.scalar(select(func.sum(SavingsMirrorPending.amount)))
     prices = await _price_eur_map([p.ticker for p in positions]) if positions else {}
     positions_value = 0.0
     pos_list = []
@@ -722,7 +759,7 @@ async def valuate() -> dict:
         "initialized": True,
         "cash": round(acc.cash, 2),
         "accrued_interest": round(acc.accrued_interest, 2),
-        "mirror_pending": round(acc.mirror_pending, 2),
+        "mirror_pending": round(float(pending or 0.0), 2),
         "interest_rate": acc.interest_rate,
         "monthly_transfer": acc.monthly_transfer,
         "positions": pos_list,
@@ -770,8 +807,9 @@ async def trueup(actual_total: float) -> dict:
         acc = await _account(s)
         if acc is None:
             return {"ok": False, "reason": "not initialized"}
-        # Apply the delta proportionally to paid + accrued so the split
-        # stays consistent; a fresh month's payout then books cleanly.
+        # The whole delta lands in `cash`; `accrued_interest` keeps its
+        # tracked value, so cash + accrued equals the entered total and
+        # the next monthly payout books the remaining accrued cleanly.
         if abs(delta) < 0.005:
             await s.commit()
             return {"ok": True, "delta": 0.0, "cash": acc.cash}
@@ -978,35 +1016,50 @@ async def remove_plan(plan_id: int) -> dict:
 
 async def _unwind_mirror(source_ticker: str) -> float:
     """Release the mirror € that `source_ticker`'s buys allocated: delete
-    its source-tagged mirror entries and rebuild the mirror positions from
-    the remaining entries' breakdowns. Returns the € released. Seed-seeded
-    mirror € (source "") has no ticker link and stays. Without this, a
-    removed position would leave orphaned comparison € behind (the mirror
-    tracking more than the real positions ever held)."""
+    its source-tagged mirror entries AND its still-parked (deferred) €,
+    then rebuild the mirror positions from the remaining entries'
+    breakdowns. Returns the placed € released. Seed mirror € (source "")
+    has no ticker link and stays. Without this, a removed position would
+    leave orphaned comparison € behind (the mirror tracking more than the
+    real positions ever held)."""
     async with Session() as s:
+        parked = (
+            await s.scalars(
+                select(SavingsMirrorPending).where(
+                    SavingsMirrorPending.source_ticker == source_ticker
+                )
+            )
+        ).all()
         entries = (await s.scalars(select(SavingsMirrorEntry))).all()
         removed = [e for e in entries if e.source_ticker == source_ticker]
-        if not removed:
+        if not parked and not removed:
             return 0.0
-        for e in removed:
-            await s.delete(e)
-        for p in (await s.scalars(select(SavingsMirrorPosition))).all():
+        for p in parked:
             await s.delete(p)
-        await s.flush()  # frees rows before re-inserting rebuilt ones
-        shares: dict[str, float] = {}
-        cost: dict[str, float] = {}
-        for e in entries:
-            if e in removed:
-                continue
-            for t, sh, px in json.loads(e.breakdown or "[]"):
-                shares[t] = shares.get(t, 0.0) + float(sh)
-                cost[t] = cost.get(t, 0.0) + float(sh) * float(px)
-        for t, sh in shares.items():
-            s.add(SavingsMirrorPosition(ticker=t, shares=sh, avg_cost=cost[t] / sh))
-        await s.commit()
+        if not removed:
+            # Only parked € released — the placed book stays untouched.
+            await s.commit()
+        else:
+            for e in removed:
+                await s.delete(e)
+            for p in (await s.scalars(select(SavingsMirrorPosition))).all():
+                await s.delete(p)
+            await s.flush()  # frees rows before re-inserting rebuilt ones
+            shares: dict[str, float] = {}
+            cost: dict[str, float] = {}
+            for e in entries:
+                if e in removed:
+                    continue
+                for t, sh, px in json.loads(e.breakdown or "[]"):
+                    shares[t] = shares.get(t, 0.0) + float(sh)
+                    cost[t] = cost.get(t, 0.0) + float(sh) * float(px)
+            for t, sh in shares.items():
+                s.add(SavingsMirrorPosition(ticker=t, shares=sh, avg_cost=cost[t] / sh))
+            await s.commit()
     released = sum(e.amount for e in removed)
-    logger.info("Savings mirror: unwound %.2f € (source %s removed)",
-                released, source_ticker)
+    parked_sum = sum(p.amount for p in parked)
+    logger.info("Savings mirror: unwound %.2f € placed + %.2f € parked "
+                "(source %s removed)", released, parked_sum, source_ticker)
     return released
 
 

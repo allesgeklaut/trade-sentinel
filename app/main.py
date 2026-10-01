@@ -198,6 +198,12 @@ async def _savings_loop() -> None:
                 logger.info("Savings loop: tracker not initialized — skipping pass")
                 continue
             r = await savings.run_savings_cycle()
+            if r.get("skipped"):
+                # A manual "Run Now" or an operator action holding
+                # account_lock is mid-pass — every stage is idempotent and
+                # the markers catch up on the next nightly pass.
+                logger.info("Savings cycle skipped: %s", r.get("reason"))
+                continue
             logger.info("Savings cycle: refresh=%d transfer=%s payout=%s accrual=%s sparplans=%d",
                         r["refresh"]["refreshed"], r["transfer"].get("deposited"),
                         r["payout"].get("paid"), r["accrual"].get("accrued"),
@@ -1067,20 +1073,23 @@ async def savings_initialize(req: SavingsInitRequest):
             raise HTTPException(422, "position needs numeric shares/avg_cost") from e
         if sh <= 0 or ac <= 0:
             raise HTTPException(422, "position shares/avg_cost must be > 0")
-    return await savings.initialize(
-        req.cash, req.positions, req.monthly_transfer, req.interest_rate)
+    async with savings.account_lock:
+        return await savings.initialize(
+            req.cash, req.positions, req.monthly_transfer, req.interest_rate)
 
 @app.post('/api/savings/reset')
 async def savings_reset():
     """Wipe the tracker back to uninitialized (setup form). Sims untouched."""
     from . import savings
-    return await savings.reset()
+    async with savings.account_lock:
+        return await savings.reset()
 
 @app.post('/api/savings/trueup')
 async def savings_trueup(req: SavingsTrueupRequest):
     """Reconcile the savings cash with the real TR balance (delta booked)."""
     from . import savings
-    r = await savings.trueup(req.actual_cash)
+    async with savings.account_lock:
+        r = await savings.trueup(req.actual_cash)
     if not r.get("ok"):
         raise HTTPException(422, r.get("reason", "true-up failed"))
     return r
@@ -1089,7 +1098,8 @@ async def savings_trueup(req: SavingsTrueupRequest):
 async def savings_config(req: SavingsConfigRequest):
     """Update interest rate / monthly transfer (persisted, runtime-editable)."""
     from . import savings
-    r = await savings.set_config(req.monthly_transfer, req.interest_rate)
+    async with savings.account_lock:
+        r = await savings.set_config(req.monthly_transfer, req.interest_rate)
     if not r.get("ok"):
         raise HTTPException(409, r.get("reason", "not initialized"))
     return r
@@ -1100,7 +1110,8 @@ async def savings_deposit(req: SavingsDepositRequest):
     a contribution (counted in Contributed). True-up stays the
     reconciliation tool for drift."""
     from . import savings
-    r = await savings.add_deposit(req.amount)
+    async with savings.account_lock:
+        r = await savings.add_deposit(req.amount)
     if not r.get("ok"):
         raise HTTPException(422, r.get("reason", "deposit failed"))
     return r
@@ -1112,7 +1123,8 @@ async def savings_saveback(req: SavingsSavebackRequest):
     ticker = req.ticker.strip().upper()
     if not _TICKER_RE.match(ticker):
         raise HTTPException(422, f"invalid ticker symbol: {ticker!r}")
-    r = await savings.add_saveback(req.amount, ticker)
+    async with savings.account_lock:
+        r = await savings.add_saveback(req.amount, ticker)
     if not r.get("ok"):
         raise HTTPException(422, r.get("reason", "saveback failed"))
     return r
@@ -1126,7 +1138,8 @@ async def savings_manual_buy(req: SavingsBuyRequest):
     ticker = req.ticker.strip().upper()
     if not _TICKER_RE.match(ticker):
         raise HTTPException(422, f"invalid ticker symbol: {ticker!r}")
-    r = await savings.manual_buy(req.amount, ticker)
+    async with savings.account_lock:
+        r = await savings.manual_buy(req.amount, ticker)
     if not r.get("ok"):
         raise HTTPException(422, r.get("reason", "buy failed"))
     return r
@@ -1142,7 +1155,8 @@ async def savings_add_plan(req: SavingsPlanRequest):
     ticker = req.ticker.strip().upper()
     if not _TICKER_RE.match(ticker):
         raise HTTPException(422, f"invalid ticker symbol: {ticker!r}")
-    r = await savings.add_plan(ticker, req.amount, req.day_of_month)
+    async with savings.account_lock:
+        r = await savings.add_plan(ticker, req.amount, req.day_of_month)
     if not r.get("ok"):
         raise HTTPException(422, r.get("reason", "invalid plan"))
     return r
@@ -1150,7 +1164,8 @@ async def savings_add_plan(req: SavingsPlanRequest):
 @app.delete('/api/savings/plans/{plan_id}')
 async def savings_remove_plan(plan_id: int):
     from . import savings
-    r = await savings.remove_plan(plan_id)
+    async with savings.account_lock:
+        r = await savings.remove_plan(plan_id)
     if not r.get("ok"):
         raise HTTPException(404, r.get("reason", "no such plan"))
     return r
@@ -1159,7 +1174,8 @@ async def savings_remove_plan(plan_id: int):
 async def savings_remove_position(ticker: str):
     """Remove a position manually (sold in TR — proceeds arrive via true-up)."""
     from . import savings
-    r = await savings.remove_position(ticker.strip().upper())
+    async with savings.account_lock:
+        r = await savings.remove_position(ticker.strip().upper())
     if not r.get("ok"):
         raise HTTPException(404, r.get("reason", "no such position"))
     return r
