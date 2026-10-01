@@ -2,9 +2,10 @@
 
 Tracks real money — cash with daily interest accrual (paid out monthly like
 Trade Republic), Sparplan buys (virtual, from the savings cash at the cached
-close), and a forward mirror that allocates every € invested into positions
-into the current daily-core suggestion for an honest "your picks vs
-daily-core's picks" comparison.
+close), one-off manual buys (also from the savings cash), Saveback bonus
+investments (new money from nothing), and a forward mirror that allocates
+every € invested into positions into the current daily-core suggestion for
+an honest "your picks vs daily-core's picks" comparison.
 
 No connection to Trade Republic exists: the balance is seeded/true-upped
 manually, everything else is derived. Deliberately separate from the paper
@@ -791,7 +792,8 @@ async def add_saveback(amount: float, ticker: str) -> dict:
     """Book a Saveback payout manually (TR invests it into a Sparplan asset
     on the 2nd of the following month; no card-spend math here — the
     operator enters what TR actually invested). Buys the position from
-    nothing (Saveback is a bonus, not savings-cash money) and mirrors it."""
+    nothing — Saveback is a bonus, money TR gives you on top, NOT savings
+    cash (a buy paid from your cash is manual_buy). Mirrors it."""
     amount = float(amount)
     ticker = ticker.strip().upper()
     if amount <= 0 or not ticker:
@@ -822,6 +824,55 @@ async def add_saveback(amount: float, ticker: str) -> dict:
         "ticker": ticker,
         "shares": shares,
         "price": price,
+        "mirror_allocated": bool(mirror),
+    }
+
+
+async def manual_buy(amount: float, ticker: str) -> dict:
+    """Record a one-off asset purchase paid from the tracked savings cash
+    (e.g. ETF shares bought directly in TR, outside any Sparplan) — the
+    manual counterpart to a Sparplan execution: cash is deducted, a
+    MANUAL_BUY ledger event is booked, and the € is mirrored."""
+    amount = float(amount)
+    ticker = ticker.strip().upper()
+    if amount <= 0 or not ticker:
+        return {"ok": False, "reason": "amount must be > 0 and ticker required"}
+    prices = await _price_eur_map([ticker])
+    price = prices.get(ticker)
+    if price is None or price <= 0:
+        return {"ok": False, "reason": f"no price for {ticker} (refresh candles?)"}
+    async with Session() as s:
+        acc = await _account(s)
+        if acc is None:
+            return {"ok": False, "reason": "not initialized"}
+        if acc.cash + 0.005 < amount:
+            return {
+                "ok": False,
+                "reason": f"insufficient savings cash ({acc.cash:.2f} < {amount:.2f} €) "
+                          f"— true-up the balance first",
+            }
+        shares = amount / price
+        acc.cash -= amount
+        pos = await s.scalar(select(SavingsPosition).where(SavingsPosition.ticker == ticker))
+        if pos:
+            total = pos.shares + shares
+            pos.avg_cost = (pos.shares * pos.avg_cost + amount) / total
+            pos.shares = total
+        else:
+            s.add(SavingsPosition(ticker=ticker, shares=shares, avg_cost=price))
+        await _log_event(
+            s, "MANUAL_BUY", -amount, ticker=ticker,
+            note=f"manual buy: {shares:.6f} sh @ {price:.4f} €"
+        )
+        cash_after = round(acc.cash, 2)
+        await s.commit()
+    mirror = await _mirror_or_defer(amount, source_ticker=ticker)
+    return {
+        "ok": True,
+        "ticker": ticker,
+        "shares": shares,
+        "price": price,
+        "cash": cash_after,
         "mirror_allocated": bool(mirror),
     }
 
@@ -902,10 +953,46 @@ async def remove_plan(plan_id: int) -> dict:
         return {"ok": True}
 
 
+async def _unwind_mirror(source_ticker: str) -> float:
+    """Release the mirror € that `source_ticker`'s buys allocated: delete
+    its source-tagged mirror entries and rebuild the mirror positions from
+    the remaining entries' breakdowns. Returns the € released. Seed-seeded
+    mirror € (source "") has no ticker link and stays. Without this, a
+    removed position would leave orphaned comparison € behind (the mirror
+    tracking more than the real positions ever held)."""
+    async with Session() as s:
+        entries = (await s.scalars(select(SavingsMirrorEntry))).all()
+        removed = [e for e in entries if e.source_ticker == source_ticker]
+        if not removed:
+            return 0.0
+        for e in removed:
+            await s.delete(e)
+        for p in (await s.scalars(select(SavingsMirrorPosition))).all():
+            await s.delete(p)
+        await s.flush()  # frees rows before re-inserting rebuilt ones
+        shares: dict[str, float] = {}
+        cost: dict[str, float] = {}
+        for e in entries:
+            if e in removed:
+                continue
+            for t, sh, px in json.loads(e.breakdown or "[]"):
+                shares[t] = shares.get(t, 0.0) + float(sh)
+                cost[t] = cost.get(t, 0.0) + float(sh) * float(px)
+        for t, sh in shares.items():
+            s.add(SavingsMirrorPosition(ticker=t, shares=sh, avg_cost=cost[t] / sh))
+        await s.commit()
+    released = sum(e.amount for e in removed)
+    logger.info("Savings mirror: unwound %.2f € (source %s removed)",
+                released, source_ticker)
+    return released
+
+
 async def remove_position(ticker: str) -> dict:
     """Remove a position manually (e.g. sold in TR — the tracker does not
     sell). The current value is NOT credited back to the savings cash: the
-    operator moves that money in TR, so it arrives via the next true-up."""
+    operator moves that money in TR, so it arrives via the next true-up.
+    The mirror € this position's buys allocated is unwound with it, so the
+    comparison tracks the same € as the positions actually held."""
     ticker = ticker.strip().upper()
     async with Session() as s:
         acc = await _account(s)
@@ -923,7 +1010,8 @@ async def remove_position(ticker: str) -> dict:
             note="position removed manually — proceeds arrive via true-up",
         )
         await s.commit()
-        return {"ok": True}
+    await _unwind_mirror(ticker)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------

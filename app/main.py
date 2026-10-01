@@ -1010,6 +1010,10 @@ class SavingsSavebackRequest(BaseModel):
     amount: float
     ticker: str
 
+class SavingsBuyRequest(BaseModel):
+    amount: float
+    ticker: str
+
 class SavingsConfigRequest(BaseModel):
     monthly_transfer: float | None = None
     interest_rate: float | None = None
@@ -1097,6 +1101,20 @@ async def savings_saveback(req: SavingsSavebackRequest):
     r = await savings.add_saveback(req.amount, ticker)
     if not r.get("ok"):
         raise HTTPException(422, r.get("reason", "saveback failed"))
+    return r
+
+@app.post('/api/savings/buy')
+async def savings_manual_buy(req: SavingsBuyRequest):
+    """Record a one-off buy paid from the tracked savings cash (deducts
+    cash, mirrors into daily-core). For TR's actual Saveback bonus use
+    /api/savings/saveback — that money comes from nowhere."""
+    from . import savings
+    ticker = req.ticker.strip().upper()
+    if not _TICKER_RE.match(ticker):
+        raise HTTPException(422, f"invalid ticker symbol: {ticker!r}")
+    r = await savings.manual_buy(req.amount, ticker)
+    if not r.get("ok"):
+        raise HTTPException(422, r.get("reason", "buy failed"))
     return r
 
 @app.get('/api/savings/plans')

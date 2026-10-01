@@ -1721,9 +1721,10 @@
             <div class="sim-section-title">Set up the Savings tracker</div>
             <p style="font-size:12px;color:#7aaa81;margin:4px 0 10px">
                 Tracks your real Trade Republic account in EUR — savings cash with daily interest accrual
-                (paid monthly like TR) and Sparplan buys executed virtually from that cash. No connection
-                to TR: seed the balance, then true it up when it drifts. Your held positions and every
-                future Sparplan € are mirrored into the current daily-core suggestion for comparison.
+                (paid monthly like TR), Sparplan buys and one-off manual buys executed virtually from that
+                cash. No connection to TR: seed the balance, then true it up when it drifts. Your held
+                positions and every future € invested into positions (Sparplan buys, manual buys,
+                Saveback) are mirrored into the current daily-core suggestion for comparison.
             </p>
             <div class="row">
                 <label>Cash balance (€)
@@ -1796,7 +1797,8 @@
                 <button id="savings-refresh-btn" onclick="svRefreshData(this)">Refresh prices</button>
                 <button onclick="svRunNow(this)">Run pass now</button>
                 <button onclick="svTrueupPrompt(this)">True-up balance</button>
-                <button onclick="svSavebackPrompt(this)">Add Saveback</button>
+                <button onclick="svBuyPrompt(this)" title="One-off asset purchase paid from your TR cash — deducts from the tracked balance, mirrors into daily-core">Add buy</button>
+                <button onclick="svSavebackPrompt(this)" title="TR's 1% card Saveback that TR invests for you on the 2nd — bonus money from nowhere, NOT from your tracked cash">Add Saveback</button>
                 <label style="font-size:12px;color:#7aaa81;display:flex;align-items:center;gap:4px">
                     Transfer €<input type="number" id="sv-cfg-transfer" min="0" step="1"
                         style="max-width:90px;background:#0a1a10;color:#b7ffc0;border:1px solid #1d4d29;border-radius:4px;padding:4px">
@@ -1811,9 +1813,10 @@
             <div id="savings-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
             <div style="margin-top:6px;font-size:11px;color:#7aaa81">
                 Real money — never touched by "Reset All Sims" or any backfill. Interest accrues daily at
-                rate/365 on the cash balance and pays out monthly, like Trade Republic. Sparplan buys run
-                on their day-of-month (catch-up after downtime) and deduct from the tracked cash; a
-                missing price defers the buy to the next pass.
+                rate/365 on the cash balance and pays out monthly, like Trade Republic. Sparplan buys and
+                one-off buys ("Add buy") deduct from the tracked cash and mirror into daily-core; "Add
+                Saveback" books TR's 1% bonus (new money, cash untouched). A missing price defers a
+                Sparplan buy to the next pass.
             </div>
         </div>
     </section>
@@ -3613,7 +3616,7 @@
                 const cls = p.pnl_pct > 0 ? 'buy' : p.pnl_pct < 0 ? 'sell' : '';
                 return `<tr><td>${escapeHtml(p.ticker)}</td><td>${p.shares.toFixed(4)}</td><td>${fmtEur(p.avg_cost)}</td><td>${fmtEur(p.current_price)}</td><td>${fmtEur(p.value)}</td><td class="${cls}">${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(2)}%</td>` +
                     `<td><button style="padding:2px 8px;font-size:11px" onclick="svRemovePosition('${escapeHtml(p.ticker)}')" title="Sold in TR — remove from tracker; the money arrives via true-up">✕</button></td></tr>`;
-            }).join('')}</table>` : '<div class="sim-empty">No positions yet — add a Sparplan or book a Saveback.</div>';
+            }).join('')}</table>` : '<div class="sim-empty">No positions yet — add a Sparplan, an "Add buy" purchase, or book a Saveback.</div>';
         }
 
         function renderSavingsPlans(status) {
@@ -3828,8 +3831,26 @@
             } catch (e) { status.textContent = 'Error: ' + e.message; }
         }
 
+        async function svBuyPrompt(btn) {
+            const amountStr = prompt('Manual buy: how much € did you invest?\n(Paid from your TR cash — the tracker deducts it from the tracked balance and mirrors the € into daily-core.)');
+            if (amountStr === null) return;
+            const amount = parseFloat(amountStr.replace(',', '.'));
+            if (isNaN(amount) || amount <= 0) { alert('Enter an amount > 0.'); return; }
+            const ticker = prompt('Which asset (ticker) did you buy?');
+            if (!ticker) return;
+            const status = document.getElementById('savings-run-status');
+            try {
+                const r = await api('savings/buy', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ amount, ticker: ticker.trim().toUpperCase() }),
+                });
+                status.textContent = `Buy booked: ${r.shares.toFixed(4)} ${r.ticker} @ ${fmtEur(r.price)} — ${fmtEur(r.cash)} tracked cash left.`;
+                await loadSavingsAll();
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
+        }
+
         async function svSavebackPrompt(btn) {
-            const amountStr = prompt('Saveback: how much € did TR invest on the 2nd of this month?');
+            const amountStr = prompt('Saveback: how much € did TR invest for you on the 2nd?\n(Only the 1% card bonus TR pays — new money from nowhere. For a buy you paid from your TR cash use "Add buy".)');
             if (amountStr === null) return;
             const amount = parseFloat(amountStr.replace(',', '.'));
             if (isNaN(amount) || amount <= 0) { alert('Enter an amount > 0.'); return; }
@@ -3839,7 +3860,7 @@
             try {
                 const r = await api('savings/saveback', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ amount, ticker }),
+                    body: JSON.stringify({ amount, ticker: ticker.trim().toUpperCase() }),
                 });
                 status.textContent = `Saveback booked: ${r.shares.toFixed(4)} ${r.ticker} @ ${fmtEur(r.price)}.`;
                 await loadSavingsAll();

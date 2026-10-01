@@ -526,8 +526,8 @@ class SavingsPlan(Base):
 class SavingsEvent(Base):
     """Immutable ledger of everything that moved money in the tracker.
 
-    kind: INIT | TRANSFER | INTEREST_PAYOUT | SPARPLAN_BUY | SAVEBACK |
-          TRUEUP | WARN
+    kind: INIT | TRANSFER | INTEREST_PAYOUT | SPARPLAN_BUY | MANUAL_BUY |
+          SAVEBACK | TRUEUP | WARN
     """
 
     __tablename__ = "savings_events"

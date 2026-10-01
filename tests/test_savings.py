@@ -12,7 +12,8 @@ data volume. They cover:
 - Sparplan execution (due-day logic, month dedupe via the event ledger,
   insufficient-cash WARN, day-31 clamp in short months, deferred when the
   price is missing)
-- True-up / Saveback / config / plan CRUD
+- True-up / Saveback / manual buys (paid from cash) / config / plan CRUD
+- Position removal unwinds the mirror € that position's buys allocated
 - The daily-core forward mirror (allocation, deferred without a ranking,
   valuation)
 - Reset isolation: savings reset never touches the sim tables and
@@ -118,6 +119,20 @@ async def _backdate_plan(session_factory, ticker: str, created: date) -> None:
             plan.created_at = datetime(
                 created.year, created.month, created.day, 12, 0, tzinfo=UTC
             )
+        await s.commit()
+
+
+async def _backdate_events(session_factory, kinds: list[str], when: datetime) -> None:
+    """Set created_at on existing events of `kinds`. The WARN month-dedupe
+    keys off an event's created_at month, so synthetic-calendar tests must
+    pin their day-1 WARNs to the simulated month — otherwise they only pass
+    while the real clock happens to be in that same month."""
+    async with session_factory() as s:
+        rows = (
+            await s.scalars(select(SavingsEvent).where(SavingsEvent.kind.in_(kinds)))
+        ).all()
+        for r in rows:
+            r.created_at = when
         await s.commit()
 
 
@@ -614,6 +629,69 @@ async def test_saveback_buys_position_and_mirrors(mem_db):
     assert mirror["allocated"] == 10.0
 
 
+async def test_manual_buy_deducts_cash_books_event_and_mirrors(mem_db):
+    await savings.initialize(100.0)
+    await _seed_ranking(mem_db, ["AAPL"])
+    await _seed_candle(mem_db, "SPY", 50.0)
+    await _seed_candle(mem_db, "AAPL", 100.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    r = await savings.manual_buy(30.0, "SPY")
+    assert r["ok"] is True
+    assert r["shares"] == pytest.approx(0.6)
+    assert r["cash"] == 70.0
+    val = await savings.valuate()
+    assert val["cash"] == 70.0  # PAID from the tracked cash, unlike saveback
+    assert val["positions_value"] == pytest.approx(30.0)
+    assert val["contributed"] == 100.0  # a buy moves money, not contributions
+    evs = await _events(mem_db, "MANUAL_BUY")
+    assert len(evs) == 1 and evs[0].amount == -30.0 and evs[0].ticker == "SPY"
+    mirror = await savings._mirror_valuate()
+    assert mirror["allocated"] == 30.0  # mirrored like a sparplan buy
+
+
+async def test_manual_buy_aggregates_into_existing_position(mem_db):
+    await savings.initialize(100.0)
+    await _seed_ranking(mem_db, ["AAPL"])
+    await _seed_candle(mem_db, "AAPL", 100.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await _seed_candle(mem_db, "SPY", 50.0)
+    await savings.manual_buy(30.0, "SPY")  # 0.6 sh @ 50
+    # A newer close moves the price for the second lot.
+    await _seed_candle(
+        mem_db, "SPY", 40.0, when=datetime.now(UTC) + timedelta(days=1)
+    )
+    r = await savings.manual_buy(20.0, "SPY")  # 0.5 sh @ 40
+    assert r["ok"] is True
+    pos = (await savings.valuate())["positions"][0]
+    assert pos["shares"] == pytest.approx(1.1)
+    assert pos["avg_cost"] == pytest.approx(50.0 / 1.1)  # weighted avg cost
+
+
+async def test_manual_buy_refusals_change_nothing(mem_db):
+    await savings.initialize(100.0)
+    await _seed_candle(mem_db, "SPY", 50.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    # Not enough tracked cash (saveback is the tool for money from nowhere).
+    r = await savings.manual_buy(150.0, "SPY")
+    assert r["ok"] is False and "insufficient" in r["reason"]
+    # Unpriceable ticker.
+    r = await savings.manual_buy(10.0, "NOPE.DE")
+    assert r["ok"] is False and "no price" in r["reason"]
+    # Invalid amount / ticker.
+    assert (await savings.manual_buy(-1.0, "SPY"))["ok"] is False
+    assert (await savings.manual_buy(10.0, ""))["ok"] is False
+    # Nothing moved: no buy event, no position, cash untouched.
+    assert (await _events(mem_db, "MANUAL_BUY")) == []
+    val = await savings.valuate()
+    assert val["cash"] == 100.0 and val["positions"] == []
+
+
+async def test_manual_buy_noop_when_uninitialized(mem_db):
+    await _seed_candle(mem_db, "SPY", 50.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    assert (await savings.manual_buy(10.0, "SPY"))["ok"] is False
+
+
 async def test_config_and_plan_crud(mem_db):
     await savings.initialize(100.0)
     r = await savings.set_config(monthly_transfer=300.0, interest_rate=2.0)
@@ -648,6 +726,59 @@ async def test_remove_position(mem_db):
     assert val["positions"] == []
     # Removing again: no such position.
     assert (await savings.remove_position("URTH"))["ok"] is False
+
+
+async def test_remove_position_unwinds_its_mirror_but_keeps_seed_eur(mem_db):
+    """A removed position releases the mirror € its own buys allocated
+    (source-tagged entries), while init-seeded mirror € (source "") has no
+    ticker link and stays — the mistaken-saveback orphan fix."""
+    await _seed_ranking(mem_db, ["AAPL"])
+    await _seed_candle(mem_db, "AAPL", 100.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await _seed_candle(mem_db, "SPY", 50.0)
+    # Seed 40 € of holdings → 40 € mirrored with source "".
+    await savings.initialize(
+        100.0, positions=[{"ticker": "URTH", "shares": 1.0, "avg_cost": 40.0}]
+    )
+    # A manual buy of SPY → 30 € mirrored with source SPY.
+    await savings.manual_buy(30.0, "SPY")
+    mirror = await savings._mirror_valuate()
+    assert mirror["allocated"] == 70.0
+    spy_pos = next(p for p in mirror["positions"] if p["ticker"] == "AAPL")
+    assert spy_pos["shares"] == pytest.approx(0.7)  # 40 € + 30 € at 100 €
+    # Removing SPY unwinds ONLY its own 30 € of mirror…
+    await savings.remove_position("SPY")
+    mirror = await savings._mirror_valuate()
+    assert mirror["allocated"] == 40.0
+    seed_pos = next(p for p in mirror["positions"] if p["ticker"] == "AAPL")
+    assert seed_pos["shares"] == pytest.approx(0.4)
+    assert seed_pos["avg_cost"] == pytest.approx(100.0)  # rebuilt w/ entry prices
+    # …while the seeded URTH mirror € survives removing URTH itself.
+    await savings.remove_position("URTH")
+    assert (await savings._mirror_valuate())["allocated"] == 40.0
+
+
+async def test_unwind_mirror_rebuilds_multi_entry_positions(mem_db):
+    """Two buys of different tickers share one mirror pick: unwinding one
+    must leave the other's shares at their own entry prices (no drift)."""
+    await savings.initialize(100.0)
+    await _seed_ranking(mem_db, ["AAPL"])
+    await _seed_candle(mem_db, "AAPL", 100.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await _seed_candle(mem_db, "SPY", 50.0)
+    await _seed_candle(mem_db, "URTH", 100.0)
+    await savings.manual_buy(30.0, "SPY")   # 30 € -> 0.3 sh AAPL
+    await savings.manual_buy(20.0, "URTH")  # 20 € -> 0.2 sh AAPL
+    await savings.remove_position("SPY")
+    mirror = await savings._mirror_valuate()
+    assert mirror["allocated"] == 20.0
+    pos = next(p for p in mirror["positions"] if p["ticker"] == "AAPL")
+    assert pos["shares"] == pytest.approx(0.2)
+    assert pos["avg_cost"] == pytest.approx(100.0)
+    # Removing the last position empties the mirror book completely.
+    await savings.remove_position("URTH")
+    mirror = await savings._mirror_valuate()
+    assert mirror["allocated"] == 0.0 and mirror["positions"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -820,10 +951,12 @@ async def test_missing_price_warns_once_per_month(mem_db):
     await savings.initialize(1000.0)
     await savings.add_plan("NOPE.DE", 100.0, 1)
     await _backdate_plan(mem_db, "NOPE.DE", date(2026, 9, 1))
-    for d in (1, 2, 3, 4):
+    for i, d in enumerate((1, 2, 3, 4)):
         r = await savings.run_sparplans(day=date(2026, 9, d))
         assert r["executed"] == 0
         assert r.get("deferred") == ["NOPE.DE"]
+        if i == 0:  # pin day-1's WARN to the simulated month (real clock is not)
+            await _backdate_events(mem_db, ["WARN"], datetime(2026, 9, 1, 12, tzinfo=UTC))
     warns = await _events(mem_db, "WARN")
     assert len(warns) == 1
     assert "no price" in warns[0].note
@@ -835,9 +968,11 @@ async def test_insufficient_cash_warns_once_per_month(mem_db):
     await _seed_candle(mem_db, "EURUSD=X", 1.0)
     await savings.add_plan("URTH", 100.0, 1)
     await _backdate_plan(mem_db, "URTH", date(2026, 9, 1))
-    for d in (1, 2, 3):
+    for i, d in enumerate((1, 2, 3)):
         r = await savings.run_sparplans(day=date(2026, 9, d))
         assert r["executed"] == 0
+        if i == 0:  # pin day-1's WARN to the simulated month (real clock is not)
+            await _backdate_events(mem_db, ["WARN"], datetime(2026, 9, 1, 12, tzinfo=UTC))
     warns = await _events(mem_db, "WARN")
     assert len(warns) == 1, "one WARN per plan per month"
     assert "insufficient" in warns[0].note
