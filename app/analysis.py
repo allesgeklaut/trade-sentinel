@@ -42,12 +42,16 @@ only, so a stop level can never be moved using the bar it is checked
 against. The engine does **not** implement a persistent high-water-mark
 ratchet and does **not** freeze the ATR level at entry.
 
-The percent stop in ``strategy.py`` is the entry-anchored control, but only
-in the backtest replay: ``optimize.PaperPortfolio`` freezes ``stop_price``
-at entry. The live sim stores no entry stop (it passes ``stop_price=None``)
-and recomputes the percent level from the position's blended average cost on
-every cycle — so the live percent stop is anchored to the average cost, not
-to the original entry. Neither path implements a ratchet.
+The percent stop in ``strategy.py`` is the entry-anchored control, frozen
+at entry everywhere: the live sim persists it on the position at entry
+(``SimPosition.stop_price``, session fill contract rule 5) so a top-up
+cannot re-anchor it to the blended average cost, and the replay
+(``optimize.PaperPortfolio``) freezes it the same way. Legacy rows without
+a persisted level keep the avg_cost-based recompute as a documented
+fallback. The ATR stop becomes position-specific through a monotone
+ratchet the caller computes from the entry anchor (max candidate level
+over all completed bars since entry — contract rule 6); the per-bar
+snapshot value remains a prior-known candidate, not a ratchet itself.
 """
 
 from __future__ import annotations

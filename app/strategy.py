@@ -17,9 +17,22 @@ The input shapes:
 
   - ``positions``: list of ``{"ticker": str, "shares": float, "avg_cost": float,
     "stop_price": float | None}`` (``stop_price`` is the frozen initial stop,
-    or None to recompute from avg_cost each cycle — the sim's old behaviour).
+    or None to recompute from avg_cost each cycle — legacy rows predating the
+    frozen-stop column). A position may also carry ``atr_stop_level``: the
+    position-specific monotone ATR ratchet level (caller-computed as the max
+    candidate level over all completed bars since entry — see
+    ``app.session`` for the contract).
   - ``cash``: float
   - ``prices``: ``{ticker: close_price}`` for the current day
+  - ``session_bars`` (optional): ``{ticker: {"open": float, "low": float,
+    "close": float}}`` — the NEXT session's (F's) bar, supplied only for
+    tickers that actually have one (strict exact-date values read via
+    ``session.open_at``). When given, proposals become CONTRACT fills:
+    SELLs/BUYs fill at F's open, stops act as standing orders against F's
+    open/low, and a ticker without an F bar produces NO proposal at all
+    (its decision is re-taken next cycle). ``None`` keeps the legacy
+    behaviour — decisions filled at the decision close — for callers not
+    yet wired to the contract.
   - ``signals``: ``{ticker: {"action": "BUY"|"SELL"|"HOLD", "strength": int,
     "reason": str, "snapshot": {"atr_stop": float|None, "run_5d": float|None,
     "atr14": float|None, "net_score": int|None, "trend_up": bool,
@@ -35,17 +48,28 @@ The output shape (proposals):
 
 Stop semantics:
 
-  - ``stop_type="percent"`` — the entry-anchored control. In the backtest
-    replay the level is frozen at entry (``stop_price`` on the position);
-    the live sim stores no entry stop and recomputes it from the position's
-    blended average cost on every cycle.
+  - ``stop_type="percent"`` — the entry-anchored control, frozen at entry:
+    the level is persisted on the position (``stop_price``) when it is
+    opened and never re-anchored to the blended average cost, so a top-up
+    cannot loosen it. Positions predating the frozen-stop column (no
+    ``stop_price``) recompute the level from avg_cost each cycle —
+    documented legacy behaviour.
   - ``atr_stop`` (from the signal snapshot) — a **prior-known indicator
     candidate**: the highest close of the previous 20 completed bars minus
     2x ATR of the previous completed bar (see ``analysis.signal_series``).
-    It is recomputed per bar and can move down as well as up, so it is
-    NOT a persistent high-water-mark ratchet and NOT frozen at entry. It is
-    nevertheless a real, reachable exit level: today's close is compared
-    against a level that was already known before today's bar closed.
+    It is recomputed per bar and can move down as well as up, so on its
+    own it is NOT a persistent ratchet. The persistent control is the
+    position-specific monotone ATR ratchet the caller may supply per
+    position (``atr_stop_level`` = max candidate level over all completed
+    bars since entry): it can only tighten, never loosen.
+
+Fill semantics (see ``app.session`` for the full frozen contract): with
+``session_bars`` supplied, SELLs/BUYs fill at F's open, a stop level known
+at the previous session's close is a standing order for F (fill at F's
+open when open <= level, else at the level when F's low <= level), and a
+ticker without an F bar yields no proposal at all. Without
+``session_bars``, the legacy convention applies (fills and stop
+comparisons at the decision close) so existing callers stay green.
 """
 
 from __future__ import annotations
@@ -194,6 +218,68 @@ def _fallback_eligible(sig: dict, params: StrategyParams) -> tuple[bool, str]:
     return True, rationale
 
 
+def _bar_price(v) -> float | None:
+    """A session-bar price that is actually executable: finite and > 0.
+
+    A missing quote is not an executable price — None means "no fill".
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f <= 0:
+        return None
+    return f
+
+
+def _percent_stop_level(pos: dict, params: StrategyParams) -> float | None:
+    """The percent stop level for one position (finite positive or None).
+
+    The stop frozen at entry (``stop_price``) is a standing order for as
+    long as the position carries it — current ``stop_type`` config cannot
+    retroactively unwind it (contract rule 5). Positions without a persisted
+    stop (legacy rows) recompute from the blended average cost, only when
+    percent stops are enabled.
+    """
+    sp = pos.get("stop_price")
+    if sp is None and params.stop_type == "percent":
+        sp = pos.get("avg_cost", 0) * (1 - params.stop_pct / 100)
+    return _bar_price(sp)
+
+
+def _standing_stop_levels(
+    pos: dict,
+    sig: dict | None,
+    params: StrategyParams,
+) -> list[tuple[float, str]]:
+    """Stop levels for a position that are KNOWN at S's close (contract 4).
+
+    Returns ``[(level, label), ...]``; the caller takes the tightest
+    (highest) level as the standing order for session F. Sources:
+
+      * the frozen percent stop persisted at entry (``stop_price``) — or
+        the avg_cost recompute for legacy rows without the column;
+      * the position-specific monotone ATR ratchet (``atr_stop_level``),
+        caller-computed as the max candidate level over all completed
+        bars since entry (never loosens);
+      * the per-bar prior-known ATR candidate from the signal snapshot
+        (subsumed by the ratchet whenever one is present — kept so the
+        level stays reachable for positions without a ratchet yet).
+    """
+    levels: list[tuple[float, str]] = []
+    pct = _percent_stop_level(pos, params)
+    if pct is not None:
+        levels.append((pct, "Initial stop"))
+    ratchet = _bar_price(pos.get("atr_stop_level"))
+    if ratchet is not None:
+        levels.append((ratchet, "ATR stop"))
+    if params.use_atr_stop and sig:
+        snap_atr = _bar_price((sig.get("snapshot") or {}).get("atr_stop"))
+        if snap_atr is not None:
+            levels.append((snap_atr, "ATR stop"))
+    return levels
+
+
 def propose_trades(
     positions: list[dict],
     cash: float,
@@ -202,6 +288,7 @@ def propose_trades(
     params: StrategyParams,
     sector_of: Callable[[str], str] | None = None,
     quality_of: Callable[[str], dict[str, float | None] | None] | None = None,
+    session_bars: dict[str, dict] | None = None,
 ) -> list[dict]:
     """Propose deterministic trades WITHOUT executing them.
 
@@ -211,10 +298,11 @@ def propose_trades(
 
     SELL phase (per held position, in order):
       1. Signal SELL → propose SELL.
-      2. Initial stop (frozen at entry if ``stop_price`` is set on the
-         position, else recomputed from ``avg_cost * (1 - stop_pct/100)``).
-      3. ATR reference stop (from the signal's snapshot) — a prior-known
-         per-bar candidate level, not a ratchet and not frozen at entry.
+      2. Initial stop (frozen at entry when ``stop_price`` is set on the
+         position, else recomputed from ``avg_cost * (1 - stop_pct/100)``
+         for legacy rows).
+      3. ATR stop: the position's monotone ratchet level when supplied,
+         plus the prior-known per-bar candidate from the snapshot.
 
     BUY phase (ranked by strength, strict BUYs first, else relaxed HOLD
     fallback):
@@ -240,6 +328,25 @@ def propose_trades(
     (``analysis.entry_eligible``: daily uptrend, >2% above the SMA-200,
     weekly trend up) and must have a positive net score. A bearish HOLD
     (bullish <= bearish) can therefore never enter.
+
+    Fill semantics — ``session_bars`` is ``{ticker: {"open", "low",
+    "close"}}`` for F's bar (strict exact-date values, see ``app.session``):
+
+      * SELLs and BUYs fill at F's OPEN.
+      * A stop level known at S's close is a standing order for F: fill at
+        F's open when open <= level, else at the level when F's low <=
+        level, else no stop fill. The tightest known level governs.
+      * A ticker without an F bar (absent from the dict, or without an
+        executable open) gets NO proposal — no signal SELL, no stop fill,
+        no BUY. Its decision is re-taken next cycle; nothing stale fills.
+      * Budgets stay decision-side: dollar budgets derive from the
+        decision prices (S closes); ``price`` carries the FILL price the
+        executor must use, and ``entry_stop`` anchors to the fill (the
+        price actually paid), never to a stale decision close.
+
+    ``session_bars=None`` keeps the legacy convention (decisions filled at
+    the decision close, stops compared against that close) so callers not
+    yet wired to the contract behave exactly as before.
     """
     proposals: list[dict] = []
     total_equity = cash + sum(p["shares"] * prices.get(p["ticker"], 0) for p in positions)
@@ -251,6 +358,8 @@ def propose_trades(
     held_tickers = {p["ticker"] for p in positions}
     open_count = len(held_tickers)
     sim_cash = cash  # local copy; decremented as BUYs are proposed
+    contract = session_bars is not None
+    bars = session_bars or {}
 
     # Track sector exposure progressively (for the sector cap).
     sector_values: dict[str, float] = {}
@@ -269,19 +378,55 @@ def propose_trades(
     for pos in positions:
         ticker = pos["ticker"]
         sig = signals.get(ticker)
-        price = prices.get(ticker)
-        if price is None or price <= 0:
-            continue
+        price = prices.get(ticker)  # decision close (S); informational in contract mode
+
+        # Resolve the FILL price. Contract mode: F's open via the strict
+        # session bar — a ticker without an F bar (or without an executable
+        # open) has NO fill this cycle, so nothing is proposed for it.
+        # Legacy mode: fill at the decision close (pre-contract behaviour).
+        if contract:
+            fill = _bar_price((bars.get(ticker) or {}).get("open"))
+            if fill is None:
+                continue
+        else:
+            fill = price
+            if price is None or price <= 0:
+                continue
 
         if sig and sig["action"] == "SELL":
             proposals.append({"ticker": ticker, "side": "SELL",
-                              "price": price, "shares": None,
+                              "price": fill, "shares": None,
                               "reason": sig.get("reason", "SELL signal")})
             sell_tickers.add(ticker)
             continue
 
-        # Initial stop loss: use frozen stop_price if available, else
-        # recompute from avg_cost (the sim's old behaviour).
+        if contract:
+            # Standing-order stop semantics (contract rule 4). Every level
+            # known at S's close stands for F; the tightest (highest)
+            # level governs the fill: gap through it → fill at F's open,
+            # intrabar breach → fill AT the level, else no stop fill.
+            levels = _standing_stop_levels(pos, sig, params)
+            if levels:
+                level, label = max(levels, key=lambda lv: lv[0])
+                low = _bar_price(bars[ticker].get("low"))
+                if fill <= level:
+                    proposals.append({
+                        "ticker": ticker, "side": "SELL", "price": fill,
+                        "shares": None,
+                        "reason": (f"{label} standing order: open {fill:.2f} <= "
+                                   f"level {level:.2f} — filled at the open")})
+                    sell_tickers.add(ticker)
+                elif low is not None and low <= level:
+                    proposals.append({
+                        "ticker": ticker, "side": "SELL", "price": level,
+                        "shares": None,
+                        "reason": (f"{label} standing order: low {low:.2f} <= "
+                                   f"level {level:.2f} — filled at the level")})
+                    sell_tickers.add(ticker)
+            continue
+
+        # Initial stop loss (legacy close comparison): use frozen stop_price
+        # if available, else recompute from avg_cost (legacy rows).
         if params.stop_type != "none":
             if pos.get("stop_price") is not None:
                 sp = pos["stop_price"]
@@ -296,18 +441,25 @@ def propose_trades(
                 sell_tickers.add(ticker)
                 continue
 
-        # ATR reference stop: the level in the snapshot was computed from the
-        # PREVIOUS completed bar (prior 20-bar high close - 2x ATR), so it is
-        # already known before today's bar — today's close can break it.
-        # This is an indicator candidate level: it is recomputed per bar and
-        # is not a persistent ratchet, nor frozen at entry.
+        # ATR reference stop (legacy close comparison): the level in the
+        # snapshot was computed from the PREVIOUS completed bar (prior
+        # 20-bar high close - 2x ATR), so it is already known before
+        # today's bar — today's close can break it. This is an indicator
+        # candidate level: it is recomputed per bar and is not a persistent
+        # ratchet, nor frozen at entry. A position-specific monotone
+        # ratchet (``atr_stop_level``) supersedes it — see the contract
+        # branch above.
         if params.use_atr_stop and sig:
             snap = sig.get("snapshot", {})
             atr_stop = snap.get("atr_stop")
-            if atr_stop and price <= atr_stop:
+            ratchet = _bar_price(pos.get("atr_stop_level"))
+            level = max(x for x in (atr_stop, ratchet) if x is not None) \
+                if (atr_stop is not None or ratchet is not None) else None
+            if level is not None and price <= level:
+                src = "ATR stop hit"
                 proposals.append({"ticker": ticker, "side": "SELL",
                                   "price": price, "shares": None,
-                                  "reason": f"ATR stop hit: {price:.2f} <= {atr_stop:.2f}"})
+                                  "reason": f"{src}: {price:.2f} <= {level:.2f}"})
                 sell_tickers.add(ticker)
 
     # --- BUY phase ---
@@ -407,19 +559,29 @@ def propose_trades(
         if price is None or price <= 0:
             continue
 
+        # Resolve the fill price (contract: F's open, strict — no F bar,
+        # no fill; legacy: the decision close).
+        if contract:
+            fill = _bar_price((bars.get(ticker) or {}).get("open"))
+            if fill is None:
+                continue
+        else:
+            fill = price
+
         # The ATR reference level is anchored to the market's 20-bar closing
         # high, not to this position's entry. A pullback entry can therefore
         # publish a level ABOVE the entry price — the new position would be
         # stopped out on the very next cycle (buy -> sell -> buy churn at the
         # same price). So: when the ATR stop is armed, only enter above the
-        # published level. The level itself is prior-known (computed from the
-        # previous completed bar), so this check uses no future information.
+        # published level — judged against the price actually PAID (the
+        # fill). The level itself is prior-known (computed from the previous
+        # completed bar), so this check uses no future information.
         if params.use_atr_stop:
             atr_level = sig.get("snapshot", {}).get("atr_stop")
             if (atr_level is not None
                     and math.isfinite(atr_level)
                     and atr_level > 0
-                    and price <= atr_level):
+                    and fill <= atr_level):
                 continue
 
         current_shares = next((p["shares"] for p in positions if p["ticker"] == ticker), 0)
@@ -447,44 +609,47 @@ def propose_trades(
 
         # Risk-based position sizing: size by stop distance so each
         # trade risks a fixed % of equity (industry-standard 1% rule).
+        # Distances anchor to the fill (the price actually paid).
         if params.risk_pct > 0 and params.stop_type != "none":
             atr = sig.get("snapshot", {}).get("atr14")
             if params.stop_type == "atr" and atr and atr > 0:
-                stop = price - params.stop_atr_mult * atr
+                stop = fill - params.stop_atr_mult * atr
             elif params.stop_type == "percent":
-                stop = price * (1 - params.stop_pct / 100)
+                stop = fill * (1 - params.stop_pct / 100)
             else:
                 stop = 0
-            if stop > 0 and price > stop:
+            if stop > 0 and fill > stop:
                 risk_amount = total_equity * (params.risk_pct / 100)
-                risk_per_share = price - stop
+                risk_per_share = fill - stop
                 if risk_per_share > 0:
-                    budget_by_risk = (risk_amount / risk_per_share) * price
+                    budget_by_risk = (risk_amount / risk_per_share) * fill
                     budget = min(budget, budget_by_risk)
 
         if budget < 1:
             continue
 
-        # Frozen entry stop for the new proposal. The percent stop is the
-        # entry-anchored control (frozen at entry in the replay; the live sim
-        # recomputes it from the blended average cost every cycle). The ATR
-        # entry stop is frozen at entry too (entry price - N x ATR) and is
-        # distinct from the per-bar ATR reference candidate checked in the
-        # SELL phase.
+        # Frozen entry stop for the new proposal, anchored to the ENTRY
+        # fill (the price actually paid — F's open in contract mode, the
+        # decision close in legacy mode). The percent stop is frozen at
+        # entry everywhere: persisted on the position when it is opened
+        # and never re-anchored to a blended average cost, so a top-up
+        # cannot loosen it. The ATR entry stop is frozen at entry too
+        # (entry price - N x ATR) and is distinct from the per-bar ATR
+        # reference candidate checked in the SELL phase.
         entry_stop = None
         if params.stop_type == "percent":
-            entry_stop = price * (1 - params.stop_pct / 100)
+            entry_stop = fill * (1 - params.stop_pct / 100)
         elif params.stop_type == "atr":
             atr = sig.get("snapshot", {}).get("atr14")
             if atr and atr > 0:
-                entry_stop = price - params.stop_atr_mult * atr
+                entry_stop = fill - params.stop_atr_mult * atr
 
         # A fallback BUY explains why a HOLD was entered (near-threshold
         # rationale); a strict BUY keeps the signal's own reason.
         reason = fallback_reason.get(ticker) or sig.get("reason", "BUY signal")
 
         proposals.append({"ticker": ticker, "side": "BUY",
-                          "price": price, "budget": budget,
+                          "price": fill, "budget": budget,
                           "reason": reason,
                           "entry_stop": entry_stop})
         # Reserve the budget locally so the next BUY proposal sees reduced

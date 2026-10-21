@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from dataclasses import fields
 
+import pytest
+
 from app.strategy import StrategyParams, propose_trades
 
 # ---------------------------------------------------------------------------
@@ -537,3 +539,197 @@ class TestStrategyParams:
         p = StrategyParams()
         assert p.relaxed_hold_strength == 40
         assert p.relaxed_hold_limit == 3
+
+
+# ---------------------------------------------------------------------------
+# 5. Session fill contract: fills at the next session's open
+# ---------------------------------------------------------------------------
+#
+# The audit's "executable, fresh next-session fills" item: a decision taken
+# on a completed bar may not fill at that same close. When the caller
+# supplies ``session_bars`` (the NEXT session's strict exact-date bar, see
+# ``app.session``), SELLs/BUYs fill at F's open, stop levels known at the
+# previous close act as standing orders (open-gap → fill at open, intrabar
+# breach → fill at the level), and a ticker without an F bar produces no
+# proposal at all.
+
+def _held(ticker: str, shares: float = 10.0, avg_cost: float = 100.0,
+          stop_price: float | None = None,
+          atr_stop_level: float | None = None) -> dict:
+    return {"ticker": ticker, "shares": shares, "avg_cost": avg_cost,
+            "stop_price": stop_price, "atr_stop_level": atr_stop_level}
+
+
+class TestSessionFillPrices:
+    """Contract fills: price fields carry the EXECUTION price (F's open)."""
+
+    def test_buy_fills_at_open_not_close(self):
+        sig = _sig(action="BUY", strength=80, net=60, trend_up=True,
+                   dist_above=5.0, weekly=True)
+        bars = {"X": {"open": 98.0, "low": 97.0, "close": 99.0}}
+        out = propose_trades([], 10_000.0, {"X": 100.0}, {"X": sig},
+                             _params(stop_type="percent", stop_pct=15.0),
+                             session_bars=bars)
+        buys = _buys(out)
+        assert len(buys) == 1
+        assert buys[0]["price"] == 98.0, "the BUY must fill at F's open"
+        assert buys[0]["price"] != 100.0, "same-close fill is not executable"
+        # The entry stop anchors to the price actually paid (the open).
+        assert buys[0]["entry_stop"] == pytest.approx(98.0 * 0.85)
+
+    def test_sell_fills_at_open_not_close(self):
+        sig = _sig(action="SELL", strength=70, net=-60, trend_up=False,
+                   trend_down=True, dist_above=-8.0)
+        bars = {"X": {"open": 102.0, "low": 101.0, "close": 100.0}}
+        out = propose_trades([_held("X")], 1_000.0, {"X": 100.0},
+                             {"X": sig}, _params(), session_bars=bars)
+        sells = [p for p in out if p["side"] == "SELL"]
+        assert len(sells) == 1
+        assert sells[0]["price"] == 102.0, "the SELL must fill at F's open"
+
+    def test_missing_f_bar_means_no_fill(self):
+        """No F bar → no proposal at all, even for a hard stop breach at the
+        decision close: the decision is re-taken next cycle, nothing stale
+        fills."""
+        # Massive stop breach known at S's close (close 50 <= stop 90).
+        pos = _held("X", stop_price=90.0)
+        sig = _sig(action="HOLD", strength=60, net=25, close=50.0)
+        out = propose_trades([pos], 1_000.0, {"X": 50.0}, {"X": sig},
+                             _params(use_atr_stop=True),
+                             session_bars={})  # F has no bar for X
+        assert out == []
+        # Same for a fresh BUY signal without an F bar.
+        buy = _sig(action="BUY", strength=80, net=60, trend_up=True,
+                   dist_above=5.0, weekly=True)
+        out = propose_trades([], 10_000.0, {"X": 100.0}, {"X": buy},
+                             _params(), session_bars={})
+        assert out == []
+
+    def test_missing_open_is_not_executable(self):
+        """A bar without an open is not an executable price."""
+        sig = _sig(action="BUY", strength=80, net=60, trend_up=True,
+                   dist_above=5.0, weekly=True)
+        bars = {"X": {"open": None, "low": 90.0, "close": 99.0}}
+        out = propose_trades([], 10_000.0, {"X": 100.0}, {"X": sig},
+                             _params(), session_bars=bars)
+        assert out == []
+
+    def test_stop_gap_down_fills_at_open(self):
+        """Open <= level: the standing order fills at the OPEN (market order
+        at the open after the gap), not at the level, not at the close."""
+        pos = _held("X", stop_price=90.0)
+        # strength 30 keeps the relaxed top-up fallback out of the way: this
+        # test isolates the standing stop, not the near-BUY entry logic.
+        sig = _sig(action="HOLD", strength=30, net=25, close=95.0)
+        bars = {"X": {"open": 85.0, "low": 84.0, "close": 86.0}}
+        out = propose_trades([pos], 1_000.0, {"X": 95.0}, {"X": sig},
+                             _params(stop_type="percent", stop_pct=15.0,
+                                     use_atr_stop=True),
+                             session_bars=bars)
+        sells = [p for p in out if p["side"] == "SELL"]
+        assert len(sells) == 1
+        assert sells[0]["price"] == 85.0
+        assert sells[0]["reason"].lower().startswith("initial stop"), \
+            "stop-out reasons keep the stop-out marker"
+        assert "filled at the open" in sells[0]["reason"]
+
+    def test_stop_intrabar_breach_fills_at_level(self):
+        """Open above the level but low <= level: the order fills AT the
+        level (the price the resting order attains), never at the close."""
+        pos = _held("X", stop_price=90.0)
+        sig = _sig(action="HOLD", strength=30, net=25, close=95.0)
+        bars = {"X": {"open": 92.0, "low": 89.0, "close": 94.0}}
+        out = propose_trades([pos], 1_000.0, {"X": 95.0}, {"X": sig},
+                             _params(stop_type="percent", stop_pct=15.0,
+                                     use_atr_stop=True),
+                             session_bars=bars)
+        sells = [p for p in out if p["side"] == "SELL"]
+        assert len(sells) == 1
+        assert sells[0]["price"] == 90.0, "intrabar breach fills at the level"
+        assert "filled at the level" in sells[0]["reason"]
+
+    def test_stop_untriggered_means_no_fill(self):
+        pos = _held("X", stop_price=90.0)
+        sig = _sig(action="HOLD", strength=30, net=25, close=95.0)
+        bars = {"X": {"open": 95.0, "low": 94.0, "close": 96.0}}
+        out = propose_trades([pos], 1_000.0, {"X": 95.0}, {"X": sig},
+                             _params(stop_type="percent", stop_pct=15.0,
+                                     use_atr_stop=True),
+                             session_bars=bars)
+        assert out == []
+
+    def test_tightest_stop_level_governs(self):
+        """Percent stop + monotone ratchet: the highest (tightest) level is
+        the standing order."""
+        pos = _held("X", stop_price=85.0, atr_stop_level=92.0)
+        sig = _sig(action="HOLD", strength=60, net=25, close=95.0)
+        # Open above 92 but low breaches it → fill AT the ratchet level.
+        bars = {"X": {"open": 93.0, "low": 91.0, "close": 94.0}}
+        out = propose_trades([pos], 1_000.0, {"X": 95.0}, {"X": sig},
+                             _params(use_atr_stop=True), session_bars=bars)
+        sells = [p for p in out if p["side"] == "SELL"]
+        assert len(sells) == 1
+        assert sells[0]["price"] == 92.0
+        assert sells[0]["reason"].lower().startswith("atr stop")
+
+    def test_legacy_percent_stop_fallback_uses_avg_cost(self):
+        """A position without a persisted stop (legacy rows) recomputes the
+        level from the blended average cost — documented fallback."""
+        pos = _held("X", avg_cost=100.0)  # stop_price=None
+        sig = _sig(action="HOLD", strength=60, net=25, close=84.0)
+        bars = {"X": {"open": 84.0, "low": 83.0, "close": 85.0}}
+        out = propose_trades([pos], 1_000.0, {"X": 84.0}, {"X": sig},
+                             _params(stop_type="percent", stop_pct=15.0,
+                                     use_atr_stop=True),
+                             session_bars=bars)
+        sells = [p for p in out if p["side"] == "SELL"]
+        assert len(sells) == 1
+        assert sells[0]["price"] == 84.0  # open <= 85.0 → filled at the open
+        assert sells[0]["reason"].lower().startswith("initial stop")
+
+    def test_mutating_f_bar_does_not_change_the_decision(self):
+        """The decision is frozen to data <= S: mutating F's close/low (away
+        from any stop trigger) must produce identical proposals."""
+        sig = _sig(action="BUY", strength=80, net=60, trend_up=True,
+                   dist_above=5.0, weekly=True)
+        cash, prices, signals, params = (
+            10_000.0, {"X": 100.0}, {"X": sig},
+            _params(stop_type="percent", stop_pct=15.0))
+        bars_a = {"X": {"open": 99.0, "low": 98.0, "close": 99.0}}
+        bars_b = {"X": {"open": 99.0, "low": 95.0, "close": 110.0}}
+        out_a = propose_trades([], cash, prices, signals, params,
+                               session_bars=bars_a)
+        out_b = propose_trades([], cash, prices, signals, params,
+                               session_bars=bars_b)
+        assert out_a == out_b, "F's bar must not inform the decision"
+
+    def test_entry_gate_judges_the_price_actually_paid(self):
+        """No entry at or below the published ATR reference level — judged
+        against F's open (the fill), not the decision close."""
+        sig = _sig(action="BUY", strength=80, net=60, trend_up=True,
+                   dist_above=5.0, weekly=True, atr_stop=99.0)
+        # Decision close 100 > 99 (gate would pass at the close), but the
+        # open 98 <= 99 → no fill (entering would churn the stop out).
+        bars = {"X": {"open": 98.0, "low": 97.0, "close": 101.0}}
+        out = propose_trades([], 10_000.0, {"X": 100.0}, {"X": sig},
+                             _params(use_atr_stop=True), session_bars=bars)
+        assert out == []
+        # Open above the level → the entry fills at the open.
+        bars = {"X": {"open": 99.5, "low": 99.0, "close": 101.0}}
+        out = propose_trades([], 10_000.0, {"X": 100.0}, {"X": sig},
+                             _params(use_atr_stop=True), session_bars=bars)
+        buys = _buys(out)
+        assert len(buys) == 1 and buys[0]["price"] == 99.5
+
+    def test_legacy_path_fills_at_decision_close(self):
+        """session_bars=None keeps the legacy convention for unwired
+        callers: fills and stop comparisons at the decision close."""
+        pos = _held("X", stop_price=90.0)
+        sig = _sig(action="HOLD", strength=60, net=25, close=89.0)
+        out = propose_trades([pos], 1_000.0, {"X": 89.0}, {"X": sig},
+                             _params(stop_type="percent", stop_pct=15.0,
+                                     use_atr_stop=True))
+        sells = [p for p in out if p["side"] == "SELL"]
+        assert len(sells) == 1
+        assert sells[0]["price"] == 89.0
+        assert sells[0]["reason"] == "Initial stop: 89.00 <= 90.00"

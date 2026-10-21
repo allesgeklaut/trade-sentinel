@@ -25,6 +25,7 @@ from app import sim
 from app.config import settings
 from app.db import (
     Base,
+    Candle,
     SimAccount,
     SimPosition,
     SimSnapshot,
@@ -1085,6 +1086,38 @@ class TestYearLongSimulation:
 
         monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
 
+        # --- the candle cache lives in the DB now --------------------------
+        # The session fill contract reads decision candles and F's bar from
+        # the stored candle cache (one query), not through market.candles().
+        # Seed the synthetic series into the temp DB progressively — each
+        # cycle reveals one more month of stored sessions.
+        seeded = {"n": 0}
+
+        async def seed_candles():
+            n = reveal["day"]
+            async with mem_db() as s:
+                for t, data in synthetic.items():
+                    for r in data[seeded["n"]:n]:
+                        s.add(Candle(
+                            ticker=t,
+                            timestamp=datetime.fromisoformat(r["time"]),
+                            open=r["open"], high=r["high"], low=r["low"],
+                            close=r["close"], volume=r["volume"]))
+                await s.commit()
+            seeded["n"] = n
+
+        # --- the simulated session clock -----------------------------------
+        # Each cycle stands for ONE completed session F: the last revealed
+        # candle's date, at the scheduler's 23:30 UTC. The per-session fill
+        # guard keys on this date, so the 12 cycles are 12 distinct sessions.
+        base_date = datetime(2025, 1, 1)
+
+        def mock_utcnow():
+            d = base_date + timedelta(days=reveal["day"] - 1)
+            return datetime(d.year, d.month, d.day, 23, 30, tzinfo=UTC)
+
+        monkeypatch.setattr(sim, "_utcnow", mock_utcnow)
+
         # --- mock _current_month to advance through 12 months ---
         month_iter = iter(self.MONTHS)
         current_month = [next(month_iter)]
@@ -1106,6 +1139,7 @@ class TestYearLongSimulation:
             if i > 0:
                 current_month[0] = next(month_iter)
                 reveal["day"] += self.DAYS_PER_MONTH
+            await seed_candles()
             result = await sim.run_cycle()
             results.append(result)
 
@@ -1174,8 +1208,22 @@ class TestYearLongSimulation:
         # 7. No negative cash
         assert val["cash"] >= 0
 
-        # 8. Bot has at least one open position
-        assert len(val["positions"]) >= 1
+        # 8. Ledger reconciliation: every open position's shares equal the
+        # net of the trade log for its ticker (the end state IS the replay
+        # of the trades), and equity = cash + Σ(shares × mark). Under the
+        # session fill contract a chandelier stop can legitimately flatten
+        # the whole book in a choppy synthetic year, so "has a position" is
+        # not an invariant — the ledger matching is.
+        from collections import defaultdict
+        net_shares: dict[str, float] = defaultdict(float)
+        for t in trades:
+            net_shares[t["ticker"]] += (t["shares"] if t["side"] == "BUY"
+                                        else -t["shares"])
+        held = {p["ticker"]: p["shares"] for p in val["positions"]}
+        assert held == {t: s for t, s in net_shares.items() if s > 0.0001}
+        assert val["total_equity"] == pytest.approx(
+            val["cash"] + sum(p["shares"] * p["current_price"]
+                              for p in val["positions"]), abs=0.05)
 
         # 9. Equity curve snapshots show non-decreasing allowance_total
         curve = await sim.get_equity_curve(limit=365)
@@ -2609,6 +2657,64 @@ class TestSimBackfill:
                     assert t.shares > 0 and t.price > 0
                     assert t.reason.startswith("backfill:")
         await check()
+
+    async def test_backfill_positions_carry_entry_anchors(
+            self, mem_db, fake_series, monkeypatch, tmp_path):
+        """End-state positions must carry the replay's REAL entry anchors:
+        ``opened_at`` = the actual first-buy session date (the monotone ATR
+        ratchet's anchor — wall-clock now() would let the ratchet see bars
+        from before the position existed), and ``stop_price`` = the percent
+        stop frozen at the entry fill (a top-up can never loosen it)."""
+        from sqlalchemy import select
+
+        from app import optimize as opt
+
+        monkeypatch.setattr(sim, "_STATE_FILE", tmp_path / "sim_state.json")
+
+        r = await sim.backfill(start="2025-03-01")
+        assert r["ok"] is True
+
+        async with mem_db() as s:
+            pos = (await s.scalars(select(SimPosition))).all()
+            trades = (await s.scalars(select(SimTrade)
+                                      .order_by(SimTrade.created_at))).all()
+        assert pos, "the replay must end with at least one holding"
+
+        # First BUY per ticker, respecting that a full SELL closes the
+        # position — a later re-buy is a NEW entry.
+        opened: dict[str, str] = {}
+        entry_px: dict[str, float] = {}
+        live: set[str] = set()
+        for tr in trades:
+            if tr.side == "BUY":
+                if tr.ticker not in live:
+                    live.add(tr.ticker)
+                    opened[tr.ticker] = tr.created_at.strftime("%Y-%m-%d")
+                    entry_px[tr.ticker] = tr.price
+            else:
+                live.discard(tr.ticker)
+
+        stop_pct = opt._live_sim_params().stop_pct
+        for p in pos:
+            assert p.opened_at is not None
+            anchor = p.opened_at.strftime("%Y-%m-%d") if p.opened_at else ""
+            assert anchor == opened[p.ticker], (
+                f"{p.ticker}: opened_at {anchor} must be the replay's "
+                f"first-buy date {opened[p.ticker]}, not wall-clock now()")
+            assert p.stop_price is not None
+            assert p.stop_price == pytest.approx(
+                entry_px[p.ticker] * (1 - stop_pct / 100), rel=1e-6)
+
+    async def test_backfill_resets_session_guard(
+            self, mem_db, fake_series, monkeypatch, tmp_path):
+        """The replay replaces the whole portfolio, so it must clear the
+        per-session fill guard — the next cycle has to be free to run."""
+        monkeypatch.setattr(sim, "_STATE_FILE", tmp_path / "sim_state.json")
+
+        sim._stamp_session_guard("2099-01-01")  # a consumed-looking session
+        r = await sim.backfill(start="2025-03-01")
+        assert r["ok"] is True
+        assert sim._load_state().get("last_session") is None
 
     async def test_uncovered_current_month_keeps_its_contribution(
             self, mem_db, fake_series, monkeypatch):

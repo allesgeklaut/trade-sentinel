@@ -5,8 +5,17 @@ assets from a configurable universe using deterministic signals, an LLM-based
 portfolio manager (hybrid mode), or a pure LLM mode, and tracks portfolio
 performance over time.
 
-All trades are executed at the latest cached daily close price — no real
-broker, no intraday, no shorting.  This is a research/education tool.
+Execution follows the session fill contract — documented in full in
+``app/session.py``, the single place it lives. Short version: the scheduled
+23:30 UTC cycle decides on data up to the PREVIOUS completed session's close
+(S) and fills at the CURRENT session's (F's) open — strict same-session
+bars, no stale or forward-filled fills; a stop level known at S's close is
+a standing order for F (open-gap fills at the open, intrabar breaches fill
+at the level); the percent stop is frozen at entry and persisted; the ATR
+stop is a position-specific monotone ratchet from the entry date; marks
+use F's close; and a per-session guard makes a second cycle in the same
+session a no-op. No real broker, no intraday orders, no shorting. This is
+a research/education tool.
 """
 
 from __future__ import annotations
@@ -15,7 +24,11 @@ import asyncio
 import json
 import logging
 import math
+import os
+import threading
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, UTC
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from collections.abc import Callable
 from typing import Any
@@ -24,10 +37,11 @@ from sqlalchemy import delete, func, select
 
 import pandas as pd
 
-from .analysis import compute
+from .analysis import MIN_CANDLES, compute, signal_series
 from .config import settings
 from . import llm as llm_mod
 from . import monthly as monthly_mod
+from . import session as session_mod
 from .db import (
     SimAccount,
     SimAllowance,
@@ -42,6 +56,7 @@ from .db import (
 from .market import candles, latest_close, refresh, refresh_many
 from .screener import tickers as universe_tickers
 from .strategy import (
+    _bar_price,
     StrategyParams,
     llm_sell_shares,
     plan_llm_buys,
@@ -84,6 +99,67 @@ _run_cycle_task: asyncio.Task | None = None
 # How many candles to refresh for the sim universe (2y is a good balance
 # for indicator computation without excessive API load).
 _SIM_REFRESH_PERIOD = "2y"
+
+# ---------------------------------------------------------------------------
+# Per-session fill guard (session fill contract, rule 2)
+# ---------------------------------------------------------------------------
+# Exactly ONE decision/fill cycle runs per session: a second cycle in the
+# same session (a scheduled retry, a manual "Run Bot Now" after the
+# scheduled run, a process restart) must not double-fill. The guard is a
+# small JSON state file next to the other sims' state files (e.g.
+# daily_core_state.json) rather than a new DB column — the additive
+# DB-migration surface stays untouched, and tests can point the file at a
+# temp path. It is stamped just BEFORE the decision/fill step (a crash
+# mid-cycle must never lead to a second fill pass) and reset by backfill /
+# reset_sim, which replace the whole portfolio and must leave the next
+# cycle free.
+_STATE_FILE = Path("/data/sim_state.json")
+_state_lock = threading.Lock()
+
+
+def _load_state() -> dict:
+    try:
+        return json.loads(_STATE_FILE.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning("Could not read sim state file %s: %s", _STATE_FILE, e)
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    try:
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic replace so a concurrent reader never sees a half-written file.
+        tmp = _STATE_FILE.with_suffix(_STATE_FILE.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        os.replace(tmp, _STATE_FILE)
+    except Exception as e:
+        logger.warning("Could not write sim state file %s: %s", _STATE_FILE, e)
+
+
+def _session_guard_key() -> str:
+    """The guard key for the cycle's own session F (the run date, UTC)."""
+    return _utcnow().date().isoformat()
+
+
+def _session_guard_passed(key: str) -> bool:
+    with _state_lock:
+        return _load_state().get("last_session") != key
+
+
+def _stamp_session_guard(key: str) -> None:
+    with _state_lock:
+        state = _load_state()
+        state["last_session"] = key
+        _save_state(state)
+
+
+def _reset_session_guard() -> None:
+    with _state_lock:
+        state = _load_state()
+        state.pop("last_session", None)
+        _save_state(state)
 
 
 # ---------------------------------------------------------------------------
@@ -290,11 +366,20 @@ def _universe() -> str:
         return settings.sim_universe
 
 
-async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str) -> dict | None:
+async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str,
+                    stop_price: float | None = None) -> dict | None:
     """Execute a paper BUY.  Returns the trade dict or None if skipped.
 
     Uses fractional shares (rounded to 4 decimals) so the bot can always
     deploy capital regardless of share price.
+
+    ``stop_price``: the percent stop frozen at entry (session fill
+    contract, rule 5). When None, the sim default applies — the entry fill
+    price dropped by ``sim_stop_pct`` — so every NEW position carries a
+    frozen stop. A top-up NEVER touches the stored level: freezing at
+    entry means a lower-priced top-up cannot loosen the stop (re-anchoring
+    it to the blended average cost would), and the position-specific
+    monotone ATR ratchet is the only mechanism that can tighten it.
     """
     if price <= 0 or max_budget < 1:
         return None
@@ -314,13 +399,18 @@ async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str) -
 
         pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
         if pos:
-            # Update weighted average cost
+            # Update weighted average cost. The frozen percent stop is NOT
+            # re-anchored here (see docstring): the stored level survives
+            # every top-up untouched.
             total_shares = pos.shares + shares
             pos.avg_cost = (pos.shares * pos.avg_cost + cost) / total_shares
             pos.shares = total_shares
         else:
+            frozen = stop_price
+            if frozen is None:
+                frozen = price * (1 - settings.sim_stop_pct / 100)
             s.add(SimPosition(ticker=ticker, shares=shares, avg_cost=price,
-                              thesis=reason))
+                              thesis=reason, stop_price=frozen))
 
         trade = SimTrade(
             ticker=ticker, side="BUY", shares=shares, price=price,
@@ -404,15 +494,174 @@ async def _quality_map(tickers: list[str]) -> dict[str, dict[str, float | None]]
     return out
 
 
+# ---------------------------------------------------------------------------
+# Frozen decision inputs (session fill contract)
+# ---------------------------------------------------------------------------
+
+# Warmup bound for the one-query candle load. The nightly refresh stores ~2y
+# of daily bars (matches _SIM_REFRESH_PERIOD); the indicator engine needs
+# ~206 daily bars, 50 weekly closes and the 52-week high, so ~760 calendar
+# days covers the warmup deterministically (a longer cache is simply not
+# loaded; a shorter one degrades exactly as the indicator math demands).
+_DECISION_WARMUP_DAYS = 760
+
+
+@dataclass
+class _DecisionInputs:
+    """One cycle's frozen decision inputs.
+
+    ``signals``/``prices`` come strictly from data <= the previous completed
+    session S; ``session_bars`` carries F's bar (strict exact date) for the
+    tickers that have one — the only place F's data enters the cycle — and
+    ``ratchets`` holds the per-position monotone ATR levels.
+    """
+
+    f_ts: pd.Timestamp
+    s_ts: pd.Timestamp | None
+    signals: dict[str, dict]
+    prices: dict[str, float]           # decision closes (on S)
+    session_bars: dict[str, dict]      # {ticker: {"open","low","close"}} at F
+    ratchets: dict[str, float | None]  # held ticker -> monotone ATR level
+
+
+def _atr_ratchets(frames: session_mod.SessionFrames,
+                  held_entries: dict[str, str | None],
+                  s_str: str | None) -> dict[str, float | None]:
+    """Position-specific monotone ATR ratchet levels (contract rule 6).
+
+    For each held ticker: the MAX of the prior-known ATR candidate level
+    (``analysis``'s atr_stop) over all COMPLETED bars since the position's
+    entry anchor. The max over a growing window is naturally monotone —
+    recomputing it each cycle from the entry anchor can tighten but never
+    loosen the level, so no persistence is needed. The entry anchor is
+    ``SimPosition.opened_at``'s date: the actual first-buy session for live
+    fills, and the replay's first-buy date after a backfill (the backfill
+    writes it there instead of wall-clock now()).
+    """
+    out: dict[str, float | None] = {}
+    for t in held_entries:
+        out[t] = None
+    if s_str is None:
+        return out
+    for t, entry in held_entries.items():
+        if not entry:
+            continue
+        rows = session_mod.rows_for(frames, t)
+        dec_rows = [r for r in rows if r["time"] <= s_str]
+        if not dec_rows:
+            continue
+        try:
+            ser = signal_series(dec_rows)["atr_stop"]
+        except Exception as e:
+            logger.warning("No ratchet series for %s: %s", t, e)
+            continue
+        vals: list[float] = []
+        for r, v in zip(dec_rows, ser, strict=True):
+            if r["time"] < entry or r["time"] > s_str:
+                continue  # bars before entry are not this position's levels
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(fv):
+                vals.append(fv)
+        if vals:
+            out[t] = max(vals)
+    return out
+
+
+async def _decision_inputs(tickers: list[str],
+                           held_entries: dict[str, str | None] | None = None,
+                           now: datetime | None = None) -> _DecisionInputs:
+    """Build the frozen decision inputs for one cycle.
+
+    One candle query for all decision tickers (candidates + held), then:
+
+      * S = the previous completed session strictly before F (the cycle's
+        run date), taken from the stored frame index
+        (``session.prev_session``);
+      * signals = ``analysis.compute`` over each ticker's candles truncated
+        to <= S — F's bar is never a decision input, so mutating or
+        appending F's candle cannot change a decision;
+      * a signal additionally requires the ticker to have ACTUALLY traded
+        on S (its last truncated candle is dated S): a ticker whose last
+        candle predates S has no current view and gets no decision this
+        cycle — its stop standing orders still apply through F's bar;
+      * prices = each signal ticker's close ON S (decision-side equity and
+        budget math);
+      * session_bars = F's strict exact-date open/low/close per ticker
+        (``session.open_at`` — no ffill); tickers without an F bar are
+        absent, which makes them unfillable this cycle;
+      * ratchets = per held ticker the monotone ATR level since its entry
+        anchor.
+    """
+    f_ts = pd.Timestamp((now or _utcnow()).date())
+    start = (f_ts - pd.Timedelta(days=_DECISION_WARMUP_DAYS)).to_pydatetime()
+    all_tickers = sorted(set(tickers) | set(held_entries or {}))
+    frames = await session_mod.load_open_frames(all_tickers, asof=f_ts, start=start)
+    s_ts = session_mod.prev_session(frames.index, f_ts)
+    s_str = s_ts.strftime("%Y-%m-%d") if s_ts is not None else None
+
+    signals: dict[str, dict] = {}
+    prices: dict[str, float] = {}
+    session_bars: dict[str, dict] = {}
+    for t in all_tickers:
+        rows = session_mod.rows_for(frames, t)
+        if not rows:
+            continue
+        # F's bar via the strict exact-date lookup — never a forward-fill.
+        open_px = session_mod.open_at(frames.open, f_ts, t)
+        if open_px is not None:
+            session_bars[t] = {
+                "open": open_px,
+                "low": session_mod.open_at(frames.low, f_ts, t),
+                "close": session_mod.open_at(frames.close, f_ts, t),
+            }
+        # Decision data: candles truncated to <= S (F's bar excluded).
+        if s_str is None:
+            continue
+        dec_rows = [r for r in rows if r["time"] <= s_str]
+        if not dec_rows or dec_rows[-1]["time"] != s_str:
+            continue  # did not trade on S — no fresh decision view
+        if len(dec_rows) < MIN_CANDLES:
+            continue
+        try:
+            signals[t] = compute(dec_rows)
+        except Exception as e:
+            logger.warning("No signal for %s: %s", t, e)
+            continue
+        prices[t] = float(dec_rows[-1]["close"])
+
+    ratchets = _atr_ratchets(frames, held_entries or {}, s_str)
+    return _DecisionInputs(f_ts=f_ts, s_ts=s_ts, signals=signals,
+                           prices=prices, session_bars=session_bars,
+                           ratchets=ratchets)
+
+
+def _session_fill_open(session_bars: dict[str, dict], ticker: str) -> float | None:
+    """F's OPEN for a ticker from the cycle's strict session bars.
+
+    None when the ticker has no F bar — no fill this cycle. Only the open
+    is ever returned: cycle fills happen at F's open, never at a stale
+    close (the stop standing orders may fill AT their level instead — that
+    level comes from the proposals, not from here).
+    """
+    bar = session_bars.get(ticker) or session_bars.get(ticker.upper())
+    if not bar:
+        return None
+    return _bar_price(bar.get("open"))
+
+
 async def _deterministic_propose(
     valuation: dict[str, Any],
     signals: dict[str, dict] | None = None,
     quality_of: Callable[[str], dict[str, float | None] | None] | None = None,
+    decision: _DecisionInputs | None = None,
 ) -> list[dict]:
     """Propose deterministic trades WITHOUT executing them.
 
     Thin wrapper over ``strategy.propose_trades`` — loads positions from the
-    DB, fetches current prices, gathers signals if not pre-supplied, converts
+    DB, resolves prices, gathers signals if not pre-supplied, converts
     to plain data, and delegates the SELL/BUY logic to the shared module.
     The hybrid strategy passes the proposals to the LLM for review/veto
     before any DB write happens.
@@ -420,38 +669,61 @@ async def _deterministic_propose(
     Each proposal carries everything ``_execute_proposed`` needs:
       - SELL: {"ticker", "side": "SELL", "price", "shares": None, "reason"}
       - BUY:  {"ticker", "side": "BUY",  "price", "budget", "reason", "entry_stop"}
+
+    With ``decision`` (the cycle's frozen decision inputs — the normal
+    path) the proposals follow the session fill contract: decision data
+    <= S, fills at F's open via the strict session bars, stops as standing
+    orders (rule 4), the position's persisted frozen percent stop plus the
+    monotone ATR ratchet (rules 5-6) passed through. With ``decision=None``
+    (legacy callers/tests) the old behaviour is kept: signals from the
+    full cached candles, fills at the latest cached close — NOT contract-
+    compliant, kept only until every caller is wired.
     """
-    tickers = await _candidate_tickers()
-
-    if signals is None:
-        signals = {}
-        for t in tickers:
-            try:
-                rows = await candles(t)
-                signals[t] = compute(rows)
-            except Exception:
-                continue
-
-    # Load positions from DB and convert to plain data.
     async with Session() as s:
         open_positions = (await s.scalars(select(SimPosition))).all()
+
+    if decision is None:
+        # Legacy path: the old candles()-per-ticker gather and latest-close
+        # fills. Kept for backward compatibility with existing callers and
+        # tests until they are wired to the contract.
+        if signals is None:
+            signals = {}
+            for t in await _candidate_tickers():
+                try:
+                    signals[t] = compute(await candles(t))
+                except Exception:
+                    continue
+
+        # Fetch current prices for all held + candidate tickers.
+        prices: dict[str, float] = {}
+        for pos in open_positions:
+            price = await _latest_close(pos.ticker)
+            if price is not None:
+                prices[pos.ticker] = price
+        for t in signals:
+            if t not in prices:
+                price = await _latest_close(t)
+                if price is not None:
+                    prices[t] = price
+        session_bars = None
+        ratchets: dict[str, float | None] = {}
+    else:
+        signals = decision.signals
+        prices = decision.prices
+        session_bars = decision.session_bars
+        ratchets = decision.ratchets
+
     positions = [
         {"ticker": pos.ticker, "shares": pos.shares, "avg_cost": pos.avg_cost,
-         "stop_price": None}  # sim recomputes stop from avg_cost (no frozen column)
+         # The percent stop frozen at entry — persisted since the
+         # stop_price column exists. Legacy rows without it fall back to
+         # the avg_cost recompute inside propose_trades (documented).
+         "stop_price": pos.stop_price,
+         # Position-specific monotone ATR ratchet since the entry anchor
+         # (contract rule 6) — None until the position has completed bars.
+         "atr_stop_level": ratchets.get(pos.ticker)}
         for pos in open_positions
     ]
-
-    # Fetch current prices for all held + candidate tickers.
-    prices: dict[str, float] = {}
-    for p in positions:
-        price = await _latest_close(p["ticker"])
-        if price is not None:
-            prices[p["ticker"]] = price
-    for t in signals:
-        if t not in prices:
-            price = await _latest_close(t)
-            if price is not None:
-                prices[t] = price
 
     sp = StrategyParams(
         buy_threshold=40, sell_threshold=-40,
@@ -459,12 +731,14 @@ async def _deterministic_propose(
         max_position_pct=settings.sim_max_position_pct,
         max_positions=settings.sim_max_positions,
         # Two independent exit controls:
-        #  - stop_type="percent": the entry-anchored control, recomputed
-        #    from the position's blended average cost every cycle (the sim
-        #    keeps no entry stop column, so it is NOT frozen at entry).
-        #  - use_atr_stop: the ATR reference stop from the signal snapshot —
-        #    a prior-known, per-bar candidate level (previous 20-bar high
-        #    close - 2x ATR of the previous bar), not a ratchet.
+        #  - stop_type="percent": the entry-anchored control, FROZEN at
+        #    entry — persisted on the position (SimPosition.stop_price) so
+        #    a top-up cannot loosen it (session fill contract, rule 5).
+        #  - use_atr_stop: the ATR exit control — a position-specific
+        #    monotone ratchet (max candidate level over all completed bars
+        #    since entry, contract rule 6) plus the per-bar prior-known
+        #    candidate from the snapshot; it can only tighten, never
+        #    loosen.
         stop_type="percent",
         stop_pct=settings.sim_stop_pct,
         use_atr_stop=True,
@@ -485,7 +759,7 @@ async def _deterministic_propose(
         relaxed_hold_limit=3,
     )
     return propose_trades(positions, valuation["cash"], prices, signals, sp,
-                          quality_of=quality_of)
+                          quality_of=quality_of, session_bars=session_bars)
 
 
 async def _execute_proposed(proposals: list[dict]) -> list[dict]:
@@ -513,22 +787,30 @@ async def _execute_proposed(proposals: list[dict]) -> list[dict]:
             held = await s.scalar(select(SimPosition).where(SimPosition.ticker == p["ticker"]))
         if open_count >= settings.sim_max_positions and held is None:
             continue  # at cap and this is a new position — skip
-        t = await _exec_buy(p["ticker"], p["price"], p["budget"], p["reason"])
+        # The frozen percent stop rides on the proposal (entry_stop,
+        # anchored to the entry fill); _exec_buy falls back to the sim
+        # default (entry price - sim_stop_pct) when absent.
+        t = await _exec_buy(p["ticker"], p["price"], p["budget"], p["reason"],
+                            stop_price=p.get("entry_stop"))
         if t:
             executed.append(t)
     return executed
 
 
 async def _deterministic_decide(valuation: dict[str, Any],
-                                quality_of: Callable[[str], dict[str, float | None] | None] | None = None) -> list[dict]:
+                                quality_of: Callable[[str], dict[str, float | None] | None] | None = None,
+                                decision: _DecisionInputs | None = None) -> list[dict]:
     """Rule-based strategy: propose + execute deterministic trades.
 
     Thin wrapper over ``_deterministic_propose`` + ``_execute_proposed`` so
     the deterministic-only strategy keeps its original behaviour. The hybrid
     strategy calls the two halves separately so the LLM can review proposals
-    before they execute.
+    before they execute. ``decision`` = the cycle's frozen decision inputs
+    (session fill contract); None = legacy behaviour (fills at the latest
+    cached close).
     """
-    proposals = await _deterministic_propose(valuation, quality_of=quality_of)
+    proposals = await _deterministic_propose(valuation, quality_of=quality_of,
+                                             decision=decision)
     return await _execute_proposed(proposals)
 
 
@@ -601,10 +883,17 @@ _SIM_METHODOLOGY = (
     "  - **atr_stop**: volatility exit reference. It is the highest close of "
     "the previous 20 completed bars minus 2x ATR of the previous completed "
     "bar — a level that was already known before today's bar closed. Price "
-    "at or below it = the trend broke. It is recomputed every bar (it can "
-    "move down as well as up), so it is a reference level, not a frozen or "
-    "ratcheting stop. The fixed % stop is anchored to the position's average "
-    "cost in the live sim (it is not frozen at the original entry price).\n"
+    "at or below it = the trend broke. The engine holds a position-specific "
+    "monotone ratchet of that level since entry (it can only tighten, never "
+    "loosen) plus the percent stop FROZEN at the position's entry price — a "
+    "later top-up cannot loosen either.\n"
+    "\n"
+    "## Timing (session fill contract)\n"
+    "Signals are computed from candles up to the PREVIOUS completed session's "
+    "close; fills execute at the CURRENT session's OPEN, and marks use the "
+    "current session's close. A stop level known at the previous close is a "
+    "standing order: it fills at the open after an opening gap through it, "
+    "otherwise at the level itself when the session's low reaches it.\n"
     "\n"
     "## GATING deterministic BUYs\n"
     "The deterministic BUY signal (net score >= +40 + uptrend confirmed) fires "
@@ -672,11 +961,13 @@ _LLM_SYSTEM_PROMPT = (
     "concentrate in a single ticker. The engine caps the number of open "
     "positions (it stops buying once the max position count is reached), so "
     "prioritize the strongest candidates.\n"
-    "4. The engine enforces an initial stop loss (a fixed % below the "
-    "position's average cost) and an ATR reference stop (the highest close "
-    "of the previous 20 completed bars minus 2x ATR of the previous bar, "
-    "recomputed every bar — a reference level, not a ratchet): positions "
-    "that hit either are auto-sold by the deterministic layer. Do not be "
+    "4. The engine enforces a percent stop FROZEN at the position's entry "
+    "price (persisted — a top-up cannot loosen it) plus a position-specific "
+    "monotone ATR ratchet (the highest candidate ATR level since entry — it "
+    "can only tighten). Fills execute at the next session's open, and a stop "
+    "known before a session acts as a standing order for it (open-gap fills "
+    "at the open, intrabar breaches at the level): positions that hit either "
+    "are auto-sold by the deterministic layer. Do not be "
     "surprised if a position disappears between cycles — that is the stop "
     "loss, not a decision you need to replicate.\n"
     "5. Do NOT sell a position to free up cash for another BUY. Selling one "
@@ -750,8 +1041,9 @@ _PURE_LLM_METHODOLOGY = (
     "  - **atr_stop**: volatility exit reference. Highest close of the "
     "previous 20 completed bars minus 2x ATR of the previous completed bar "
     "— known before today's bar closed. Price at or below it = the trend "
-    "broke. Recomputed every bar, so it is a reference level, not a frozen "
-    "or ratcheting stop.\n"
+    "broke. The engine tracks a position-specific monotone ratchet of this "
+    "level since entry (it can only tighten), and the percent stop is "
+    "FROZEN at the entry price.\n"
     "\n"
     "## Managing exits\n"
     "You are the ONLY mechanism that sells positions — no engine will do it "
@@ -786,10 +1078,11 @@ _PURE_LLM_SYSTEM_PROMPT = (
     "Use the indicators and your exit-management principles; do not simply "
     "echo the signal actions.\n"
     "3. You are responsible for stop losses. Each open position shows its "
-    "initial stop price (a fixed % below the position's average cost) and the "
-    "signals include an ATR reference stop (the highest close of the "
-    "previous 20 completed bars minus 2x ATR of the previous bar — a "
-    "reference level recomputed every bar, not a ratchet). Sell any "
+    "initial stop price (FROZEN at the position's entry price — a later "
+    "top-up cannot loosen it) and the signals include an ATR reference stop "
+    "(the highest close of the previous 20 completed bars minus 2x ATR of "
+    "the previous bar; the engine also tracks a monotone ratchet of it "
+    "since entry that can only tighten). Sell any "
     "position whose current price is at or below either stop unless you have "
     "a strong indicator-based reason to override. (The engine also "
     "auto-sells stop hits as a safety net, but do not rely on it — act on "
@@ -949,7 +1242,7 @@ def _build_llm_context(
     lines.append(f"Min cash floor (buy-time only, {settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
     lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
     lines.append(f"Max open positions: {max_positions if max_positions > 0 else settings.sim_max_positions}")
-    lines.append(f"Stop loss: {settings.sim_stop_pct:.0f}% below average cost (recomputed each cycle; ATR reference stop also applies)")
+    lines.append(f"Stop loss: {settings.sim_stop_pct:.0f}% below the position's entry price (frozen at entry — a top-up cannot loosen it; monotone ATR ratchet also applies)")
     lines.append("")
 
     if valuation["positions"]:
@@ -1344,6 +1637,7 @@ async def _llm_review_proposals(
     signals: dict[str, dict],
     news: dict[str, list[dict]] | None = None,
     quality: dict[str, dict[str, float | None]] | None = None,
+    session_bars: dict[str, dict] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Hybrid flow: let the LLM review deterministic proposals before they execute.
 
@@ -1365,6 +1659,18 @@ async def _llm_review_proposals(
 
     On LLM call failure or unparseable response, falls back to executing all
     proposals as-is (equivalent to the deterministic-only strategy).
+
+    Fill timing follows the session fill contract (``app.session``): with
+    ``session_bars`` (the cycle's strict F bars) every fill — approved
+    proposals and LLM additions alike — reads F's OPEN, and a ticker
+    without an F bar fills nothing. The decision INPUTS (signals and the
+    proposal set) were frozen to data <= the previous session's close by
+    the caller. Honest limitation: the LLM's reasoning TEXT is timestamped
+    to the cycle that produced it and there is no frozen-decision ledger
+    yet (Phase 2) — a re-run on identical frozen inputs consults the LLM
+    again and may reason differently; the per-session guard limits that to
+    one consult per session. With ``session_bars=None`` (legacy
+    callers/tests), fills read the latest cached close as before.
     """
     global _last_llm_reasoning, _last_llm_summary
 
@@ -1439,13 +1745,23 @@ async def _llm_review_proposals(
     if total_equity <= 0:
         return executed, vetoed
 
-    async def _price_of(ticker: str) -> float | None:
-        return await _latest_close(ticker)
+    # Fill prices: contract mode reads F's OPEN from the cycle's strict
+    # session bars (a ticker without an F bar fills nothing); legacy mode
+    # reads the latest cached close.
+    if session_bars is not None:
+
+        async def _price_of(ticker: str) -> float | None:
+            return _session_fill_open(session_bars, ticker)
+
+    else:
+
+        async def _price_of(ticker: str) -> float | None:
+            return await _latest_close(ticker)
 
     async def _value_of(ticker: str) -> float:
         async with Session() as s:
             pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
-        price = await _latest_close(ticker) or 0.0
+        price = await _latest_close(ticker) or 0.0  # mark: latest cached close
         return (pos.shares * price) if pos else 0.0
 
     plan = await plan_llm_buys(
@@ -1469,7 +1785,8 @@ async def _llm_review_proposals(
         if action == "HOLD":
             continue  # HOLD on a non-proposal ticker = no-op
 
-        price = await _latest_close(d["ticker"])
+        price = (_session_fill_open(session_bars, d["ticker"])
+                 if session_bars is not None else await _latest_close(d["ticker"]))
         if price is None or price <= 0:
             logger.warning("LLM addition for %s skipped: no price", d["ticker"])
             continue
@@ -1502,6 +1819,7 @@ async def _llm_decide(
     news: dict[str, list[dict]] | None = None,
     pure_llm: bool = False,
     quality: dict[str, dict[str, float | None]] | None = None,
+    session_bars: dict[str, dict] | None = None,
 ) -> list[dict]:
     """LLM strategy: let an LLM decide what to buy/sell.
 
@@ -1517,6 +1835,17 @@ async def _llm_decide(
 
     If the LLM call fails or the response can't be parsed, falls back to the
     deterministic trades (empty in pure-LLM mode, so effectively no trades).
+
+    Fill timing follows the session fill contract (``app.session``): the
+    ``signals`` handed in were frozen to data <= the previous session's
+    close, and with ``session_bars`` (the cycle's strict F bars) every fill
+    reads F's OPEN — a ticker without an F bar fills nothing. Honest
+    limitation: the LLM's reasoning TEXT is timestamped to the cycle that
+    produced it and there is no frozen-decision ledger yet (Phase 2) — a
+    re-run on identical frozen inputs consults the LLM again and may reason
+    differently; the per-session guard limits that to one consult per
+    session. With ``session_bars=None`` (legacy callers/tests), fills read
+    the latest cached close as before.
     """
     # Default fallback
     if signals is None:
@@ -1609,13 +1938,20 @@ async def _llm_decide(
 
     # Plan all BUY budgets up front so unsized BUYs split the cash evenly
     # instead of the first one taking everything.
-    async def _price_of(ticker: str) -> float | None:
-        return await _latest_close(ticker)
+    if session_bars is not None:
+        # Contract mode: fill prices are F's open (strict session bars).
+        async def _price_of(ticker: str) -> float | None:
+            return _session_fill_open(session_bars, ticker)
+
+    else:
+        # Legacy mode: latest cached close.
+        async def _price_of(ticker: str) -> float | None:
+            return await _latest_close(ticker)
 
     async def _value_of(ticker: str) -> float:
         async with Session() as s:
             pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
-        price = await _latest_close(ticker) or 0.0
+        price = await _latest_close(ticker) or 0.0  # mark: latest cached close
         return (pos.shares * price) if pos else 0.0
 
     plan = await plan_llm_buys(
@@ -1642,7 +1978,8 @@ async def _llm_decide(
         action = decision["action"]
         reason = decision["reason"] or f"LLM {action}"
 
-        price = await _latest_close(ticker)
+        price = (_session_fill_open(session_bars, ticker)
+                 if session_bars is not None else await _latest_close(ticker))
         if price is None or price <= 0:
             logger.warning("LLM decision for %s skipped: no price", ticker)
             continue
@@ -1691,7 +2028,14 @@ async def _llm_decide(
 # ---------------------------------------------------------------------------
 
 async def _gather_signals(tickers: list[str]) -> dict[str, dict]:
-    """Fetch compute() signals for every ticker, skipping failures."""
+    """Fetch compute() signals for every ticker, skipping failures.
+
+    Kept for direct callers and tests; the scheduled cycle instead uses
+    ``_decision_inputs`` (the session fill contract), whose signals are
+    frozen to data <= the previous completed session and fill at F's open.
+    NOTE: these signals include the LATEST cached bar (possibly the
+    session still in progress) and are therefore NOT contract inputs.
+    """
     signals: dict[str, dict] = {}
     for t in tickers:
         try:
@@ -1809,6 +2153,18 @@ async def run_cycle() -> dict[str, Any]:
         return {"skipped": True, "reason": "already running"}
 
     async with _run_cycle_lock:
+        # Per-session guard (session fill contract, rule 2): exactly one
+        # decision/fill cycle per session F. A second cycle in the same
+        # session — a scheduled retry, a manual click after the scheduled
+        # run, a post-restart catch-up — must not double-fill, so it bails
+        # out before touching anything.
+        session_key = _session_guard_key()
+        if not _session_guard_passed(session_key):
+            logger.info("run_cycle() skipped — session %s already processed",
+                        session_key)
+            return {"skipped": True,
+                    "reason": f"session {session_key} already processed"}
+
         # Reset all per-cycle LLM state; the LLM paths set them if they run.
         # The deterministic path leaves them empty so the frontend can show a
         # "deterministic mode — no LLM was called" explanation instead of
@@ -1847,9 +2203,27 @@ async def run_cycle() -> dict[str, Any]:
                     refresh_errors.append(f"{settings.sim_benchmark_ticker}: {e}")
                 benchmark_result = await _benchmark_deposit_and_buy()
 
-            # 3. Valuate
+            # 3. Valuate (marks: held positions at the latest cached close —
+            # after the refresh above that is session F's close, the
+            # contract's mark basis).
             _set_progress("valuate", "Valuing portfolio", started_at=started_at)
             valuation = await valuate()
+
+            # 3b. Frozen decision inputs (session fill contract): one candle
+            # load, decision data truncated to <= the previous completed
+            # session S, F's bar kept only as the strict fill reference.
+            # Built once so every strategy path decides on identical frozen
+            # inputs (bit-identical on a re-run of the same session data).
+            _set_progress("session", "Preparing session decision inputs", started_at=started_at)
+            held_entries = {p["ticker"]: p.get("buy_date") or None
+                            for p in valuation["positions"]}
+            decision = await _decision_inputs(tickers, held_entries)
+
+            # Stamp the per-session guard BEFORE decisions/fills run: a
+            # crash mid-cycle must never lead to a second fill pass for the
+            # same session (contract rule 2). The stages before this point
+            # (allowance, refresh, valuation) are safe to retry.
+            _stamp_session_guard(session_key)
 
             # 4. Decide & trade
             strategy = settings.sim_strategy.lower()
@@ -1863,11 +2237,14 @@ async def run_cycle() -> dict[str, Any]:
                 quality = await _quality_map(tickers)
             if strategy == "deterministic":
                 _set_progress("decide", "Deterministic engine deciding", started_at=started_at)
-                trades = await _deterministic_decide(valuation, quality_of=_quality_lookup(quality))
+                trades = await _deterministic_decide(valuation, quality_of=_quality_lookup(quality),
+                                                     decision=decision)
                 _last_deterministic_trades = trades
             elif strategy == "llm":
-                _set_progress("signals", "Gathering signals", started_at=started_at)
-                signals = await _gather_signals(tickers)
+                # Decision inputs are the cycle's frozen ones (data <= S);
+                # fills read F's open via the strict session bars.
+                _set_progress("signals", "Preparing signals from frozen session inputs", started_at=started_at)
+                signals = decision.signals
                 news = await _gather_news(signals)
                 # Pure-LLM mode (main-branch parity): the engine makes NO
                 # proposals and NO risk-floor sells — the LLM picks the names,
@@ -1875,7 +2252,8 @@ async def run_cycle() -> dict[str, Any]:
                 # max-position-%, max-positions cap) size every BUY.
                 _set_progress("decide", "LLM deciding (pure-LLM strategy)", started_at=started_at)
                 trades = await _llm_decide(valuation, [], signals, news, pure_llm=True,
-                                           quality=quality if settings.sim_llm_fundamentals_context else None)
+                                           quality=quality if settings.sim_llm_fundamentals_context else None,
+                                           session_bars=decision.session_bars)
                 _last_deterministic_trades = []
             elif strategy == "hybrid":
                 # Hybrid with a weekly review: the deterministic engine runs
@@ -1935,19 +2313,20 @@ async def run_cycle() -> dict[str, Any]:
                     )
                 if not is_review_cycle:
                     _set_progress("decide", "Deterministic engine deciding (LLM review off-cycle)", started_at=started_at)
-                    trades = await _deterministic_decide(valuation, quality_of=_quality_lookup(quality))
+                    trades = await _deterministic_decide(valuation, quality_of=_quality_lookup(quality),
+                                                         decision=decision)
                     _last_deterministic_trades = trades
                     _last_llm_vetoes = []
                 else:
-                    _set_progress("signals", "Gathering signals", started_at=started_at)
-                    signals = await _gather_signals(tickers)
-                    news = await _gather_news(signals)
+                    _set_progress("signals", "Preparing signals from frozen session inputs", started_at=started_at)
+                    news = await _gather_news(decision.signals)
                     _set_progress("propose", "Deterministic engine proposing", started_at=started_at)
-                    proposals = await _deterministic_propose(valuation, signals,
+                    proposals = await _deterministic_propose(valuation, decision=decision,
                                                              quality_of=_quality_lookup(quality))
                     _set_progress("decide", "LLM reviewing proposals (hybrid)", started_at=started_at)
-                    trades, vetoed = await _llm_review_proposals(valuation, proposals, signals, news,
-                                                                 quality=quality if settings.sim_llm_fundamentals_context else None)
+                    trades, vetoed = await _llm_review_proposals(valuation, proposals, decision.signals, news,
+                                                                 quality=quality if settings.sim_llm_fundamentals_context else None,
+                                                                 session_bars=decision.session_bars)
                     _last_deterministic_trades = proposals
                     _last_llm_vetoes = vetoed
                     # Mark the week as reviewed — no more LLM calls until the
@@ -1960,10 +2339,12 @@ async def run_cycle() -> dict[str, Any]:
             else:
                 logger.warning("Unknown strategy '%s', falling back to deterministic", strategy)
                 _set_progress("decide", "Deterministic engine deciding (unknown strategy fallback)", started_at=started_at)
-                trades = await _deterministic_decide(valuation)
+                trades = await _deterministic_decide(valuation, decision=decision)
                 _last_deterministic_trades = trades
 
-            # 5. Snapshot for equity curve
+            # 5. Snapshot for equity curve (marks at F's close — contract
+            # rule 3; valuate() reads the latest cached close, which is F's
+            # completed bar after the refresh above).
             _set_progress("snapshot", "Snapshotting equity curve", started_at=started_at)
             post_valuation = await valuate()
             allowance_total = post_valuation["allowance_total"]
@@ -2222,6 +2603,18 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
     today, depositing the allowance on each month's first trading day and
     applying the engine's decisions at the day's close.
 
+    Honesty note: the underlying replay (``optimize._replay``) still fills
+    each decision at that decision bar's close — a different fill timing
+    from the live engine's session fill contract (fills at the next
+    session's open). Live/replay kernel+fill parity is a separate Phase 1
+    item; treat this replay as a deterministic approximation, not a track
+    record.
+
+    The persisted end-state positions carry the replay's real entry anchor
+    (``opened_at`` = the replay's actual first-buy date — NOT wall-clock
+    now(), which would silently anchor the position ratchet to the wrong
+    bars) and the percent stop frozen at that entry fill (contract rule 5).
+
     ``start`` semantics (mirrors monthly.backfill / daily_core.backfill):
       - explicit "YYYY-MM-DD": replay from that day
       - "all": the full stored history (candles to 1980; the replay walks
@@ -2287,6 +2680,9 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
             acc.last_allowance_month = None
             acc.last_review_week = None
             await s.commit()
+        # The replay replaces the whole portfolio state, so the per-session
+        # fill guard must reset too — the next cycle must be free to run.
+        _reset_session_guard()
 
         # Replay state comes from the result's curves; shares/cash are not
         # exported by ReplayResult, so rebuild the end-state holdings from
@@ -2295,6 +2691,11 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
         # pf.cash) — add one deposit per replayed month or cash ends ~$100k
         # negative and the equity curve cliffs on the live point.
         shares: dict[str, float] = {}
+        # Entry anchor per END-STATE holding: the replay's actual first-buy
+        # date + entry fill price. A full SELL closes the anchor — a later
+        # re-buy is a NEW entry (the ratchet must not see the previous
+        # holding period's bars). Contract rules 5-6.
+        entry_anchor: dict[str, dict] = {}
         cash = params.start_cash
         deposited_months: set[str] = set()
         for tr in res.trades:
@@ -2304,10 +2705,13 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
             if tr["side"] == "BUY":
                 shares[tr["ticker"]] = shares.get(tr["ticker"], 0.0) + tr["shares"]
                 cash -= notional
+                if tr["ticker"] not in entry_anchor:
+                    entry_anchor[tr["ticker"]] = {"date": d, "price": tr["price"]}
             else:
                 shares[tr["ticker"]] = shares.get(tr["ticker"], 0.0) - tr["shares"]
                 if shares[tr["ticker"]] <= 0.0001:
                     shares.pop(tr["ticker"], None)
+                    entry_anchor.pop(tr["ticker"], None)
                 cash += notional
         # deposits: _replay deposits on the first trading day of every month
         # it processes — including months where the portfolio stayed flat
@@ -2338,7 +2742,23 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
                 df = series.get(t)
                 if df is not None and len(df):
                     last_px = float(df["close"].iloc[-1])
-                s.add(Pos(ticker=t, shares=round(sh, 6), avg_cost=round(last_px or 0.0, 6)))
+                anchor = entry_anchor.get(t)
+                # opened_at: the replay's ACTUAL first-buy date (16:00 UTC
+                # on that session), NOT wall-clock now() — this is the
+                # monotone ATR ratchet's entry anchor (contract rule 6);
+                # anchoring it to now() would let the ratchet see bars from
+                # before the position existed.
+                opened_at = (pd.Timestamp(f"{anchor['date']} 16:00:00+00:00").to_pydatetime()
+                             if anchor else None)
+                # stop_price: the percent stop frozen at the ENTRY fill
+                # (contract rule 5) — the same value the replay froze from
+                # its proposals' entry_stop for the percent config the live
+                # sim runs (optimize._live_sim_params).
+                frozen_stop = (anchor["price"] * (1 - params.stop_pct / 100)
+                               if anchor and params.stop_type == "percent" else None)
+                s.add(Pos(ticker=t, shares=round(sh, 6),
+                          avg_cost=round(last_px or 0.0, 6),
+                          opened_at=opened_at, stop_price=frozen_stop))
             for tr in res.trades:
                 s.add(Tr(ticker=tr["ticker"], side=tr["side"],
                          shares=round(tr["shares"], 6), price=round(tr["price"], 6),
@@ -2399,6 +2819,9 @@ async def reset_sim() -> dict[str, Any]:
         acc = SimAccount(id=1, cash=settings.sim_start_cash, last_allowance_month=None)
         s.add(acc)
         await s.commit()
+
+    # A fresh portfolio leaves the next cycle free (per-session fill guard).
+    _reset_session_guard()
 
     await reset_benchmark()
     logger.info("Sim reset: cash=%.2f", settings.sim_start_cash)
@@ -3052,7 +3475,7 @@ async def _build_sim_chat_context() -> str:
     lines.append(f"Max position %: {settings.sim_max_position_pct}")
     lines.append(f"Min cash %: {settings.sim_min_cash_pct}")
     lines.append(f"Max open positions: {settings.sim_max_positions}")
-    lines.append(f"Stop loss: {settings.sim_stop_pct:.0f}% below average cost (recomputed each cycle; ATR reference stop also applies)")
+    lines.append(f"Stop loss: {settings.sim_stop_pct:.0f}% below the position's entry price (frozen at entry — a top-up cannot loosen it; monotone ATR ratchet also applies)")
     lines.append(f"Min cash floor (buy-time only, {settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
     lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
     lines.append("")

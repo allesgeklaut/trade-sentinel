@@ -139,6 +139,12 @@ class SimPosition(Base):
     avg_cost: Mapped[float] = mapped_column(Float)
     opened_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     thesis: Mapped[str] = mapped_column(Text, default="")  # BUY reason for context feedback
+    # The percent stop FROZEN at entry (fill price * (1 - stop_pct/100)).
+    # Persisted so a top-up can never re-anchor the level to the blended
+    # average cost (which would loosen it) — the session fill contract's
+    # rule 5. NULL on legacy rows created before the column: those keep the
+    # documented fallback (level recomputed from avg_cost each cycle).
+    stop_price: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class SimTrade(Base):
@@ -651,6 +657,16 @@ async def init_db():
         try:
             await conn.execute(
                 text("ALTER TABLE sim_positions ADD COLUMN thesis TEXT DEFAULT ''")
+            )
+        except Exception:
+            pass  # column already exists
+        # Migration for sim_positions: the percent stop FROZEN at entry
+        # (session fill contract, rule 5) — persisted on the position so a
+        # top-up can never loosen it. Nullable: legacy rows keep the
+        # avg_cost-based fallback, no data migration.
+        try:
+            await conn.execute(
+                text("ALTER TABLE sim_positions ADD COLUMN stop_price FLOAT")
             )
         except Exception:
             pass  # column already exists
