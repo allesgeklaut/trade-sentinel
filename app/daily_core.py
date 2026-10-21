@@ -693,8 +693,13 @@ async def compute_targets(force: bool = False) -> tuple[list[str], list[str], pd
         band = order[:settings.sim_monthly_hold_band]
         async with Session() as s:
             held = [p.ticker for p in (await s.scalars(select(DailyCorePosition))).all()]
-        picks = monthly_mod._band_fill(order, held, settings.sim_monthly_target_n,
-                                       settings.sim_monthly_hold_band)
+        # Live always releases daily, so the pick pass always refills — but
+        # through _deploy_targets so the picks carry the hysteresis-selected
+        # membership in RANKING order (deployment funds best rank first;
+        # _band_fill's alphabetical sort is for the monthly display path).
+        picks = monthly_mod._deploy_targets(
+            order, held, settings.sim_monthly_target_n,
+            settings.sim_monthly_hold_band, refill=True)
         await _store_ranking(band, picks)
         return band, picks, frame
 
@@ -702,14 +707,24 @@ async def compute_targets(force: bool = False) -> tuple[list[str], list[str], pd
 async def run_deployment() -> dict:
     """One daily-core deployment pass.
 
-    1. Compute the qv-mom ranking + hysteresis picks.
+    1. Compute the qv-mom ranking + hysteresis picks (``compute_targets``).
     2. SELL held names that fell out of the band (band release, same rule
        as the monthly sim's rebalance).
-    3. BUY: deploy all free cash into the top-ranked names, topping each up
-       toward the equal-weight target — best rank first, until cash or
-       targets are exhausted. This is the backtest-winning "rank deploy,
-       boost=0" rule: fresh cash reinforces the top of the ranking, never
-       spreads pro-rata, never waits for month-end.
+    3. BUY: deploy all free cash into the hysteresis-selected ``picks``,
+       topping each up toward the equal-weight target — best rank first,
+       until cash or targets are exhausted. This is the backtest-winning
+       "rank deploy, boost=0" rule: fresh cash reinforces the top of the
+       ranking, never spreads pro-rata, never waits for month-end.
+       Held names the band retained (ranks 11-20) keep their slots; a new
+       name is bought only when a slot is actually free, so the book never
+       grows past the ten-slot target (audit P0-D).
+
+    Preexisting >target_n state (e.g. holdings carried in from before the
+    contract was enforced) is handled deterministically WITHOUT sells: band
+    members keep their slots whatever the count, only names that leave the
+    band are released, and no new names are bought until a slot frees. The
+    excess names stop receiving top-ups (they are dropped from ``picks`` by
+    the target_n cap) and exit naturally via the band rule.
 
     Optional protection overlays (`gate` + `gradient_arm` in the daily-core
     state file, the §12-15 mechanisms), independent: the deployment gate parks
@@ -726,7 +741,11 @@ async def run_deployment() -> dict:
         held_rows = (await s.scalars(select(DailyCorePosition))).all()
     held_before = sorted(p.ticker for p in held_rows)
     trades: list[dict] = []
-    px_map = await monthly_mod._price_usd_map(sorted(set(band) | set(held_before)))
+    # USD-converted prices for everything we might touch: the full band
+    # (the ranking behind the picks), the picks themselves (a fill can come
+    # from beyond the band when the band is thinner than target_n) and the
+    # held names (SELL proceeds + avg_cost fallback).
+    px_map = await monthly_mod._price_usd_map(sorted(set(band) | set(picks) | set(held_before)))
 
     # --- protection overlays: independent deployment gate + gradient (§12-15) ---
     gate_sma, gradient_active, arm_sma = current_protection_config()
@@ -773,11 +792,17 @@ async def run_deployment() -> dict:
             if r:
                 trades.append(r)
 
-    # BUYs: rank-first top-up toward equal weight. The rank loop stops at
-    # the top target_n names; with weight = equity/target_n, exhausting
-    # those exactly consumes the cash (the backtest-winning "rank deploy,
-    # boost=0" rule — fresh cash reinforces the top of the ranking, never
-    # spreads pro-rata, never waits for month-end).
+    # BUYs: rank-first top-up toward equal weight across the HYSTERESIS
+    # picks — NOT the raw band[:target_n]. ``picks`` keeps held names that
+    # the band retained (including held ranks 11-20 of the ranking) and adds
+    # a new name only when a slot is actually free; buying the raw top-10 of
+    # the band instead kept adding names the picks list never chose, growing
+    # the book past the ten-slot target (audit P0-D: ten retained positions
+    # plus one monthly cash cycle produced an 11th holding). With
+    # weight = equity/target_n, exhausting the picks exactly consumes the
+    # cash (the backtest-winning "rank deploy, boost=0" rule — fresh cash
+    # reinforces the top of the ranking, never spreads pro-rata, never waits
+    # for month-end).
     valuation = await valuate()
     if block_buys:
         return {"deployed": True, "band": band, "picks": picks,
@@ -793,7 +818,8 @@ async def run_deployment() -> dict:
     if target_vol:
         room = _vol_deploy_room(valuation["total_equity"], valuation["cash"],
                                 await _recent_port_returns(_VOL_WINDOW), target_vol)
-    for t in band[:settings.sim_monthly_target_n]:
+    held_count = len(valuation["positions"])  # ACTUAL post-SELL count
+    for t in picks:
         if room < 1:
             break
         price = px_map.get(t)
@@ -801,6 +827,14 @@ async def run_deployment() -> dict:
             continue
         held_pos = next((p for p in valuation["positions"] if p["ticker"] == t), None)
         current_value = held_pos["value"] if held_pos else 0.0
+        if held_pos is None and held_count >= settings.sim_monthly_target_n:
+            # No free slot. ``compute_targets`` planned this replacement
+            # BEFORE the SELL pass, assuming every release succeeds; a
+            # failed release (`_exec_sell` -> None: no usable price / zero
+            # avg_cost) leaves the old slot occupied, and filling the
+            # replacement anyway created an 11th holding. Top-ups of held
+            # picks are unaffected.
+            continue
         budget = min(weight - current_value, valuation["cash"], room)
         if budget < 1:
             continue
@@ -809,6 +843,8 @@ async def run_deployment() -> dict:
         if r:
             trades.append(r)
             room -= r["cost"]
+            if held_pos is None:
+                held_count += 1
             # refresh cash so successive buys see the balance
             valuation = await valuate()
 
@@ -948,26 +984,35 @@ async def backfill(start: str | None = None,
         if idx.empty:
             return {"ok": False, "error": f"no trading days since {start_note}"}
 
-        months: list[pd.Timestamp] = []
-        for ym in sorted({(d.year, d.month) for d in idx}):
-            sub = idx[(idx.year == ym[0]) & (idx.month == ym[1])]
-            if len(sub):
-                months.append(sub[-1])
+        # COMPLETED month-ends only, by the US session calendar (the shared
+        # monthly.completed_month_ends rule, same as the research backtests
+        # and monthly.backfill): the scheduler's last trading day of each
+        # calendar month, kept when its candle is stored and it falls inside
+        # the replay window. The old "last stored day of each month in the
+        # windowed index" rule rebalanced on the replay's last candle when
+        # the window ends inside a running month — a partial-month end
+        # treated as a completed month-end.
+        full_idx = pd.DatetimeIndex(close.index)
+        months = monthly_mod.completed_month_ends(close.index, idx[0], idx[-1])
 
         # Eligibility frames per month (same caching as the backtest), plus
         # the month-end BEFORE the window: a start like 2026-06-01 should
         # replay June 1-29 against May's month-end ranking (facts public by
         # then), not sit idle until June's month-end. Point-in-time safe:
-        # the prior frame only uses facts public by its own date.
+        # the prior frame only uses facts public by its own date. Keyed off
+        # the WINDOW START's month — independent of the rebalance list (a
+        # window inside the current partial month still ranks against last
+        # month's frame).
         # The frames honor the runtime-selected momentum variant (the UI
         # dropdown) — the replay always models the strategy as configured.
         settings.sim_daily_core_mom_variant = current_variant()
         prior_month_ends: list[pd.Timestamp] = []
-        if months:
-            prev = months[0] - pd.offsets.MonthEnd(1)
-            prev_idx = close.index[close.index <= prev]
-            if len(prev_idx):
-                prior_month_ends.append(prev_idx[-1])
+        d0 = idx[0]
+        prev_y, prev_m = (d0.year - 1, 12) if d0.month == 1 else (d0.year, d0.month - 1)
+        pme_sched = pd.Timestamp(monthly_mod.month_last_trading_day(datetime(prev_y, prev_m, 1)))
+        prev_idx = full_idx[full_idx <= pme_sched]
+        if len(prev_idx):
+            prior_month_ends.append(prev_idx[-1])
         frame_cache: dict[pd.Timestamp, pd.DataFrame | None] = {}
         for m in prior_month_ends + months:
             if m in shared_frames:
@@ -979,13 +1024,16 @@ async def backfill(start: str | None = None,
         def _has_eligible(m: pd.Timestamp) -> bool:
             f = frame_cache[m]
             return f is not None and bool(f["eligible"].any())
-        months = [m for m in months if _has_eligible(m)]
-        if not months:
-            return {"ok": False, "error": "no month with eligible names"}
-        # Ranking sources: window month-ends PLUS the prior month-end (so
-        # days between `start` and the first window month-end rank against
-        # the last frame before the window instead of sitting idle).
+        # Dead months are dropped from the REBALANCE list only; the prior
+        # month-end frame still ranks, so a window without any completed
+        # month-end of its own (e.g. a start inside the current partial
+        # month) still rebuilds the book against it — no rebuild days, no
+        # releases, daily deployment only.
+        if months:
+            months = [m for m in months if _has_eligible(m)]
         ranking_months = sorted(set(prior_month_ends) | set(months))
+        if not any(_has_eligible(m) for m in ranking_months):
+            return {"ok": False, "error": "no month with eligible names"}
         # No idx clamp to months[0]: days before the first eligible
         # month-end in the window replay against the PRIOR month-end's
         # frame (built above), so start=YYYY-06-01 really starts June 1.
@@ -1102,6 +1150,14 @@ async def backfill(start: str | None = None,
 
             def do_buy(t: str, budget: float, day=d) -> None:
                 nonlocal cash
+                if t not in shares and len(shares) >= target_n:
+                    # Hard slot backstop: `_deploy_targets` plans the
+                    # post-release membership (refill=True fills toward
+                    # target_n assuming pending releases succeed), so the
+                    # executor must check the ACTUAL free capacity before
+                    # opening a NEW name — a failed release (no usable
+                    # price) leaves its slot occupied.
+                    return
                 p = px_of(t, day)
                 if p is None or p <= 0:
                     return
@@ -1167,19 +1223,39 @@ async def backfill(start: str | None = None,
                 for t in list(shares):
                     do_sell(t)
 
+            # The hysteresis-selected deployment targets (audit P0-D): the
+            # old loop deployed over the raw order[:target_n] — buying the
+            # ranking's top-10 even when ten held names already occupied the
+            # slots, growing the book past the ten-slot target. Held names
+            # inside the band keep their slots; new names fill open slots
+            # only when one is actually free — a rebuild day (the releases
+            # above freed slots) or an account below capacity. Between
+            # month-ends, with the deferred-release replay policy, no new
+            # name is bought while an out-of-band release is still pending.
+            # A FAILED release (no price) leaves `shares` unchanged while
+            # `refill` is True, so the CAPACITY TEST alone does not cap the
+            # plan — the executor backstop below (do_buy skips new names
+            # once len(shares) >= target_n) enforces the ten-slot guarantee.
+            if order:
+                deploy_picks = monthly_mod._deploy_targets(
+                    order, list(shares), target_n, hold_band,
+                    refill=len(shares) < target_n)
+            else:
+                deploy_picks = []
+
             equity = cash + sum((shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0)
                                 for t in shares)
             weight = equity / max(target_n, 1)
 
-            # rank-deployment (boost=0): top up top-ranked names toward the
-            # equal-weight target, best rank first. On month-end days the
+            # rank-deployment (boost=0): top up the hysteresis picks toward
+            # the equal-weight target, best rank first. On month-end days the
             # full equal-weight rebuild also fills NEW names to weight.
             # Blocked while the market gate says "bad times" (contributions
             # park) — the gradient cash-out already emptied the book.
-            if order and protect_ok and not grad_out:
+            if deploy_picks and protect_ok and not grad_out:
                 room = (_vol_deploy_room(equity, cash, port_rets, target_vol)
                         if target_vol else float("inf"))
-                for t in order[:target_n]:
+                for t in deploy_picks:
                     if room < 1:
                         break
                     p = px_of(t, d)

@@ -387,9 +387,11 @@ def eligible_frame(rebal_date: pd.Timestamp, close: pd.DataFrame, vol: pd.DataFr
         mcap = price * sh[1]
         fcf = None
         if ocf is not None and capex is not None:
-            fcf = ocf + capex  # capex is conventionally negative
-        elif ocf is not None:
-            fcf = ocf  # conservative fallback: OCF alone
+            fcf = ocf + capex  # capex is canonical: a NEGATIVE cash outflow
+        # Capex missing -> FCF missing. The old OCF-only fallback assumed
+        # capex == 0, which OVERSTATES FCF for every non-repiler and quietly
+        # inflates the value factor (audit P0-A). Ingestion
+        # (fundamentals.canonical_capex) owns the negative-outflow sign.
         p_fcf = mcap / fcf if fcf is not None and fcf > 0 else None
         mom_v = float(mom.get(t, np.nan))
         rows[t] = {
@@ -430,8 +432,10 @@ def quality_snapshot(fund: dict[str, dict[str, list[dict]]], ticker: str,
     ROE = TTM net income / latest stockholders' equity (None when equity <= 0
     or NI missing). P/FCF = market cap / TTM FCF, where market cap uses the
     `close` price (pass the USD-converted close so foreign listings compare)
-    and TTM FCF = OCF + capex (capex conventionally negative; falls back to
-    OCF alone). None values mean "not computable", never "bad".
+    and TTM FCF = OCF + capex (capex is canonical: a NEGATIVE cash outflow,
+    normalized at ingestion). Missing capex -> missing FCF — OCF alone is
+    never substituted, because assuming capex == 0 overstates FCF. None
+    values mean "not computable", never "bad".
 
     Reuses the same as-of helpers as the monthly qv-mom scoring, so the daily
     sim sees exactly the numbers the monthly strategy would compute.
@@ -451,9 +455,10 @@ def quality_snapshot(fund: dict[str, dict[str, list[dict]]], ticker: str,
     capex = _ttm_as_of(rec.get("PaymentsToAcquirePropertyPlantAndEquipment", []), asof)
     fcf = None
     if ocf is not None and capex is not None:
-        fcf = ocf + capex  # capex is conventionally negative
-    elif ocf is not None:
-        fcf = ocf  # conservative fallback: OCF alone
+        fcf = ocf + capex  # capex is canonical: a NEGATIVE cash outflow
+    # Capex missing -> FCF missing: OCF alone is NOT a conservative FCF
+    # estimate (it assumes capex == 0 and overstates value). Same contract
+    # as eligible_frame; the negative sign is owned by ingestion.
     if fcf is not None and fcf > 0 and close is not None and close > 0:
         sh = _latest_as_of(
             rec.get("CommonStockSharesOutstanding", [])
@@ -479,6 +484,53 @@ def _band_fill(order: list[str], holdings: list[str], target_n: int, hold_band: 
             continue  # already kept, or held-but-outside-band -> slot released
         picked.append(t)
     return sorted(picked)
+
+
+def _deploy_targets(order: list[str], holdings: list[str], target_n: int,
+                    hold_band: int, *, refill: bool) -> list[str]:
+    """The hysteresis-selected names ONE deployment pass may act on.
+
+    PLANNING semantics: with ``refill`` the return is the POST-RELEASE
+    membership — band members kept + open slots filled from the best-ranked
+    non-held names — assuming every pending release succeeds. The live
+    engine calls this BEFORE its SELL pass so replacements are planned, not
+    deferred to the next day; the executor then enforces the ACTUAL
+    post-SELL capacity (a failed release leaves its slot occupied, so the
+    live BUY loop / backfill ``do_buy`` / replay BUY blocks each guard a
+    new-name buy with ``len(shares) < target_n``). Capping the PLAN instead
+    would defer every replacement after a successful release to the next
+    day.
+
+    With ``refill=False`` the held in-band names are returned WITHOUT
+    fills: that is the deferred-release replay between rebuilds, where a
+    slot only frees at the next rebuild, so buying a fill would create a
+    transient 11th holding while an out-of-band release is still pending.
+
+    Held names inside the top ``hold_band`` of ``order`` keep their slots
+    (capped at ``target_n``). ``refill = len(holdings) < target_n`` only
+    decides WHETHER fills are planned — it does not cap their count: a
+    FAILED release (no usable price) leaves held-but-out-of-band names
+    occupying slots while ``refill`` is True (9 held, 8 in-band, 1 pending:
+    the plan still queues 2 fills). The ten-slot guarantee comes from the
+    executors' hard backstops (the live BUY loop, backfill ``do_buy``,
+    replay ``trade()``/BUY blocks), each of which skips a new-name buy once
+    ``len(shares) >= target_n``.
+
+    The return is the selected MEMBERSHIP in RANKING order (``order``
+    position), never ``_band_fill``'s alphabetical sort: deployment funds
+    best-rank first, and with limited cash the top-ranked picks must be the
+    ones that get the money.
+
+    Deployment MUST act on this set — not on ``order[:target_n]``. Buying
+    the raw top-10 of the ranking while ten held names already occupy the
+    slots grew the daily-core book past the target (audit P0-D).
+    """
+    if refill:
+        members = _band_fill(order, holdings, target_n, hold_band)
+    else:
+        members = [t for t in order[:hold_band] if t in holdings][:target_n]
+    member_set = set(members)
+    return [t for t in order if t in member_set]
 
 
 def residual_momentum(close: pd.DataFrame, asof: pd.Timestamp,
@@ -627,6 +679,41 @@ def is_rebalance_day(today: datetime | None = None) -> bool:
     non-NYSE-holiday)."""
     now = today or datetime.now(UTC)
     return now.date() == month_last_trading_day(now).date()
+
+
+def completed_month_ends(index, start=None, end=None) -> list[pd.Timestamp]:
+    """Calendar month-ends actually stored in ``index``, within [start, end].
+
+    A month-end is the scheduler's last US trading day of its calendar month
+    (weekday, non-NYSE-holiday — ``month_last_trading_day``), NOT the last
+    stored candle of that month: a frame ending inside a running month has
+    NO month-end, and recognizing one by "a later candle exists" breaks
+    future-data invariance (appending February candles flipped January-31's
+    membership). The scheduled date counts only when its own candle is
+    stored, so a data hole at the true month-end is never papered over by
+    the last mid-month bar. Every path keys frames on these dates — the
+    research backtests, the parameter sweep and both backfills.
+    """
+    idx = pd.DatetimeIndex(index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    idx = idx.normalize()
+    if not len(idx):
+        return []
+
+    def _naive(ts) -> pd.Timestamp:
+        ts = pd.Timestamp(ts)
+        return ts.tz_localize(None) if ts.tzinfo is not None else ts
+
+    lo = _naive(start) if start is not None else idx[0]
+    hi = _naive(end) if end is not None else idx[-1]
+    out: list[pd.Timestamp] = []
+    for ym in sorted({(d.year, d.month) for d in idx}):
+        me = pd.Timestamp(month_last_trading_day(
+            datetime(int(ym[0]), int(ym[1]), 1))).normalize()
+        if me in idx and lo <= me <= hi:
+            out.append(me)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1074,7 +1161,9 @@ async def backfill(start: str | None = None,
 
     Paper-portfolio convenience, not a live track record. Point-in-time
     discipline: a rebalance on date d only sees fundamentals public by then
-    (same EDGAR-first fact store as the backtest).
+    (same EDGAR-first fact store as the backtest). A month only rebalances
+    on its ACTUAL US session calendar month-end (never the last stored
+    candle of a still-running month).
     """
     from sqlalchemy import delete as sa_delete
     from .db import (MonthlyAccount as Acc, MonthlyPosition as Pos,
@@ -1110,21 +1199,24 @@ async def backfill(start: str | None = None,
         if idx.empty:
             return {"ok": False, "error": f"no trading days since {start_note}"}
 
-        # last trading day of each month in the window
-        months: list[pd.Timestamp] = []
-        for ym in sorted({(d.year, d.month) for d in idx}):
-            sub = idx[(idx.year == ym[0]) & (idx.month == ym[1])]
-            if len(sub):
-                months.append(sub[-1])
+        # COMPLETED month-ends only, by the US session calendar (same rule
+        # as the research backtests — completed_month_ends): a frame ending
+        # inside a running month (e.g. the current partial month) has no
+        # month-end, so the replay no longer fabricates a rebuild on its
+        # last candle.
+        months = completed_month_ends(close.index, idx[0], idx[-1])
 
         # eligibility frames per month-end (plus the month-end before the
-        # window so a mid-month start ranks against the prior frame)
+        # window so a mid-month start ranks against the prior frame) — the
+        # prior month-end is keyed off the WINDOW START's month,
+        # independent of the rebalance list.
         prior_month_ends: list[pd.Timestamp] = []
-        if months:
-            prev = months[0] - pd.offsets.MonthEnd(1)
-            prev_idx = close.index[close.index <= prev]
-            if len(prev_idx):
-                prior_month_ends.append(prev_idx[-1])
+        d0 = idx[0]
+        prev_y, prev_m = (d0.year - 1, 12) if d0.month == 1 else (d0.year, d0.month - 1)
+        pme_sched = pd.Timestamp(month_last_trading_day(datetime(prev_y, prev_m, 1)))
+        prev_idx = pd.DatetimeIndex(close.index)[pd.DatetimeIndex(close.index) <= pme_sched]
+        if len(prev_idx):
+            prior_month_ends.append(prev_idx[-1])
         shared = preload.frames if preload is not None else {}
         frame_cache: dict[pd.Timestamp, pd.DataFrame | None] = {}
         for m in sorted(set(prior_month_ends) | set(months)):
@@ -1199,6 +1291,13 @@ async def backfill(start: str | None = None,
         # replayed even without an eligible ranking: the live engine still
         # deposits monthly (deposit_allowance runs before the frame check), so
         # their days are funded and snapshotted; only the rebalance is skipped.
+        # The window's TRAILING partial month (no completed month-end yet) is
+        # walked the same way — deposits + daily snapshots, no rebuild: the
+        # live engine won't rebalance until the scheduled month-end. A marker
+        # day (the last candle) outside frame_cache marks it rebuild-free.
+        last_key = (idx[-1].year, idx[-1].month)
+        if last_key not in {(m.year, m.month) for m in months}:
+            months.append(idx[-1].normalize())
         replay_seq = [m for m in months if m >= live_months[0]]
         for i, m in enumerate(replay_seq):
             frame = frame_cache.get(m)
@@ -1209,23 +1308,24 @@ async def backfill(start: str | None = None,
             prev_td = replay_seq[i - 1] if i > 0 else None
             month_days = [d for d in idx if (prev_td is None or d > prev_td) and d <= m]
 
-            # contribution on the first trading day of EVERY calendar month in
-            # this span (the live engine deposits monthly even without a
-            # ranking; only the rebalance needs a frame).
+            # Chronological daily walk over the span: book the calendar
+            # month's contribution on its first trading day, then take that
+            # day's snapshot. A skipped interior month-end (its true
+            # calendar-end candle missing) makes ONE span cover several
+            # calendar months — booking all their contributions before the
+            # marks applied FUTURE money to earlier months' snapshots
+            # (February's marks carried March's deposit). Snapshots still
+            # value the holdings actually owned during this span — the picks
+            # from the PREVIOUS month-end rebalance (snapshotting after the
+            # rebuild below valued this month's days on this month's own
+            # month-end purchases: a look-ahead that made every month start
+            # distorted — the first point of a 2025 backfill read 91%).
             for d in month_days:
                 key = f"{d.year}-{d.month:02d}"
                 if contrib_days.get(key) == d:
                     cash += settings.sim_monthly_contribution
                     contributed += settings.sim_monthly_contribution
                     deposited_months.add(key)
-
-            # daily snapshots FIRST, on the holdings actually owned during
-            # this month — the picks from the PREVIOUS month-end rebalance.
-            # (Snapshotting after the rebuild below valued this month's days
-            # on this month's own month-end purchases: a look-ahead that made
-            # every month start distorted — the first point of a 2025 backfill
-            # read 91% instead of 100%.)
-            for d in month_days:
                 eq = cash + sum(sh * (px_of(t, d) or 0.0) for t, sh in shares.items())
                 snaps.append((d.strftime("%Y-%m-%d"), eq, contributed))
 
@@ -1254,6 +1354,13 @@ async def backfill(start: str | None = None,
                                         for t, sh in shares.items())
                 weight = equity_now / max(len(picks), 1)
                 for t in picks:
+                    if t not in shares and len(shares) >= settings.sim_monthly_target_n:
+                        # Hard slot backstop: pick_portfolio plans the
+                        # post-release membership, so a FAILED release (no
+                        # usable price leaves `shares` unchanged) must not
+                        # let the replacement buys grow the book past the
+                        # target.
+                        continue
                     p = px_of(t, m)
                     if p is None or p <= 0:
                         continue

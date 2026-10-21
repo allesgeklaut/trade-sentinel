@@ -275,45 +275,18 @@ def _sharpe(daily_returns: list[float]) -> float:
 
 
 def _max_drawdown(equity: list[float], invested: list[float] | None = None) -> float:
-    """Max peak-to-trough drawdown as a percentage.
+    """Max peak-to-trough drawdown, in PERCENT — the shared cash-flow-neutral
+    definition from ``app.performance`` (audit P0-B).
 
-    If ``invested`` (cumulative capital deposited so far per day) is provided,
-    the drawdown is measured on the **return ratio** (equity / invested) rather
-    than raw equity. This neutralises the growing capital base from monthly
-    DCA deposits — a 10% drawdown means the portfolio lost 10% of *its current
-    capital base*, not that the equity dropped from a late peak to an early
-    low point. Without this, a DCA backtest reports absurd drawdowns like 95%
-    because the equity naturally grows over time from deposits alone.
+    With ``invested`` (cumulative contributions per point) the drawdown is
+    measured on the contribution-adjusted unitized NAV, so a deposit that
+    leaves the portfolio value unchanged can no longer read as a loss (the
+    old equity/invested-ratio arithmetic reported an 8.33% drawdown for the
+    audit's deposit-only reproduction). Without ``invested`` the plain
+    equity drawdown is used. One definition for the backend and the UI.
     """
-    if invested is None:
-        # Fixed-capital backtest: drawdown on raw equity.
-        peak = -math.inf
-        max_dd = 0.0
-        for e in equity:
-            if e > peak:
-                peak = e
-            if peak > 0:
-                dd = (peak - e) / peak * 100
-                if dd > max_dd:
-                    max_dd = dd
-        return max_dd
-    # DCA backtest: drawdown on the return ratio (equity / invested).
-    # This is a time-weighted measure: if equity is 105% of invested and
-    # drops to 95% of invested, that's a ~9.5% drawdown regardless of how
-    # much capital has been deposited.
-    peak_ratio = -math.inf
-    max_dd = 0.0
-    for e, inv in zip(equity, invested, strict=False):
-        if inv <= 0:
-            continue
-        ratio = e / inv
-        if ratio > peak_ratio:
-            peak_ratio = ratio
-        if peak_ratio > 0:
-            dd = (peak_ratio - ratio) / peak_ratio * 100
-            if dd > max_dd:
-                max_dd = dd
-    return max_dd
+    from .performance import max_drawdown
+    return max_drawdown(equity, invested)
 
 
 # Warmup kept ahead of a replay start when bounding the series load. Signals
@@ -852,6 +825,21 @@ def _signals_for_day_from_bytime(
             continue
         action = _row_action(row, params)
         strength = _row_strength(row, action)
+        # Canonical snapshot conversions (analysis.snapshot_from_row): the
+        # entry gate and the tightened HOLD fallback read net_score /
+        # trend_up / trend_down / weekly_trend_up — the adapter omitted
+        # them, so the fallback failed closed in EVERY replay while the
+        # live engine kept using it (review D2).
+        net = row.get("net")
+        net_score: int | None = None
+        try:
+            net_f = float(net)
+        except (TypeError, ValueError):
+            net_f = float("nan")
+        # math.isfinite, not just isna: int(+inf)/int(-inf) raise
+        # OverflowError — a non-finite score fails closed to None instead.
+        if math.isfinite(net_f):
+            net_score = int(net_f)
         signals[t] = {
             "action": action,
             "strength": strength,
@@ -861,6 +849,12 @@ def _signals_for_day_from_bytime(
                 "run_5d": row.get("run_5d"),
                 "atr14": row.get("atr14"),
                 "dist_above": row.get("dist_above"),
+                # by_time rows carry weekly_trend_up already normalized
+                # (NaN -> True, matching the canonical conversion).
+                "net_score": net_score,
+                "trend_up": bool(row.get("trend_up", False)),
+                "trend_down": bool(row.get("trend_down", False)),
+                "weekly_trend_up": bool(row.get("weekly_trend_up", True)),
             },
         }
     return signals
@@ -2321,6 +2315,12 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
     deposit `contribution`, pick the top-N with hysteresis from point-in-time
     fundamentals, and trade at that day's close (10 bps one-way on swapped
     notional). Reports the money-weighted IRR like the stockstrat results.
+
+    Disclosed approximations (this is an aggregate baseline, not a
+    live-parity claim): contributions settle lumpy at the month-end marks
+    (a month whose month-end candle is missing books at the next month-end)
+    and are parked cash (0% return) until a live-frame rebalance deploys
+    them; the money-weighted IRR assumes uniformly spaced contributions.
     """
     from . import monthly as monthly_mod
     from . import fundamentals as fundamentals_mod
@@ -2349,57 +2349,50 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
         print("No trading days in the requested window.")
         return
 
-    # last trading day of each month within the window
-    months: list[pd.Timestamp] = []
-    for ym in sorted({(d.year, d.month) for d in idx}):
-        sub = idx[(idx.year == ym[0]) & (idx.month == ym[1])]
-        if len(sub):
-            months.append(sub[-1])
+    # COMPLETED month-ends only, by the US session calendar (same rule as
+    # _daily_core_backtest — see monthly.completed_month_ends): a window
+    # ending inside a still-running month keeps that partial stretch —
+    # mark-to-marketed below without a synthetic rebalance.
+    months = monthly_mod.completed_month_ends(close.index, idx[0], idx[-1])
 
     # Momentum warmup uses closes *before* the window (--start filters only
     # the rebalance months, the full frame is loaded). Early months whose
     # warmup is thin simply have no eligible names and get trimmed below —
-    # only refuse when even the LAST month can't reach 253 days of history.
-    n_days_to_first = int((close.index <= months[-1]).sum())
+    # only refuse when even the LAST window day can't reach 253 days of
+    # history.
+    n_days_to_first = int((close.index <= idx[-1]).sum())
     if n_days_to_first < settings.sim_monthly_min_history_days:
         print(f"Not enough history ({n_days_to_first} trading days up to "
-              f"{months[-1].date()}; need {settings.sim_monthly_min_history_days} "
+              f"{idx[-1].date()}; need {settings.sim_monthly_min_history_days} "
               f"for momentum warmup).")
         return
 
+    if not months:
+        print("No completed month-end inside the requested window.")
+        return
+
     # eligibility frame per rebalance date is the expensive part — cache by
-    # month (a prebuilt cache can be passed in by the parameter sweep)
+    # month (a prebuilt cache can be passed in by the parameter sweep);
+    # missing keys are built here so a foreign/partial cache never
+    # KeyErrors on a month the window's calendar rule selects.
     if frame_cache is None:
         frame_cache = {}
-        for i, d in enumerate(months):
+    for i, d in enumerate(months):
+        if d not in frame_cache:
             frame_cache[d] = await asyncio.to_thread(
                 monthly_mod.eligible_frame, d, close, vol, fund)
             if (i + 1) % 12 == 0:
                 logger.info("eligibility %d/%d", i + 1, len(months))
 
-    # Drop dead months: yfinance fundamentals only cover ~4-5 years, so early
-    # rebalances have zero eligible names (the strategy would hold cash at 0%
-    # while contributions pile up — reporting IRR over that period would be
-    # meaningless, not conservative). Start at the first month with an
-    # eligible frame; the 253d momentum warmup needs no extra headroom because
-    # eligibility already requires the price history.
-    def _live(d: pd.Timestamp) -> bool:
-        f = frame_cache[d]
-        return f is not None and bool(f["eligible"].any())
-
-    first_live = next((d for d in months if _live(d)), None)
-    if first_live is None:
-        print("No month has eligible names (fundamentals coverage too thin?). "
-              "Run the monthly rebalance once to fetch fundamentals, then retry.")
-        return
-    if first_live != months[0]:
-        skipped = [d for d in months if d < first_live]
-        print(f"Trimming {len(skipped)} months before {first_live.date()}: "
-              f"no eligible names (fundamentals not yet public).")
-        months = [d for d in months if d >= first_live]
-
+    # NO dead-month trim on eligibility: dropping months whose frame turned
+    # out dead erased their funding and made the aggregate depend on FUTURE
+    # eligibility. A dead month stays in the sequence and simply holds the
+    # previous picks through it (pick_portfolio returns the holdings for a
+    # dead frame), while its contribution is still settled — the live
+    # engine deposits monthly regardless of eligibility. (Fee policy is
+    # unchanged: this aggregate keeps its one-way cost model.)
     cost = settings.sim_monthly_cost_oneway
-    value, contributed = 0.0, 0.0
+    contributed = 0.0
     holdings: list[str] = []
     churns: list[float] = []
     picks_hist: list[tuple[str, list[str]]] = []
@@ -2410,29 +2403,89 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
         r = (close.loc[d1].reindex(names) / close.loc[d0].reindex(names) - 1.0).dropna()
         return _col_f(r.mean()) if len(r) else 0.0
 
+    # Contributions are counted per CALENDAR month present in the window and
+    # settled at the marks: each month-end settles every not-yet-booked
+    # month whose contribution day has arrived by then, and the trailing
+    # stretch settles the rest. The live engine deposits on the month's
+    # first trading day regardless of eligibility or of whether the
+    # month-end candle is stored, so a LEADING hole (start Jan-2, Jan-31's
+    # bar missing, first completed end in February) funds BOTH January and
+    # February, and a trailing stretch after an interior hole can span
+    # several funding months — keying the count on month-ends alone dropped
+    # those deposits. Parked-vs-invested separation: only the deployed
+    # portfolio earns the month-gap returns — contributions sit as parked
+    # cash (0%) until a live-frame rebalance deploys them, so no
+    # contribution earns a return for a period before it is invested (a
+    # dead frame leaves money parked; no synthetic rebalance is fabricated).
+    # Approximations kept and disclosed (no live-parity claim): settlement
+    # is lumpy at the marks (a hole month's deposit books at the next
+    # month-end) and the money-weighted IRR assumes uniformly spaced
+    # contributions.
+    first_days = sorted(_contribution_days(
+        idx, {(d.year, d.month) for d in idx}))
+    invested = 0.0   # deployed portfolio value (earns the gap returns)
+    parked = 0.0     # contributions received, not yet deployed (cash: 0%)
+    booked: set[tuple[int, int]] = set()
+    n_contrib = 0
+
+    def _settle_arrived(mark: pd.Timestamp) -> None:
+        """Book every calendar month whose contribution day has arrived by
+        ``mark`` — never a future key, never earlier than the mark."""
+        nonlocal parked, contributed, n_contrib
+        for day in first_days:
+            key = (int(day.year), int(day.month))
+            if key not in booked and day <= mark:
+                parked += contribution
+                contributed += contribution
+                n_contrib += 1
+                booked.add(key)
+
     for i, d in enumerate(months):
         if i > 0:
-            value *= 1.0 + period_ret(months[i - 1], d, holdings)
-        value += contribution
-        contributed += contribution
+            invested *= 1.0 + period_ret(months[i - 1], d, holdings)
+        _settle_arrived(d)
         frame = frame_cache[d]
+        live = frame is not None and bool(frame["eligible"].any())
         picks, _ = monthly_mod.pick_portfolio(d, close, vol, fund, holdings, frame) if frame is not None else (holdings, None)
         # turnover = fraction of the portfolio's slots swapped this month:
         # buys of new names plus sells of dropped names, each leg one-way
         adds = len(set(picks) - set(holdings))
         drops = len(set(holdings) - set(picks))
         turn = (adds + drops) / max(max(len(picks), len(holdings)), 1)
-        # The fresh contribution is deployed by buying new/rebalanced names —
-        # charging it separately would double-count the swap leg on entry
-        # months. One-way cost on swapped notional only.
-        value *= 1.0 - turn * cost
+        # A live frame rebalances (one pass EVERY month it has a ranking,
+        # no-op months included): parked cash joins the book. The fresh
+        # contribution is deployed by buying new/rebalanced names — charging
+        # it separately would double-count the swap leg on entry months.
+        # One-way cost on swapped notional only; a dead frame keeps money
+        # parked (turn is 0 there, so no cost either).
+        if live:
+            invested += parked
+            parked = 0.0
+        invested *= 1.0 - turn * cost
         churns.append(turn)
         if picks != holdings:
             picks_hist.append((d.strftime("%Y-%m"), list(picks)))
         holdings = list(picks)
 
+    # Trailing partial month: the live engine deposits at the start of every
+    # month, and a window that ends inside a month whose month-end never
+    # arrives must still fund and mark that stretch (the daily-core replay
+    # receives the same deposits via its contribution keys, so the two
+    # backtests' contribution counts stay equal) and mark-to-market the
+    # INVESTED value to the window's last day. The stretch may span several
+    # calendar months when an interior month-end is missing: settle every
+    # remaining key — parked, so none of them earns the stretch's gap
+    # return.
+    last_key = (idx[-1].year, idx[-1].month)
+    trailing = last_key not in {(m.year, m.month) for m in months}
+    if trailing:
+        invested *= 1.0 + period_ret(months[-1], idx[-1], holdings)
+        _settle_arrived(idx[-1])
+
+    value = invested + parked
+
     # money-weighted IRR: contribution * sum((1+r)^k) = final value
-    n = len(months)
+    n = n_contrib
 
     def f(r: float) -> float:
         return contribution * sum((1.0 + r) ** k for k in range(n)) - value
@@ -2534,21 +2587,21 @@ def _fill_buy(cash: float, price: float, delta_value: float,
 
 
 def _contribution_days(days: pd.DatetimeIndex,
-                       months: list[pd.Timestamp]) -> set[pd.Timestamp]:
+                       month_keys: set[tuple[int, int]]) -> set[pd.Timestamp]:
     """The days on which a monthly contribution is received.
 
-    One per calendar month that has a month-end rebalance in the window,
-    deposited on that month's FIRST trading day in the window (mirroring
-    the live daily-core engine and ``daily_core.backfill``, which deposit
-    at the start of the month) rather than parking the cash until the
-    month-end rebuild. Every month in ``months`` gets exactly one
-    contribution, so the count still matches the monthly baseline."""
-    keys = {(m.year, m.month) for m in months}
+    One per calendar month key in ``month_keys``, deposited on that month's
+    FIRST trading day in the window (mirroring the live daily-core engine
+    and ``daily_core.backfill``, which deposit at the start of the month)
+    rather than parking the cash until the month-end rebuild. Callers pass
+    the calendar months that should fund — currently every calendar month
+    present in the replay window, so an interior month with normal daily
+    bars but a missing month-end candle still receives its deposit."""
     out: set[pd.Timestamp] = set()
     seen: set[tuple[int, int]] = set()
     for d in days:
         k = (d.year, d.month)
-        if k in keys and k not in seen:
+        if k in month_keys and k not in seen:
             seen.add(k)
             out.add(d)
     return out
@@ -2650,12 +2703,34 @@ async def _daily_core_backtest(
         return
 
     days_all = idx  # every trading day in the window
-    months: list[pd.Timestamp] = []
-    for ym in sorted({(d.year, d.month) for d in days_all}):
-        sub = days_all[(days_all.year == ym[0]) & (days_all.month == ym[1])]
-        if len(sub):
-            months.append(sub[-1])
     last_day = days_all[-1]
+
+    # COMPLETED month-ends only, by the US session calendar (the same
+    # scheduler rule the live engine uses) — see
+    # monthly.completed_month_ends. A frame ending inside a still-running
+    # month has no month-end, and an ``end`` cut mid-month must not
+    # rebalance at an arbitrary partial-month date.
+    full_idx = pd.DatetimeIndex(close.index)
+    months = monthly_mod.completed_month_ends(close.index, days_all[0], last_day)
+
+    # Most recent PRE-window month-end, keyed off the WINDOW START's month —
+    # independent of the rebalance list above (a short Jan-02..Jan-15 window
+    # has no month-end of its own but must still rank against Dec-31's
+    # frame). The days between the window start and the first window
+    # month-end rank against the last frame public BEFORE the window (facts
+    # public by its own date — point-in-time safe). The old ``month_for``
+    # fallback returned months[0] instead, a FUTURE frame, so a January run
+    # traded on January's own month-end ranking (audit P0-E).
+    prior_month_end: pd.Timestamp | None = None
+    d0 = days_all[0]
+    prev_y, prev_m = (d0.year - 1, 12) if d0.month == 1 else (d0.year, d0.month - 1)
+    pme_sched = pd.Timestamp(
+        monthly_mod.month_last_trading_day(datetime(prev_y, prev_m, 1)))
+    prev_idx = full_idx[full_idx <= pme_sched]
+    if len(prev_idx):
+        # Last stored candle at/below the scheduled prior month-end: a
+        # ranking-only frame (no rebalance trigger), point-in-time safe.
+        prior_month_end = prev_idx[-1]
 
     # Momentum warmup: same rule as _monthly_backtest.
     n_days_to_first = int((close.index <= last_day).sum())
@@ -2665,33 +2740,49 @@ async def _daily_core_backtest(
               f"for momentum warmup).")
         return
 
+    # NOTE: no "months empty -> return" guard here. A window with NO
+    # in-window month-end (e.g. Jan-02..Jan-15) still runs — every day ranks
+    # against the pre-window frame and the daily deployment builds the book;
+    # it simply never hits a rebuild day.
+
     # Eligibility frames per MONTH (fundamentals move quarterly; daily
     # overlays reuse the current month's frame — no per-day TTM recompute).
     # A prebuilt cache can be passed in (parameter sweep: frames built once,
-    # reused across every config).
+    # reused across every config); any month key it lacks is built here so a
+    # cache assembled by a different helper or window never KeyErrors or
+    # silently drops a month's ranking. NOTE: the missing keys are built
+    # with the AMBIENT mom variant — the sweep pins the variant BEFORE
+    # building its cache and passes complete caches for its own keys.
     if frame_cache is None:
         frame_cache = {}
-        for i, d in enumerate(months):
+    n_built = 0
+    for d in months:
+        if d not in frame_cache:
             frame_cache[d] = await asyncio.to_thread(
                 monthly_mod.eligible_frame, d, close, vol, fund)
-            if (i + 1) % 12 == 0:
-                logger.info("eligibility %d/%d", i + 1, len(months))
+            n_built += 1
+            if n_built % 12 == 0:
+                logger.info("eligibility %d/%d (cache fill)", n_built, len(months))
 
-    def _live(d: pd.Timestamp) -> bool:
-        f = frame_cache[d]
-        return f is not None and bool(f["eligible"].any())
+    # The pre-window ranking frame: build it into the cache when a caller's
+    # prebuilt cache doesn't carry it (the sweep builds from its own start —
+    # its windows normally already include the prior month-end, so this is a
+    # single extra frame at most).
+    if prior_month_end is not None and prior_month_end not in frame_cache:
+        frame_cache[prior_month_end] = await asyncio.to_thread(
+            monthly_mod.eligible_frame, prior_month_end, close, vol, fund)
 
-    first_live = next((d for d in months if _live(d)), None)
-    if first_live is None:
-        print("No month has eligible names (fundamentals coverage too thin?). "
-              "Run the monthly rebalance once to fetch fundamentals, then retry.")
-        return
-    if first_live != months[0]:
-        skipped = [d for d in months if d < first_live]
-        print(f"Trimming {len(skipped)} months before {first_live.date()}: "
-              f"no eligible names (fundamentals not yet public).")
-        months = [d for d in months if d >= first_live]
-        days_all = days_all[days_all >= first_live]
+    # NO dead-month trim on frame coverage: cutting days/months whose frame
+    # turned out ineligible made the replay's START depend on FUTURE
+    # eligibility (a valid Dec-31 prior + empty Jan-31 + valid Feb-28 frame
+    # trimmed January entirely, so the prior frame never funded Jan-2, and
+    # January's contribution vanished). The simulation is causal instead:
+    # every window day is walked in order; a day ranks against its most
+    # recent completed month-end (the pre-window frame before the first
+    # one) and a dead/missing frame simply yields no ranking — cash sits
+    # and no entries happen until a valid frame becomes current again.
+    # Contributions are booked per calendar month present in the window
+    # (see contrib_keys below), independent of rebalance bars.
 
     cost = settings.sim_monthly_cost_oneway
     target_n = settings.sim_monthly_target_n
@@ -2751,6 +2842,14 @@ async def _daily_core_backtest(
         if p is None or p <= 0:
             return
         if side == "BUY":
+            if t not in shares and len(shares) >= target_n:
+                # Hard ten-slot backstop: `_deploy_targets` plans the
+                # post-release membership (refill=True fills toward
+                # target_n assuming the pending releases succeed), so an
+                # executor must check the ACTUAL free capacity before
+                # opening a NEW name — a failed release (no usable price)
+                # leaves its slot occupied and the book must not grow.
+                return
             fill = _fill_buy(cash, p, delta_value, cost)
             if fill is None:
                 return
@@ -2778,8 +2877,8 @@ async def _daily_core_backtest(
     # distinct months have distinct frames.
     order_memo: dict[int, tuple[list[str], pd.DataFrame | None]] = {}
 
-    def current_order(d: pd.Timestamp, month_td: pd.Timestamp) -> tuple[list[str], pd.DataFrame | None]:
-        frame = frame_cache.get(month_td)
+    def current_order(d: pd.Timestamp, month_td: pd.Timestamp | None) -> tuple[list[str], pd.DataFrame | None]:
+        frame = frame_cache.get(month_td) if month_td is not None else None
         if frame is None or not frame["eligible"].any():
             return [], frame
         key = id(frame)
@@ -2791,13 +2890,27 @@ async def _daily_core_backtest(
         order_memo[key] = result
         return result
 
-    def month_for(d: pd.Timestamp) -> pd.Timestamp:
-        # the most recent month-end at or before d
+    def month_for(d: pd.Timestamp) -> pd.Timestamp | None:
+        # The most recent month-end at or before d. Before the first window
+        # month-end this is the PRE-WINDOW month-end frame (preloaded above);
+        # when even that does not exist (the window starts at the first
+        # stored candles) it is None — no ranking, no trades that day. It is
+        # NEVER months[0]: substituting the first window month-end for days
+        # before it leaked that future frame's ranking backwards (audit P0-E:
+        # a synthetic run bought on 2025-01-01 on a 2025-01-31 ranking).
         m = [m for m in months if m <= d]
-        return m[-1] if m else months[0]
+        return m[-1] if m else prior_month_end
 
     pending_cash = 0.0  # contributions not yet deployed (dca="monthly")
-    contrib_days = _contribution_days(days_all, months)
+    # One contribution per CALENDAR month present in the replay window —
+    # the live engine deposits monthly regardless of eligibility or of
+    # whether the month's scheduled month-end candle is stored. Keying on
+    # rebalance month-ends alone made an INTERIOR month with normal daily
+    # bars but a missing month-end candle lose its funding entirely. The
+    # monthly baseline settles the same calendar-month sequence, so the
+    # two backtests' contributed counts stay equal.
+    contrib_keys = {(d.year, d.month) for d in days_all}
+    contrib_days = _contribution_days(days_all, contrib_keys)
 
     # --- Risk overlays (opt-in; measured via the daily-core sweep) ---
     # vol_weight: per-name target weights proportional to 1/realized vol
@@ -2937,7 +3050,8 @@ async def _daily_core_backtest(
     def _record_equity(d: pd.Timestamp, equity: float, contrib_today: float) -> None:
         """Append one day of equity; maintain the matching log-return list
         (contribution-adjusted) that `realized_vol` reads, plus the running
-        invested total for the contributed-normalized drawdown."""
+        cumulative-contribution series that the unitized-NAV drawdown
+        (app.performance) consumes."""
         nonlocal peak_eq
         port_days.append(d)
         port_eq.append(equity)
@@ -3059,16 +3173,31 @@ async def _daily_core_backtest(
         equity_now = cash + pending_cash + sum(
             (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0) for t in shares)
         weight = equity_now / max(target_n, 1)
-        # Inverse-vol weights among the day's deployment candidates (the top
-        # target_n of the ranking). Sums to the same total as equal weight.
-        vw_map = (_inv_vol_weights(order[:target_n], frame, target_n, weight)
-                  if vol_weight and order else {})
 
-        # month-end rebuild: pick the portfolio with hysteresis (monthly cadence)
-        picks: list[str] = []
-        if d in months and order:
-            held = list(shares)
-            picks = monthly_mod._band_fill(order, held, target_n, hold_band)
+        # The hysteresis-selected deployment targets (audit P0-D). On a
+        # rebuild day the releases above freed slots and the picks refill
+        # them from the top of the ranking; below target capacity the same
+        # fill applies. Otherwise — a non-rebuild day under the deferred
+        # "monthly" exit cadence — held names keep their slots and NO new
+        # name is bought while an out-of-band release is still pending.
+        # Deploying the raw order[:target_n] instead bought names the picks
+        # never chose and grew the book past the ten-slot target. The
+        # capacity test decides whether fills are PLANNED; when a FAILED
+        # release leaves the book at/over capacity while `refill` is True,
+        # the executor backstops (this replay's trade() and BUY blocks)
+        # enforce the ACTUAL free capacity — the ten-slot guarantee
+        # survives incomplete state.
+        if order:
+            picks: list[str] = monthly_mod._deploy_targets(
+                order, list(shares), target_n, hold_band,
+                refill=len(shares) < target_n)
+        else:
+            picks = []
+
+        # Inverse-vol weights among the day's deployment candidates (the
+        # hysteresis picks). Sums to the same total as equal weight.
+        vw_map = (_inv_vol_weights(picks, frame, target_n, weight)
+                  if vol_weight and picks else {})
 
         paused = ((crash_pause and pullback_day(d)) or risk_off
                   or basket_out
@@ -3088,17 +3217,19 @@ async def _daily_core_backtest(
 
         # --- Rank-weighted cash deployment (dca="rank") ---
         # Fresh cash goes where the qv-mom ranking says it belongs: each day,
-        # deploy (a slice of) available cash into the top-ranked names with
+        # deploy (a slice of) available cash into the HYSTERESIS picks with
         # target weights ABOVE their current value — i.e. new cash reinforces
         # the strongest core names instead of equal-weight rebalancing into
         # laggards. A held name at/above target gets nothing; a not-yet-held
-        # top name is bought to its target. This is the momentum-preserving
-        # variant of "deploy daily": the monthly sim's edge is concentrating
-        # fresh capital into the top of the ranking — rank deployment does
-        # that every day without the ~2-week cash drag.
-        if dca == "rank" and order and not paused:
+        # pick (a slot that freed) is bought to its target. This is the
+        # momentum-preserving variant of "deploy daily": the monthly sim's
+        # edge is concentrating fresh capital into the top of the ranking —
+        # rank deployment does that every day without the ~2-week cash drag.
+        if dca == "rank" and picks and not paused:
             remaining = min(cash, room)
-            for rank_i, t in enumerate(order[:target_n]):
+            rank_of = {t: i for i, t in enumerate(order)}
+            for t in picks:
+                rank_i = rank_of.get(t, target_n - 1)
                 if remaining < 1:
                     break
                 p = px_of(t, d)
@@ -3112,6 +3243,25 @@ async def _daily_core_backtest(
                 cur = shares.get(t, 0.0) * p
                 gap = tgt - cur
                 if gap > 1:
+                    if t not in shares and len(shares) >= target_n:
+                        continue  # no free slot: a failed release occupies it
+                    # NEW names respect the entry gate too (it used to be
+                    # inert under rank deploy — the gate knob silently did
+                    # nothing in rank-mode sweeps). A gated fill waits in
+                    # pending_pick for the daily re-check below; held-name
+                    # top-ups are never gated.
+                    if t not in shares and entry_gate != "none":
+                        s = px_of_col(sma50_frame, d, t)
+                        if entry_gate == "above-sma50":
+                            ok = s is not None and p > s
+                        elif entry_gate == "not-crash":
+                            r5 = px_of_col(run5_frame, d, t)
+                            ok = r5 is None or r5 > -0.10
+                        else:
+                            ok = True
+                        if not ok:
+                            pending_pick[t] = d
+                            continue
                     spend = min(gap, remaining)
                     trade(d, t, "BUY", spend)
                     remaining -= spend
@@ -3127,6 +3277,8 @@ async def _daily_core_backtest(
         # happened in the SELL phase). This makes all-defaults ≈ baseline.
         if dca == "monthly" and d in months and order and not paused:
             for t in picks:
+                if t not in shares and len(shares) >= target_n:
+                    continue  # no free slot: a failed release occupies it
                 p = px_of(t, d)
                 if p is None:
                     continue
@@ -3141,10 +3293,13 @@ async def _daily_core_backtest(
         # and month-end days already allocated). NOT pro-rata: the fresh
         # cash goes to the single most underweight holding — equal-weight
         # rebalancing into laggards dilutes momentum and was measured worse
-        # than the monthly baseline on 2020-2026.
-        if dca == "daily" and order and not paused and d not in months:
+        # than the monthly baseline on 2020-2026. Candidates are the
+        # hysteresis picks (held names the band retained): an out-of-band
+        # release waiting for the month-end is not topped up, and no new
+        # name is opened here.
+        if dca == "daily" and picks and not paused and d not in months:
             worst_t, worst_gap = None, 0.0
-            for t in order:
+            for t in picks:
                 if t not in shares:
                     continue
                 p = px_of(t, d)
@@ -3161,6 +3316,8 @@ async def _daily_core_backtest(
             for t in picks:
                 if t in shares or paused:
                     continue
+                if len(shares) >= target_n:
+                    continue  # no free slot: a failed release occupies it
                 p = px_of(t, d)
                 if p is None:
                     continue
@@ -3178,14 +3335,23 @@ async def _daily_core_backtest(
                 budget = min(weight_of(t, weight, frame), cash, room)
                 if budget > 1:
                     trade(d, t, "BUY", budget)
+                    pending_pick.pop(t, None)
                     room -= budget
         elif entry_gate != "none" and order:
-            # daily re-check of gated entries once the gate opens
+            # daily re-check of gated entries once the gate opens. The fill
+            # must be in the day's hysteresis-selected deployment targets
+            # (``picks`` — capacity-aware by construction: a refill only
+            # happens while the book is below target) and the book must
+            # actually be below capacity: buying a pending name outside the
+            # selected set, or while a failed release still occupies the
+            # slot, grew the book past the ten-slot target.
             for t in list(pending_pick):
                 if t in shares or paused:
                     continue
-                if t not in order:
+                if t not in band:
                     pending_pick.pop(t, None)
+                    continue
+                if t not in picks or len(shares) >= target_n:
                     continue
                 p = px_of(t, d)
                 if p is None:
@@ -3312,9 +3478,11 @@ async def _daily_core_backtest(
         mu = float(np.mean(port_rets))
         sd = float(np.std(port_rets))
         ann_sharpe = (mu / sd) * np.sqrt(252.0) if sd > 0 else 0.0
-    # Max drawdown on the CONTRIBUTED-NORMALIZED curve (equity / invested so
-    # far) — the same convention as the live UI and _max_drawdown's DCA mode.
-    # Raw-equity DD understates a DCA portfolio's real peak-to-trough loss.
+    # Max drawdown on the contribution-adjusted unitized NAV
+    # (performance.max_drawdown's cash-flow-neutral definition, shared with
+    # the live UI): a deposit that leaves the portfolio value unchanged is
+    # not a loss. Raw-equity DD reads deposits as gains and quietly
+    # understates the real peak-to-trough loss of a DCA portfolio.
     mdd = _max_drawdown(port_eq, port_invested) / 100.0
     print(f"\n=== Daily-core backtest [{universe}] {days_all[0].date()}..{last_day.date()} ===")
     print(f"  config: {cfg}")
@@ -3334,7 +3502,9 @@ async def _daily_core_backtest(
     # --- Monthly baseline over the same window (for comparison) ---
     # Skippable: the sweep computes the (config-independent) baseline once
     # per window instead of once per config.
-    if with_baseline:
+    if with_baseline and months:
+        # A short no-rebalance window has no monthly-baseline counterpart
+        # (the baseline needs its own completed month-ends).
         print("\n--- Monthly qv-mom baseline over the same window ---")
         await _monthly_backtest(
             start or (days_all[0].strftime("%Y-%m-%d")),
@@ -3671,15 +3841,13 @@ _SWEEP_WINDOWS = [("2017-01-01", "2019-12-31"), ("2020-01-01", "2021-12-31"),
 
 
 def _sweep_months(idx, start: str) -> list[pd.Timestamp]:
-    """Last trading day of each month at/after `start`."""
-    idx = pd.DatetimeIndex(idx)
-    idx = idx[idx >= pd.Timestamp(start)]
-    months: list[pd.Timestamp] = []
-    for ym in sorted({(d.year, d.month) for d in idx}):
-        sub = idx[(idx.year == ym[0]) & (idx.month == ym[1])]
-        if len(sub):
-            months.append(sub[-1])
-    return months
+    """Completed calendar month-ends at/after `start` (the shared
+    ``monthly.completed_month_ends`` rule — the sweep's frame-cache keys
+    must match what the backtests look up, otherwise a caller-provided
+    cache misses the month-end keys: silent ranking misses, or a data hole
+    at the true month-end leaving a stale last-stored-candle key)."""
+    from . import monthly as monthly_mod
+    return monthly_mod.completed_month_ends(idx, pd.Timestamp(start), None)
 
 
 async def _sweep_load_market(universe: str):

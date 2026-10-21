@@ -179,7 +179,54 @@ def test_eligible_frame_filters_and_factors():
     assert (frame["dollar_vol"] > settings.sim_monthly_min_dollar_vol).all()
 
 
-def test_eligible_frame_requires_history():
+def test_eligible_frame_missing_capex_is_missing_fcf():
+    """Capex missing -> FCF missing: OCF alone is never substituted as FCF.
+
+    The old fallback assumed capex == 0, which OVERSTATES FCF for every
+    non-repiler (capex is a real cash outflow) and inflated the 1/P-FCF
+    value factor (audit P0-A)."""
+    close = _make_close()
+    vol = _make_vol(close)
+    fund = _fund_all_positive(close.columns)
+    # drop capex everywhere
+    for rec in fund.values():
+        rec.pop("PaymentsToAcquirePropertyPlantAndEquipment", None)
+    d = pd.Timestamp(close.index[-1])
+    frame = monthly.eligible_frame(d, close, vol, fund)
+    assert frame is not None
+    assert frame["eligible"].all()          # missing p_fcf is not a filter
+    assert frame["p_fcf"].isna().all()      # FCF missing, NOT ocf-as-FCF
+
+
+def test_eligible_frame_missing_ocf_is_missing_fcf():
+    close = _make_close()
+    vol = _make_vol(close)
+    fund = _fund_all_positive(close.columns)
+    for rec in fund.values():
+        rec.pop("NetCashProvidedByUsedInOperatingActivities", None)
+    d = pd.Timestamp(close.index[-1])
+    frame = monthly.eligible_frame(d, close, vol, fund)
+    assert frame is not None
+    assert frame["eligible"].all()
+    assert frame["p_fcf"].isna().all()
+
+
+def test_quality_snapshot_missing_capex_is_missing_fcf():
+    """quality_snapshot mirrors eligible_frame's FCF contract, and the
+    negative-capex arithmetic is unchanged: FCF = OCF + capex with capex
+    canonical (a negative outflow)."""
+    fund = _fund_all_positive(["AAA"])
+    asof = pd.Timestamp("2025-06-30")
+    # missing capex -> missing P/FCF
+    no_capex = {"AAA": {k: v for k, v in fund["AAA"].items()
+                        if k != "PaymentsToAcquirePropertyPlantAndEquipment"}}
+    snap = monthly.quality_snapshot(no_capex, "AAA", asof, close=100.0)
+    assert snap is not None
+    assert snap["roe"] == pytest.approx(0.1)
+    assert snap["p_fcf"] is None
+    # capex PRESENT and negative: P/FCF = 100 * 1e8 / (1e9 + (-2e8)) = 12.5
+    snap_ok = monthly.quality_snapshot(fund, "AAA", asof, close=100.0)
+    assert snap_ok["p_fcf"] == pytest.approx(12.5)
     close = _make_close(n_days=100)
     vol = _make_vol(close)
     fund = _fund_all_positive(close.columns)
@@ -230,6 +277,119 @@ def test_band_fill_hysteresis():
     assert "T25" not in picked2 and len(picked2) == 10
     # no holdings: pure top-10
     assert monthly._band_fill(order, [], 10, 20) == order[:10]
+
+
+class TestDeployTargets:
+    """The shared deployment-target contract (audit P0-D): the hysteresis
+    picks in RANKING order — never band[:target_n], never alphabetical."""
+
+    # deliberately NON-alphabetical ranking: Z01 is the best name, Z25 the
+    # worst in the band
+    ORDER = ["Z01", "M02", "C03", "P04", "B05", "A06", "Z07", "Q08", "K09",
+             "J10", "I11", "H12", "G13", "F14", "E15", "D16", "C17", "B18",
+             "A19", "Z20"]
+
+    def test_rank_order_not_alphabetical(self):
+        # 3 held names deep in the band: membership preserved, order is the
+        # ranking's (deployment funds best rank first with limited cash)
+        held = ["C17", "Z01", "H12"]
+        got = monthly._deploy_targets(self.ORDER, held, 10, 20, refill=False)
+        assert got == ["Z01", "H12", "C17"]  # rank order, NOT sorted(held)
+
+    def test_refill_true_is_band_fill_membership_in_rank_order(self):
+        held = ["C17", "H12"]
+        got = monthly._deploy_targets(self.ORDER, held, 10, 20, refill=True)
+        filled = monthly._band_fill(self.ORDER, held, 10, 20)
+        assert set(got) == set(filled) and len(got) == 10
+        assert got == [t for t in self.ORDER if t in set(got)]  # rank order
+        # hysteresis: the held band names keep their slots over raw top-10
+        assert "H12" in got and "C17" in got and "J10" not in got
+
+    def test_refill_false_keeps_held_no_fills(self):
+        # 10 held in-band + refill=False: exactly those held names, NO new
+        # name (the deferred-release replay cannot open a transient 11th)
+        held = ["Z01", "M02", "C03", "P04", "B05", "A06", "Z07", "Q08",
+                "K09", "J10"]
+        got = monthly._deploy_targets(self.ORDER, held, 10, 20, refill=False)
+        assert got == held
+
+    def test_preexisting_overflow_capped_no_fills(self):
+        # 11 held in-band: deterministic retention — top-10 by rank keep
+        # their slots, the excess is dropped from picks (no sell here, no
+        # new name until a slot frees)
+        held = ["Z01", "M02", "C03", "P04", "B05", "A06", "Z07", "Q08",
+                "K09", "J10", "I11"]
+        got = monthly._deploy_targets(self.ORDER, held, 10, 20, refill=True)
+        assert got == held[:10] and "I11" not in got
+
+    def test_out_of_band_pending_release_not_in_picks(self):
+        # 10 held, one of them outside a 15-name band (Z20 at rank 19): the
+        # pending release is not a deployment candidate between rebuilds
+        held = ["Z01", "M02", "C03", "P04", "B05", "A06", "Z07", "Q08",
+                "K09", "Z20"]
+        got = monthly._deploy_targets(self.ORDER, held, 10, 15, refill=False)
+        assert "Z20" not in got and len(got) == 9
+        got2 = monthly._deploy_targets(self.ORDER, held, 10, 15, refill=True)
+        assert "Z20" not in got2 and len(got2) == 10  # released + refilled
+
+    def test_pending_release_plan_keeps_replacements_queued(self):
+        # Review round 3, exact repro: 9 held (8 in-band + 1 out-of-band
+        # pending release), target 10 — the PLAN still queues 2 replacements
+        # (the release frees the slot), NOT 1. This is PLANNING semantics:
+        # the live engine calls _deploy_targets BEFORE its SELL pass so
+        # replacements are never deferred to the next day; the EXECUTORS
+        # (live BUY loop, backfill do_buy, replay trade()/BUY blocks) each
+        # enforce the ACTUAL post-SELL capacity with `len(shares) <
+        # target_n` — capping the plan here instead would defer every
+        # replacement after a successful release.
+        held = ["Z01", "M02", "C03", "P04", "B05", "A06", "Z07", "Q08",
+                "OLD_PENDING"]  # OLD_PENDING is stale/out-of-band, still held
+        got = monthly._deploy_targets(self.ORDER, held, 10, 20, refill=True)
+        assert len(got) == 10  # full post-release membership
+        assert "K09" in got and "J10" in got  # both replacement fills queued
+        assert "OLD_PENDING" not in got  # a pending release is never a pick
+
+
+class TestCompletedMonthEnds:
+    """The shared calendar rule: a month-end is the scheduler's last US
+    trading day of the month, counted only when its candle is stored."""
+
+    def test_good_friday_month_end_walks_back(self):
+        # March 2024: last weekday is Good Friday 2024-03-29 (NYSE closed)
+        # -> the scheduled month-end is 2024-03-28; it must be found WITHOUT
+        # any April candle existing (no future-candle completion test).
+        idx = pd.bdate_range("2024-03-01", "2024-03-28")
+        assert monthly.completed_month_ends(idx, idx[0], idx[-1]) == \
+            [pd.Timestamp("2024-03-28")]
+
+    def test_truncation_at_month_end_still_counts(self):
+        # A frame truncated EXACTLY at the scheduled month-end keeps its
+        # month-end (the old later-candle rule lost it) — future-data
+        # invariance at the endpoint.
+        idx = pd.bdate_range("2024-01-02", "2024-01-31")
+        assert monthly.completed_month_ends(idx, idx[0], idx[-1]) == \
+            [pd.Timestamp("2024-01-31")]
+
+    def test_last_mid_month_candle_is_not_a_month_end(self):
+        # Data ends 2026-01-15: no fabricated month-end from the last bar.
+        idx = pd.bdate_range("2026-01-02", "2026-01-15")
+        assert monthly.completed_month_ends(idx, idx[0], idx[-1]) == []
+
+    def test_window_bounds_and_dedup(self):
+        idx = pd.bdate_range("2025-11-03", "2026-01-15")
+        got = monthly.completed_month_ends(idx, pd.Timestamp("2025-11-15"),
+                                           pd.Timestamp("2025-12-31"))
+        assert got == [pd.Timestamp("2025-11-28"), pd.Timestamp("2025-12-31")]
+
+    def test_month_end_candle_hole_not_papered_over(self):
+        # The scheduled month-end's candle is missing (hole) while later
+        # candles exist: no month-end — never the last mid-month bar.
+        idx = pd.bdate_range("2025-01-02", "2025-02-10")
+        hole = pd.Timestamp("2025-01-31")
+        assert hole in idx
+        idx2 = idx.delete(idx.get_loc(hole))
+        got = monthly.completed_month_ends(idx2, idx2[0], idx2[-1])
+        assert pd.Timestamp("2025-01-31") not in got
 
 
 def test_pick_portfolio_end_to_end():
@@ -984,7 +1144,10 @@ def test_qv_order_lowvol_tilt():
 def fake_market(monkeypatch):
     """Patch monthly's market/fundamentals loaders so backfill replays a tiny
     deterministic two-ticker market (no network, no real DB rows)."""
-    dates = pd.bdate_range("2026-07-01", "2026-08-28")
+    # Two COMPLETE months: 2026-08-31 is the real US session month-end, so
+    # the replay rebalances on scheduled month-ends — a frame ending inside
+    # a running month has none (see monthly.completed_month_ends).
+    dates = pd.bdate_range("2026-07-01", "2026-08-31")
     close = pd.DataFrame({"AAA": 100.0, "BBB": 50.0}, index=dates)
     vol = pd.DataFrame(1e6, index=dates, columns=["AAA", "BBB"])
 
@@ -1031,7 +1194,7 @@ class TestBackfill:
                 assert len(snaps) == r["snapshots"] > 0
                 # one snapshot per trading day, dated by the replay day
                 days = sorted(x.created_at.strftime("%Y-%m-%d") for x in snaps)
-                assert days[0] == "2026-07-01" and days[-1] == "2026-08-28"
+                assert days[0] == "2026-07-01" and days[-1] == "2026-08-31"
                 # allowance rows: exactly the deposited months
                 months = sorted(x.month for x in (await s.scalars(select(Al))).all())
                 assert months == ["2026-07", "2026-08"]
@@ -1130,6 +1293,108 @@ class TestBackfill:
                 pos = (await s.scalars(select(Pos))).all()
                 value = acc.cash + sum(p.shares * p.avg_cost for p in pos)
                 assert value == pytest.approx(r["contributed"], abs=1e-6)
+        asyncio.run(check())
+
+    def test_partial_month_is_walked_but_never_rebalanced(self, mem_db, fake_market,
+                                                          monkeypatch):
+        """A window ending INSIDE a running month (e.g. Oct-21's partial
+        candle vs the actual Oct-30 month-end) is walked — funded and
+        snapshotted — but NEVER rebalanced: no partial month-end is treated
+        as a completed month-end (persisted-backfill boundary fix)."""
+        from app.db import MonthlyRebalance as Rb
+        from app.db import MonthlySnapshot as Sn
+
+        # truncate the market to a mid-August last candle
+        truncated = fake_market["close"].loc[:"2026-08-21"]
+
+        async def fake_load_frames(_tickers, _asof, start=None):
+            return truncated, pd.DataFrame(1e6, index=truncated.index,
+                                           columns=["AAA", "BBB"])
+
+        monkeypatch.setattr(monthly, "load_frames", fake_load_frames)
+        monkeypatch.setattr(monthly, "_current_month", lambda: "2026-08")
+
+        r = asyncio.run(monthly.backfill(start="2026-07-01"))
+        assert r["ok"] is True
+        # Jul + Aug funded (the partial month still receives the deposit)
+        assert r["contributed"] == pytest.approx(2 * settings.sim_monthly_contribution)
+
+        async def check():
+            async with mem_db() as s:
+                rbs = (await s.scalars(select(Rb))).all()
+                assert sorted(x.rebal_month for x in rbs) == ["2026-07"]
+                snaps = (await s.scalars(select(Sn))).all()
+                last = max(x.created_at for x in snaps)
+                assert last.strftime("%Y-%m-%d") == "2026-08-21"
+        asyncio.run(check())
+
+    def test_interior_month_end_hole_funds_months_in_order(
+            self, mem_db, monkeypatch):
+        """A month whose true calendar-end candle is MISSING (February 2026:
+        its scheduled month-end Feb-27 was never stored) is still funded and
+        marked in order. The replay walks ONE chronological daily loop, so
+        February's snapshots must NOT carry March's deposit — the old
+        book-all-deposits-then-snapshot ordering applied FUTURE money to
+        earlier months' marks whenever one span covered several calendar
+        months. February is not fabricated into a rebalance either."""
+        from app.db import MonthlyAllowance as Al
+        from app.db import MonthlyRebalance as Rb
+        from app.db import MonthlySnapshot as Sn
+
+        dates = pd.bdate_range("2026-01-02", "2026-03-31")
+        hole = pd.Timestamp("2026-02-27")  # February's scheduled month-end
+        assert hole in dates
+        dates = dates.delete(dates.get_loc(hole))
+        close = pd.DataFrame({"AAA": 100.0, "BBB": 50.0}, index=dates)
+        vol = pd.DataFrame(1e6, index=dates, columns=["AAA", "BBB"])
+
+        def fake_frame(m, c, v, f):
+            return pd.DataFrame({
+                "roe": [0.1, 0.2], "p_fcf": [20.0, 15.0], "mcap": [1e10, 1e10],
+                "dollar_vol": [5e7, 5e7], "mom": [0.1, 0.2],
+                "price": [100.0, 50.0], "vol": [0.2, 0.25],
+                "eligible": [True, True],
+            }, index=pd.Index(["AAA", "BBB"], name="ticker"))
+
+        async def fake_load_frames(_tickers, _asof, start=None):
+            return close, vol
+
+        async def fake_load_fundamentals(_tickers):
+            return {"AAA": {"x": []}, "BBB": {"x": []}}
+
+        monkeypatch.setattr(monthly, "universe_tickers", lambda _u: ["AAA", "BBB"])
+        monkeypatch.setattr(monthly.fundamentals_mod, "load_fundamentals",
+                            fake_load_fundamentals)
+        monkeypatch.setattr(monthly, "load_frames", fake_load_frames)
+        monkeypatch.setattr(monthly, "eligible_frame", fake_frame)
+        monkeypatch.setattr(monthly, "_current_month", lambda: "2026-03")
+
+        r = asyncio.run(monthly.backfill(start="2026-01-02"))
+        assert r["ok"] is True
+        # Jan + Feb + Mar all funded despite February's missing month-end
+        assert r["contributed"] == \
+            pytest.approx(3 * settings.sim_monthly_contribution)
+
+        async def check():
+            async with mem_db() as s:
+                al = sorted(x.month for x in (await s.scalars(select(Al))).all())
+                assert al == ["2026-01", "2026-02", "2026-03"]
+                rbs = sorted(x.rebal_month
+                             for x in (await s.scalars(select(Rb))).all())
+                # only months with a STORED month-end rebalance — no
+                # fabricated February rebuild
+                assert rbs == ["2026-01", "2026-03"]
+                snaps = (await s.scalars(
+                    select(Sn).order_by(Sn.created_at))).all()
+                by_day = {x.created_at.strftime("%Y-%m-%d"): x.allowance_total
+                          for x in snaps}
+                # February's marks exclude March's money (March's deposit
+                # lands on Mar-2, never inside February). Feb-27 itself has
+                # no snapshot — its candle is the hole.
+                assert by_day["2026-02-02"] == pytest.approx(2000.0)
+                assert by_day["2026-02-26"] == pytest.approx(2000.0)
+                assert "2026-02-27" not in by_day
+                assert by_day["2026-03-02"] == pytest.approx(3000.0)
         asyncio.run(check())
 
 

@@ -1494,7 +1494,7 @@
                 <span style="color:#7aaa81;font-size:12px">● Contributed</span>
                 <span style="flex:1"></span>
                 <button id="sim-cmp-pct" class="range-btn range-active" onclick="setSimCompareMode('pct')"
-                    title="Each curve as % of its contributed allowance — fair growth comparison">% View</button>
+                    title="Each curve as % of its own contributed total — gain on contributions, NOT a time-weighted (TWR) return">% View</button>
                 <button id="sim-cmp-usd" class="range-btn" onclick="setSimCompareMode('usd')" title="Absolute dollars">$
                     View</button>
                 <span id="s-range-bar" style="display:inline-flex;gap:4px;margin-left:10px">
@@ -1579,7 +1579,7 @@
                 <span style="color:#ff9f43;font-size:12px">● DCA benchmark</span>
                 <span style="flex:1"></span>
                 <button id="cmp-pct" class="range-btn range-active" onclick="setCompareMode('pct')"
-                    title="Each curve as % of its contributed total — fair comparison even when contributed differs">%
+                    title="Each curve as % of its own contributed total — gain on contributions, NOT a time-weighted (TWR) return; the contributed totals differ">%
                     View</button>
                 <button id="cmp-usd" class="range-btn" onclick="setCompareMode('usd')" title="Absolute dollars">$
                     View</button>
@@ -1650,7 +1650,7 @@
                 <span style="color:#ff9f43;font-size:12px">● DCA benchmark</span>
                 <span style="flex:1"></span>
                 <button id="dc-cmp-pct" class="range-btn range-active" onclick="setDCCompareMode('pct')"
-                    title="Each curve as % of its contributed total — fair comparison even when contributed differs">%
+                    title="Each curve as % of its own contributed total — gain on contributions, NOT a time-weighted (TWR) return; the contributed totals differ">%
                     View</button>
                 <button id="dc-cmp-usd" class="range-btn" onclick="setDCCompareMode('usd')" title="Absolute dollars">$
                     View</button>
@@ -1860,7 +1860,7 @@
             'macd_hist': 'MACD minus its signal line — the histogram bars. A rising histogram means momentum is building; a shrinking one means the move is fading, even without any crossover.',
             'atr14': 'Average True Range (14 periods). Measures market volatility — higher values mean more price movement and risk.',
             'adx': 'Average Directional Index (14) — measures trend strength regardless of direction. Above ~25 = a strong, tradable trend; low values = choppy/range-bound. The engine cuts the trend score\'s weight when ADX is low so a choppy-but-rising market isn\'t scored like a clean trend.',
-            'atr_stop': 'Suggested stop-loss price = close minus 2× ATR. A wider ATR means a looser stop to avoid noise whipsaws.',
+            'atr_stop': 'Exit reference = highest close of the previous 20 completed bars minus 2× the ATR of the previous bar. Prior-known (no same-bar data) and recomputed every bar, so it can move down as well as up — an indicator candidate, not a position ratchet and not frozen at entry. A wider ATR means a looser level.',
             'atr_pct': 'ATR as a percentage of the closing price — a normalised volatility measure for cross-asset comparison.',
             'vol_surge': 'True when the latest bar volume exceeds 1.25× the 20-day average. Confirms conviction behind a move; a bonus to the signal score, not a requirement.',
             'weekly_trend_up': 'Multi-timeframe filter — true when the weekly close sits above the weekly SMA-50. When false, BUY signals are suppressed (no buying into bear-market rallies); SELLs are never gated by it.',
@@ -3068,17 +3068,83 @@
         }
 
         // ===================== Shared portfolio risk metrics =====================
-        // Max drawdown on the contributed-normalized curve (each point =
-        // equity/contributed): the honest "worst peak-to-trough" for a
-        // DCA-funded portfolio — raw USD drawdown misleads because the
-        // denominator steps up every month.
+        // Cash-flow-neutral (time-weighted) max drawdown.
+        //
+        // The old version divided the equity by the CUMULATIVE contributed
+        // total and took the drawdown of THAT ratio. That is not a drawdown
+        // of the portfolio: the denominator steps up on every deposit, so it
+        // mostly measures the deposit schedule. Reproduction from the audit:
+        // invest 1000, grow to 1200, deposit 1000 with no price move -> the
+        // ratio falls 1.20 -> 1.10 and the app reported an 8.3% drawdown
+        // although nothing was lost.
+        //
+        // Correct convention (Portfolio Performance / TWR): external money
+        // is not a return, so chain the cash-flow-adjusted daily returns
+        // into a unitized NAV and measure the peak-to-trough on the NAV:
+        //
+        //   flow_t = contributed_t - contributed_{t-1}   external net flow
+        //   base_t = value_{t-1} + flow_t                beginning-of-day value
+        //   nav_t  = nav_{t-1} * value_t / base_t
+        //
+        // `contributed` is the CUMULATIVE contributed total (same shape as
+        // the backend's `invested` curve); the first funded point starts the
+        // NAV at 1. Deposits/withdrawals then leave the NAV (and the
+        // drawdown) untouched. Mirrors app/performance.py — keep both in
+        // sync, the parity test checks them against each other.
         function mddOf(points) {
-            let peak = -Infinity, mdd = 0;
+            // Coercion policy — identical to app/performance.py::_floats:
+            // null / undefined / non-numeric / NaN / Infinity are INVALID
+            // observations. They are skipped (the NAV is carried forward and
+            // the last valid baseline is kept) so a data glitch can never
+            // look like a loss. Note that Number(null) === 0 and
+            // Number(NaN) || 0 === 0 would turn bad data into a fake 0-value
+            // point -> a fake 100% drawdown.
+            const num = v => {
+                if (v === null || v === undefined) return NaN;
+                if (typeof v === 'number') return v;
+                if (typeof v === 'boolean') return v ? 1 : 0;
+                if (typeof v === 'string') {
+                    const t = v.trim();
+                    if (t === '') return NaN;
+                    const n = Number(t);
+                    return Number.isFinite(n) ? n : NaN;
+                }
+                return NaN;
+            };
+            let nav = 0, peak = 0, mdd = 0;
+            let prevValue = 0, prevContributed = 0, started = false;
             for (const p of points) {
-                const v = p.contributed > 0 ? p.value / p.contributed : 0;
-                if (v <= 0) continue;
-                peak = Math.max(peak, v);
-                mdd = Math.max(mdd, (peak - v) / peak);
+                const value = num(p.value);
+                const contributed = num(p.contributed);
+                const valid = Number.isFinite(value) && Number.isFinite(contributed);
+                if (!started) {
+                    // Not funded yet (value 0) or invalid — skip the startup;
+                    // the first valid funded point starts the NAV at 1.
+                    if (!valid || !(value > 0)) continue;
+                    started = true;
+                    nav = 1; peak = 1;
+                    prevValue = value; prevContributed = contributed;
+                    continue;
+                }
+                if (!valid) {
+                    // Invalid observation: carry the NAV forward and keep the
+                    // last valid equity/contribution baseline.
+                    continue;
+                }
+                const flow = contributed - prevContributed;   // may be negative
+                const base = prevValue + flow;                // start-of-day value
+                if (base > 0) {
+                    if (nav <= 0 && value > 0) {
+                        nav = 1;   // chain broken by a total loss -> restart
+                    } else {
+                        nav = nav * (value / base);
+                    }
+                    if (nav > peak) peak = nav;
+                    mdd = Math.max(mdd, (peak - nav) / peak);
+                }
+                // base <= 0: no computable return (withdrawal >= the
+                // portfolio value) -> NAV carried forward unchanged.
+                prevValue = value; prevContributed = contributed;
             }
             return mdd * 100;
         }
@@ -3139,10 +3205,13 @@
                 const v = s.valuation || {};
                 const gain = v.allowance_total > 0 ? (v.total_equity / v.allowance_total * 100 - 100) : null;
                 // Risk metrics from the already-fetched curves (no extra
-                // endpoints): max drawdown of the contributed-normalized
-                // curve + live alpha vs the monthly sim and the DCA bench.
-                // The alpha chips compare LIVE valuations on both sides —
-                // snapshot vintages would mix "today" vs "last night".
+                // endpoints): cash-flow-neutral (unitized NAV) max drawdown
+                // + the live difference in gain-on-contributions vs the
+                // monthly sim and the DCA bench. The gain chips are NOT a
+                // risk-adjusted alpha — they compare equity/contributed of
+                // two portfolios, and the chips compare LIVE valuations on
+                // both sides (snapshot vintages would mix "today" vs "last
+                // night").
                 const points = (snaps || []).map(x => ({ value: x.total_equity, contributed: x.allowance_total }));
                 const mdd = points.length ? mddOf(points) : null;
                 const dcGain = gain != null ? gain : null;
@@ -3159,15 +3228,15 @@
                 const m = [
                     ['Total Equity', v.total_equity != null ? '$' + v.total_equity.toFixed(2) : '—'],
                     ['Contributed', v.allowance_total != null ? '$' + v.allowance_total.toFixed(2) : '—'],
-                    ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(1) + '%' : '—'],
-                    ['Max DD', mdd != null ? '-' + mdd.toFixed(1) + '%' : '—'],
-                    ['vs Monthly', alphaM != null ? (alphaM >= 0 ? '+' : '') + alphaM.toFixed(1) + 'pp' : '—'],
-                    ['vs DCA', alphaB != null ? (alphaB >= 0 ? '+' : '') + alphaB.toFixed(1) + 'pp' : '—'],
+                    ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(1) + '%' : '—', '', 'Gain on contributed capital (equity / contributed - 1) - NOT a time-weighted return'],
+                    ['Max DD', mdd != null ? '-' + mdd.toFixed(1) + '%' : '—', '', 'Cash-flow-neutral drawdown of the unitized (time-weighted) NAV - deposits and withdrawals do not count as losses'],
+                    ['vs Monthly', alphaM != null ? (alphaM >= 0 ? '+' : '') + alphaM.toFixed(1) + 'pp' : '—', '', 'Difference in gain-on-contributions vs the monthly sim - NOT a risk-adjusted alpha'],
+                    ['vs DCA', alphaB != null ? (alphaB >= 0 ? '+' : '') + alphaB.toFixed(1) + 'pp' : '—', '', 'Difference in gain-on-contributions vs the DCA benchmark - NOT a risk-adjusted alpha'],
                     ['Cash', v.cash != null ? '$' + v.cash.toFixed(2) : '—'],
                     ['Picks', (s.picks || []).length || '—'],
                     ['Ranking', rankingDate ? (stale ? rankingDate + ' ⚠' : rankingDate) : '—'],
                 ];
-                document.getElementById('dailycore-summary').innerHTML = m.map(([k, x]) => `<span class="metric">${k}<br><b>${x}</b></span>`).join('');
+                document.getElementById('dailycore-summary').innerHTML = m.map(([k, x, cls, tip]) => `<span class="metric${cls ? ' ' + cls : ''}"${tip ? ` title="${tip}"` : ''}>${k}<br><b>${x}</b></span>`).join('');
                 // Strategy dropdown: keep the options static, sync the
                 // selection with the server's effective variant.
                 const sel = document.getElementById('dailycore-variant');
@@ -3272,6 +3341,9 @@
             // total so all lines share the 100 baseline; in USD mode the
             // overlays go on a hidden left scale (contributed totals can
             // differ between portfolios).
+            // NOTE: pct mode is gain-on-contributions (equity / contributed),
+            // NOT a time-weighted return — with different deposit dates it
+            // is not a like-for-like performance comparison.
             const simByDay = new Map();
             for (const s of (simSnaps || [])) {
                 simByDay.set(new Date(s.at).toISOString().slice(0, 10),
@@ -3622,12 +3694,12 @@
                 ['Accrued Interest', fmtEur(status.accrued_interest)],
                 ['Positions', fmtEur(status.positions_value)],
                 ['Contributed', fmtEur(status.contributed)],
-                ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(2) + '%' : '—'],
+                ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(2) + '%' : '—', '', 'Gain on contributed capital (equity / contributed - 1) - NOT a time-weighted return'],
                 ['Rate', status.interest_rate.toFixed(2) + '% p.a.'],
                 ['Transfer', fmtEur(status.monthly_transfer, 0) + '/mo'],
             ];
             document.getElementById('savings-summary').innerHTML =
-                m.map(([k, x]) => `<span class="metric">${k}<br><b>${x}</b></span>`).join('');
+                m.map(([k, x, cls, tip]) => `<span class="metric${cls ? ' ' + cls : ''}"${tip ? ` title="${tip}"` : ''}>${k}<br><b>${x}</b></span>`).join('');
         }
 
         function renderSavingsPositions(status) {
@@ -3960,6 +4032,9 @@
         // $1000/month but at different times (sim at month start, monthly
         // historically at month end) — absolute dollars would compare apples
         // to oranges.
+        // NOTE: pct mode is gain-on-contributions (equity / contributed), NOT
+        // a time-weighted return — it stays a rough visual comparison while
+        // the deposit dates differ.
         let compareMode = 'pct';
         let monthlyRange = '1Y';
         let monthlyChartReq = 0;
@@ -3981,13 +4056,13 @@
                 const m = [
                     ['Total Equity', s.total_equity != null ? '$' + s.total_equity.toFixed(2) : '—'],
                     ['Contributed', s.allowance_total != null ? '$' + s.allowance_total.toFixed(2) : '—'],
-                    ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(1) + '%' : '—'],
-                    ['Max DD', mdd != null ? '-' + mdd.toFixed(1) + '%' : '—'],
+                    ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(1) + '%' : '—', '', 'Gain on contributed capital (equity / contributed - 1) - NOT a time-weighted return'],
+                    ['Max DD', mdd != null ? '-' + mdd.toFixed(1) + '%' : '—', '', 'Cash-flow-neutral drawdown of the unitized (time-weighted) NAV - deposits and withdrawals do not count as losses'],
                     ['Cash', s.cash != null ? '$' + s.cash.toFixed(2) : '—'],
                     ['Universe', s.sim_monthly_universe || '—'],
                     ['Next Rebalance', s.next_rebalance || '—'],
                 ];
-                document.getElementById('monthly-summary').innerHTML = m.map(([k, v]) => `<span class="metric">${k}<br><b>${v}</b></span>`).join('');
+                document.getElementById('monthly-summary').innerHTML = m.map(([k, v, cls, tip]) => `<span class="metric${cls ? ' ' + cls : ''}"${tip ? ` title="${tip}"` : ''}>${k}<br><b>${v}</b></span>`).join('');
                 const pos = s.positions || [];
                 document.getElementById('monthly-positions').innerHTML = pos.length ? `<table><tr><th>Ticker</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>P&L%</th></tr>${pos.map(p => {
                     const pnl = p.pnl_pct;
@@ -4039,6 +4114,8 @@
             // drift), so each sim point is normalized by ITS OWN
             // contributed value in pct mode. Live-today appended so overlays
             // agree across tabs.
+            // NOTE: pct mode is gain-on-contributions (equity / contributed),
+            // NOT a time-weighted return.
             const byDay = new Map();  // collapse intraday snapshots -> last per day
             for (const s of (simSnaps || [])) {
                 byDay.set(new Date(s.at).toISOString().slice(0, 10),
@@ -4185,11 +4262,12 @@
                     api('sim/status'), api('sim/benchmark').catch(() => null),
                     api('sim/equity?limit=12000').catch(() => null)]);
                 const benchEquity = bench && bench.total_equity != null ? '$' + bench.total_equity.toFixed(2) : '—';
-                // Normalized gain + max drawdown; alpha vs the DCA bench is
-                // the number that matters for this engine's churn-prone sim.
-                // Both gains compare LIVE valuations (bench contributed total
-                // is acc.cash — total deposited) so the chip matches the
-                // Daily-Core tab's live-vs-live convention.
+                // Gain-on-contributions + cash-flow-neutral max drawdown; the
+                // DCA chip is the difference in gain-on-contributions (not a
+                // risk-adjusted alpha). Both gains compare LIVE valuations
+                // (bench contributed total is acc.cash — total deposited) so
+                // the chip matches the Daily-Core tab's live-vs-live
+                // convention.
                 const points = (snaps || []).map(x => ({ value: x.total_equity, contributed: x.allowance_total }));
                 const mdd = points.length ? mddOf(points) : null;
                 const gain = (s.allowance_total > 0) ? (s.total_equity / s.allowance_total * 100 - 100) : null;
@@ -4199,15 +4277,15 @@
                 const m = [
                     ['Total Equity', s.total_equity != null ? '$' + s.total_equity.toFixed(2) : '—'],
                     ['Bench Equity', benchEquity, 'bench-metric'],
-                    ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(1) + '%' : '—'],
-                    ['Max DD', mdd != null ? '-' + mdd.toFixed(1) + '%' : '—'],
-                    ['vs DCA', alpha != null ? (alpha >= 0 ? '+' : '') + alpha.toFixed(1) + 'pp' : '—'],
+                    ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(1) + '%' : '—', '', 'Gain on contributed capital (equity / contributed - 1) - NOT a time-weighted return'],
+                    ['Max DD', mdd != null ? '-' + mdd.toFixed(1) + '%' : '—', '', 'Cash-flow-neutral drawdown of the unitized (time-weighted) NAV - deposits and withdrawals do not count as losses'],
+                    ['vs DCA', alpha != null ? (alpha >= 0 ? '+' : '') + alpha.toFixed(1) + 'pp' : '—', '', 'Difference in gain-on-contributions vs the DCA benchmark - NOT a risk-adjusted alpha'],
                     ['Cash', s.cash != null ? '$' + s.cash.toFixed(2) : '—'],
                     ['Positions Value', s.positions_value != null ? '$' + s.positions_value.toFixed(2) : '—'],
                     ['Strategy', s.sim_strategy || '—'],
                     ['Universe', s.sim_universe || '—'],
                 ];
-                document.getElementById('sim-summary').innerHTML = m.map(([k, v, cls]) => `<span class="metric${cls ? ' ' + cls : ''}">${k}<br><b>${v}</b></span>`).join('');
+                document.getElementById('sim-summary').innerHTML = m.map(([k, v, cls, tip]) => `<span class="metric${cls ? ' ' + cls : ''}"${tip ? ` title="${tip}"` : ''}>${k}<br><b>${v}</b></span>`).join('');
                 const pos = s.positions || [];
                 document.getElementById('sim-positions').innerHTML = pos.length ? `<table><tr><th>Ticker</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>P&L%</th></tr>${pos.map(p => {
                     const pnl = p.pnl_pct;
@@ -4298,6 +4376,9 @@
         // is plotted as % of its own contributed allowance total — the sim
         // and benchmark can receive deposits at different times, so absolute
         // dollars would compare apples to oranges.
+        // NOTE: pct mode is gain-on-contributions (equity / contributed), NOT
+        // a time-weighted return — it stays a rough visual comparison while
+        // the deposit dates differ.
         let simCompareMode = 'pct';
         let simRange = '1Y';
         let simChartReq = 0;

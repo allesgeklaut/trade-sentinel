@@ -16,6 +16,22 @@ SEC fair-access: max ~10 req/s — we fetch companyfacts once per ticker at
 The CIK map on www.sec.gov blocks User-Agents without a contact email, so set
 `SEC_CONTACT_EMAIL` to refresh it; without one the cached map is reused and
 unknown tickers fall back to yfinance (see `ensure_cik_map`).
+
+Capex sign: ``us-gaap:PaymentsToAcquirePropertyPlantAndEquipment`` reports the
+expenditure as a POSITIVE number (Apple FY2025: +12,715,000,000), while the
+strategy math expects a negative cash outflow (FCF = OCF + capex). The parsed
+records are therefore normalized to the canonical sign — see
+``fundamentals.canonical_capex`` for the single definition of that contract.
+Stored capex rows are canonical from now on; rows written before this change
+still hold the raw positive number and are corrected when they are read
+(``fundamentals._load_fundamentals_rows``), so no data migration is needed and
+no value is ever inverted twice.
+
+Non-finite facts (NaN, +/-inf) are dropped individually, before the DB write:
+SQLite would store a NaN as NULL, breaking the NOT NULL constraint on
+``fundamentals.val`` and rolling back the whole ticker's insert batch. A bad
+fact is skipped on its own — it is never coerced to 0 and never takes the
+ticker's other, valid facts down with it.
 """
 import asyncio
 import json
@@ -30,6 +46,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from .config import settings
 from .db import Fundamental, SecCik, Session
+from .fundamentals import CAPEX_TAG, canonical_capex, finite_float
 from .screener import tickers as universe_tickers
 
 logger = logging.getLogger("trade_sentinel.edgar")
@@ -171,7 +188,13 @@ async def ensure_cik_map(tickers: list[str], force: bool = False) -> dict[str, i
 
 def _parse_companyfacts(facts: dict) -> dict[str, list[dict]]:
     """Extract the needed XBRL tags from a companyfacts payload as
-    {tag: [{start,end,filed,val}, ...]} with fallback-tag gap filling."""
+    {tag: [{start,end,filed,val}, ...]} with fallback-tag gap filling.
+
+    Capex is returned in the canonical sign (a negative cash outflow): SEC
+    reports ``PaymentsToAcquirePropertyPlantAndEquipment`` as a positive
+    expenditure, so the parsed value is flipped once, here, at the source.
+    The flip only touches positive values, so re-parsing an already-canonical
+    record is a no-op."""
     rec: dict[str, list[dict]] = {}
     gaap = facts.get("facts", {}).get("us-gaap", {})
     dei = facts.get("facts", {}).get("dei", {})
@@ -203,6 +226,23 @@ def _parse_companyfacts(facts: dict) -> dict[str, list[dict]]:
                     keys.add((e["end"], e.get("start")))
         if primary:
             rec[tag] = sorted(primary, key=lambda e: (e["end"], e["filed"]))
+
+    # canonical capex sign: SEC reports the expenditure positive, the strategy
+    # math expects a negative cash outflow (FCF = OCF + capex). A non-finite
+    # capex fact is dropped here, on its own: it must not reach the DB (a NaN
+    # would be stored as NULL and roll back the whole ticker's batch) and it
+    # must not abort the ticker's other, valid facts.
+    if CAPEX_TAG in rec:
+        kept: list[dict] = []
+        for e in rec[CAPEX_TAG]:
+            try:
+                e["val"] = canonical_capex(e["val"], "edgar")
+            except ValueError as err:
+                logger.warning("edgar: dropping capex fact (end=%s): %s",
+                               e.get("end"), err)
+                continue
+            kept.append(e)
+        rec[CAPEX_TAG] = kept
     return rec
 
 
@@ -259,9 +299,18 @@ async def refresh_edgar(tickers: list[str] | None = None, force: bool = False,
             async with Session() as s:
                 for tag, entries in facts.items():
                     for e in entries:
+                        val = finite_float(e["val"])
+                        if val is None:
+                            # last line of defence: a non-finite value must
+                            # never reach the DB (SQLite stores NaN as NULL ->
+                            # NOT NULL violation -> the whole ticker's batch
+                            # is rolled back). Skip this fact, keep the rest.
+                            logger.warning("edgar %s: skipping non-finite %s fact",
+                                           t, tag)
+                            continue
                         stmt = sqlite_insert(Fundamental).values(
                             ticker=t, tag=tag, start=e.get("start"),
-                            end=e["end"], filed=e["filed"], val=float(e["val"]),
+                            end=e["end"], filed=e["filed"], val=val,
                             currency="shares" if tag.endswith("SharesOutstanding") else "USD",
                             source="edgar")
                         stmt = stmt.on_conflict_do_update(

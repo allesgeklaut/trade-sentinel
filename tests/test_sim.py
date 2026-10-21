@@ -1319,6 +1319,168 @@ class TestTopUpAtCap:
             f"position count {len(positions)} != 10 (top-ups opened new positions)"
         )
 
+
+# ---------------------------------------------------------------------------
+# Deterministic engine: entry gate + ATR stop (Phase 1 financial correctness)
+# ---------------------------------------------------------------------------
+
+class TestDeterministicEntryAndStops:
+    """The live sim must not buy a bearish HOLD through the relaxed fallback,
+    and the ATR stop must be a level the price can actually break."""
+
+    def _hold_signal(self, *, net: int, trend_up: bool, dist_above: float,
+                     weekly: bool, strength: int = 60,
+                     atr_stop: float | None = None, close: float = 100.0) -> dict:
+        return {
+            "action": "HOLD",
+            "strength": strength,
+            "reason": f"HOLD (score {net:+d})",
+            "snapshot": {
+                "close": close,
+                "atr14": 2.0,
+                "atr_stop": atr_stop,
+                "run_5d": 0.0,
+                "dist_above": dist_above,
+                "trend_up": trend_up,
+                "trend_down": not trend_up,
+                "weekly_trend_up": weekly,
+                "net_score": net,
+            },
+        }
+
+    async def test_bearish_hold_is_not_bought(self, with_cash, monkeypatch):
+        """The audit reproduction: bullish 0 / bearish 65 with a weekly
+        downtrend produced a BUY. It must not any more."""
+        sig = self._hold_signal(net=-65, trend_up=False, dist_above=-8.0,
+                                 weekly=False, strength=65)
+
+        async def mock_close(ticker):
+            return 100.0
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+
+        async def mock_candidates():
+            return ["BEAR"]
+        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
+
+        valuation = await sim.valuate()
+        proposals = await sim._deterministic_propose(valuation, {"BEAR": sig})
+        assert [p for p in proposals if p["side"] == "BUY"] == []
+
+    async def test_near_threshold_hold_is_bought_when_eligible(
+        self, with_cash, monkeypatch
+    ):
+        """A HOLD that misses only the score threshold still enters."""
+        sig = self._hold_signal(net=25, trend_up=True, dist_above=5.0,
+                                 weekly=True, strength=45)
+
+        async def mock_close(ticker):
+            return 100.0
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+
+        async def mock_candidates():
+            return ["GOOD"]
+        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
+
+        valuation = await sim.valuate()
+        proposals = await sim._deterministic_propose(valuation, {"GOOD": sig})
+        buys = [p for p in proposals if p["side"] == "BUY"]
+        assert len(buys) == 1
+        assert buys[0]["ticker"] == "GOOD"
+        assert "relaxed HOLD entry" in buys[0]["reason"]
+
+    async def test_atr_stop_sells_a_broken_position(self, with_cash, monkeypatch):
+        """A price below the snapshot's ATR stop must produce a SELL."""
+        await sim._exec_buy("AAA", 100.0, 1_000.0, "seed")
+        sig = self._hold_signal(net=5, trend_up=True, dist_above=5.0,
+                                 weekly=True, strength=10, atr_stop=95.0,
+                                 close=90.0)
+
+        async def mock_close(ticker):
+            return 90.0
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+
+        async def mock_candidates():
+            return ["AAA"]
+        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
+
+        valuation = await sim.valuate()
+        proposals = await sim._deterministic_propose(valuation, {"AAA": sig})
+        sells = [p for p in proposals if p["side"] == "SELL"]
+        assert len(sells) == 1
+        assert sells[0]["reason"].startswith("ATR stop hit")
+
+    async def test_no_buy_below_the_published_atr_level(self, with_cash, monkeypatch):
+        """The ATR level is anchored to the market's 20-bar high, so a pullback
+        entry can sit below it. Entering there would be stopped out on the
+        next cycle (buy -> sell -> buy churn at the same price)."""
+        sig = {
+            "action": "BUY",
+            "strength": 80,
+            "reason": "BUY (score +60)",
+            "snapshot": {
+                "close": 128.46,
+                "atr14": 2.0,
+                "atr_stop": 128.97,   # above the entry price
+                "run_5d": 0.0,
+                "dist_above": 8.0,
+                "trend_up": True,
+                "trend_down": False,
+                "weekly_trend_up": True,
+                "net_score": 60,
+            },
+        }
+
+        async def mock_close(ticker):
+            return 128.46
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+
+        async def mock_candidates():
+            return ["AAA"]
+        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
+
+        valuation = await sim.valuate()
+        proposals = await sim._deterministic_propose(valuation, {"AAA": sig})
+        assert [p for p in proposals if p["side"] == "BUY"] == []
+
+    async def test_no_rebuy_of_a_ticker_sold_in_the_same_cycle(
+        self, with_cash, monkeypatch
+    ):
+        """A ticker stopped out in a cycle must not be bought again in it."""
+        await sim._exec_buy("AAA", 100.0, 1_000.0, "seed")
+        sig = {
+            "action": "BUY",
+            "strength": 80,
+            "reason": "BUY (score +60)",
+            "snapshot": {
+                "close": 85.0,
+                "atr14": 2.0,
+                "atr_stop": 90.0,     # price below the level -> SELL
+                "run_5d": 0.0,
+                "dist_above": 8.0,
+                "trend_up": True,
+                "trend_down": False,
+                "weekly_trend_up": True,
+                "net_score": 60,
+            },
+        }
+
+        async def mock_close(ticker):
+            return 85.0
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+
+        async def mock_candidates():
+            return ["AAA"]
+        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
+
+        valuation = await sim.valuate()
+        proposals = await sim._deterministic_propose(valuation, {"AAA": sig})
+        sides = [(p["ticker"], p["side"]) for p in proposals]
+        assert ("AAA", "SELL") in sides
+        assert ("AAA", "BUY") not in sides, (
+            f"the ticker was sold and bought again in the same cycle: {sides}"
+        )
+
+
 class TestTimezoneConvention:
     """Verify that sim timestamps are stored as tz-aware UTC, and the monthly
     allowance deposit is anchored to Europe/Vienna (a calendar concept)."""

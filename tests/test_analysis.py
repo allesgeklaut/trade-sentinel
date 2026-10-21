@@ -13,7 +13,15 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from app.analysis import MIN_CANDLES, compute
+from app.analysis import (
+    ATR_STOP_LOOKBACK,
+    ATR_STOP_MULT,
+    MIN_CANDLES,
+    compute,
+    decide_action,
+    entry_eligible,
+    signal_series,
+)
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -201,6 +209,7 @@ class TestSnapshotShape:
             "atr_stop", "atr_pct", "vol_surge", "weekly_trend_up", "net_score", "strength",
             "rsi_3d_change", "macd_hist_3d_change", "run_5d",
             "run_20d", "run_60d", "dist_52w_high", "dist_above",
+            "trend_up", "trend_down",
         }
         assert set(snap.keys()) == expected_keys
 
@@ -229,3 +238,120 @@ class TestVolume:
         )
         result = compute(rows)
         assert result["snapshot"]["vol_surge"] is True
+
+
+# ---------------------------------------------------------------------------
+# ATR stop: prior-known, reachable level (Phase 1 financial correctness)
+# ---------------------------------------------------------------------------
+
+def _uptrend_rows(n: int = 260) -> list[dict]:
+    """A steady uptrend with a small daily spread (ATR > 0)."""
+    return _build_candles(n, lambda i, p: 100.0 + 0.3 * i)
+
+
+class TestAtrStop:
+    """The ATR stop used to be ``close - 2 * ATR`` on the *same* bar that was
+    then compared against that close — unreachable by construction, so the
+    stop could never fire. It is now a prior-known level built from the
+    previous completed bar only."""
+
+    def test_stop_is_below_the_close_so_it_can_trigger(self):
+        rows = _uptrend_rows()
+        snap = compute(rows)["snapshot"]
+        # A reachable stop sits below the current close in an uptrend.
+        assert snap["atr_stop"] is not None
+        assert snap["atr_stop"] < snap["close"], (
+            "the ATR stop must be reachable — it has to sit below the close "
+            "for the close to be able to break it"
+        )
+
+    def test_stop_matches_the_prior_bar_formula(self):
+        rows = _uptrend_rows()
+        df = signal_series(rows)
+        expected = (
+            df["close"].rolling(ATR_STOP_LOOKBACK).max().shift(1)
+            - ATR_STOP_MULT * df["atr14"].shift(1)
+        )
+        assert df["atr_stop"].iloc[-1] == pytest.approx(expected.iloc[-1])
+        # ... and the snapshot publishes exactly that level.
+        snap = compute(rows)["snapshot"]
+        assert snap["atr_stop"] == pytest.approx(round(expected.iloc[-1], 2))
+
+    def test_stop_ignores_the_current_bar(self):
+        """The level must not move using the bar it is checked against:
+        crashing the last close leaves the published stop unchanged."""
+        rows = _uptrend_rows()
+        before = compute(rows)["snapshot"]["atr_stop"]
+
+        crashed = [dict(r) for r in rows]
+        last = crashed[-1]
+        last_close = last["close"] * 0.5
+        last["close"] = last_close
+        last["low"] = min(last["low"], last_close)
+        last["high"] = max(last["high"], last["close"])
+        after = compute(crashed)["snapshot"]["atr_stop"]
+
+        assert after == before, (
+            "the ATR stop changed when only the current bar changed — the "
+            "level must be known before that bar closes"
+        )
+
+    def test_old_same_bar_formula_was_unreachable(self):
+        """Guards the regression: the old level (close - 2*ATR) can never be
+        broken by the same close, so it must not be what we publish."""
+        rows = _uptrend_rows()
+        snap = compute(rows)["snapshot"]
+        old_level = snap["close"] - ATR_STOP_MULT * snap["atr14"]
+        assert snap["close"] >= old_level          # unreachable by construction
+        assert snap["atr_stop"] != pytest.approx(old_level)
+
+    def test_percent_stop_is_unaffected(self):
+        """The frozen percent stop lives in strategy.py and is independent of
+        the ATR candidate level."""
+        from app.strategy import StrategyParams, propose_trades
+
+        params = StrategyParams(stop_type="percent", stop_pct=10.0,
+                                use_atr_stop=False)
+        positions = [{"ticker": "AAA", "shares": 10, "avg_cost": 100.0,
+                      "stop_price": None}]
+        out = propose_trades(
+            positions, 0.0, {"AAA": 89.0},
+            {"AAA": {"action": "HOLD", "strength": 10, "reason": "hold",
+                     "snapshot": {"atr_stop": 1.0, "close": 89.0}}},
+            params,
+        )
+        assert [p["side"] for p in out] == ["SELL"]
+        assert out[0]["reason"].startswith("Initial stop")
+
+
+# ---------------------------------------------------------------------------
+# Shared entry gate
+# ---------------------------------------------------------------------------
+
+class TestEntryEligible:
+    """One definition of "entry eligible", shared by the strict BUY and the
+    relaxed HOLD fallback."""
+
+    def test_uptrend_above_2pct_and_weekly_up(self):
+        assert entry_eligible(True, 5.0, True) is True
+
+    def test_requires_daily_uptrend(self):
+        assert entry_eligible(False, 5.0, True) is False
+
+    def test_requires_more_than_2pct_above_sma200(self):
+        assert entry_eligible(True, 2.0, True) is False
+        assert entry_eligible(True, -3.0, True) is False
+
+    def test_requires_weekly_uptrend(self):
+        assert entry_eligible(True, 5.0, False) is False
+
+    def test_missing_distance_is_not_eligible(self):
+        assert entry_eligible(True, None, True) is False
+
+    def test_decide_action_uses_the_same_gate(self):
+        # Trend up but only 1% above the SMA200 → HOLD, not BUY.
+        assert decide_action(60, True, False, 1.0, 0.0, 40, -40, True) == "HOLD"
+        # Same score, now above the SMA200 → BUY.
+        assert decide_action(60, True, False, 5.0, 0.0, 40, -40, True) == "BUY"
+        # Weekly trend down → HOLD.
+        assert decide_action(60, True, False, 5.0, 0.0, 40, -40, False) == "HOLD"

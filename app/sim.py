@@ -458,6 +458,13 @@ async def _deterministic_propose(
         min_cash_pct=settings.sim_min_cash_pct,
         max_position_pct=settings.sim_max_position_pct,
         max_positions=settings.sim_max_positions,
+        # Two independent exit controls:
+        #  - stop_type="percent": the entry-anchored control, recomputed
+        #    from the position's blended average cost every cycle (the sim
+        #    keeps no entry stop column, so it is NOT frozen at entry).
+        #  - use_atr_stop: the ATR reference stop from the signal snapshot —
+        #    a prior-known, per-bar candidate level (previous 20-bar high
+        #    close - 2x ATR of the previous bar), not a ratchet.
         stop_type="percent",
         stop_pct=settings.sim_stop_pct,
         use_atr_stop=True,
@@ -471,6 +478,9 @@ async def _deterministic_propose(
         # ROE. Missing fundamentals stay neutral (ETFs, thin coverage).
         # Opt-in via SIM_BLOCK_NEGATIVE_ROE until the replay A/B verdict.
         block_negative_roe=settings.sim_block_negative_roe,
+        # Relaxed fallback: a HOLD may only be entered when it is a genuine
+        # near-threshold BUY — positive net score and the same entry gate as
+        # a strict BUY (see strategy._fallback_eligible).
         relaxed_hold_strength=40,
         relaxed_hold_limit=3,
     )
@@ -588,8 +598,13 @@ _SIM_METHODOLOGY = (
     "weekly trend is still up — it fires on normal pullbacks within an uptrend, "
     "not just on real trend breaks.\n"
     "  - **vol_surge**: a confirmation bonus, not a primary driver.\n"
-    "  - **atr_stop**: trailing-volatility stop. Price below it = the trend "
-    "broke.\n"
+    "  - **atr_stop**: volatility exit reference. It is the highest close of "
+    "the previous 20 completed bars minus 2x ATR of the previous completed "
+    "bar — a level that was already known before today's bar closed. Price "
+    "at or below it = the trend broke. It is recomputed every bar (it can "
+    "move down as well as up), so it is a reference level, not a frozen or "
+    "ratcheting stop. The fixed % stop is anchored to the position's average "
+    "cost in the live sim (it is not frozen at the original entry price).\n"
     "\n"
     "## GATING deterministic BUYs\n"
     "The deterministic BUY signal (net score >= +40 + uptrend confirmed) fires "
@@ -657,11 +672,13 @@ _LLM_SYSTEM_PROMPT = (
     "concentrate in a single ticker. The engine caps the number of open "
     "positions (it stops buying once the max position count is reached), so "
     "prioritize the strongest candidates.\n"
-    "4. The engine enforces an initial stop loss (a fixed % below the entry "
-    "price) and an ATR-based trailing stop: positions that hit either are "
-    "auto-sold by the deterministic layer. Do not be surprised if a position "
-    "disappears between cycles — that is the stop loss, not a decision you "
-    "need to replicate.\n"
+    "4. The engine enforces an initial stop loss (a fixed % below the "
+    "position's average cost) and an ATR reference stop (the highest close "
+    "of the previous 20 completed bars minus 2x ATR of the previous bar, "
+    "recomputed every bar — a reference level, not a ratchet): positions "
+    "that hit either are auto-sold by the deterministic layer. Do not be "
+    "surprised if a position disappears between cycles — that is the stop "
+    "loss, not a decision you need to replicate.\n"
     "5. Do NOT sell a position to free up cash for another BUY. Selling one "
     "ticker to buy another is portfolio churn — backtesting proved this "
     "reduces returns because the \"stronger opportunity\" has the same "
@@ -730,8 +747,11 @@ _PURE_LLM_METHODOLOGY = (
     "down is structurally weaker.\n"
     "  - **run_5d**: the 5-day run-up %. A BUY after a >15% spike is chasing "
     "a short-term move prone to reversion.\n"
-    "  - **atr_stop**: trailing-volatility stop. Price below it = the trend "
-    "broke.\n"
+    "  - **atr_stop**: volatility exit reference. Highest close of the "
+    "previous 20 completed bars minus 2x ATR of the previous completed bar "
+    "— known before today's bar closed. Price at or below it = the trend "
+    "broke. Recomputed every bar, so it is a reference level, not a frozen "
+    "or ratcheting stop.\n"
     "\n"
     "## Managing exits\n"
     "You are the ONLY mechanism that sells positions — no engine will do it "
@@ -751,8 +771,8 @@ _PURE_LLM_METHODOLOGY = (
 _PURE_LLM_SYSTEM_PROMPT = (
     "You are the sole portfolio manager for a paper-trading simulation. "
     "A deterministic risk floor runs alongside you: it auto-sells positions "
-    "that hit their initial stop or ATR trailing stop, but you make all buy "
-    "and discretionary sell decisions yourself.\n"
+    "that hit their initial stop or the ATR reference stop, but you make all "
+    "buy and discretionary sell decisions yourself.\n"
     "You will receive the current portfolio state and a list of candidate "
     "tickers with their technical indicators (signal action, strength, close "
     "price, RSI, MACD). The signal action/strength is a deterministic "
@@ -766,11 +786,14 @@ _PURE_LLM_SYSTEM_PROMPT = (
     "Use the indicators and your exit-management principles; do not simply "
     "echo the signal actions.\n"
     "3. You are responsible for stop losses. Each open position shows its "
-    "initial stop price (a fixed % below the entry) and the signals include "
-    "an ATR trailing stop. Sell any position whose current price is at or "
-    "below either stop unless you have a strong indicator-based reason to "
-    "override. (The engine also auto-sells stop hits as a safety net, but "
-    "do not rely on it — act on your read.)\n"
+    "initial stop price (a fixed % below the position's average cost) and the "
+    "signals include an ATR reference stop (the highest close of the "
+    "previous 20 completed bars minus 2x ATR of the previous bar — a "
+    "reference level recomputed every bar, not a ratchet). Sell any "
+    "position whose current price is at or below either stop unless you have "
+    "a strong indicator-based reason to override. (The engine also "
+    "auto-sells stop hits as a safety net, but do not rely on it — act on "
+    "your read.)\n"
     "4. STABILITY RULES — do NOT rotate the portfolio. These are the most "
     "important rules you have:\n"
     "   - Never SELL and BUY in the same cycle (no 'sell X to buy Y' rotation). "
@@ -926,7 +949,7 @@ def _build_llm_context(
     lines.append(f"Min cash floor (buy-time only, {settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
     lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
     lines.append(f"Max open positions: {max_positions if max_positions > 0 else settings.sim_max_positions}")
-    lines.append(f"Stop loss: {settings.sim_stop_pct:.0f}% (frozen at entry; ATR stop also applies)")
+    lines.append(f"Stop loss: {settings.sim_stop_pct:.0f}% below average cost (recomputed each cycle; ATR reference stop also applies)")
     lines.append("")
 
     if valuation["positions"]:
@@ -2931,11 +2954,14 @@ _SIM_CHAT_SYSTEM_PROMPT = (
     " on that BUY action. This lets the buy spend below the normal min-cash floor"
     " (down to zero cash). Use it only when the user clearly requests it — never"
     " on your own initiative.\n"
-    "6. The engine enforces an initial stop loss (a fixed % below the entry price)"
-    " and an ATR-based trailing stop on every position. Positions that hit either"
-    " are auto-sold by the deterministic layer, so if the user asks why a position"
-    " vanished it was likely stopped out — explain that rather than proposing to"
-    " re-buy it unless the user explicitly asks.\n"
+    "6. The engine enforces an initial stop loss (a fixed % below the "
+    "position's average cost) and an ATR reference stop on every position "
+    "(the highest close of the previous 20 completed bars minus 2x ATR of "
+    "the previous bar — a reference level recomputed every bar, not a "
+    "ratchet). Positions that hit either are auto-sold by the deterministic "
+    "layer, so if the user asks why a position vanished it was likely "
+    "stopped out — explain that rather than proposing to re-buy it unless "
+    "the user explicitly asks.\n"
     "7. The max position % is a buy-time sizing limit, not a ceiling to enforce "
     "on exits. Do NOT sell a position just because its price rose above it — let "
     "winners run. Only trim a position (with an exact \"shares\" or \"amount\", or "
@@ -3026,7 +3052,7 @@ async def _build_sim_chat_context() -> str:
     lines.append(f"Max position %: {settings.sim_max_position_pct}")
     lines.append(f"Min cash %: {settings.sim_min_cash_pct}")
     lines.append(f"Max open positions: {settings.sim_max_positions}")
-    lines.append(f"Stop loss: {settings.sim_stop_pct:.0f}% (frozen at entry; ATR stop also applies)")
+    lines.append(f"Stop loss: {settings.sim_stop_pct:.0f}% below average cost (recomputed each cycle; ATR reference stop also applies)")
     lines.append(f"Min cash floor (buy-time only, {settings.sim_min_cash_pct}%): {valuation['total_equity'] * settings.sim_min_cash_pct / 100:.2f}")
     lines.append(f"Max position size ({settings.sim_max_position_pct}%): {valuation['total_equity'] * settings.sim_max_position_pct / 100:.2f}")
     lines.append("")

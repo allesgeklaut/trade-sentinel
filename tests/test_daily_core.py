@@ -73,7 +73,13 @@ def fake_ranking(monkeypatch):
         async with daily_core.Session() as s:
             held = [p.ticker for p in
                     (await s.scalars(select(daily_core.DailyCorePosition))).all()]
-        picks = monthly._band_fill(band, held, 3, 4)
+        # target_n/hold_band mirror the LIVE defaults the deployment loop
+        # uses (settings.sim_monthly_target_n / hold_band): the tiny 4-name
+        # universe sits below the 10-slot target, so every band name is a
+        # pick and the deployment tops all of them up.
+        picks = monthly._band_fill(
+            band, held, settings.sim_monthly_target_n,
+            settings.sim_monthly_hold_band)
         return band, picks, frame
     monkeypatch.setattr(daily_core, "compute_targets", fake_targets)
     return frame
@@ -135,6 +141,140 @@ class TestAllowance:
 # ---------------------------------------------------------------------------
 # Deployment
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ten_slot_ranking(monkeypatch):
+    """A 25-name ranking, deliberately NON-alphabetical, behind a live-shaped
+    ``compute_targets`` (band = the hold-band order, picks = the hysteresis
+    refill) so the ten-slot contract can be asserted against a realistic
+    ranking where rank order != ticker order."""
+    order = ["Z01", "M02", "C03", "P04", "B05", "A06", "Z07", "Q08", "K09",
+             "J10", "I11", "H12", "G13", "F14", "E15", "D16", "C17", "B18",
+             "A19", "Z20", "Y21", "X22", "W23", "V24", "U25"]
+
+    async def fake_targets(force=False):
+        band = order[:settings.sim_monthly_hold_band]
+        async with daily_core.Session() as s:
+            held = [p.ticker for p in
+                    (await s.scalars(select(daily_core.DailyCorePosition))).all()]
+        picks = monthly._deploy_targets(
+            order, held, settings.sim_monthly_target_n,
+            settings.sim_monthly_hold_band, refill=True)
+        return band, picks, None
+
+    monkeypatch.setattr(daily_core, "compute_targets", fake_targets)
+    return order
+
+
+async def _seed_dc(cash: float, positions: list[tuple[str, float, float]]):
+    async with daily_core.Session() as s:
+        acc = await daily_core._account(s)
+        acc.cash = cash
+        await s.commit()
+        for t, sh, avg in positions:
+            s.add(daily_core.DailyCorePosition(ticker=t, shares=sh, avg_cost=avg))
+        await s.commit()
+
+
+async def _dc_positions() -> list[tuple[str, float]]:
+    async with daily_core.Session() as s:
+        rows = (await s.scalars(select(daily_core.DailyCorePosition))).all()
+        return sorted((p.ticker, p.shares) for p in rows)
+
+
+def _flat_px_100(tickers):
+    return _px({t: 100.0 for t in tickers})
+
+
+class TestTenSlotContract:
+    """The live deployment must fund the hysteresis-selected picks (never
+    band[:target_n]) and never grow the book past the ten-slot target,
+    however incomplete the release state is (audit P0-D)."""
+
+    def test_ten_retained_plus_cash_stays_ten(self, mem_db, ten_slot_ranking,
+                                              monkeypatch):
+        """Audit P0-D exact reproduction: ten valid retained positions (the
+        ranking's ranks 2-11) plus one fresh monthly cash cycle stay TEN —
+        the old band[:target_n] buy loop bought rank-1 Z01, the one name
+        the picks never chose, and produced the 'resulting 11'."""
+        held = ["M02", "C03", "P04", "B05", "A06", "Z07", "Q08", "K09",
+                "J10", "I11"]
+        asyncio.run(_seed_dc(1000.0, [(t, 10.0, 100.0) for t in held]))
+        monkeypatch.setattr(monthly, "_price_usd_map", _flat_px_100)
+
+        async def scenario():
+            return await daily_core.run_deployment()
+        r = asyncio.run(scenario())
+
+        traded = [(t["ticker"], t["side"]) for t in r["trades"]]
+        assert ("Z01", "BUY") not in traded      # the 11th-name buy is gone
+        assert all(side == "BUY" for _, side in traded)   # no phantom sells
+        # fresh cash reinforces exactly the retained picks, then stops
+        assert r["valuation"]["cash"] == pytest.approx(0.0, abs=1.0)
+        pos = asyncio.run(_dc_positions())
+        assert [t for t, _ in pos] == sorted(held)     # still exactly ten
+
+    def test_failed_release_keeps_slot_no_replacement_eleventh(
+            self, mem_db, ten_slot_ranking, monkeypatch):
+        """`_exec_sell` returns None when no usable price exists (no candle,
+        zero avg_cost): the released slot stays occupied and filling the
+        planned replacement anyway created an 11th holding. The BUY loop
+        counts the ACTUAL post-SELL positions."""
+        held = ["M02", "C03", "P04", "B05", "A06", "Z07", "Q08", "K09",
+                "J10", "ZZZ"]  # ZZZ: out of band, unpriceable, avg_cost 0
+        asyncio.run(_seed_dc(1000.0, [(t, 10.0, 100.0) for t in held[:9]]
+                            + [("ZZZ", 5.0, 0.0)]))
+        monkeypatch.setattr(
+            monthly, "_price_usd_map",
+            lambda tickers: _px({t: 100.0 for t in tickers if t != "ZZZ"}))
+
+        async def scenario():
+            return await daily_core.run_deployment()
+        r = asyncio.run(scenario())
+
+        sells = [t for t in r["trades"] if t["side"] == "SELL"]
+        assert sells == []                     # the release failed: no price
+        buys = [t["ticker"] for t in r["trades"] if t["side"] == "BUY"]
+        assert "Z01" not in buys               # the planned replacement...
+        assert len(buys) == 0                  # ...is not bought: no free slot
+        pos = asyncio.run(_dc_positions())
+        assert [t for t, _ in pos] == sorted(held)   # book unchanged, still ten
+
+    def test_rank_first_funding_limited_cash(self, mem_db, ten_slot_ranking,
+                                             monkeypatch):
+        """With limited cash the deployment funds the BEST-RANKED picks —
+        never the alphabetically-first ones (deployment is rank-ordered,
+        not _band_fill's sorted())."""
+        held = ["C03", "P04"]  # ranks 3-4, both at weight
+        asyncio.run(_seed_dc(250.0, [(t, 10.0, 100.0) for t in held]))
+        monkeypatch.setattr(monthly, "_price_usd_map", _flat_px_100)
+
+        async def scenario():
+            return await daily_core.run_deployment()
+        r = asyncio.run(scenario())
+
+        buys = [t["ticker"] for t in r["trades"] if t["side"] == "BUY"]
+        # equity 2250 -> weight 225: Z01 takes 225, M02 the remaining 25 —
+        # in RANK order (alphabetical funding would have bought A06 first)
+        assert buys == ["Z01", "M02"]
+        pos = asyncio.run(_dc_positions())
+        assert [t for t, _ in pos] == sorted(held + ["Z01", "M02"])
+
+    def test_backfill_respects_ten_slot_target(self, mem_db, fake_market,
+                                               monkeypatch):
+        """The persisted backfill replay keeps positions <= target_n at
+        every point: month 1 builds the book, month 2 only tops up/fills."""
+        monkeypatch.setattr(daily_core, "_current_month", lambda: "2026-08")
+        r = asyncio.run(daily_core.backfill(start="2026-07-01"))
+        assert r["ok"] is True
+
+        async def check():
+            async with daily_core.Session() as s:
+                rows = (await s.scalars(select(daily_core.DailyCorePosition))).all()
+                assert 0 < len(rows) <= settings.sim_monthly_target_n
+        asyncio.run(check())
+
 
 class TestDeployment:
     def test_rank_first_topup(self, mem_db, fake_ranking, monkeypatch):

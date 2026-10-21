@@ -22,8 +22,9 @@ The input shapes:
   - ``prices``: ``{ticker: close_price}`` for the current day
   - ``signals``: ``{ticker: {"action": "BUY"|"SELL"|"HOLD", "strength": int,
     "reason": str, "snapshot": {"atr_stop": float|None, "run_5d": float|None,
-    "atr14": float|None, ...}}}`` — same shape as ``analysis.compute()`` /
-    ``optimize._signals_for_day`` return.
+    "atr14": float|None, "net_score": int|None, "trend_up": bool,
+    "dist_above": float|None, "weekly_trend_up": bool, ...}}}`` — same shape
+    as ``analysis.compute()`` / ``optimize._signals_for_day`` return.
   - ``params``: a ``StrategyParams`` instance ( thresholds + risk config ).
 
 The output shape (proposals):
@@ -31,13 +32,30 @@ The output shape (proposals):
   - SELL: ``{"ticker", "side": "SELL", "price", "shares": None, "reason"}``
   - BUY:  ``{"ticker", "side": "BUY",  "price", "budget", "reason",
     "entry_stop": float|None}``
+
+Stop semantics:
+
+  - ``stop_type="percent"`` — the entry-anchored control. In the backtest
+    replay the level is frozen at entry (``stop_price`` on the position);
+    the live sim stores no entry stop and recomputes it from the position's
+    blended average cost on every cycle.
+  - ``atr_stop`` (from the signal snapshot) — a **prior-known indicator
+    candidate**: the highest close of the previous 20 completed bars minus
+    2x ATR of the previous completed bar (see ``analysis.signal_series``).
+    It is recomputed per bar and can move down as well as up, so it is
+    NOT a persistent high-water-mark ratchet and NOT frozen at entry. It is
+    nevertheless a real, reachable exit level: today's close is compared
+    against a level that was already known before today's bar closed.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from collections.abc import Awaitable, Callable
 from typing import Any
+
+from .analysis import entry_eligible
 
 
 @dataclass
@@ -81,8 +99,6 @@ class StrategyParams:
     # Missing fundamentals are neutral (ETFs like GLD, thin coverage) — only
     # known-bad data blocks. 0 = disabled (default until the replay A/B).
     block_negative_roe: bool = False
-    relaxed_hold_strength: int = 40
-    relaxed_hold_limit: int = 3
 
 
 def valuate_portfolio(
@@ -121,6 +137,63 @@ def valuate_portfolio(
     }
 
 
+def _fallback_eligible(sig: dict, params: StrategyParams) -> tuple[bool, str]:
+    """Can this HOLD be entered through the relaxed fallback?
+
+    Returns ``(eligible, rationale)``. The rationale explains *why* the
+    candidate qualifies (or, when it does not, why it is blocked).
+
+    The relaxed fallback exists to capture a **near-threshold** BUY: the
+    signal is a HOLD only because the net score did not reach the BUY
+    threshold, while every trend gate already passed. Two conditions
+    therefore have to hold:
+
+      1. the net score is present, finite and positive (bullish >
+         bearish) — a bearish HOLD can never be entered, and
+      2. the same entry gate a strict BUY must clear
+         (``analysis.entry_eligible``: daily uptrend, more than 2% above the
+         SMA-200, weekly trend up).
+
+    Anything unknown fails closed: a snapshot without a net score, without
+    the trend flags or without an explicit ``weekly_trend_up`` flag is not
+    eligible for the fallback. A missing weekly flag is NOT treated as
+    "no weekly data → no gate": the weekly filter is a hard
+    multi-timeframe confirmation, not an optional extra.
+    """
+    snap = sig.get("snapshot", {}) or {}
+    if "weekly_trend_up" not in snap:
+        return False, "no weekly trend flag in the snapshot"
+    weekly_trend_up = bool(snap.get("weekly_trend_up"))
+
+    net = snap.get("net_score")
+    if net is None:
+        return False, "no net score in the snapshot"
+    try:
+        net_val = float(net)
+    except (TypeError, ValueError):
+        return False, f"unreadable net score {net!r}"
+    if not math.isfinite(net_val):
+        return False, f"net score {net!r} is not a finite number"
+    if net_val <= 0:
+        return False, f"net score {net_val:+.0f} is not bullish"
+
+    trend_up = bool(snap.get("trend_up"))
+    dist_above = snap.get("dist_above")
+    if not entry_eligible(trend_up, dist_above, weekly_trend_up):
+        return False, "the strict BUY entry gate did not pass"
+
+    try:
+        dist_txt = f"{float(dist_above):+.1f}% above SMA200"
+    except (TypeError, ValueError):
+        dist_txt = "above SMA200"
+    near = "near-threshold " if net_val < params.buy_threshold else ""
+    rationale = (
+        f"relaxed HOLD entry ({near}net {net_val:+.0f} vs BUY threshold "
+        f"{params.buy_threshold}): daily uptrend, {dist_txt}, weekly trend up"
+    )
+    return True, rationale
+
+
 def propose_trades(
     positions: list[dict],
     cash: float,
@@ -140,7 +213,8 @@ def propose_trades(
       1. Signal SELL → propose SELL.
       2. Initial stop (frozen at entry if ``stop_price`` is set on the
          position, else recomputed from ``avg_cost * (1 - stop_pct/100)``).
-      3. ATR trailing stop (from the signal's snapshot).
+      3. ATR reference stop (from the signal's snapshot) — a prior-known
+         per-bar candidate level, not a ratchet and not frozen at entry.
 
     BUY phase (ranked by strength, strict BUYs first, else relaxed HOLD
     fallback):
@@ -152,8 +226,20 @@ def propose_trades(
         thin coverage).
       - ``max_position_pct`` ceiling prevents over-concentration.
       - ``min_cash_pct`` floor preserves a cash buffer.
+      - ``max_sector_pct`` ceiling limits per-sector exposure (the budget is
+        clamped to the remaining sector room, not just pre-checked).
+      - With ``use_atr_stop`` armed, no entry at or below the published ATR
+        reference level (the level is anchored to the market's 20-bar high,
+        so a pullback entry could otherwise be stopped out immediately).
+      - A ticker sold in this cycle is never bought again in the same cycle.
       - Local cash reservation so successive BUY proposals in the same cycle
         see reduced cash.
+
+    The relaxed HOLD fallback is a *near-threshold* entry, not a free pass:
+    a HOLD candidate must clear the same entry gate as a strict BUY
+    (``analysis.entry_eligible``: daily uptrend, >2% above the SMA-200,
+    weekly trend up) and must have a positive net score. A bearish HOLD
+    (bullish <= bearish) can therefore never enter.
     """
     proposals: list[dict] = []
     total_equity = cash + sum(p["shares"] * prices.get(p["ticker"], 0) for p in positions)
@@ -174,6 +260,12 @@ def propose_trades(
             sector_values[sec] = sector_values.get(sec, 0) + p["shares"] * prices.get(p["ticker"], 0)
 
     # --- SELL phase ---
+    # Tickers proposed for sale in this cycle. They must not be bought again
+    # in the same cycle: the caller executes the SELL first, so a BUY for the
+    # same ticker would sell and immediately re-buy the same position at the
+    # same price (pure churn, twice the costs).
+    sell_tickers: set[str] = set()
+
     for pos in positions:
         ticker = pos["ticker"]
         sig = signals.get(ticker)
@@ -185,6 +277,7 @@ def propose_trades(
             proposals.append({"ticker": ticker, "side": "SELL",
                               "price": price, "shares": None,
                               "reason": sig.get("reason", "SELL signal")})
+            sell_tickers.add(ticker)
             continue
 
         # Initial stop loss: use frozen stop_price if available, else
@@ -200,16 +293,22 @@ def propose_trades(
                 proposals.append({"ticker": ticker, "side": "SELL",
                                   "price": price, "shares": None,
                                   "reason": f"Initial stop: {price:.2f} <= {sp:.2f}"})
+                sell_tickers.add(ticker)
                 continue
 
-        # ATR trailing stop
+        # ATR reference stop: the level in the snapshot was computed from the
+        # PREVIOUS completed bar (prior 20-bar high close - 2x ATR), so it is
+        # already known before today's bar — today's close can break it.
+        # This is an indicator candidate level: it is recomputed per bar and
+        # is not a persistent ratchet, nor frozen at entry.
         if params.use_atr_stop and sig:
             snap = sig.get("snapshot", {})
             atr_stop = snap.get("atr_stop")
-            if atr_stop and price < atr_stop:
+            if atr_stop and price <= atr_stop:
                 proposals.append({"ticker": ticker, "side": "SELL",
                                   "price": price, "shares": None,
-                                  "reason": f"ATR stop hit: {price:.2f} < {atr_stop:.2f}"})
+                                  "reason": f"ATR stop hit: {price:.2f} <= {atr_stop:.2f}"})
+                sell_tickers.add(ticker)
 
     # --- BUY phase ---
     max_run_5d = params.max_run_5d
@@ -255,18 +354,45 @@ def propose_trades(
 
     # Relaxed fallback: buy the best near-BUY (HOLD with high strength) so
     # the bot stays active and deploys cash instead of sitting idle.
+    #
+    # The fallback is NOT a loophole. A HOLD is only a near-threshold BUY
+    # when the *trend* gates already passed — the score was the only thing
+    # missing. So the candidate must:
+    #   * have a positive net score (bullish > bearish). A bearish HOLD
+    #     (e.g. bullish 0 / bearish 65) can never enter, whatever its
+    #     "strength" says — the HOLD strength is max(bullish, bearish),
+    #     which is exactly what made bearish HOLDs look attractive.
+    #   * clear the SAME entry gate as a strict BUY (analysis.entry_eligible:
+    #     daily uptrend, >2% above the SMA-200, weekly trend up).
+    # Unknown/missing snapshot fields fail closed.
+    fallback_reason: dict[str, str] = {}
     if not buy_candidates:
-        hold_candidates = [
-            (t, sig) for t, sig in signals.items()
-            if sig["action"] == "HOLD" and sig["strength"] >= params.relaxed_hold_strength
-            and _entry_ok(t, sig)
-        ]
+        hold_candidates = []
+        for t, sig in signals.items():
+            if sig["action"] != "HOLD":
+                continue
+            if sig["strength"] < params.relaxed_hold_strength:
+                continue
+            if not _entry_ok(t, sig):
+                continue
+            ok, why = _fallback_eligible(sig, params)
+            if not ok:
+                continue
+            hold_candidates.append((t, sig, why))
         hold_candidates.sort(key=lambda x: x[1]["strength"], reverse=True)
-        buy_candidates = hold_candidates[:params.relaxed_hold_limit]
+        selected = hold_candidates[:params.relaxed_hold_limit]
+        buy_candidates = [(t, sig) for t, sig, _ in selected]
+        fallback_reason = {t: why for t, _sig, why in selected}
 
     for ticker, sig in buy_candidates:
         if sim_cash < min_cash:
             break  # not enough cash to keep buffer
+
+        # Never buy a ticker that this cycle already sells: the caller
+        # executes the SELL first, so the BUY would immediately re-buy the
+        # position that was just stopped out (churn at the same price).
+        if ticker in sell_tickers:
+            continue
 
         # Max open positions: block NEW positions when at the cap, but still
         # allow topping up tickers already held (a top-up doesn't open a new
@@ -281,6 +407,21 @@ def propose_trades(
         if price is None or price <= 0:
             continue
 
+        # The ATR reference level is anchored to the market's 20-bar closing
+        # high, not to this position's entry. A pullback entry can therefore
+        # publish a level ABOVE the entry price — the new position would be
+        # stopped out on the very next cycle (buy -> sell -> buy churn at the
+        # same price). So: when the ATR stop is armed, only enter above the
+        # published level. The level itself is prior-known (computed from the
+        # previous completed bar), so this check uses no future information.
+        if params.use_atr_stop:
+            atr_level = sig.get("snapshot", {}).get("atr_stop")
+            if (atr_level is not None
+                    and math.isfinite(atr_level)
+                    and atr_level > 0
+                    and price <= atr_level):
+                continue
+
         current_shares = next((p["shares"] for p in positions if p["ticker"] == ticker), 0)
         current_value = current_shares * price
         if current_value >= max_position_value:
@@ -288,13 +429,21 @@ def propose_trades(
 
         # Sector diversification cap: limit total exposure per sector.
         # Tracked progressively so the 2nd same-sector BUY sees the 1st one.
+        # The pre-check only blocks a BUY that would *start* above the cap;
+        # the budget is clamped to the remaining sector room below, so a
+        # large BUY can never push the sector past the cap.
+        sector_room: float | None = None
         if params.max_sector_pct > 0 and sector_of:
             sec = sector_of(ticker)
             sector_cap = total_equity * (params.max_sector_pct / 100)
-            if sector_values.get(sec, 0) >= sector_cap:
+            sector_room = sector_cap - sector_values.get(sec, 0.0)
+            if sector_room <= 0:
                 continue
 
         budget = min(sim_cash - min_cash, max_position_value - current_value)
+        if sector_room is not None:
+            # Never allocate more than the sector still has room for.
+            budget = min(budget, sector_room)
 
         # Risk-based position sizing: size by stop distance so each
         # trade risks a fixed % of equity (industry-standard 1% rule).
@@ -316,7 +465,12 @@ def propose_trades(
         if budget < 1:
             continue
 
-        # Frozen entry stop for the new proposal
+        # Frozen entry stop for the new proposal. The percent stop is the
+        # entry-anchored control (frozen at entry in the replay; the live sim
+        # recomputes it from the blended average cost every cycle). The ATR
+        # entry stop is frozen at entry too (entry price - N x ATR) and is
+        # distinct from the per-bar ATR reference candidate checked in the
+        # SELL phase.
         entry_stop = None
         if params.stop_type == "percent":
             entry_stop = price * (1 - params.stop_pct / 100)
@@ -325,9 +479,13 @@ def propose_trades(
             if atr and atr > 0:
                 entry_stop = price - params.stop_atr_mult * atr
 
+        # A fallback BUY explains why a HOLD was entered (near-threshold
+        # rationale); a strict BUY keeps the signal's own reason.
+        reason = fallback_reason.get(ticker) or sig.get("reason", "BUY signal")
+
         proposals.append({"ticker": ticker, "side": "BUY",
                           "price": price, "budget": budget,
-                          "reason": sig.get("reason", "BUY signal"),
+                          "reason": reason,
                           "entry_stop": entry_stop})
         # Reserve the budget locally so the next BUY proposal sees reduced
         # cash. Only bump open_count for NEW positions — a top-up doesn't

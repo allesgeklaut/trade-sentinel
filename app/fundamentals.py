@@ -16,9 +16,34 @@ Point-in-time approximation (documented trade-off, mirrors stockstrat):
 Tags (SEC XBRL names): NetIncomeLoss, StockholdersEquity,
 CommonStockSharesOutstanding, NetCashProvidedByUsedInOperatingActivities,
 PaymentsToAcquirePropertyPlantAndEquipment.
+
+Sign convention — the canonical capital-expenditure contract
+------------------------------------------------------------
+``PaymentsToAcquirePropertyPlantAndEquipment`` (capex) is normalized to a
+NEGATIVE cash outflow everywhere it is produced or consumed, so every
+provider feeds the strategy math one formula:  FCF = OCF + capex  (capex <= 0).
+
+The raw providers disagree on the sign:
+  * yfinance "Capital Expenditure" is already a negative outflow.
+  * SEC ``us-gaap:PaymentsToAcquirePropertyPlantAndEquipment`` reports the
+    expenditure as a POSITIVE number (Apple FY2025: +12,715,000,000 against
+    OCF +111,482,000,000, i.e. a true FCF of 98,767,000,000).
+
+``canonical_capex`` owns that flip. It is applied when facts are parsed (new
+rows are stored canonical) and again when cached rows are read (rows stored
+before the fix are corrected on read, no DB migration). Only positive values
+are flipped, so the step is idempotent: a canonical value is never inverted
+twice and a legacy raw-positive SEC row is corrected exactly once.
+
+Non-finite values (NaN, +/-inf) are rejected one fact at a time, before the
+DB write and again on read: SQLite stores NaN as NULL, which violates the NOT
+NULL constraint on ``fundamentals.val`` and rolls back the whole ticker's
+insert batch. A bad fact is skipped, never coerced to 0, and never aborts its
+valid siblings.
 """
 import asyncio
 import logging
+import math
 from collections.abc import Sequence
 from datetime import datetime, UTC
 
@@ -45,12 +70,75 @@ SUFFIX_FX = {
 
 STALE_AFTER_DAYS = 90  # refetch fundamentals quarterly
 
+# Capital expenditure under its XBRL name. Its canonical value is a NEGATIVE
+# cash outflow (see the module docstring); every provider is normalized to it.
+CAPEX_TAG = "PaymentsToAcquirePropertyPlantAndEquipment"
+# Operating cash flow under its XBRL name (canonical: positive = inflow).
+OCF_TAG = "NetCashProvidedByUsedInOperatingActivities"
+
+
+def finite_float(value: object) -> float | None:
+    """Coerce a raw fact value to a finite float, or None when it is not one.
+
+    NaN and +/-inf are NOT usable values: SQLite stores NaN as NULL, which
+    violates the NOT NULL constraint on ``fundamentals.val`` and rolls back
+    the whole ticker's insert batch (every other fact of that ticker is lost
+    with it). A non-finite fact must therefore be rejected individually,
+    before the write — never coerced to 0 and never allowed to abort its
+    siblings.
+    """
+    try:
+        f = float(value.item()) if hasattr(value, "item") else float(value)  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def canonical_capex(val: float, source: str) -> float:
+    """Normalize one capital-expenditure fact to the canonical cash-flow sign.
+
+    Canonical contract (all sources, all read paths): capex is a NEGATIVE
+    cash outflow, so ``FCF = OCF + capex`` holds for every provider.
+
+    The raw conventions differ per source, which is why the flip cannot be a
+    blanket negation:
+      * ``edgar``    — ``us-gaap:PaymentsToAcquirePropertyPlantAndEquipment``
+        is an *expenditure* reported as a POSITIVE number (Apple FY2025:
+        +12,715,000,000).
+      * ``yfinance`` — the "Capital Expenditure" cash-flow row is already a
+        NEGATIVE outflow; negating it blindly would ADD capex to OCF.
+
+    Only a POSITIVE value is flipped, so the function is idempotent: a fact
+    normalized once (at ingest) comes back unchanged when it is read again,
+    and a legacy row still holding the raw positive SEC number is corrected
+    on read — exactly once, never twice.
+
+    ``source`` is the provider identity of the fact (``edgar`` / ``yfinance``).
+    The arithmetic is deliberately source-independent — every provider's capex
+    is an outflow magnitude, so "flip the positives" is the single rule that
+    fits them all — but the parameter keeps each call site explicit about the
+    raw convention it relies on and gives a future provider a place to hang a
+    different rule.
+
+    Raises:
+        ValueError: the value is not a finite number (NaN, +/-inf or
+            non-numeric). Callers MUST catch it and skip that single fact:
+            a NaN would reach SQLite as NULL, break the NOT NULL constraint
+            and roll back the whole ticker's insert batch. The other facts
+            of the same ticker are valid and must still be stored.
+    """
+    f = finite_float(val)
+    if f is None:
+        raise ValueError(f"non-finite capex value for source {source!r}: {val!r}")
+    return -f if f > 0 else f
+
+
 # yfinance statement row names -> (XBRL tag, duration?, convert to USD?, span days)
 _FIELD_MAP_QUARTERLY = {
     "Net Income": ("NetIncomeLoss", True, True, QUARTER_DAYS),
     "Net Income Common Stockholders": ("NetIncomeLoss", True, True, QUARTER_DAYS),
-    "Operating Cash Flow": ("NetCashProvidedByUsedInOperatingActivities", True, True, QUARTER_DAYS),
-    "Capital Expenditure": ("PaymentsToAcquirePropertyPlantAndEquipment", True, True, QUARTER_DAYS),
+    "Operating Cash Flow": (OCF_TAG, True, True, QUARTER_DAYS),
+    "Capital Expenditure": (CAPEX_TAG, True, True, QUARTER_DAYS),
     "Stockholders Equity": ("StockholdersEquity", False, True, YEAR_DAYS),
     "Total Equity Gross Minority Interest": ("StockholdersEquity", False, True, YEAR_DAYS),
     "Ordinary Shares Number": ("CommonStockSharesOutstanding", False, False, YEAR_DAYS),
@@ -61,8 +149,8 @@ _FIELD_MAP_QUARTERLY = {
 # YEAR_DAYS spans so the TTM builder can prefer them as FY anchors.
 _ANNUAL_SPAN_OVERRIDE = {
     "NetIncomeLoss": YEAR_DAYS,
-    "NetCashProvidedByUsedInOperatingActivities": YEAR_DAYS,
-    "PaymentsToAcquirePropertyPlantAndEquipment": YEAR_DAYS,
+    OCF_TAG: YEAR_DAYS,
+    CAPEX_TAG: YEAR_DAYS,
 }
 
 
@@ -124,9 +212,13 @@ def fetch_rec(symbol: str, fx_rate: pd.Series | None = None, fx_mode: str = "mul
         if span_override:
             span_days = span_override
         for end, v in series.items():
-            if pd.isna(v):
+            # NaN and +/-inf are not usable values (SQLite would store NaN as
+            # NULL and break the NOT NULL constraint on fundamentals.val,
+            # rolling back the whole ticker's batch). Skip the single bad
+            # fact; its siblings stay.
+            v_f = finite_float(v)
+            if v_f is None:
                 continue
-            v_f = float(v) if not hasattr(v, "item") else float(v.item())
             end_ts = pd.Timestamp(end)
             if pd.isna(end_ts):
                 continue
@@ -137,6 +229,15 @@ def fetch_rec(symbol: str, fx_rate: pd.Series | None = None, fx_mode: str = "mul
             else:
                 factor = 1.0
             val = v_f * factor
+            # capex is stored in the canonical sign (negative outflow) so the
+            # strategy math can use FCF = OCF + capex for every provider
+            if tag == CAPEX_TAG:
+                try:
+                    val = canonical_capex(val, "yfinance")
+                except ValueError:
+                    continue  # non-finite capex: drop this fact only
+            elif finite_float(val) is None:
+                continue  # overflowed to +/-inf: drop this fact only
             # some feeds serve quarterly-scale columns in the "annual"
             # statement; if the value equals the quarterly value at the same
             # end, it is NOT a fiscal-year figure — skip it so the TTM
@@ -236,7 +337,17 @@ async def refresh_universe(universe: str | None = None, tickers: list[str] | Non
                 continue
             async with Session() as s:
                 for f in facts:
-                    stmt = sqlite_insert(Fundamental).values(ticker=t, source="yfinance", **f)
+                    val = finite_float(f["val"])
+                    if val is None:
+                        # last line of defence: a non-finite value must never
+                        # reach the DB (SQLite stores NaN as NULL -> NOT NULL
+                        # violation -> the whole ticker's batch is rolled
+                        # back). Skip this fact, keep the rest.
+                        logger.warning("fundamentals %s: skipping non-finite %s fact",
+                                       t, f.get("tag"))
+                        continue
+                    stmt = sqlite_insert(Fundamental).values(
+                        ticker=t, source="yfinance", **{**f, "val": val})
                     stmt = stmt.on_conflict_do_update(
                         index_elements=["ticker", "tag", "start", "end", "filed", "source"],
                         set_={"val": stmt.excluded.val,
@@ -258,7 +369,18 @@ def _load_fundamentals_rows(tickers: list[str], rows: Sequence[Fundamental]) -> 
     When a ticker has facts from both sources (edgar + yfinance), EDGAR wins:
     its filed dates are real and its values as-reported. Dropping the yfinance
     rows for those tickers avoids mixing a restated view into a point-in-time
-    series."""
+    series.
+
+    Capex is returned in the canonical sign (negative outflow) whatever the
+    stored row holds: rows written before the sign fix still carry the raw
+    positive SEC expenditure and are corrected here, while rows written after
+    it are already canonical and pass through untouched (the flip is
+    idempotent, so nothing is inverted twice).
+
+    A stored value that is not a finite number is dropped, one fact at a
+    time: a legacy row holding +/-inf (SQLite can store it) must not poison
+    the valid facts of the same ticker, and it must not abort the load for
+    the other tickers either."""
     by_ticker_source: dict[str, dict[str, list]] = {}
     for r in rows:
         by_ticker_source.setdefault(r.ticker, {}).setdefault(getattr(r, "source", "yfinance"), []).append(r)
@@ -266,8 +388,20 @@ def _load_fundamentals_rows(tickers: list[str], rows: Sequence[Fundamental]) -> 
     for t, by_src in by_ticker_source.items():
         chosen = by_src.get("edgar") or by_src.get("yfinance") or []
         for r in chosen:
+            val = finite_float(r.val)
+            if val is None:
+                logger.warning("fundamentals: dropping %s fact for %s (non-finite value)",
+                               r.tag, t)
+                continue
+            if r.tag == CAPEX_TAG:
+                try:
+                    val = canonical_capex(val, getattr(r, "source", "yfinance"))
+                except ValueError:
+                    logger.warning("fundamentals: dropping capex fact for %s "
+                                   "(non-finite value)", t)
+                    continue
             out.setdefault(t, {}).setdefault(r.tag, []).append({
-                "start": r.start, "end": r.end, "filed": r.filed, "val": r.val,
+                "start": r.start, "end": r.end, "filed": r.filed, "val": val,
             })
     return out
 

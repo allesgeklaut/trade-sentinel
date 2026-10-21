@@ -34,11 +34,26 @@ The returned dict shape (consumed by ``main.py`` and the chat system prompt):
         "strength": int,            # 0-100 confidence in the action
         "candles":  list[dict],     # last 120 OHLCV rows (for charting)
     }
+
+Stop semantics (see ``atr_stop`` below): the ATR stop published in the
+snapshot is a **prior-known indicator candidate**, not a guaranteed
+ratcheting stop. It is recomputed per bar from the *previous* completed bar
+only, so a stop level can never be moved using the bar it is checked
+against. The engine does **not** implement a persistent high-water-mark
+ratchet and does **not** freeze the ATR level at entry.
+
+The percent stop in ``strategy.py`` is the entry-anchored control, but only
+in the backtest replay: ``optimize.PaperPortfolio`` freezes ``stop_price``
+at entry. The live sim stores no entry stop (it passes ``stop_price=None``)
+and recomputes the percent level from the position's blended average cost on
+every cycle — so the live percent stop is anchored to the average cost, not
+to the original entry. Neither path implements a ratchet.
 """
 
 from __future__ import annotations
 
 import json
+import math
 
 import numpy as np
 import pandas as pd
@@ -54,6 +69,14 @@ MIN_CANDLES = 206
 # Net-score thresholds for a decisive signal.
 BUY_THRESHOLD = 40
 SELL_THRESHOLD = -40
+
+# ATR exit reference (Chandelier-style *candidate* level).
+#   atr_stop(t) = max(close[t-LOOKBACK .. t-1]) - MULT * atr14[t-1]
+# The window is applied to closes (not highs) and the whole expression is
+# shifted by one bar so the level is known before the bar it is checked
+# against closes.
+ATR_STOP_LOOKBACK = 20
+ATR_STOP_MULT = 2.0
 
 
 def _np_where(cond, a, b):
@@ -218,7 +241,28 @@ def signal_series(rows: list[dict]) -> pd.DataFrame:
     bearish = bearish.clip(upper=100, lower=0)
 
     net = bullish - bearish
-    atr_stop = c - 2 * d.atr14
+
+    # --- ATR exit reference (Chandelier-style candidate) -------------------
+    # Prior-known level: built from the *previous* completed bar only, so
+    # the engine can compare today's close against it without using any
+    # information from today's bar.
+    #
+    #     atr_stop(t) = max(close[t-LOOKBACK .. t-1]) - MULT * atr14[t-1]
+    #
+    # The previous formula was ``close - 2 * ATR`` computed on the *same*
+    # bar that was then compared against that close. For a non-negative ATR
+    # that comparison can never be true (``close >= close - 2*ATR``), so the
+    # ATR stop could not fire at all.
+    #
+    # Semantics: this is an *indicator candidate* — a fresh reference level
+    # per bar. It is NOT a persistent high-water-mark ratchet and it is NOT
+    # frozen at entry: between two bars the level can move down as well as
+    # up, so it must not be described as a guaranteed ratchet. The
+    # entry-anchored control is the percent stop in ``strategy.py`` (frozen
+    # at entry in the replay, recomputed from the average cost live).
+    atr_stop = (
+        c.rolling(ATR_STOP_LOOKBACK).max() - ATR_STOP_MULT * d.atr14
+    ).shift(1)
 
     # --- momentum trend (direction of change, for the LLM exit-gating) ----
     # 3-day net change: positive = rising, negative = falling. Exposed in the
@@ -296,6 +340,41 @@ def signal_series(rows: list[dict]) -> pd.DataFrame:
     })
 
 
+def entry_eligible(
+    trend_up: bool,
+    dist_above: float | None,
+    weekly_trend_up: bool,
+) -> bool:
+    """The shared BUY entry gate.
+
+    A BUY — strict *or* relaxed — requires ALL of:
+
+      * a genuine daily uptrend (``close > SMA50 > SMA200``),
+      * more than 2% above the SMA-200 (not a marginal touch),
+      * the weekly chart trending up (weekly close > weekly SMA-50).
+
+    This is the single definition of "entry eligible"; ``decide_action``
+    (strict BUY) and the relaxed HOLD fallback in ``strategy.py`` both use
+    it, so the fallback can never bypass a trend check that blocked the
+    strict BUY.
+
+    ``dist_above`` may be ``None`` (missing / not-yet-computed) — that is
+    treated as *not* eligible (fail closed). Non-finite distances (NaN,
+    infinity) are rejected for the same reason.
+    """
+    if not trend_up:
+        return False
+    if dist_above is None:
+        return False
+    try:
+        dist = float(dist_above)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(dist) or not dist > 2:
+        return False
+    return bool(weekly_trend_up)
+
+
 def decide_action(net, trend_up, trend_down, dist_above, dist_below,
                   buy_threshold, sell_threshold,
                   weekly_trend_up: bool = True) -> str:
@@ -308,7 +387,7 @@ def decide_action(net, trend_up, trend_down, dist_above, dist_below,
     downtrend and daily BUY signals are suppressed (multi-timeframe filter).
     SELLs are not gated — we always manage risk on the way down.
     """
-    if net >= buy_threshold and trend_up and dist_above > 2 and weekly_trend_up:
+    if net >= buy_threshold and entry_eligible(trend_up, dist_above, weekly_trend_up):
         return "BUY"
     if net <= sell_threshold and trend_down and dist_below > 2:
         return "SELL"
@@ -344,10 +423,18 @@ def snapshot_from_row(x, net: float, bullish: float, bearish: float,
     snap = {k: norm(x[k]) for k in
             ["close", "sma20", "sma50", "sma200", "rsi",
              "macd", "macd_signal", "macd_hist", "atr14", "adx"]}
+    # Prior-known ATR exit reference (see the signal_series comment): a
+    # per-bar candidate level, not a frozen or ratcheting stop.
     snap["atr_stop"] = norm(atr_stop)
     snap["atr_pct"] = norm(100 * float(x.atr14) / float(x.close))
     snap["vol_surge"] = vol_surge
     snap["weekly_trend_up"] = weekly_trend_up
+    # Daily trend flags — the entry gate (``analysis.entry_eligible``) needs
+    # them, and the relaxed HOLD fallback in ``strategy.py`` must apply the
+    # same gate as a strict BUY. Published here so the live engine, the
+    # optimizer replay and the LLM all see identical fields.
+    snap["trend_up"] = bool(x.trend_up)
+    snap["trend_down"] = bool(x.trend_down)
     snap["net_score"] = int(net)
     snap["strength"] = strength
     snap["rsi_3d_change"] = norm(x.rsi_3d_change)

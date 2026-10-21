@@ -123,6 +123,109 @@ class TestRowStrength:
         assert _row_strength(row, "HOLD") == 55
 
 
+class TestByTimeAdapterGateFields:
+    """The deterministic replay adapter must carry the canonical snapshot
+    fields the entry gate and the tightened HOLD fallback read (review D2):
+    net_score / trend_up / trend_down / weekly_trend_up. The old adapter
+    omitted them, so the fallback failed closed in EVERY replay while the
+    live engine kept using it."""
+
+    @staticmethod
+    def _row(**over) -> dict:
+        row = {"close": 100.0, "net": 25.0, "bullish": 40.0, "bearish": 15.0,
+               "trend_up": True, "trend_down": False, "dist_above": 5.0,
+               "dist_below": -5.0, "atr_stop": None, "atr14": 2.0,
+               "weekly_trend_up": True, "run_5d": 3.0, "run_20d": 4.0,
+               "run_60d": 6.0, "dist_52w_high": -2.0}
+        row.update(over)
+        return row
+
+    @staticmethod
+    def _signals(row: dict, day: str = "2026-10-20") -> dict:
+        return optimize._signals_for_day_from_bytime(
+            {"UP": {day: row}}, day, ReplayParams())
+
+    def test_snapshot_carries_gate_fields(self):
+        sig = self._signals(self._row())["UP"]
+        snap = sig["snapshot"]
+        assert sig["action"] == "HOLD"          # net 25 < buy_threshold 40
+        assert snap["net_score"] == 25          # canonical int conversion
+        assert snap["trend_up"] is True
+        assert snap["trend_down"] is False
+        assert snap["weekly_trend_up"] is True
+        assert snap["dist_above"] == 5.0
+
+    def test_non_finite_net_fails_closed_to_none(self):
+        # math.isfinite (review D): int(+inf)/int(-inf) raise OverflowError
+        sig = self._signals(self._row(net=float("inf")))["UP"]
+        assert sig["snapshot"]["net_score"] is None
+        sig2 = self._signals(self._row(net=float("-inf")))["UP"]
+        assert sig2["snapshot"]["net_score"] is None
+        sig3 = self._signals(self._row(net=float("nan")))["UP"]
+        assert sig3["snapshot"]["net_score"] is None
+
+    def test_weekly_flag_missing_defaults_true_like_canonical(self):
+        row = self._row()
+        row.pop("weekly_trend_up")
+        sig = self._signals(row)["UP"]
+        assert sig["snapshot"]["weekly_trend_up"] is True
+
+    def test_adapter_proposal_matches_live_shaped_signal(self):
+        """The adapter path and the live engine path must propose the SAME
+        trade for the same facts: net 25 below the BUY threshold with
+        strength 40 — the relaxed HOLD fallback fires in BOTH (it never
+        fired in any replay while the adapter omitted the fields)."""
+        from app.strategy import StrategyParams, propose_trades
+        row = self._row()
+        adapted = self._signals(row)["UP"]
+        live_shaped = {"action": "HOLD", "strength": 40,
+                       "reason": "HOLD (strength 40)",
+                       "snapshot": dict(adapted["snapshot"])}
+        positions: list[dict] = []
+        prices = {"UP": 100.0}
+        sp = StrategyParams(buy_threshold=40, sell_threshold=-40)
+        p_adapter = propose_trades(positions, 10000.0, prices,
+                                   {"UP": adapted}, sp)
+        p_live = propose_trades(positions, 10000.0, prices,
+                                {"UP": live_shaped}, sp)
+        assert [x["side"] for x in p_adapter] == ["BUY"] == \
+            [x["side"] for x in p_live]
+        assert p_adapter[0]["ticker"] == "UP" == p_live[0]["ticker"]
+        # and the fallback never fired before the fix (reason parity)
+        assert "relaxed" in p_adapter[0]["reason"].lower() or \
+            "fallback" in p_adapter[0]["reason"].lower()
+
+    def test_bearish_and_weekly_down_block_the_fallback(self):
+        from app.strategy import StrategyParams, propose_trades
+        sp = StrategyParams(buy_threshold=40, sell_threshold=-40)
+        # bearish HOLD: net negative, strength 40 — fallback must NOT fire
+        bear = self._signals(self._row(net=-25.0, bullish=15.0, bearish=40.0,
+                                       trend_up=False))["UP"]
+        assert propose_trades([], 10000.0, {"UP": 100.0}, {"UP": bear}, sp) == []
+        # weekly trend down blocks the entry gate
+        wdown = self._signals(self._row(weekly_trend_up=False))["UP"]
+        assert propose_trades([], 10000.0, {"UP": 100.0}, {"UP": wdown}, sp) == []
+
+
+class TestMaxDrawdownDelegation:
+    """_max_drawdown is now a thin wrapper on app.performance.max_drawdown
+    (one cash-flow-neutral definition for backend + UI, audit P0-B)."""
+
+    def test_delegates_to_performance_percent(self):
+        from app.performance import max_drawdown
+        eq = [100.0, 120.0, 90.0, 110.0]
+        assert optimize._max_drawdown(eq) == pytest.approx(max_drawdown(eq))
+        assert optimize._max_drawdown(eq) == pytest.approx(25.0)  # in PERCENT
+
+    def test_deposit_only_is_no_drawdown(self):
+        # the audit's P0-B reproduction: invest 1000, grow to 1200, then
+        # deposit 1000 with NO price move — the old equity/invested-ratio
+        # arithmetic reported 8.33% despite no investment loss after the peak
+        eq = [1000.0, 1200.0, 2200.0]
+        inv = [1000.0, 1000.0, 2000.0]
+        assert optimize._max_drawdown(eq, inv) == pytest.approx(0.0)
+
+
 class TestSplitWindows:
     def test_non_overlapping(self):
         days = [f"2025-01-{i:02d}" for i in range(1, 11)]  # 10 days
@@ -1444,8 +1547,8 @@ class TestContributionDays:
     def test_first_trading_day_of_each_month(self):
         days = pd.DatetimeIndex(["2025-01-15", "2025-01-31",
                                  "2025-02-03", "2025-02-28"])
-        months = [pd.Timestamp("2025-01-31"), pd.Timestamp("2025-02-28")]
-        got = optimize._contribution_days(days, months)
+        keys = {(2025, 1), (2025, 2)}
+        got = optimize._contribution_days(days, keys)
         assert got == {pd.Timestamp("2025-01-15"), pd.Timestamp("2025-02-03")}
 
     def test_starts_mid_month_still_deposits(self):
@@ -1453,16 +1556,168 @@ class TestContributionDays:
         # on the first day the window sees (matching the monthly baseline's
         # one contribution for that month-end).
         days = pd.DatetimeIndex(["2025-01-15", "2025-01-31"])
-        months = [pd.Timestamp("2025-01-31")]
-        assert optimize._contribution_days(days, months) == {pd.Timestamp("2025-01-15")}
+        assert optimize._contribution_days(days, {(2025, 1)}) == {
+            pd.Timestamp("2025-01-15")}
 
     def test_one_contribution_per_month_key(self):
         days = pd.DatetimeIndex(["2024-12-30", "2025-01-02", "2025-01-31",
                                  "2025-02-03", "2025-02-28"])
-        months = [pd.Timestamp("2024-12-31"), pd.Timestamp("2025-01-31"),
-                  pd.Timestamp("2025-02-28")]
-        got = optimize._contribution_days(days, months)
+        got = optimize._contribution_days(
+            days, {(2024, 12), (2025, 1), (2025, 2)})
         assert len(got) == 3
+
+    def test_month_key_without_window_days_is_skipped(self):
+        # A key with no trading day inside the window deposits nothing —
+        # callers pass the trailing-window month explicitly; a month the
+        # window never touches can't fund.
+        days = pd.DatetimeIndex(["2025-01-15", "2025-01-31"])
+        assert optimize._contribution_days(days, {(2025, 3)}) == set()
+
+
+class TestMonthlyBacktestCalendarSettlement:
+    """The monthly aggregate settles contributions per CALENDAR month
+    spanned (review round 3): the live engine deposits monthly regardless
+    of eligibility or of whether the month's month-end candle is stored, so
+    a skipped interior month-end must not vanish that month's funding — and
+    a dead month must not trim the sequence based on FUTURE frame
+    eligibility. (Fee/cost policy is deliberately NOT touched here.)"""
+
+    TICKERS = ["A01", "B02", "C03", "D04", "E05", "F06", "G07", "H08"]
+
+    def _canned_frame(self, order: list[str]) -> pd.DataFrame:
+        roe = {t: 0.5 - 0.01 * i for i, t in enumerate(order)}
+        rows = {t: {"roe": roe.get(t, 0.001), "p_fcf": 20.0, "mcap": 1e10,
+                    "dollar_vol": 1e8, "mom": 0.1, "price": 100.0,
+                    "vol": 0.2, "eligible": True}
+                for t in self.TICKERS}
+        return pd.DataFrame(rows).T
+
+    def _dead_frame(self) -> pd.DataFrame:
+        return self._canned_frame(self.TICKERS).assign(eligible=False)
+
+    async def _run(self, monkeypatch, close, vol, frames, end="2026-03-31"):
+        from app import monthly as monthly_mod
+        monkeypatch.setattr(
+            monthly_mod, "eligible_frame",
+            lambda d, c, v, f: frames.get(pd.Timestamp(d).normalize()))
+        return await optimize._monthly_backtest(
+            "2026-01-02", end, "diversified-plus", 1000.0, False,
+            close_preloaded=(close, vol), fund_preloaded={})
+
+    def _market(self, last_day: str = "2026-03-31") -> tuple[pd.DataFrame, pd.DataFrame]:
+        dates = pd.bdate_range("2023-06-01", last_day)
+        close = pd.DataFrame(100.0, index=dates, columns=self.TICKERS)
+        vol = pd.DataFrame(1e6, index=dates, columns=self.TICKERS)
+        return close, vol
+
+    async def test_interior_month_end_hole_still_funds_that_month(
+            self, monkeypatch):
+        """February 2026's scheduled month-end (Feb-27) is missing from the
+        candles: months = [Jan-30, Mar-31], but the window spans THREE
+        calendar months — the aggregate must settle 3 contributions (Jan's
+        at Jan-30, Feb's + Mar's accrued at Mar-31), not 2."""
+        close, vol = self._market()
+        hole = pd.Timestamp("2026-02-27")
+        assert hole in close.index
+        close = close.drop(index=hole)
+        vol = vol.drop(index=hole)
+        frames = {pd.Timestamp(k): self._canned_frame(self.TICKERS)
+                  for k in ("2026-01-30", "2026-03-31")}
+        m = await self._run(monkeypatch, close, vol, frames)
+
+        assert m is not None
+        assert m.contributed == pytest.approx(3000.0)  # was 2000 before
+        assert m.window[0] == "2026-01-30"
+
+    async def test_dead_month_not_trimmed_still_funds_and_holds(
+            self, monkeypatch):
+        """A dead January frame (no eligible names) must not trim the
+        sequence: January is still funded (its deposit settles at its own
+        month-end) and the dead month holds the previous picks instead of
+        silently erasing the month's reporting."""
+        close, vol = self._market()
+        frames = {pd.Timestamp("2026-01-30"): self._dead_frame(),
+                  pd.Timestamp("2026-02-27"): self._canned_frame(self.TICKERS),
+                  pd.Timestamp("2026-03-31"): self._canned_frame(self.TICKERS)}
+        m = await self._run(monkeypatch, close, vol, frames)
+
+        assert m is not None
+        # all three months funded, starting at the DEAD month (the old trim
+        # started at the first live month and dropped January's funding)
+        assert m.contributed == pytest.approx(3000.0)  # was 2000 before
+        assert m.window[0] == "2026-01-30"
+        # the dead month holds the (empty) book — it is reported, not erased
+
+    async def test_leading_missing_month_end_funds_the_start_months(
+            self, monkeypatch):
+        """Window starts Jan-2 but January's month-end candle is missing
+        (first completed end is February's): the count keys on the CALENDAR
+        months present in the window, so February's month-end settles BOTH
+        January's and February's deposits — the old fixed k=1 dropped
+        January's funding."""
+        close, vol = self._market()
+        hole = pd.Timestamp("2026-01-30")  # January's scheduled month-end
+        assert hole in close.index
+        close = close.drop(index=hole)
+        vol = vol.drop(index=hole)
+        frames = {pd.Timestamp("2026-02-27"): self._canned_frame(self.TICKERS)}
+        m = await self._run(monkeypatch, close, vol, frames, end="2026-02-27")
+
+        assert m is not None
+        assert m.contributed == pytest.approx(2000.0)  # was 1000 before
+        assert m.window == ("2026-02-27", "2026-02-27")
+        # both deposits joined the book at February's month-end rebalance
+        assert m.final_value == pytest.approx(2 * 1000.0 * (1 - 0.001))
+
+    async def test_trailing_stretch_settles_every_funding_month(
+            self, monkeypatch):
+        """Jan-31 valid, February's month-end bar missing, window ends
+        Mar-13: the trailing stretch spans Feb AND Mar — both must fund (3
+        contributions total). The old trailing block deposited a fixed 1."""
+        close, vol = self._market()
+        hole = pd.Timestamp("2026-02-27")  # February's scheduled month-end
+        assert hole in close.index
+        close = close.drop(index=hole)
+        vol = vol.drop(index=hole)
+        frames = {pd.Timestamp("2026-01-30"): self._canned_frame(self.TICKERS)}
+        m = await self._run(monkeypatch, close, vol, frames,
+                            end="2026-03-13")
+
+        assert m is not None
+        assert m.contributed == pytest.approx(3000.0)  # was 2000 before
+        # flat market: the Jan-30 entry (cost) plus the parked Feb+Mar money
+        assert m.final_value == pytest.approx(1000.0 * (1 - 0.001) + 2000.0)
+
+    async def test_trailing_contributions_are_parked_not_invested(
+            self, monkeypatch):
+        """Parked-vs-invested separation on a rising market: the trailing
+        stretch has NO rebalance, so its contributions must NOT earn the
+        stretch's gap return — only the invested portfolio does. The old
+        deposit-then-mark ordering handed parked money the stretch's
+        return."""
+        dates = pd.bdate_range("2023-06-01", "2026-03-13")
+        growth = pd.Series([1.01 ** i for i in range(len(dates))], index=dates)
+        close = pd.DataFrame(100.0, index=dates, columns=self.TICKERS) \
+            .mul(growth, axis=0)
+        vol = pd.DataFrame(1e6, index=dates, columns=self.TICKERS)
+        hole = pd.Timestamp("2026-02-27")
+        close = close.drop(index=hole)
+        vol = vol.drop(index=hole)
+        frames = {pd.Timestamp("2026-01-30"): self._canned_frame(self.TICKERS)}
+        m = await self._run(monkeypatch, close, vol, frames)
+
+        assert m is not None
+        assert m.contributed == pytest.approx(3000.0)
+        # invested at Jan-30: 1000 -> one-way cost on the full-entry swap
+        invested0 = 1000.0 * (1 - 0.001)
+        gap = float(
+            (close.loc["2026-03-13"] / close.loc["2026-01-30"] - 1.0)
+            .dropna().mean())
+        expected = invested0 * (1.0 + gap) + 2 * 1000.0  # parked earns 0%
+        assert m.final_value == pytest.approx(expected, rel=1e-9)
+        # and the parked money clearly did NOT ride the gap return
+        lumped = (invested0 + 2 * 1000.0) * (1.0 + gap)
+        assert m.final_value < lumped
 
 
 class TestMonthPriceMap:
