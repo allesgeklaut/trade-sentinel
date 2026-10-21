@@ -325,9 +325,20 @@ async def _load_series(tickers: list[str],
             "close": r.close, "volume": r.volume,
         } for r in rs]
         try:
-            series[t] = _signal_series(data)
+            ser = _signal_series(data)
         except Exception as e:
             logger.warning("Could not compute series for %s: %s", t, e)
+            continue
+        # Carry F's strict session bar alongside the indicators: the session
+        # fill contract needs the OPEN (fill price) and the LOW (stop trigger)
+        # per session. ``_signal_series`` returns closes/indicators only, so
+        # the three raw bar columns are attached here — minimally, no ffill
+        # (a missing open stays NaN = no fill that session).
+        ser = ser.copy()
+        ser["open"] = [r["open"] for r in data]
+        ser["high"] = [r["high"] for r in data]
+        ser["low"] = [r["low"] for r in data]
+        series[t] = ser
     return series
 
 
@@ -372,7 +383,12 @@ def _col_b(v) -> bool:
 
 
 def px_of_col(frame: pd.DataFrame, d: pd.Timestamp, col: str) -> float | None:
-    """frame.at[d, col] as float; None when missing/NaN (pyright-friendly)."""
+    """frame.at[d, col] as float; None when missing/NaN (pyright-friendly).
+
+    This is the research engines' STRICT exact-date lookup — the same rule as
+    ``session.open_at``: no forward fill, ever, so a missing quote is "no
+    fill" rather than a stale price.
+    """
     try:
         v = frame.at[d, col]
     except KeyError:
@@ -380,6 +396,134 @@ def px_of_col(frame: pd.DataFrame, d: pd.Timestamp, col: str) -> float | None:
     if pd.isna(v):
         return None
     return float(np.asarray(v).reshape(-1)[0])
+
+
+def _exec_price(v) -> float | None:
+    """An executable price: finite and > 0, else None (no fill).
+
+    Mirrors ``strategy._bar_price`` for the research engines: a missing or
+    non-positive quote is not an executable price, so the leg simply has no
+    fill this session and the decision is re-taken next session.
+    """
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f <= 0:
+        return None
+    return f
+
+
+def _series_carry_bars(series: dict[str, pd.DataFrame]) -> bool:
+    """True when the precomputed series carry F's strict session bars.
+
+    ``_load_series`` attaches ``open``/``high``/``low`` to every series, so the
+    backtest replays built from it run in CONTRACT mode (decision on data <=
+    S, fills at F's strict open, standing-order stops). A caller that hands
+    ``_replay`` its own ``_signal_series`` frame (close-only) runs in the
+    documented LEGACY mode instead."""
+    return any("open" in df.columns for df in series.values())
+
+
+def _by_time_index(series: dict[str, pd.DataFrame],
+                   ) -> tuple[dict[str, dict[str, dict]], bool]:
+    """``{ticker: {time: row-dict}}`` for the hot replay loop, plus the
+    contract-mode flag.
+
+    One dict per row (not a pandas Series) to avoid per-access overhead; the
+    raw scoring components are kept so action/strength can be derived
+    per-parameter-set at replay time (the sweep varies the thresholds). When
+    the series carry the session bars, each row additionally carries ``open``
+    and ``low`` — the contract's fill price and stop-trigger price.
+    """
+    by_time: dict[str, dict[str, dict]] = {}
+    cols = ("time close net bullish bearish trend_up trend_down dist_above "
+            "dist_below atr_stop atr14 weekly_trend_up run_5d run_20d "
+            "run_60d dist_52w_high").split()
+    carries = _series_carry_bars(series)
+
+    for t, df in series.items():
+        by_time[t] = {
+            str(time): {
+                "close": _col_f(close),
+                "net": _col_f(net),
+                "bullish": _col_f(bullish),
+                "bearish": _col_f(bearish),
+                "trend_up": _col_b(trend_up),
+                "trend_down": _col_b(trend_down),
+                "dist_above": _col_f(dist_above),
+                "dist_below": _col_f(dist_below),
+                "atr_stop": _col_opt(atr_stop),
+                "atr14": _col_opt(atr14),
+                "weekly_trend_up": True if pd.isna(weekly_trend_up) else _col_b(weekly_trend_up),
+                "run_5d": _col_opt(run_5d),
+                "run_20d": _col_opt(run_20d),
+                "run_60d": _col_opt(run_60d),
+                "dist_52w_high": _col_opt(dist_52w_high),
+            }
+            for time, close, net, bullish, bearish, trend_up, trend_down,
+                dist_above, dist_below, atr_stop, atr14, weekly_trend_up,
+                run_5d, run_20d, run_60d, dist_52w_high
+            in zip(*(df[c] for c in cols), strict=True)
+        }
+        if carries and "open" in df.columns and "low" in df.columns:
+            for time, op, lo in zip(df["time"], df["open"], df["low"],
+                                    strict=True):
+                row = by_time[t][str(time)]
+                row["open"] = _col_opt(op)
+                row["low"] = _col_opt(lo)
+    return by_time, carries
+
+
+def _session_bars_for(by_time: dict[str, dict[str, dict]], day: str | None,
+                      ) -> dict[str, dict]:
+    """F's strict session bars ``{ticker: {"open","low","close"}}`` for `day`.
+
+    Only tickers that actually have a bar on `day` with an executable open
+    appear — a missing quote is not an executable price (``app/session.py``
+    rule 2), so an absent ticker simply has no fill this session. This is the
+    ``session_bars`` payload ``strategy.propose_trades`` consumes in contract
+    mode (open fills + standing-order stops)."""
+    bars: dict[str, dict] = {}
+    if day is None:
+        return bars
+    for t, idx in by_time.items():
+        row = idx.get(day)
+        if row is None:
+            continue
+        open_px = _exec_price(row.get("open"))
+        if open_px is None:
+            continue
+        bars[t] = {"open": open_px,
+                   "low": _exec_price(row.get("low")),
+                   "close": _exec_price(row.get("close"))}
+    return bars
+
+
+def _standing_stop_fill(bar: dict | None, level: float,
+                        fallback_close: float | None) -> float | None:
+    """Fill price for a stop standing order (contract rule 4).
+
+    A level known at S's close stands for session F: fill at F's open when
+    the open is already through the level, else AT the level when F's low
+    breaches it, else no stop fill this session. ``bar`` None means the
+    ticker has no executable F bar — no fill (retried next session); the
+    caller then falls back to the legacy close comparison by passing
+    ``fallback_close`` (None = contract mode, no fill).
+    """
+    if bar is not None:
+        open_px = _exec_price(bar.get("open"))
+        if open_px is not None:
+            if open_px <= level:
+                return open_px
+            low = _exec_price(bar.get("low"))
+            if low is not None and low <= level:
+                return level
+        return None
+    # Legacy (close-only series): the original same-close comparison.
+    return fallback_close if fallback_close is not None and fallback_close <= level else None
 
 
 def _candidate_tickers() -> list[str]:
@@ -417,52 +561,43 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
     ``quality`` is the optional monthly fundamentals provider; when given
     together with ``params.block_negative_roe``, BUY entries into names with
     known non-positive ROE are blocked (missing data stays neutral).
+
+    Session fill contract (app/session.py):
+
+      * CONTRACT mode — the series carry the strict session bars (``open``/
+        ``low``, attached by ``_load_series``). Every session F decides on
+        data <= S (S = the previous session of the timeline, so the decision
+        row is shifted one session back); the deterministic proposals fill at
+        F's strict exact-date OPEN; a stop level known at S's close (initial
+        stop, ATR ratchet, the replay's own trailing stop) is a standing
+        order for F — fill at the open when open <= level, else at the level
+        when F's low breaches it, else no stop fill. A ticker without an F
+        bar gets no fill and the decision is re-taken next session. The
+        portfolio circuit breaker and the regime/BUY gates read the S close
+        (marks at F's close only advance the trackers for the NEXT session).
+      * LEGACY mode — a caller that hands ``_replay`` its own close-only
+        ``_signal_series`` frame keeps the pre-contract behaviour: the
+        decision shift still applies, but fills and stops compare against the
+        decision-day close (there is no open series to fill at).
     """
     # Build a global timeline of all trading days across tickers.
     all_days: set[str] = set()
     for df in series.values():
         all_days.update(df["time"].tolist())
-    days = sorted(all_days)
+    days_full = sorted(all_days)
+    lo, hi = 0, len(days_full)
     if start:
-        days = [d for d in days if d >= start]
+        lo = next((i for i, d in enumerate(days_full) if d >= start), len(days_full))
     if end:
-        days = [d for d in days if d <= end]
-    if not days:
+        hi = next((i for i, d in enumerate(days_full) if d > end), len(days_full))
+    if lo >= hi:
         return ReplayResult(params=params)
 
     # Index each series by time for O(1) lookup. Convert each row to a plain
     # dict (not a pandas Series) to avoid per-access overhead in the hot loop.
     # The raw scoring components are kept so action/strength can be derived
     # per-parameter-set at replay time (the sweep varies the thresholds).
-    by_time: dict[str, dict[str, dict]] = {}
-    cols = ("time close net bullish bearish trend_up trend_down dist_above "
-            "dist_below atr_stop atr14 weekly_trend_up run_5d run_20d "
-            "run_60d dist_52w_high").split()
-
-    for t, df in series.items():
-        by_time[t] = {
-            str(time): {
-                "close": _col_f(close),
-                "net": _col_f(net),
-                "bullish": _col_f(bullish),
-                "bearish": _col_f(bearish),
-                "trend_up": _col_b(trend_up),
-                "trend_down": _col_b(trend_down),
-                "dist_above": _col_f(dist_above),
-                "dist_below": _col_f(dist_below),
-                "atr_stop": _col_opt(atr_stop),
-                "atr14": _col_opt(atr14),
-                "weekly_trend_up": True if pd.isna(weekly_trend_up) else _col_b(weekly_trend_up),
-                "run_5d": _col_opt(run_5d),
-                "run_20d": _col_opt(run_20d),
-                "run_60d": _col_opt(run_60d),
-                "dist_52w_high": _col_opt(dist_52w_high),
-            }
-            for time, close, net, bullish, bearish, trend_up, trend_down,
-                dist_above, dist_below, atr_stop, atr14, weekly_trend_up,
-                run_5d, run_20d, run_60d, dist_52w_high
-            in zip(*(df[c] for c in cols), strict=True)
-        }
+    by_time, carries_bars = _by_time_index(series)
 
     pf = PaperPortfolio(cash=params.start_cash)
     equity_curve: list[dict] = []
@@ -477,9 +612,15 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
     cumulative_invested = params.start_cash
 
     last_known_prices: dict[str, float] = {}  # carry forward for missing-data days
+    last_decision_prices: dict[str, float] = {}  # decision closes (<= S), carried
     sp = _replay_params_to_strategy(params)
 
-    for day in days:
+    for i in range(lo, hi):
+        day = days_full[i]
+        # S = the previous session of the (unbounded) timeline — the decision
+        # row. F's own bar is never a decision input (contract rule 1).
+        s_day = days_full[i - 1] if i > 0 else None
+
         # Monthly allowance deposit (first trading day of a new month).
         month = day[:7]
         if month != last_deposit_month:
@@ -487,10 +628,10 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
             cumulative_invested += params.monthly_allowance
             last_deposit_month = month
 
-        # Prices for this day across all tickers. Carry forward the last known
-        # close when a ticker has no data on this day (e.g. US holidays where
-        # European markets are open). Without this, positions are priced at 0
-        # on sparse-data days, producing fake 95% drawdowns.
+        # MARKS: F's close, carried forward when a ticker has no data on this
+        # day (e.g. US holidays where European markets are open). Without this,
+        # positions are priced at 0 on sparse-data days, producing fake 95%
+        # drawdowns.
         prices: dict[str, float] = {}
         for t, idx in by_time.items():
             row = idx.get(day)
@@ -501,6 +642,24 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
             elif t in last_known_prices:
                 prices[t] = last_known_prices[t]
 
+        # DECISION closes: the S row (data <= S), carried forward so a held
+        # name without an S bar is valued at its last known close instead of
+        # zero (only the BUDGETS/valuations read these; fills read F's bar).
+        decision_prices: dict[str, float] = {}
+        for t, idx in by_time.items():
+            row = idx.get(s_day) if s_day is not None else None
+            if row is not None:
+                p = row["close"]
+                decision_prices[t] = p
+                last_decision_prices[t] = p
+            elif t in last_decision_prices:
+                decision_prices[t] = last_decision_prices[t]
+
+        # F's strict session bars — the ONLY place F's data enters a fill
+        # (`None` = legacy close-only series).
+        session_bars = _session_bars_for(by_time, day) if carries_bars else None
+        fill_prices_source = decision_prices if carries_bars else prices
+
         total_equity = pf.equity(prices)
         if total_equity <= 0:
             equity_curve.append({"time": day, "equity": 0.0})
@@ -509,22 +668,28 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
             position_count_curve.append(len(pf.positions))
             continue
 
-        # Track portfolio peak for circuit breaker.
-        if total_equity > portfolio_peak:
-            portfolio_peak = total_equity
-
         # Portfolio-level circuit breaker: if equity has dropped
         # portfolio_stop_pct from its peak, sell everything and go risk-off.
+        # Contract mode judges the drawdown on the S close (the last completed
+        # session's equity) and stands the cash-out order for F at F's opens;
+        # legacy mode keeps the old same-day close comparison.
+        eq_for_stop = (prev_equity if (carries_bars and prev_equity is not None)
+                       else total_equity)
+        if eq_for_stop > portfolio_peak:
+            portfolio_peak = eq_for_stop
         if params.portfolio_stop_pct > 0 and portfolio_peak > 0:
-            dd = (portfolio_peak - total_equity) / portfolio_peak * 100
+            dd = (portfolio_peak - eq_for_stop) / portfolio_peak * 100
             if dd >= params.portfolio_stop_pct:
                 if not risk_off:
-                    # Sell all positions immediately.
+                    # Sell all positions at F's strict open (no bar = no fill;
+                    # risk_off keeps the order standing and retries it).
                     for ticker in list(pf.positions.keys()):
-                        price = prices.get(ticker, 0)
-                        if price > 0:
+                        price = (_exec_price((session_bars.get(ticker) or {}).get("open"))
+                                 if session_bars is not None
+                                 else prices.get(ticker, 0))
+                        if price:
                             pf.sell(ticker, price, None,
-                                    f"Portfolio stop: equity {total_equity:.0f} "
+                                    f"Portfolio stop: equity {eq_for_stop:.0f} "
                                     f"is -{dd:.1f}% from peak {portfolio_peak:.0f}",
                                     date=day)
                     risk_off = True
@@ -532,10 +697,14 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
                 # Re-engage when drawdown recovers to half the stop level.
                 risk_off = False
 
-        # Update peak prices for trailing stop tracking.
-        pf.update_peaks(prices)
+        # Legacy mode advances the peak-price tracker on today's close BEFORE
+        # the stop check (the pre-contract same-close convention). Contract
+        # mode advances it at the END of the session, so the level that
+        # governs F is the one known at S's close.
+        if not carries_bars:
+            pf.update_peaks(prices)
 
-        # --- Pre-filter: trailing stop ---
+        # --- Pre-filter: trailing stop (a standing order in contract mode) ---
         # Sell if price has dropped trailing_stop_pct from its peak since entry.
         # This is a backtest-only SELL that strategy.propose_trades doesn't know
         # about (it doesn't track per-position peaks), so we apply it before
@@ -543,30 +712,36 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
         if params.trailing_stop_pct > 0:
             for ticker in list(pf.positions.keys()):
                 peak = pf.peak_price.get(ticker, 0)
-                price = prices.get(ticker, 0)
-                if peak > 0 and price > 0:
-                    stop_level = peak * (1 - params.trailing_stop_pct / 100)
-                    if price <= stop_level:
-                        pf.sell(ticker, price, None,
-                                f"Trailing stop: {price:.2f} <= {stop_level:.2f} "
-                                f"(peak {peak:.2f}, -{params.trailing_stop_pct}%)",
-                                date=day)
+                if peak <= 0:
+                    continue
+                stop_level = peak * (1 - params.trailing_stop_pct / 100)
+                bar = session_bars.get(ticker) if session_bars is not None else None
+                legacy_close = prices.get(ticker) if session_bars is None else None
+                fill = _standing_stop_fill(bar, stop_level, legacy_close)
+                if fill is not None:
+                    pf.sell(ticker, fill, None,
+                            f"Trailing stop: {fill:.2f} <= {stop_level:.2f} "
+                            f"(peak {peak:.2f}, -{params.trailing_stop_pct}%)",
+                            date=day)
 
         # --- Core: delegate SELL to strategy.propose_trades, execute, then BUY ---
         # propose_trades works on a snapshot; SELLs must execute first so the
         # BUY phase sees freed slots + cash (matching the old inline behaviour
-        # where SELLs mutated pf before BUYs ran).
-        signals = _signals_for_day_from_bytime(by_time, day, params)
+        # where SELLs mutated pf before BUYs ran). In contract mode the shared
+        # engine resolves F's open from ``session_bars`` and applies the
+        # standing-order stop rule; ``prices`` stay decision-side (S closes).
+        signals = _signals_for_day_from_bytime(by_time, day, params, s_day=s_day)
 
         # SELL phase: get proposals, execute them immediately.
         proposals = propose_trades(
             positions=_pf_to_positions(pf),
             cash=pf.cash,
-            prices=prices,
+            prices=fill_prices_source,
             signals=signals,
             params=sp,
             sector_of=_sector_of if params.max_sector_pct > 0 else None,
             quality_of=quality.of(day) if quality else None,
+            session_bars=session_bars,
         )
         for p in proposals:
             if p["side"] == "SELL":
@@ -574,20 +749,22 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
 
         # BUY phase: re-derive post-SELL state, re-propose for BUYs only.
         # Regime filter: block new BUYs when the broad market is below its
-        # 200-day SMA, or when the circuit breaker is active.
+        # 200-day SMA, or when the circuit breaker is active. The regime state
+        # is a decision input, so it is read at S (data <= S).
         market_ok = not risk_off
         if params.regime_filter and regime is not None:
-            market_ok = market_ok and regime.get(day, True)
+            market_ok = market_ok and regime.get(s_day, True)  # type: ignore[arg-type]
 
         if market_ok:
             proposals2 = propose_trades(
                 positions=_pf_to_positions(pf),
                 cash=pf.cash,
-                prices=prices,
+                prices=fill_prices_source,
                 signals=signals,
                 params=sp,
                 sector_of=_sector_of if params.max_sector_pct > 0 else None,
                 quality_of=quality.of(day) if quality else None,
+                session_bars=session_bars,
             )
             for p in proposals2:
                 if p["side"] == "BUY":
@@ -602,9 +779,15 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
         if prev_equity is not None and prev_equity > 0:
             daily_returns.append(total_equity / prev_equity - 1)
         prev_equity = total_equity
+        if carries_bars:
+            # Contract: F's close only advances the trackers for the NEXT
+            # session (the peak/equity levels that govern F are S's).
+            pf.update_peaks(prices)
+            portfolio_peak = max(portfolio_peak, total_equity)
 
     final_equity = equity_curve[-1]["equity"] if equity_curve else 0.0
-    total_invested = params.start_cash + params.monthly_allowance * len(set(d[:7] for d in days))
+    walk_days = days_full[lo:hi]
+    total_invested = params.start_cash + params.monthly_allowance * len(set(d[:7] for d in walk_days))
     total_return_pct = (final_equity / total_invested - 1) * 100 if total_invested > 0 else 0.0
 
     return ReplayResult(
@@ -630,23 +813,30 @@ def _signals_for_day(
     by_time: dict[str, dict[str, dict]],
     day: str,
     params: ReplayParams,
+    s_day: str | None = None,
 ) -> dict[str, dict]:
-    """Build the ``{ticker: compute()-shaped result}`` dict for one day.
+    """Build the ``{ticker: compute()-shaped result}`` dict for one session.
 
     Mirrors what ``sim._gather_signals`` produces for the live cycle: each
     ticker maps to ``{"action", "reason", "snapshot", "strength"}``. The
     snapshot is built via ``snapshot_from_row`` (the single source of truth
     shared with ``analysis.compute``) so the LLM sees exactly the fields the
-    live engine shows it. Tickers with no row for this day are skipped (the
-    live sim skips them too when ``_latest_close`` returns None).
+    live engine shows it. Tickers with no row for the DECISION session are
+    skipped (the live sim skips them too when they did not trade on S).
+
+    ``s_day`` is the decision session S (the previous completed session): the
+    indicators are read from that row, so F's bar is never a decision input
+    (session fill contract rule 1). None keeps the legacy callers' behaviour
+    (``day`` itself is the decision row).
     """
+    dec_day = s_day if s_day is not None else day
     out: dict[str, dict] = {}
     for t, idx in by_time.items():
-        row = idx.get(day)
+        row = idx.get(dec_day)
         if row is None:
             continue
         df = series[t]
-        x = df.iloc[df.index[df["time"] == day].tolist()[0]]
+        x = df.iloc[df.index[df["time"] == dec_day].tolist()[0]]
         net = float(x.net)
         bullish = float(x.bullish)
         bearish = float(x.bearish)
@@ -782,15 +972,24 @@ def _deterministic_propose_replay(
     day: str,
     params: ReplayParams,
     quality_of: Callable[[str], dict[str, float | None] | None] | None = None,
+    s_day: str | None = None,
+    session_bars: dict[str, dict] | None = None,
 ) -> list[dict]:
-    """Propose deterministic trades for one day WITHOUT mutating ``pf``.
+    """Propose deterministic trades for one session WITHOUT mutating ``pf``.
 
     Thin wrapper over ``strategy.propose_trades`` — converts PaperPortfolio
     to plain data, builds signals from the precomputed by_time rows, calls
-    the shared propose logic, and stamps each proposal with the day + any
+    the shared propose logic, and stamps each proposal with the session + any
     entry_stop the shared logic computed.
+
+    ``prices`` are DECISION prices (S closes) — budgets and valuations are
+    decision-side. ``s_day`` is the decision session (F's bar never informs a
+    decision, contract rule 1), and ``session_bars`` carries F's strict
+    ``{open, low, close}`` per ticker so the shared engine fills at F's open
+    and applies the standing-order stop rule. Both default to the legacy
+    single-session behaviour (``s_day = day``, ``session_bars = None``).
     """
-    signals = _signals_for_day_from_bytime(by_time, day, params)
+    signals = _signals_for_day_from_bytime(by_time, day, params, s_day=s_day)
     sp = _replay_params_to_strategy(params)
     proposals = propose_trades(
         positions=_pf_to_positions(pf),
@@ -799,6 +998,7 @@ def _deterministic_propose_replay(
         signals=signals,
         params=sp,
         quality_of=quality_of,
+        session_bars=session_bars,
     )
     # Stamp the day on each proposal (strategy.propose_trades is day-agnostic).
     for p in proposals:
@@ -810,17 +1010,24 @@ def _signals_for_day_from_bytime(
     by_time: dict[str, dict[str, dict]],
     day: str,
     params: ReplayParams,
+    s_day: str | None = None,
 ) -> dict[str, dict]:
-    """Build the ``{ticker: signal}`` dict for one day from precomputed by_time rows.
+    """Build the ``{ticker: signal}`` dict for one session from by_time rows.
 
     Converts the raw scoring components in by_time (net, bullish, bearish,
     trend_up, etc.) into the same {action, strength, reason, snapshot} shape
     that ``analysis.compute()`` and ``_signals_for_day`` produce, so the
     shared ``strategy.propose_trades`` can consume them uniformly.
+
+    ``s_day`` is the DECISION session S — the indicators are read from that
+    row, one session before F (contract rule 1: data <= S only). None keeps
+    the legacy behaviour where ``day`` itself is the decision row (direct
+    callers/tests that hand in a single-session view).
     """
+    dec_day = s_day if s_day is not None else day
     signals: dict[str, dict] = {}
     for t, idx in by_time.items():
-        row = idx.get(day)
+        row = idx.get(dec_day)
         if row is None:
             continue
         action = _row_action(row, params)
@@ -940,6 +1147,14 @@ async def _hybrid_replay(
     SearXNG; a historical replay has no dated news archive). When None the
     news section is omitted from the context, same as a live cycle with
     SEARXNG_URL unset.
+
+    Session fill contract: the deterministic skeleton runs in CONTRACT mode
+    when the series carry session bars (``_load_series`` does): signals come
+    from data <= S (the previous session) and the skeleton's fills execute at
+    F's strict open. The LLM legs use the same decision-side prices/budgets
+    and, when F's bar carries an executable open, fill there too; a series
+    without opens (a caller-supplied close-only ``_signal_series`` frame)
+    keeps the legacy close-fill behaviour end to end.
     """
     from .sim import _LLM_SYSTEM_PROMPT, _LLM_MINIMAL_SYSTEM_PROMPT, _LLM_MODE_AWARE_MINIMAL_PROMPT, _PURE_LLM_SYSTEM_PROMPT, _build_llm_context, _parse_llm_decisions, _week_diff
 
@@ -947,43 +1162,17 @@ async def _hybrid_replay(
     all_days: set[str] = set()
     for df in series.values():
         all_days.update(df["time"].tolist())
-    days = sorted(all_days)
+    days_full = sorted(all_days)
+    lo, hi = 0, len(days_full)
     if start:
-        days = [d for d in days if d >= start]
+        lo = next((i for i, d in enumerate(days_full) if d >= start), len(days_full))
     if end:
-        days = [d for d in days if d <= end]
-    if not days:
+        hi = next((i for i, d in enumerate(days_full) if d > end), len(days_full))
+    if lo >= hi:
         return ReplayResult(params=params)
+    days = days_full[lo:hi]
 
-    by_time: dict[str, dict[str, dict]] = {}
-    cols = ("time close net bullish bearish trend_up trend_down dist_above "
-            "dist_below atr_stop atr14 weekly_trend_up run_5d run_20d "
-            "run_60d dist_52w_high").split()
-
-    for t, df in series.items():
-        by_time[t] = {
-            str(time): {
-                "close": _col_f(close),
-                "net": _col_f(net),
-                "bullish": _col_f(bullish),
-                "bearish": _col_f(bearish),
-                "trend_up": _col_b(trend_up),
-                "trend_down": _col_b(trend_down),
-                "dist_above": _col_f(dist_above),
-                "dist_below": _col_f(dist_below),
-                "atr_stop": _col_opt(atr_stop),
-                "atr14": _col_opt(atr14),
-                "weekly_trend_up": True if pd.isna(weekly_trend_up) else _col_b(weekly_trend_up),
-                "run_5d": _col_opt(run_5d),
-                "run_20d": _col_opt(run_20d),
-                "run_60d": _col_opt(run_60d),
-                "dist_52w_high": _col_opt(dist_52w_high),
-            }
-            for time, close, net, bullish, bearish, trend_up, trend_down,
-                dist_above, dist_below, atr_stop, atr14, weekly_trend_up,
-                run_5d, run_20d, run_60d, dist_52w_high
-            in zip(*(df[c] for c in cols), strict=True)
-        }
+    by_time, carries_bars = _by_time_index(series)
 
     pf = PaperPortfolio(cash=params.start_cash)
     equity_curve: list[dict] = []
@@ -993,6 +1182,7 @@ async def _hybrid_replay(
     last_deposit_month: str | None = None
     cumulative_invested = params.start_cash
     last_known_prices: dict[str, float] = {}
+    last_decision_prices: dict[str, float] = {}
     last_review_week: str | None = None
     peak_equity: float = params.start_cash
 
@@ -1015,6 +1205,24 @@ async def _hybrid_replay(
                 elif t in last_known_prices:
                     prices[t] = last_known_prices[t]
 
+            # Decision session S + decision closes (data <= S) and F's strict
+            # session bars — the same split `_replay` uses, so the hybrid
+            # skeleton shares the contract semantics.
+            g_i = lo + day_idx - 1
+            s_day = days_full[g_i - 1] if g_i > 0 else None
+            decision_prices: dict[str, float] = {}
+            for t, idx in by_time.items():
+                row = idx.get(s_day) if s_day is not None else None
+                if row is not None:
+                    p = row["close"]
+                    decision_prices[t] = p
+                    last_decision_prices[t] = p
+                elif t in last_decision_prices:
+                    decision_prices[t] = last_decision_prices[t]
+            session_bars = (_session_bars_for(by_time, day)
+                            if carries_bars else None)
+            decision_source = decision_prices if carries_bars else prices
+
             logger.info("hybrid day %d/%d %s — equity %.2f, cash %.2f, %d positions",
                         day_idx, len(days), day, pf.equity(prices),
                         pf.cash, len(pf.positions))
@@ -1030,7 +1238,7 @@ async def _hybrid_replay(
             pf.update_peaks(prices)
 
             # --- 1. Deterministic PROPOSE phase (no mutation) ---
-            signals = _signals_for_day(series, by_time, day, params)
+            signals = _signals_for_day(series, by_time, day, params, s_day=s_day)
             if pure_llm:
                 # Pure-LLM mode (main-branch parity): the engine makes NO
                 # proposals and NO risk-floor sells — the LLM picks the names,
@@ -1041,8 +1249,10 @@ async def _hybrid_replay(
                 # sizing and engine-driven exits added variance + losses.
                 proposals = []
             else:
-                proposals = _deterministic_propose_replay(pf, by_time, prices, day, params,
-                                                          quality_of=quality.of(day) if quality else None)
+                proposals = _deterministic_propose_replay(
+                    pf, by_time, decision_source, day, params,
+                    quality_of=quality.of(day) if quality else None,
+                    s_day=s_day, session_bars=session_bars)
                 if proposals:
                     logger.info("  det proposed: %d — %s",
                                 len(proposals),
@@ -1108,7 +1318,7 @@ async def _hybrid_replay(
             if total_equity > 0 and (settings.llm_backends or settings.ollama_model) and is_review_day:
                 allowance_total = cumulative_invested
                 valuation = valuate_portfolio(_pf_to_positions(pf), pf.cash, prices, allowance_total)
-                signals = _signals_for_day(series, by_time, day, params)
+                signals = _signals_for_day(series, by_time, day, params, s_day=s_day)
                 context = _build_llm_context(valuation, proposals, signals, news,
                                             pure_llm=pure_llm,
                                             trade_history=list(reversed(pf.trades[-15:]))[:12],
@@ -1173,6 +1383,13 @@ async def _hybrid_replay(
                             action = d["action"]
                             reason = d.get("reason", f"LLM {action}")
                             price = prices.get(d["ticker"])
+                            # Contract mode: the LLM's legs fill at F's strict
+                            # open when the ticker has an F bar (a missing bar
+                            # = no fill, exactly like the deterministic legs);
+                            # the budget was still sized decision-side.
+                            if session_bars is not None:
+                                price = _exec_price(
+                                    (session_bars.get(d["ticker"]) or {}).get("open"))
                             if price is None or price <= 0 or action == "HOLD":
                                 continue
                             if action == "BUY":
@@ -1234,8 +1451,10 @@ async def _hybrid_replay(
                 for p in proposals:
                     if p["side"] == "SELL":
                         _execute_proposal(pf, p)
-                proposals2 = _deterministic_propose_replay(pf, by_time, prices, day, params,
-                                                           quality_of=quality.of(day) if quality else None)
+                proposals2 = _deterministic_propose_replay(
+                    pf, by_time, decision_source, day, params,
+                    quality_of=quality.of(day) if quality else None,
+                    s_day=s_day, session_bars=session_bars)
                 for p in proposals2:
                     if p["side"] == "BUY":
                         _execute_proposal(pf, p)
@@ -2308,19 +2527,35 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
                             frame_cache: dict[pd.Timestamp, pd.DataFrame | None] | None = None,
                             close_preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
                             fund_preloaded: dict[str, dict[str, list[dict]]] | None = None,
+                            open_preloaded: pd.DataFrame | None = None,
                             ) -> BacktestSummary | None:
     """DCA backtest of the monthly qv-mom-v1 strategy on stored candles.
 
-    Mirrors stockstrat's run_dca: at the last trading day of each month,
-    deposit `contribution`, pick the top-N with hysteresis from point-in-time
-    fundamentals, and trade at that day's close (10 bps one-way on swapped
-    notional). Reports the money-weighted IRR like the stockstrat results.
+    Cadence — the SAME session fill contract (app/session.py) the live
+    monthly engine and ``monthly.backfill`` implement: the DECISION is the
+    completed month-end's qv-mom frame (fundamentals public by ME, candles
+    <= ME), the rebalance FILLS on the FIRST stored session after that
+    month-end at that session's strict exact-date OPEN, and the book is
+    marked at closes. One session of cash drag, never a month-end-close fill.
 
-    Disclosed approximations (this is an aggregate baseline, not a
-    live-parity claim): contributions settle lumpy at the month-end marks
-    (a month whose month-end candle is missing books at the next month-end)
-    and are parked cash (0% return) until a live-frame rebalance deploys
-    them; the money-weighted IRR assumes uniformly spaced contributions.
+    It is an AGGREGATE-VALUE model (one portfolio value per rebalance), not a
+    share ledger, so it cannot claim live parity. The approximations that
+    remain are disclosed rather than hidden:
+
+      * per-name legs cannot be deferred individually: a name with no stored
+        bar on the fill session drops out of that period's equal-weight
+        return (the live engine would keep the old position and retry the
+        leg at the following session);
+      * no intra-period marks: only the fill sessions and the window's last
+        close are priced, so intra-month drawdowns do not enter the value (a
+        research number can therefore look smoother than the live curve);
+      * contributions are calendar-causal but settle lumpy at the fill marks
+        (a month whose contribution day arrives between two fills is parked
+        at 0% until the next fill deploys it), and the money-weighted IRR
+        assumes uniformly spaced contributions;
+      * one equal-weight basket rebalance per fill, with the one-way cost on
+        swapped notional (``settings.sim_monthly_cost_oneway``) — the same
+        research-only cost model as the daily-core backtest.
     """
     from . import monthly as monthly_mod
     from . import fundamentals as fundamentals_mod
@@ -2331,14 +2566,33 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
     if close_preloaded is not None and fund_preloaded is not None:
         close, vol = close_preloaded
         fund = fund_preloaded
+        if open_preloaded is None:
+            # Pre-contract callers only carry closes. Falling back to the
+            # close frame keeps them runnable, but fills then use the OLD
+            # close convention — say so loudly rather than silently.
+            logger.warning(
+                "Monthly backtest: no open frame supplied with the preloaded "
+                "closes — fills fall back to the CLOSE (pre-contract "
+                "convention); pass open_preloaded for the session-fill rule.")
+            open_px = close
+        else:
+            open_px = open_preloaded
     else:
-        close, vol = await monthly_mod.load_frames(tickers, None)
+        if open_preloaded is not None:
+            close, vol = await monthly_mod.load_frames(tickers, None)
+            open_px = open_preloaded
+        else:
+            open_px, close, vol = await monthly_mod.load_ohlcv_frames(tickers, None)
         fund = await fundamentals_mod.load_fundamentals(tickers)
     if close.empty:
         print("No candle data found. Run the monthly rebalance (or a data refresh) first.")
         return
     logger.info("Frames: %d days x %d tickers; fundamentals for %d tickers",
                 len(close), close.shape[1], len(fund))
+
+    # The strict fill series, aligned to the close calendar WITHOUT any
+    # forward fill — a missing open is not an executable price.
+    open_px = open_px.reindex(index=close.index, columns=close.columns)
 
     idx = pd.DatetimeIndex(close.index)
     if start:
@@ -2384,6 +2638,18 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
             if (i + 1) % 12 == 0:
                 logger.info("eligibility %d/%d", i + 1, len(months))
 
+    # The FILL session of each month-end: the FIRST stored session strictly
+    # after it (the deferred convention). A month-end whose next session is
+    # outside the window is a PENDING rebalance — the previous picks keep
+    # marking and nothing is fabricated. months are increasing, so the first
+    # pending one ends the sequence.
+    fill_days: list[pd.Timestamp] = []
+    for me in months:
+        later = idx[idx > pd.Timestamp(me)]
+        if not len(later):
+            break
+        fill_days.append(later[0])
+
     # NO dead-month trim on eligibility: dropping months whose frame turned
     # out dead erased their funding and made the aggregate depend on FUTURE
     # eligibility. A dead month stays in the sequence and simply holds the
@@ -2397,10 +2663,21 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
     churns: list[float] = []
     picks_hist: list[tuple[str, list[str]]] = []
 
-    def period_ret(d0: pd.Timestamp, d1: pd.Timestamp, names: list[str]) -> float:
+    def period_ret(d0: pd.Timestamp, d1: pd.Timestamp, names: list[str],
+                   *, end_at_close: bool = False) -> float:
+        """Equal-weight return of `names` from the fill at d0 to d1.
+
+        Both ends read the STRICT open (fill-to-fill), except the window's
+        final mark (``end_at_close``), which reads the closes so the trailing
+        stretch is marked at the last session's close. A name without a price
+        at either end drops out of the mean (documented approximation: the
+        live engine keeps the old position and retries the leg).
+        """
         if not names:
             return 0.0
-        r = (close.loc[d1].reindex(names) / close.loc[d0].reindex(names) - 1.0).dropna()
+        p0 = open_px.loc[d0].reindex(names)
+        p1 = (close.loc[d1] if end_at_close else open_px.loc[d1]).reindex(names)
+        r = (p1 / p0 - 1.0).dropna()
         return _col_f(r.mean()) if len(r) else 0.0
 
     # Contributions are counted per CALENDAR month present in the window and
@@ -2440,19 +2717,27 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
                 n_contrib += 1
                 booked.add(key)
 
-    for i, d in enumerate(months):
-        if i > 0:
-            invested *= 1.0 + period_ret(months[i - 1], d, holdings)
-        _settle_arrived(d)
-        frame = frame_cache[d]
+    prev_fill: pd.Timestamp | None = None
+    for me, fd in zip(months, fill_days, strict=False):
+        # Mark the deployed book from the PREVIOUS fill to this one (strict
+        # opens at both ends — the fill-to-fill holding period).
+        if prev_fill is not None:
+            invested *= 1.0 + period_ret(prev_fill, fd, holdings)
+        # Deposits that arrived by the fill session join the rebalance: the
+        # live engine deposits at the month's first session and deploys in
+        # the same cycle, so a fill on the month's first session sees that
+        # month's contribution.
+        _settle_arrived(fd)
+        frame = frame_cache[me]
         live = frame is not None and bool(frame["eligible"].any())
-        picks, _ = monthly_mod.pick_portfolio(d, close, vol, fund, holdings, frame) if frame is not None else (holdings, None)
-        # turnover = fraction of the portfolio's slots swapped this month:
-        # buys of new names plus sells of dropped names, each leg one-way
+        picks, _ = monthly_mod.pick_portfolio(me, close, vol, fund, holdings, frame) if frame is not None else (holdings, None)
+        # turnover = fraction of the portfolio's slots swapped at this
+        # rebalance: buys of new names plus sells of dropped names, each leg
+        # one-way.
         adds = len(set(picks) - set(holdings))
         drops = len(set(holdings) - set(picks))
         turn = (adds + drops) / max(max(len(picks), len(holdings)), 1)
-        # A live frame rebalances (one pass EVERY month it has a ranking,
+        # A live frame rebalances (one pass for every month it has a ranking,
         # no-op months included): parked cash joins the book. The fresh
         # contribution is deployed by buying new/rebalanced names — charging
         # it separately would double-count the swap leg on entry months.
@@ -2464,23 +2749,19 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
         invested *= 1.0 - turn * cost
         churns.append(turn)
         if picks != holdings:
-            picks_hist.append((d.strftime("%Y-%m"), list(picks)))
+            picks_hist.append((me.strftime("%Y-%m"), list(picks)))
         holdings = list(picks)
+        prev_fill = fd
 
-    # Trailing partial month: the live engine deposits at the start of every
-    # month, and a window that ends inside a month whose month-end never
-    # arrives must still fund and mark that stretch (the daily-core replay
-    # receives the same deposits via its contribution keys, so the two
-    # backtests' contribution counts stay equal) and mark-to-market the
-    # INVESTED value to the window's last day. The stretch may span several
-    # calendar months when an interior month-end is missing: settle every
-    # remaining key — parked, so none of them earns the stretch's gap
-    # return.
-    last_key = (idx[-1].year, idx[-1].month)
-    trailing = last_key not in {(m.year, m.month) for m in months}
-    if trailing:
-        invested *= 1.0 + period_ret(months[-1], idx[-1], holdings)
-        _settle_arrived(idx[-1])
+    # Trailing stretch: mark the deployed book from the LAST fill's open to
+    # the window's last close (the last session's mark), and settle every
+    # remaining funding month — parked, so none of them earns the stretch's
+    # return. When no rebalance ever filled (a window that ends before the
+    # first fill session) everything stays parked and nothing is marked.
+    if prev_fill is not None:
+        invested *= 1.0 + period_ret(prev_fill, idx[-1], holdings,
+                                     end_at_close=True)
+    _settle_arrived(idx[-1])
 
     value = invested + parked
 
@@ -2505,8 +2786,10 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
     print(f"\n=== Monthly qv-mom backtest [{universe}] {months[0].date()}..{months[-1].date()} ===")
     print(f"  contributions: {n} x ${contribution:,.0f} = ${contributed:,.0f}")
     print(f"  final value:   ${value:,.0f}  (multiple {value / max(contributed, 1e-9):.2f}x)")
-    print(f"  money-weighted IRR: {irr:.2%}/yr   avg monthly turnover: {sum(churns) / len(churns):.1%}")
-    print(f"  (paper costs: {cost * 1e4:.0f} bps one-way; fundamentals: SEC EDGAR point-in-time "
+    print(f"  money-weighted IRR: {irr:.2%}/yr   avg monthly turnover: {sum(churns) / len(churns):.1%}"
+          if churns else f"  money-weighted IRR: {irr:.2%}/yr   avg monthly turnover: n/a")
+    print(f"  (research-only cost model: {cost * 1e4:.0f} bps one-way on swapped notional "
+          f"at the fill; fundamentals: SEC EDGAR point-in-time "
           f"for US filers, yfinance approximation for CIK-less listings)")
     if verbose:
         print("\nLast 12 rebalances:")
@@ -2539,6 +2822,11 @@ class BacktestSummary:
     max_drawdown: float = 0.0  # peak-to-trough, fraction (positive number)
     brake_events: int = 0      # portfolio-stop cash-outs that fired
     basket_events: int = 0     # gradient-filter cash-outs that fired
+    # Per-fill ledger for the daily-core replay: one dict per leg with
+    # ``date``, ``side``, ``ticker``, ``notional``, ``shares`` and ``price``
+    # (the strict-open fill price). tests/test_replay_fills.py compares it
+    # against daily_core.backfill's trade rows.
+    trades: list[dict] = field(default_factory=list)
 
 
 def _inv_vol_weights(names: list[str], frame: pd.DataFrame | None,
@@ -2573,17 +2861,40 @@ def _inv_vol_weights(names: list[str], frame: pd.DataFrame | None,
 def _fill_buy(cash: float, price: float, delta_value: float,
               cost: float) -> tuple[float, float, float] | None:
     """One BUY fill: ``(notional, shares, cash_after)`` or None when the
-    spend would be under $1.
+    spend would be under $1 or the booked cost exceeds the exact cash.
 
-    The one-way fee is reserved INSIDE the spend, so a full-cash buy
-    (``delta_value >= cash``) can never drive cash negative — without this
-    the fee was charged on top and every full-cash buy left the account at
-    ``-cash * cost``, which also blocked follow-on buys until cash
-    recovered. ``daily_core.backfill.do_buy`` uses the same rule."""
-    notional = min(delta_value, max(cash, 0.0) / (1.0 + cost))
-    if notional < 1.0:
+    Sizing mirrors the live executor exactly (``daily_core.backfill.do_buy`` /
+    ``daily_core._exec_buy``, and the monthly engines' ``share_size`` call):
+    ``shares = floor4(budget / price)``, ``cost = shares * price``, and the
+    leg is DROPPED when the account cash cannot cover that booked cost — the
+    live engine skips it and re-takes the decision next session. That guard
+    matters at ``cost=0`` in the razor-thin case where the caller's budget is
+    the ROUNDED cash (``round(cash, 2)``) and the 4dp share floor lands a
+    fraction of a cent above the exact cash: shrinking the budget to the exact
+    cash instead would book a fill the live engine never makes
+    (tests/test_replay_fills.py pins the golden parity).
+
+    With a non-zero ``cost`` the one-way fee is reserved INSIDE the spend, so
+    a full-cash research buy can never drive cash negative — without this the
+    fee was charged on top and every full-cash buy left the account at
+    ``-cash * cost``, which also blocked follow-on buys until cash recovered.
+    """
+    budget = delta_value
+    if cost > 0:
+        budget = min(budget, max(cash, 0.0) / (1.0 + cost))
+    if budget < 1.0:
         return None
-    return notional, notional / price, cash - notional * (1.0 + cost)
+    from .monthly import share_size  # lazy: monthly imports db/analysis only
+    shares = share_size(budget, price)
+    if shares < 0.0001:
+        return None
+    notional = shares * price
+    if cash < notional * (1.0 + cost):
+        # The live executor's own guard. A missing fill is NOT forced: the
+        # research replay retries the leg at the next session, exactly like
+        # the live cycle.
+        return None
+    return notional, shares, cash - notional * (1.0 + cost)
 
 
 def _contribution_days(days: pd.DatetimeIndex,
@@ -2637,6 +2948,8 @@ async def _daily_core_backtest(
     frame_cache: dict[pd.Timestamp, pd.DataFrame | None] | None = None,
     close_preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
     fund_preloaded: dict[str, dict[str, list[dict]]] | None = None,
+    open_preloaded: pd.DataFrame | None = None,
+    cost_oneway: float | None = None,
     with_baseline: bool = True,
     vol_weight: bool | None = None,
     target_vol: float | None = None,
@@ -2674,6 +2987,31 @@ async def _daily_core_backtest(
     monthly qv-mom backtest (same eligibility, same hysteresis, same cost
     model) — that equivalence is the sanity check. The report compares the
     money-weighted IRR against the monthly baseline over the same window.
+
+    SESSION FILL CONTRACT (app/session.py) — this replay walks F = each stored
+    session in order and treats ``S`` = the previous stored session:
+
+      * DECISION on data <= S: the ranking frame is the newest COMPLETED
+        month-end <= S (so the band switches on the first session AFTER a
+        month-end, and the month-end rebuild/release pass runs on that first
+        session — ``rebuild``), and every overlay (crash-pause breadth,
+        exposure gate, portfolio-stop drawdown, entry gate, vol management)
+        reads S's close. F's own bar never changes the decision.
+      * FILLS at F's strict exact-date OPEN per ticker (``session.open_at``):
+        never forward-filled, never a stale close. A ticker without a bar on
+        F has NO fill and the decision is re-taken next session (the band
+        release / deployment retries). Marks/valuation use the
+        forward-filled CLOSE.
+      * The trailing stop is a standing order: the level known at S's close
+        fills at F's open when the open is already through it. There is no
+        low/high frame in this loader, so an intrabar breach that closes back
+        above the level waits for the next session's open (documented, not
+        modelled) — the live engine has F's low and would fill at the level.
+      * ``cost_oneway`` is the research-only cost model (default
+        ``settings.sim_monthly_cost_oneway`` = 10 bps one-way). It is NOT the
+        live engine's policy: the live paper portfolios are fee-free, which is
+        why tests/test_replay_fills.py runs this replay at
+        ``cost_oneway=0.0`` to compare fills with ``daily_core.backfill``.
     """
     from . import monthly as monthly_mod
     from . import fundamentals as fundamentals_mod
@@ -2684,14 +3022,35 @@ async def _daily_core_backtest(
     if close_preloaded is not None and fund_preloaded is not None:
         close, vol = close_preloaded
         fund = fund_preloaded
+        if open_preloaded is None:
+            # Pre-contract callers only carry closes (the parameter sweep did
+            # until opens were threaded through). Falling back to the close
+            # frame keeps them runnable, but fills then use the OLD close
+            # convention — say so loudly rather than silently.
+            logger.warning(
+                "Daily-core backtest: no open frame supplied with the "
+                "preloaded closes — fills fall back to the CLOSE "
+                "(pre-contract convention); pass open_preloaded for the "
+                "session-fill rule.")
+            open_px = close
+        else:
+            open_px = open_preloaded
     else:
-        close, vol = await monthly_mod.load_frames(tickers, None)
+        if open_preloaded is not None:
+            close, vol = await monthly_mod.load_frames(tickers, None)
+            open_px = open_preloaded
+        else:
+            open_px, close, vol = await monthly_mod.load_ohlcv_frames(tickers, None)
         fund = await fundamentals_mod.load_fundamentals(tickers)
     if close.empty:
         print("No candle data found. Run the monthly rebalance (or a data refresh) first.")
         return
     logger.info("Frames: %d days x %d tickers; fundamentals for %d tickers",
                 len(close), close.shape[1], len(fund))
+
+    # The strict fill series, aligned to the close calendar WITHOUT any
+    # forward fill — a missing open is not an executable price.
+    open_px = open_px.reindex(index=close.index, columns=close.columns)
 
     idx = pd.DatetimeIndex(close.index)
     if start:
@@ -2712,6 +3071,12 @@ async def _daily_core_backtest(
     # rebalance at an arbitrary partial-month date.
     full_idx = pd.DatetimeIndex(close.index)
     months = monthly_mod.completed_month_ends(close.index, days_all[0], last_day)
+    month_set = set(months)
+    # Position of every walk day in the FULL stored index: S = the stored
+    # session before it (contract: the decision is made on S's completed
+    # bar, so the first window day is allowed to decide on the session
+    # before the window — the ranking frame and the overlays both use it).
+    locs = full_idx.get_indexer(pd.DatetimeIndex(days_all))
 
     # Most recent PRE-window month-end, keyed off the WINDOW START's month —
     # independent of the rebalance list above (a short Jan-02..Jan-15 window
@@ -2784,7 +3149,8 @@ async def _daily_core_backtest(
     # Contributions are booked per calendar month present in the window
     # (see contrib_keys below), independent of rebalance bars.
 
-    cost = settings.sim_monthly_cost_oneway
+    cost = (settings.sim_monthly_cost_oneway if cost_oneway is None
+            else float(cost_oneway))
     target_n = settings.sim_monthly_target_n
     hold_band = settings.sim_monthly_hold_band
 
@@ -2795,8 +3161,8 @@ async def _daily_core_backtest(
     run5_frame = close.pct_change(5)
     above50 = (close > sma50_frame)
 
-    def pullback_day(d: pd.Timestamp) -> bool:
-        if d not in above50.index:
+    def pullback_day(d: pd.Timestamp | None) -> bool:
+        if d is None or d not in above50.index:
             return False
         row = above50.loc[d].dropna()
         if row.empty:
@@ -2805,6 +3171,25 @@ async def _daily_core_backtest(
         r5 = run5_frame.loc[d].dropna()
         med5 = _col_f(r5.median()) if len(r5) else 0.0
         return bool(breadth < 0.60 and med5 < -0.025)
+
+    def entry_ok(t: str, d_ref: pd.Timestamp | None) -> bool:
+        """The entry gate as a DECISION input — evaluated on data <= S.
+
+        The gated fill happens at F's open, so reading the SMA50/5-day run at
+        F's close would be look-ahead: the gate would "know" the session's
+        outcome before the fill. ``d_ref`` is S; during warmup/missing data
+        the fail-closed branches below match the pre-contract behaviour.
+        """
+        if entry_gate == "none" or d_ref is None:
+            return True
+        if entry_gate == "above-sma50":
+            s = px_of_col(sma50_frame, d_ref, t)
+            c = px_of(t, d_ref)
+            return s is not None and c is not None and c > s
+        if entry_gate == "not-crash":
+            r5 = px_of_col(run5_frame, d_ref, t)
+            return r5 is None or r5 > -0.10
+        return True
 
     # --- Portfolio state ---
     shares: dict[str, float] = {}     # ticker -> shares held
@@ -2835,12 +3220,27 @@ async def _daily_core_backtest(
     def px_of(t: str, d: pd.Timestamp) -> float | None:
         return monthly_mod.px_at(close_val, d, t)
 
-    def trade(d: pd.Timestamp, t: str, side: str, delta_value: float) -> None:
-        """Execute one fill at d's close with one-way cost on the notional."""
+    def fill_px_of(t: str, d: pd.Timestamp) -> float | None:
+        # Session fill contract rule 2 (app/session.py): the strict
+        # exact-date OPEN — a stored bar on `d`, or NOTHING. A missing quote
+        # is not an executable price, so the leg retries at the next session
+        # (never a stale or forward-filled close).
+        return monthly_mod.px_at(open_px, d, t)
+
+    def trade(d: pd.Timestamp, t: str, side: str, delta_value: float) -> float:
+        """Execute one fill at d's strict exact-date OPEN.
+
+        Returns the BOOKED notional rounded to cents (0.0 when the leg did
+        not fill) so deployment callers can decrement their room exactly as
+        ``daily_core.backfill`` does. ``delta_value`` caps the spend; shares
+        are 4dp-floored through ``monthly.share_size`` on the open, so at
+        ``cost=0`` the booked ticker/side/shares/price rows are identical to
+        the live executor's (tests/test_replay_fills.py pins that parity).
+        """
         nonlocal cash, month_buys, month_sells
-        p = px_of(t, d)
+        p = fill_px_of(t, d)
         if p is None or p <= 0:
-            return
+            return 0.0
         if side == "BUY":
             if t not in shares and len(shares) >= target_n:
                 # Hard ten-slot backstop: `_deploy_targets` plans the
@@ -2849,26 +3249,28 @@ async def _daily_core_backtest(
                 # executor must check the ACTUAL free capacity before
                 # opening a NEW name — a failed release (no usable price)
                 # leaves its slot occupied and the book must not grow.
-                return
-            fill = _fill_buy(cash, p, delta_value, cost)
+                return 0.0
+            fill = _fill_buy(cash, p, min(delta_value, round(cash, 2)), cost)
             if fill is None:
-                return
+                return 0.0
             notional, sh, cash = fill
             shares[t] = shares.get(t, 0.0) + sh
             # trailing-stop peak: a fresh position starts at its entry price;
             # an add to an existing one keeps the higher peak.
             peak_px[t] = max(peak_px.get(t, p), p)
             month_buys += notional
-        else:
-            sh = shares.get(t, 0.0)
-            if sh <= 0:
-                return
-            notional = sh * p
-            cash += notional * (1.0 - cost)
-            del shares[t]
-            peak_px.pop(t, None)
-            month_sells += notional
-        trades_log.append((d.strftime("%Y-%m-%d"), side, t, notional))
+            trades_log.append((d.strftime("%Y-%m-%d"), side, t, notional, sh, p))
+            return round(notional, 2)
+        sh = shares.get(t, 0.0)
+        if sh <= 0:
+            return 0.0
+        notional = sh * p
+        cash += notional * (1.0 - cost)
+        del shares[t]
+        peak_px.pop(t, None)
+        month_sells += notional
+        trades_log.append((d.strftime("%Y-%m-%d"), side, t, notional, sh, p))
+        return round(notional, 2)
 
     # Ranking memo: the eligibility frame is per-month, so the qv-mom
     # order is identical for every trading day within that month —
@@ -2890,15 +3292,21 @@ async def _daily_core_backtest(
         order_memo[key] = result
         return result
 
-    def month_for(d: pd.Timestamp) -> pd.Timestamp | None:
-        # The most recent month-end at or before d. Before the first window
-        # month-end this is the PRE-WINDOW month-end frame (preloaded above);
-        # when even that does not exist (the window starts at the first
-        # stored candles) it is None — no ranking, no trades that day. It is
-        # NEVER months[0]: substituting the first window month-end for days
-        # before it leaked that future frame's ranking backwards (audit P0-E:
-        # a synthetic run bought on 2025-01-01 on a 2025-01-31 ranking).
-        m = [m for m in months if m <= d]
+    def month_for(s_prev: pd.Timestamp | None) -> pd.Timestamp | None:
+        # The most recent COMPLETED month-end at or before S (the previous
+        # stored session). Before the first window month-end this is the
+        # PRE-WINDOW month-end frame (preloaded above); when even that does
+        # not exist (the window starts at the first stored candles) it is
+        # None — no ranking, no trades that day. It is NEVER months[0]:
+        # substituting the first window month-end for days before it leaked
+        # that future frame's ranking backwards (audit P0-E: a synthetic run
+        # bought on 2025-01-01 on a 2025-01-31 ranking). Deferring by one
+        # session is the contract's decision rule (data <= S), and it makes
+        # the band switch — and therefore the month-end rebuild — happen on
+        # the FIRST session after the month-end.
+        if s_prev is None:
+            return prior_month_end
+        m = [m for m in months if m <= s_prev]
         return m[-1] if m else prior_month_end
 
     pending_cash = 0.0  # contributions not yet deployed (dca="monthly")
@@ -2992,19 +3400,21 @@ async def _daily_core_backtest(
     # (independent of the deployment gate's window; window configurable).
     mkt_sma_arm = mkt_index.rolling(max(basket_arm_sma, 2)).mean()
 
-    def market_above_arm_sma(d: pd.Timestamp) -> bool:
+    def market_above_arm_sma(d: pd.Timestamp | None) -> bool:
         """True while the market index is at/above its 200-day SMA (the
         good-times arming condition). Warmup/missing -> True (armed)."""
+        if d is None:
+            return True
         sma = mkt_sma_arm.get(d)
         idx = mkt_index.get(d)
         if sma is None or idx is None or not np.isfinite(sma) or not np.isfinite(idx):
             return True
         return bool(float(idx) >= float(sma))
 
-    def market_uptrend(d: pd.Timestamp) -> bool:
+    def market_uptrend(d: pd.Timestamp | None) -> bool:
         """True when the universe index is at/above its SMA (always True when
         the filter is disabled)."""
-        if mkt_sma is None:
+        if d is None or mkt_sma is None:
             return True
         sma = mkt_sma.get(d)
         idx = mkt_index.get(d)
@@ -3021,8 +3431,10 @@ async def _daily_core_backtest(
                      if exposure_trend_days and exposure_trend_days > 0 else 200)
     _mkt_sma_reentry = mkt_index.rolling(_reentry_days).mean()
 
-    def market_recovered(d: pd.Timestamp) -> bool:
+    def market_recovered(d: pd.Timestamp | None) -> bool:
         """True once the market index is back at/above its re-entry SMA."""
+        if d is None:
+            return True
         sma = _mkt_sma_reentry.get(d)
         idx = mkt_index.get(d)
         if sma is None or idx is None or not np.isfinite(sma) or not np.isfinite(idx):
@@ -3082,8 +3494,17 @@ async def _daily_core_backtest(
             return default_w
         return vw_map.get(t, default_w)
 
-    for d in days_all:
-        month_td = month_for(d)
+    for i, d in enumerate(days_all):
+        li = locs[i]
+        # S = the stored session BEFORE F (contract rule 1): the decision
+        # row. Every overlay below reads S, never F's own bar.
+        s_prev = full_idx[li - 1] if li > 0 else None
+        # The first session AFTER a completed month-end: the DEFERRED rebuild
+        # day. The band (and the parked "monthly" pool) switch on S's
+        # completed month-end, exactly like the live engine's stored decision
+        # row and daily_core.backfill's `S` lookup.
+        rebuild = s_prev is not None and s_prev in month_set
+        month_td = month_for(s_prev)
         order, frame = current_order(d, month_td)
 
         # --- monthly turnover bookkeeping ---
@@ -3114,31 +3535,39 @@ async def _daily_core_backtest(
                 pending_cash += contribution
             else:
                 cash += contribution
-        # month-end rebuild releases the parked "monthly" pool
-        if d in months and pending_cash:
+        # month-end rebuild releases the parked "monthly" pool (deferred to
+        # the first session after the month-end, like every other rebalance
+        # leg here)
+        if rebuild and pending_cash:
             cash += pending_cash
             pending_cash = 0.0
 
         # --- Portfolio-stop brake (peak-to-trough cash-out) ---
-        # Mark the book, measure the drawdown from the running equity peak,
-        # and CASH OUT when it breaches the stop. Re-engage only on a market
-        # uptrend: once fully cashed the portfolio's own drawdown is frozen,
-        # so a drawdown-recovery rule could never fire.
-        if portfolio_stop_pct > 0:
+        # Measure the drawdown on S's marks (the stop is a decision known at
+        # S's close) and stand the cash-out order for F at F's strict opens.
+        # Re-engage only on a market uptrend: once fully cashed the
+        # portfolio's own drawdown is frozen, so a drawdown-recovery rule
+        # could never fire.
+        if portfolio_stop_pct > 0 and s_prev is not None:
             eq_mark = cash + pending_cash + sum(
-                (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0) for t in shares)
+                (shares.get(t, 0.0) or 0.0) * (px_of(t, s_prev) or 0.0)
+                for t in shares)
             dd = (peak_eq - eq_mark) / peak_eq if peak_eq > 0 else 0.0
-            if not risk_off and dd >= portfolio_stop_pct:
+            if dd >= portfolio_stop_pct:
+                if not risk_off:
+                    risk_off = True
+                    brake_events += 1
+                # Retried every session (a leg without an F bar keeps the
+                # standing order) until the book is cash.
                 for t in list(shares):
                     trade(d, t, "SELL", 0.0)
                     pending_pick.pop(t, None)
-                risk_off = True
-                brake_events += 1
-            elif risk_off and market_recovered(d):
+            elif risk_off and market_recovered(s_prev):
                 risk_off = False
 
         # --- Gradient filter cash-out: when the basket trend confirmed
-        # negative, exit the book (the flip was set at yesterday's close).
+        # negative, exit the book (the flip was set at S's close, i.e. the
+        # previous iteration's end-of-day pass).
         if (basket_trend_days > 0 or basket_drawdown > 0) and basket_out and shares:
             for t in list(shares):
                 trade(d, t, "SELL", 0.0)
@@ -3147,31 +3576,37 @@ async def _daily_core_backtest(
         # --- SELL phase: releases from the hysteresis band ---
         if order:
             band = set(order[:hold_band])
-            if exit_cadence == "daily" or d in months:
+            if exit_cadence == "daily" or rebuild:
                 for t in list(shares):
                     if t not in band:
                         trade(d, t, "SELL", 0.0)
                         pending_pick.pop(t, None)
 
-        # --- Per-name trailing stop: exit any holding fallen X% below its
-        # own peak since entry. Runs every day (not just month-end) and cuts
-        # individual reversals regardless of the market regime.
+        # --- Per-name trailing stop: a STANDING ORDER struck at S's close
+        # (level = peak since entry - X%) and filled at F's open when the
+        # open is already through it. The loader carries no low/high frame,
+        # so an intrabar breach that closes back above the level is not
+        # modelled — it waits for the next session's open (documented in the
+        # docstring). The peak advances at the END of the session on F's
+        # close, so the level that governs F is the one known at S.
         if trailing_stop_pct > 0:
             for t in list(shares):
-                p = px_of(t, d)
-                if p is None or p <= 0:
+                level = peak_px.get(t, 0.0) * (1.0 - trailing_stop_pct)
+                if level <= 0:
                     continue
-                # Advance the peak to today's close first: the stop is
-                # measured from the high since entry, not the highest buy.
-                pk = max(peak_px.get(t, 0.0), p)
-                peak_px[t] = pk
-                if p <= pk * (1.0 - trailing_stop_pct):
+                op = fill_px_of(t, d)
+                if op is not None and op <= level:
                     trade(d, t, "SELL", 0.0)
                     pending_pick.pop(t, None)
 
         # --- BUY phase: keep the portfolio at target weights ---
-        equity_now = cash + pending_cash + sum(
-            (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0) for t in shares)
+        # Marks at F's close (contract rule 3), summed ticker-ordered and
+        # rounded once — the same arithmetic daily_core.backfill uses, so a
+        # rank-deploy run's budgets (and therefore its fills) match it.
+        positions_value = sum(
+            (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0)
+            for t in sorted(shares))
+        equity_now = round(cash + pending_cash + positions_value, 2)
         weight = equity_now / max(target_n, 1)
 
         # The hysteresis-selected deployment targets (audit P0-D). On a
@@ -3199,9 +3634,9 @@ async def _daily_core_backtest(
         vw_map = (_inv_vol_weights(picks, frame, target_n, weight)
                   if vol_weight and picks else {})
 
-        paused = ((crash_pause and pullback_day(d)) or risk_off
+        paused = ((crash_pause and pullback_day(s_prev)) or risk_off
                   or basket_out
-                  or (exposure_trend_days > 0 and not market_uptrend(d)))
+                  or (exposure_trend_days > 0 and not market_uptrend(s_prev)))
 
         # Barroso-Santa-Clara vol management: cap deployment when the
         # portfolio's own recent vol exceeds the target. Only scales DOWN
@@ -3226,68 +3661,59 @@ async def _daily_core_backtest(
         # edge is concentrating fresh capital into the top of the ranking —
         # rank deployment does that every day without the ~2-week cash drag.
         if dca == "rank" and picks and not paused:
-            remaining = min(cash, room)
             rank_of = {t: i for i, t in enumerate(order)}
             for t in picks:
                 rank_i = rank_of.get(t, target_n - 1)
-                if remaining < 1:
+                if room < 1:
                     break
-                p = px_of(t, d)
-                if p is None:
+                # rule 2: no strict-open bar this session -> no fill; the
+                # daily pass simply re-takes the decision next session.
+                if fill_px_of(t, d) is None:
                     continue
                 # score-weighted target: rank 1 gets up to `weight` * boost,
                 # linearly decaying to the equal weight at the band edge.
                 boost = 1.0 + settings.sim_monthly_rank_boost * (
                     1.0 - rank_i / max(target_n - 1, 1))
                 tgt = weight_of(t, weight, frame) * boost
-                cur = shares.get(t, 0.0) * p
+                # `cur` is marked at F's close and rounded to cents — the
+                # exact arithmetic daily_core.backfill uses, so a rank-deploy
+                # replay books byte-identical fills on the same tape.
+                cur = round((shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0), 2)
                 gap = tgt - cur
-                if gap > 1:
-                    if t not in shares and len(shares) >= target_n:
-                        continue  # no free slot: a failed release occupies it
-                    # NEW names respect the entry gate too (it used to be
-                    # inert under rank deploy — the gate knob silently did
-                    # nothing in rank-mode sweeps). A gated fill waits in
-                    # pending_pick for the daily re-check below; held-name
-                    # top-ups are never gated.
-                    if t not in shares and entry_gate != "none":
-                        s = px_of_col(sma50_frame, d, t)
-                        if entry_gate == "above-sma50":
-                            ok = s is not None and p > s
-                        elif entry_gate == "not-crash":
-                            r5 = px_of_col(run5_frame, d, t)
-                            ok = r5 is None or r5 > -0.10
-                        else:
-                            ok = True
-                        if not ok:
-                            pending_pick[t] = d
-                            continue
-                    spend = min(gap, remaining)
-                    trade(d, t, "BUY", spend)
-                    remaining -= spend
-            # Propagate the consumed budget so the month-end NEW-entries block
-            # (which also draws on `room`) can't deploy past the vol cap.
-            if room != float("inf"):
-                room = remaining
+                if t not in shares and len(shares) >= target_n:
+                    continue  # no free slot: a failed release occupies it
+                # NEW names respect the entry gate (it used to be inert under
+                # rank deploy — the gate knob silently did nothing in
+                # rank-mode sweeps). A gated fill waits in pending_pick for
+                # the daily re-check below; held-name top-ups are never gated.
+                if t not in shares and entry_gate != "none" \
+                        and not entry_ok(t, s_prev):
+                    pending_pick[t] = d
+                    continue
+                # Budget mirrors backfill: the gap, the ROUNDED cash and the
+                # vol-cap room, all in dollars; < $1 is not worth a fill.
+                budget = min(gap, round(cash, 2), room)
+                if budget < 1:
+                    continue
+                room -= trade(d, t, "BUY", budget)
 
         # Month-end equal-weight rebuild (dca="monthly" only): the baseline
         # semantics — spread the FULL portfolio (incl. fresh contribution)
         # 1/N across the picks. Implemented as: buy each underweight pick up
         # to weight (releasing cash pro-rata), sell nothing here (releases
         # happened in the SELL phase). This makes all-defaults ≈ baseline.
-        if dca == "monthly" and d in months and order and not paused:
+        if dca == "monthly" and rebuild and order and not paused:
             for t in picks:
                 if t not in shares and len(shares) >= target_n:
                     continue  # no free slot: a failed release occupies it
-                p = px_of(t, d)
-                if p is None:
+                if fill_px_of(t, d) is None:
                     continue
-                cur = shares.get(t, 0.0) * p
+                cur = round((shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0), 2)
                 gap = weight_of(t, weight, frame) - cur
-                if gap > 1 and cash > 1 and room > 1:
-                    spend = min(gap, cash, room)
-                    trade(d, t, "BUY", spend)
-                    room -= spend
+                budget = min(gap, round(cash, 2), room)
+                if budget < 1:
+                    continue
+                room -= trade(d, t, "BUY", budget)
 
         # daily top-up of underweight holdings (dca="daily" only; rank mode
         # and month-end days already allocated). NOT pro-rata: the fresh
@@ -3297,42 +3723,36 @@ async def _daily_core_backtest(
         # hysteresis picks (held names the band retained): an out-of-band
         # release waiting for the month-end is not topped up, and no new
         # name is opened here.
-        if dca == "daily" and picks and not paused and d not in months:
+        if dca == "daily" and picks and not paused and not rebuild:
             worst_t, worst_gap = None, 0.0
             for t in picks:
                 if t not in shares:
                     continue
-                p = px_of(t, d)
-                if p is None:
+                if fill_px_of(t, d) is None:
                     continue
-                gap = weight_of(t, weight, frame) - shares[t] * p
+                gap = weight_of(t, weight, frame) - round(
+                    (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0), 2)
                 if gap > worst_gap:
                     worst_t, worst_gap = t, gap
             if worst_t is not None and worst_gap > 1.0:
-                trade(d, worst_t, "BUY", min(worst_gap, room))
+                trade(d, worst_t, "BUY", min(worst_gap, round(cash, 2), room))
 
         # --- NEW entries (core names not yet held) ---
-        if d in months and order:
+        # Month-end cadences only: rank deployment opens its new names in the
+        # daily pass above (it targets every hysteresis pick, held or not), so
+        # re-running this block would double-deploy on the rebuild session.
+        if rebuild and dca != "rank" and order:
             for t in picks:
                 if t in shares or paused:
                     continue
                 if len(shares) >= target_n:
                     continue  # no free slot: a failed release occupies it
-                p = px_of(t, d)
-                if p is None:
+                if fill_px_of(t, d) is None:
                     continue
-                ok = True
-                if entry_gate != "none":
-                    s = px_of_col(sma50_frame, d, t)
-                    if entry_gate == "above-sma50":
-                        ok = s is not None and p > s
-                    elif entry_gate == "not-crash":
-                        r5 = px_of_col(run5_frame, d, t)
-                        ok = r5 is None or r5 > -0.10
-                if not ok:
+                if entry_gate != "none" and not entry_ok(t, s_prev):
                     pending_pick[t] = d  # wait for the gate to open
                     continue
-                budget = min(weight_of(t, weight, frame), cash, room)
+                budget = min(weight_of(t, weight, frame), round(cash, 2), room)
                 if budget > 1:
                     trade(d, t, "BUY", budget)
                     pending_pick.pop(t, None)
@@ -3344,7 +3764,8 @@ async def _daily_core_backtest(
             # happens while the book is below target) and the book must
             # actually be below capacity: buying a pending name outside the
             # selected set, or while a failed release still occupies the
-            # slot, grew the book past the ten-slot target.
+            # slot, grew the book past the ten-slot target. The gate itself
+            # is a decision input, so it is re-read at S (data <= S).
             for t in list(pending_pick):
                 if t in shares or paused:
                     continue
@@ -3353,29 +3774,32 @@ async def _daily_core_backtest(
                     continue
                 if t not in picks or len(shares) >= target_n:
                     continue
-                p = px_of(t, d)
-                if p is None:
+                if fill_px_of(t, d) is None:
                     continue
-                s = px_of_col(sma50_frame, d, t)
-                ok = s is not None and p > s
-                if entry_gate == "not-crash":
-                    r5 = px_of_col(run5_frame, d, t)
-                    ok = r5 is None or r5 > -0.10
-                if ok:
-                    budget = min(weight_of(t, weight, frame), cash, room)
+                if entry_ok(t, s_prev):
+                    budget = min(weight_of(t, weight, frame), round(cash, 2), room)
                     if budget > 1:
-                        trade(d, t, "BUY", budget)
-                        room -= budget
+                        room -= trade(d, t, "BUY", budget)
                     pending_pick.pop(t, None)
 
         # Track the portfolio's own daily equity for the vol gate. The 21d
         # realized vol is computed from log returns of *invested* equity;
         # contribution days subtract the deposit from the base so a fresh
         # $1000 doesn't read as a +x% return.
-        equity_close = cash + pending_cash + sum(
-            (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0) for t in shares)
+        equity_close = round(cash + pending_cash + sum(
+            (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0)
+            for t in sorted(shares)), 2)
         contrib_today = contribution if d in contrib_days else 0.0
         _record_equity(d, equity_close, contrib_today)
+
+        # Contract rule 1/4: F's close only advances the trailing-stop peaks
+        # for the NEXT session — the level that governs F is the one known
+        # at S's close.
+        if trailing_stop_pct > 0:
+            for t in list(shares):
+                p = px_of(t, d)
+                if p is not None and p > 0:
+                    peak_px[t] = max(peak_px.get(t, 0.0), p)
 
         # --- Gradient filter: the N-day slope of the target basket ---
         # Chain the equal-weight top-N basket from yesterday to today (one
@@ -3454,7 +3878,8 @@ async def _daily_core_backtest(
 
     irr = irr_of(value, n_contribs)
     cfg = (f"dca={dca} entry-gate={entry_gate} exit-cadence={exit_cadence} "
-           f"crash-pause={'on' if crash_pause else 'off'}"
+           f"crash-pause={'on' if crash_pause else 'off'} "
+           f"cost={cost * 1e4:.0f}bps-oneway(research-only)"
            + (f" rank-boost={settings.sim_monthly_rank_boost:g}"
               if dca == "rank" else "")
            + (f" mom={settings.sim_daily_core_mom_variant}"
@@ -3496,7 +3921,7 @@ async def _daily_core_backtest(
              if (basket_trend_days or basket_drawdown) else ""))
     if verbose:
         print("\nLast 15 trades:")
-        for td, side, t, notional in trades_log[-15:]:
+        for td, side, t, notional, _sh, _px in trades_log[-15:]:
             print(f"  {td} {side:<4} {t:<10} ${notional:,.0f}")
 
     # --- Monthly baseline over the same window (for comparison) ---
@@ -3512,6 +3937,7 @@ async def _daily_core_backtest(
             universe, contribution, False,
             frame_cache=frame_cache, close_preloaded=close_preloaded,
             fund_preloaded=fund_preloaded,
+            open_preloaded=None if close_preloaded is None else open_preloaded,
         )
 
     return BacktestSummary(
@@ -3526,6 +3952,9 @@ async def _daily_core_backtest(
         max_drawdown=mdd,
         brake_events=brake_events,
         basket_events=basket_events,
+        trades=[{"date": td, "side": side, "ticker": t,
+                 "notional": notional, "shares": sh, "price": px}
+                for td, side, t, notional, sh, px in trades_log],
     )
 
 
@@ -3856,8 +4285,10 @@ async def _sweep_load_market(universe: str):
 
     tickers = universe_tickers(universe)
     fund = await fundamentals_mod.load_fundamentals(tickers)
-    close, vol = await monthly_mod.load_frames(tickers, None)
-    return tickers, close, vol, fund
+    # Opens are the CONTRACT fill series (strict exact-date, never ffilled);
+    # the sweep reuses them for every config instead of refilling at closes.
+    open_px, close, vol = await monthly_mod.load_ohlcv_frames(tickers, None)
+    return tickers, open_px, close, vol, fund
 
 
 def _sweep_grid() -> list[tuple]:
@@ -3902,9 +4333,11 @@ def _sweep_risk_grid() -> list[dict]:
 _SWEEP_WORKER_STATE: dict = {}
 
 
-def _sweep_worker_init(close: pd.DataFrame, vol: pd.DataFrame,
+def _sweep_worker_init(open_px: pd.DataFrame, close: pd.DataFrame,
+                       vol: pd.DataFrame,
                        fund: dict[str, dict[str, list[dict]]],
                        fc: dict[pd.Timestamp, pd.DataFrame | None]) -> None:
+    _SWEEP_WORKER_STATE["open"] = open_px
     _SWEEP_WORKER_STATE["close"] = close
     _SWEEP_WORKER_STATE["vol"] = vol
     _SWEEP_WORKER_STATE["fund"] = fund
@@ -3927,6 +4360,7 @@ def _sweep_run_config(task: tuple[str, str, str, bool, float]) -> dict:
             frame_cache=_SWEEP_WORKER_STATE["fc"],
             close_preloaded=(_SWEEP_WORKER_STATE["close"], _SWEEP_WORKER_STATE["vol"]),
             fund_preloaded=_SWEEP_WORKER_STATE["fund"],
+            open_preloaded=_SWEEP_WORKER_STATE["open"],
             with_baseline=False)
 
     r = asyncio.run(go())
@@ -3938,7 +4372,7 @@ def _sweep_run_config(task: tuple[str, str, str, bool, float]) -> dict:
     }
 
 
-async def _sweep_stage1(fc, close, vol, fund, baseline_irr: float,
+async def _sweep_stage1(fc, open_px, close, vol, fund, baseline_irr: float,
                         out_path: str, workers: int) -> list[dict]:
     from concurrent.futures import ProcessPoolExecutor
 
@@ -3947,7 +4381,7 @@ async def _sweep_stage1(fc, close, vol, fund, baseline_irr: float,
     t0 = time.time()
     results: list[dict] = []
     with ProcessPoolExecutor(max_workers=workers, initializer=_sweep_worker_init,
-                             initargs=(close, vol, fund, fc)) as ex:
+                             initargs=(open_px, close, vol, fund, fc)) as ex:
         for res in ex.map(_sweep_run_config, grid, chunksize=1):
             if res["irr"] is not None:
                 results.append(res)
@@ -3966,7 +4400,7 @@ async def _sweep_stage1(fc, close, vol, fund, baseline_irr: float,
     return results
 
 
-async def _sweep_stage2(fc, close, vol, fund, results: list[dict],
+async def _sweep_stage2(fc, open_px, close, vol, fund, results: list[dict],
                         top_n: int, out_path: str) -> None:
     seen: set = set()
     configs = []
@@ -3986,7 +4420,7 @@ async def _sweep_stage2(fc, close, vol, fund, results: list[dict],
         base = await _monthly_backtest(w_start, w_end, settings.sim_monthly_universe,
                                        settings.sim_monthly_contribution, False,
                                        frame_cache=fc, close_preloaded=(close, vol),
-                                       fund_preloaded=fund)
+                                       fund_preloaded=fund, open_preloaded=open_px)
         assert base is not None, "monthly backtest returned no summary"
         row = {"window": f"{w_start[:4]}-{w_end[:4]}", "baseline_irr": base.irr,
                "configs": []}
@@ -3997,7 +4431,7 @@ async def _sweep_stage2(fc, close, vol, fund, results: list[dict],
                 settings.sim_monthly_contribution, False,
                 c["gate"], c["exit"], c["pause"], c["dca"],
                 frame_cache=fc, close_preloaded=(close, vol), fund_preloaded=fund,
-                with_baseline=False)
+                open_preloaded=open_px, with_baseline=False)
             row["configs"].append({
                 "cfg": f"{c['dca']}/{c['gate']}/{c['exit']}/p{int(c['pause'])}/b{c['boost']}",
                 "irr": r.irr if r else None})
@@ -4027,7 +4461,7 @@ async def _sweep_daily_core(args: argparse.Namespace) -> None:
     from . import monthly as monthly_mod
 
     print("loading market frames...", flush=True)
-    _tickers, close, vol, fund = await _sweep_load_market(universe)
+    _tickers, open_px, close, vol, fund = await _sweep_load_market(universe)
     print(f"frames: {close.shape[0]} days x {close.shape[1]} tickers", flush=True)
 
     fc: dict[pd.Timestamp, pd.DataFrame | None] = {}
@@ -4044,23 +4478,24 @@ async def _sweep_daily_core(args: argparse.Namespace) -> None:
     base = await _monthly_backtest("2017-01-01", None, universe,
                                    settings.sim_monthly_contribution, False,
                                    frame_cache=fc, close_preloaded=(close, vol),
-                                   fund_preloaded=fund)
+                                   fund_preloaded=fund, open_preloaded=open_px)
     assert base is not None, "monthly backtest returned no summary"
     print(f"baseline IRR full window: {base.irr:.2%}", flush=True)
 
-    results = await _sweep_stage1(fc, close, vol, fund, base.irr, stage1_path, workers)
+    results = await _sweep_stage1(fc, open_px, close, vol, fund, base.irr,
+                                  stage1_path, workers)
     if args.stage in ("2", "all"):
-        await _sweep_stage2(fc, close, vol, fund, results,
+        await _sweep_stage2(fc, open_px, close, vol, fund, results,
                             top_n=args.top, out_path=stage2_path)
     if args.stage in ("3", "all"):
-        await _sweep_stage3(fc, close, vol, fund, results,
+        await _sweep_stage3(fc, open_px, close, vol, fund, results,
                             out_path=os.path.join(out_dir, "daily_core_risk_overlays.json"))
     if args.stage in ("4", "all"):
-        await _sweep_stage4(fc, close, vol, fund,
+        await _sweep_stage4(fc, open_px, close, vol, fund,
                             out_path=os.path.join(out_dir, "daily_core_risk_walkforward.json"))
 
 
-async def _sweep_stage4(fc, close, vol, fund, out_path: str) -> None:
+async def _sweep_stage4(fc, open_px, close, vol, fund, out_path: str) -> None:
     """Walk-forward A/B of the risk overlays on the LIVE daily-core config
     (rank deploy, boost=0, no gates) across the non-overlapping OOS windows.
     In-sample stage-3 numbers are necessary but not sufficient — the 2026-09
@@ -4144,7 +4579,7 @@ async def _sweep_stage4(fc, close, vol, fund, out_path: str) -> None:
                 settings.sim_monthly_contribution, False,
                 "none", "monthly", False, "rank",
                 frame_cache=use_fc, close_preloaded=(close, vol), fund_preloaded=fund,
-                with_baseline=False,
+                open_preloaded=open_px, with_baseline=False,
                 vol_weight=ov.get("vol_weight") or None,
                 target_vol=ov.get("target_vol") or None,
                 portfolio_stop_pct=ov.get("portfolio_stop") or None,
@@ -4172,7 +4607,7 @@ async def _sweep_stage4(fc, close, vol, fund, out_path: str) -> None:
         json.dump(report, f, indent=1)
 
 
-async def _sweep_stage3(fc, close, vol, fund, results: list[dict],
+async def _sweep_stage3(fc, open_px, close, vol, fund, results: list[dict],
                         out_path: str) -> None:
     """Risk-overlay sweep on top of the stage-1 winner: fix the best
     (dca/gate/exit/pause/boost) config, then vary the risk knobs one at a
@@ -4210,7 +4645,7 @@ async def _sweep_stage3(fc, close, vol, fund, results: list[dict],
             settings.sim_monthly_contribution, False,
             best["gate"], best["exit"], best["pause"], best["dca"],
             frame_cache=local_fc, close_preloaded=(close, vol), fund_preloaded=fund,
-            with_baseline=False,
+            open_preloaded=open_px, with_baseline=False,
             vol_weight=ov.get("vol_weight") or None,
             target_vol=ov.get("target_vol") or None)
         label = "+".join(f"{k}={v}" for k, v in ov.items()) or "control"

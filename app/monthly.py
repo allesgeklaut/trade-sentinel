@@ -1,5 +1,16 @@
 """Monthly qv-mom portfolio: stockstrat's qv-mom-v1 as a separate paper
-portfolio with a monthly rebalance (last trading day of each month).
+portfolio with a monthly rebalance under the session fill contract
+(app/session.py — normative).
+
+Cadence: the ranking DECISION is the completed month-end's qv-mom frame
+(month-end ranking frame, unchanged); the rebalance FILLS land at the FIRST
+session after that month-end, at that session's strict exact-date OPEN per
+ticker (never a stale or forward-filled close) — one session of cash drag,
+which is the faithful option. Legs that cannot fill (no stored bar for the
+ticker that session) are retried at the following sessions until the
+membership is complete; a newer month-end ranking supersedes a still-pending
+one. The audit row keeps the decision date (``rebal_date`` = the month-end)
+distinct from the fill date (the trades' ``created_at`` = the fill session).
 
 Strategy rules (deterministic, ported from stockstrat qv-mom-v1):
   * eligibility: mcap > $5B, 20d avg dollar volume > $10M, >=253 trading days
@@ -73,9 +84,13 @@ class BackfillPreload:
     builds one of these and hands it to both the monthly and daily-core
     replays, which otherwise load the same fundamentals/frames twice (the
     frames are the expensive part — ~1.6s per month on a 500-name universe).
+    ``open`` is the USD-converted strict-open fill series (session fill
+    contract rule 2): the replays fill at the fill session's exact open,
+    never a stale close.
     """
     tickers: list[str]
     fund: dict[str, dict[str, list[dict]]]
+    open: pd.DataFrame
     close: pd.DataFrame
     vol: pd.DataFrame
     frames: dict[pd.Timestamp, pd.DataFrame | None] = field(default_factory=dict)
@@ -83,15 +98,15 @@ class BackfillPreload:
 
 async def preload_backfill(start: str | None) -> BackfillPreload:
     """Load the inputs shared by the monthly and daily-core backfills for the
-    same window: point-in-time fundamentals and the USD close/volume frames
-    (frames are computed lazily, per month, by the replays themselves)."""
+    same window: point-in-time fundamentals and the USD open/close/volume
+    frames (frames are computed lazily, per month, by the replays themselves)."""
     settings.sim_daily_core_mom_variant = _strategy_variant()
     tickers = universe_tickers(_strategy_universe())
     fund = await fundamentals_mod.load_fundamentals(tickers)
     load_start = ((pd.Timestamp(start) - timedelta(days=_BACKFILL_WARMUP_DAYS)).to_pydatetime()
                   if start else None)
-    close, vol = await load_frames(tickers, None, start=load_start)
-    return BackfillPreload(tickers=tickers, fund=fund, close=close, vol=vol)
+    open_, close, vol = await load_ohlcv_frames(tickers, None, start=load_start)
+    return BackfillPreload(tickers=tickers, fund=fund, open=open_, close=close, vol=vol)
 
 # Anchor for the allowance "month" key: the same operator-local timezone the
 # sim portfolio uses (settings.allowance_tz), so both portfolios' cumulative
@@ -112,15 +127,25 @@ _BACKFILL_WARMUP_DAYS = 600
 _LIVE_HISTORY_DAYS = 1460
 
 
+def _now() -> datetime:
+    """The live decision path's clock (UTC) — injectable for tests.
+
+    Every ``datetime.now(UTC)`` on a decision path routes through this hook so
+    the golden parity tests (tests/test_cadence_parity.py) can drive the live
+    deployment session by session through a fake multi-session market;
+    production returns real UTC now."""
+    return datetime.now(UTC)
+
+
 def _live_history_start() -> datetime:
     """Naive-UTC lower bound for the live ranking's candle load. Candle
     timestamps are stored naive, so the bound must be naive too."""
-    return datetime.now(UTC).replace(tzinfo=None) - timedelta(days=_LIVE_HISTORY_DAYS)
+    return _now().replace(tzinfo=None) - timedelta(days=_LIVE_HISTORY_DAYS)
 
 
 def _current_month() -> str:
     """Operator-local calendar month key (YYYY-MM), matching sim._current_month."""
-    return datetime.now(_TZ).strftime("%Y-%m")
+    return _now().astimezone(_TZ).strftime("%Y-%m")
 
 
 # Serializes rebalances: the month-idempotence check runs before the
@@ -230,6 +255,29 @@ def _ttm_as_of(entries: list[dict], asof: pd.Timestamp) -> float | None:
 # Prices / volume / FX from the candle cache
 # ---------------------------------------------------------------------------
 
+def _fx_convert_usd(frame: pd.DataFrame) -> pd.DataFrame:
+    """Convert a raw {date x ticker} price frame to USD in place-style.
+
+    Same suffix->FX mapping and historical-rate convention as
+    ``load_frames_sync`` (the pair's own closes ffilled across the frame
+    index: the rate prevailing at each date). FX pseudo-ticker columns are
+    dropped; untouched columns (USD tickers, pairs without a listed rate)
+    pass through unchanged."""
+    out = frame.copy()
+    for t in list(out.columns):
+        suffix = t[t.rfind("."):] if "." in t else None
+        pm = fundamentals_mod.SUFFIX_FX.get(suffix) if suffix else None
+        if not pm or pm[0] not in out.columns:
+            continue
+        rate = out[pm[0]].reindex(out.index).ffill()
+        if pm[1] == "mul":
+            out[t] = out[t] * rate
+        else:
+            out[t] = out[t] / rate
+    drop = [c for c in out.columns if c.endswith("=X")]
+    return out.drop(columns=drop)
+
+
 def load_frames_sync(tickers: list[str], rows: list, asof: datetime | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Build (close, volume) frames from candle rows (sync, no DB)."""
     closes: dict[str, dict[pd.Timestamp, float]] = {}
@@ -245,18 +293,7 @@ def load_frames_sync(tickers: list[str], rows: list, asof: datetime | None = Non
     close = pd.DataFrame({t: pd.Series(v).sort_index() for t, v in closes.items()})
     vol = pd.DataFrame({t: pd.Series(v).sort_index() for t, v in vols.items()})
 
-    for t in list(close.columns):
-        suffix = t[t.rfind("."):] if "." in t else None
-        pm = fundamentals_mod.SUFFIX_FX.get(suffix) if suffix else None
-        if not pm or pm[0] not in close.columns:
-            continue
-        rate = close[pm[0]].reindex(close.index).ffill()
-        if pm[1] == "mul":
-            close[t] = close[t] * rate
-        else:
-            close[t] = close[t] / rate
-    drop = [c for c in close.columns if c.endswith("=X")]
-    close = close.drop(columns=drop)
+    close = _fx_convert_usd(close)
     vol = vol.drop(columns=[c for c in vol.columns if c not in close.columns])
     # FX-only calendar rows: currency pairs also print on days US equities
     # don't trade (holidays, today-before-tonight's-close). A trailing row
@@ -270,6 +307,47 @@ def load_frames_sync(tickers: list[str], rows: list, asof: datetime | None = Non
     close = close.reindex(columns=[t for t in tickers if t in close.columns])
     vol = vol.reindex(columns=close.columns)
     return close, vol
+
+
+def load_ohlcv_frames_sync(tickers: list[str], rows: list,
+                           asof: datetime | None = None,
+                           ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """(open, close, volume) frames from candle rows (sync, no DB).
+
+    ``load_frames_sync`` plus the OPEN series the session fill contract's
+    fill rule needs (app/session.py rule 2: fills execute at F's open, read
+    from the stored bar with an exact date match). The open frame is NEVER
+    forward-filled — a date where a ticker has no stored bar carries NaN
+    there, and the executor treats it as "no fill this session". Both price
+    series go through the same USD conversion as the closes."""
+    opens: dict[str, dict[pd.Timestamp, float]] = {}
+    closes: dict[str, dict[pd.Timestamp, float]] = {}
+    vols: dict[str, dict[pd.Timestamp, float]] = {}
+    for r in rows:
+        ts = pd.Timestamp(r.timestamp)
+        if ts.tzinfo is not None:
+            ts = ts.tz_localize(None)
+        if r.open is not None:
+            opens.setdefault(r.ticker, {})[ts] = r.open
+        closes.setdefault(r.ticker, {})[ts] = r.close
+        vols.setdefault(r.ticker, {})[ts] = r.volume
+
+    def _pivot(col: dict[str, dict[pd.Timestamp, float]]) -> pd.DataFrame:
+        return pd.DataFrame({t: pd.Series(v).sort_index() for t, v in col.items()})
+
+    close = _fx_convert_usd(_pivot(closes))
+    open_ = _fx_convert_usd(_pivot(opens))
+    vol = _pivot(vols)
+    vol = vol.drop(columns=[c for c in vol.columns if c not in close.columns])
+    # Same FX-only-calendar cleanup as load_frames_sync, keyed on the CLOSES.
+    close = close.dropna(how="all")
+    idx = close.index
+    open_ = open_.reindex(index=idx).reindex(columns=close.columns)  # strict, no ffill
+    vol = vol.reindex(columns=close.columns).loc[idx]
+    close = close.reindex(columns=[t for t in tickers if t in close.columns])
+    open_ = open_.reindex(columns=close.columns)
+    vol = vol.reindex(columns=close.columns)
+    return open_, close, vol
 
 
 def px_at(frame: pd.DataFrame, d: pd.Timestamp, ticker: str) -> float | None:
@@ -311,6 +389,26 @@ async def load_frames(tickers: list[str], asof: datetime | None = None,
             q = q.where(Candle.timestamp <= asof)
         rows = list((await s.execute(q)).all())
     return await asyncio.to_thread(load_frames_sync, tickers, rows, asof)
+
+
+async def load_ohlcv_frames(tickers: list[str], asof: datetime | None = None,
+                            start: datetime | None = None,
+                            ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """(open, close, volume) DataFrames from the candles cache — the factor
+    portfolios' loader WITH the strict-open fill series (the session fill
+    contract's rule 2). Same bounds/conversion as ``load_frames``."""
+    async with Session() as s:
+        pairs = sorted({pm[0] for t in tickers if (pm := fundamentals_mod._suffix_fx(t))})
+        q = (select(Candle.ticker, Candle.timestamp, Candle.open, Candle.close,
+                    Candle.volume)
+             .where(Candle.ticker.in_(set(tickers) | set(pairs)))
+             .order_by(Candle.timestamp))
+        if start is not None:
+            q = q.where(Candle.timestamp >= start)
+        if asof is not None:
+            q = q.where(Candle.timestamp <= asof)
+        rows = list((await s.execute(q)).all())
+    return await asyncio.to_thread(load_ohlcv_frames_sync, tickers, rows, asof)
 
 
 # ---------------------------------------------------------------------------
@@ -720,8 +818,13 @@ def completed_month_ends(index, start=None, end=None) -> list[pd.Timestamp]:
 # Monthly portfolio engine
 # ---------------------------------------------------------------------------
 
-async def monthly_valuate() -> dict[str, Any]:
-    """Value the monthly portfolio (same shape as sim.valuate)."""
+async def monthly_valuate(now: datetime | None = None) -> dict[str, Any]:
+    """Value the monthly portfolio (same shape as sim.valuate).
+
+    ``now`` is the valuation's clock: marks use closes <= now (the cycle's
+    own session F)."""
+    if now is None:
+        now = _now()
     async with Session() as s:
         acc = await s.get(MonthlyAccount, 1)
         if acc is None:
@@ -734,7 +837,7 @@ async def monthly_valuate() -> dict[str, Any]:
 
     positions_value = 0.0
     pos_list: list[dict[str, Any]] = []
-    px_map = await _price_usd_map([p.ticker for p in positions])
+    px_map = await _price_usd_map([p.ticker for p in positions], asof=now)
     for p in positions:
         price = px_map.get(p.ticker)
         if price is None:
@@ -792,13 +895,21 @@ def _convert_usd(price: float, ts: pd.Timestamp, fx: pd.Series, mode: str) -> fl
     return price * rf if mode == "mul" else price / rf
 
 
-async def _price_usd_map(tickers: list[str]) -> dict[str, float | None]:
+async def _price_usd_map(tickers: list[str],
+                         asof: datetime | pd.Timestamp | None = None,
+                         ) -> dict[str, float | None]:
     """{ticker: latest USD-converted close} for the given tickers.
 
     The strategy decides on USD-converted closes (load_frames_sync), so
     execution and valuation must book the same converted price — a raw
     local-currency close booked as USD would misstate exposure by the FX
-    rate and ignore FX moves in pnl/equity. Same suffix->FX mapping."""
+    rate and ignore FX moves in pnl/equity. Same suffix->FX mapping.
+
+    ``asof`` bounds the valuation's clock (marks use data <= that session —
+    the live engines pass the cycle's own session F so a valuation can never
+    see a bar after F, rule 1/3 of the contract); None keeps the historical
+    behavior (the latest stored close).
+    """
     from sqlalchemy import select as _select
 
     wanted = set(tickers)
@@ -806,11 +917,16 @@ async def _price_usd_map(tickers: list[str]) -> dict[str, float | None]:
     # Only the recent tail is needed for a "latest close": held tickers with
     # full history (broad universes) otherwise hydrate ~16k rows each on every
     # valuation, which dominated the status endpoints.
-    since = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=_PRICE_LOOKBACK_DAYS)
+    since = _now().replace(tzinfo=None) - timedelta(days=_PRICE_LOOKBACK_DAYS)
+    bounds = [Candle.timestamp >= since]
+    if asof is not None:
+        bounds.append(Candle.timestamp <= pd.Timestamp(asof).tz_localize(None)
+                      if pd.Timestamp(asof).tzinfo is not None
+                      else pd.Timestamp(asof).to_pydatetime())
     async with Session() as s:
         rows = (await s.execute(
             _select(Candle.ticker, Candle.timestamp, Candle.close)
-            .where(Candle.ticker.in_(wanted | set(pairs)), Candle.timestamp >= since)
+            .where(Candle.ticker.in_(wanted | set(pairs)), *bounds)
             .order_by(Candle.timestamp))).all()
     pair_close = {p: _fx_close_series([r for r in rows if r.ticker == p])
                   for p in pairs}
@@ -838,6 +954,59 @@ async def _price_usd_map(tickers: list[str]) -> dict[str, float | None]:
 async def _price(ticker: str) -> float | None:
     """Latest USD-converted close for `ticker` from the candle cache."""
     return (await _price_usd_map([ticker])).get(ticker)
+
+
+async def _open_usd_map(tickers: list[str], d: datetime | pd.Timestamp,
+                        ) -> dict[str, float | None]:
+    """{ticker: USD-converted OPEN of the session exactly on `d`} — the fill
+    price of the session fill contract (app/session.py rule 2).
+
+    Strict exact-date stored bar per ticker: a ticker without a stored bar
+    on `d` maps to None — a missing quote is not an executable price, and
+    the executor must give that leg NO fill (it is retried at the next
+    session). NEVER a stale or forward-filled close. The FX conversion
+    reuses _price_usd_map's mapping and `_convert_usd` unchanged, so the
+    decision (USD closes) and the execution (USD opens) book the same
+    currency."""
+    from sqlalchemy import select as _select
+
+    wanted = set(tickers)
+    ts_d = pd.Timestamp(d)
+    if ts_d.tzinfo is not None:
+        ts_d = ts_d.tz_localize(None)
+    ts_d = ts_d.normalize()
+    pairs = sorted({pm[0] for t in tickers if (pm := fundamentals_mod._suffix_fx(t))})
+    since = (ts_d - timedelta(days=_PRICE_LOOKBACK_DAYS)).to_pydatetime()
+    async with Session() as s:
+        rows = (await s.execute(
+            _select(Candle.ticker, Candle.timestamp, Candle.open)
+            .where(Candle.ticker.in_(wanted | set(pairs)),
+                   Candle.timestamp >= since,
+                   Candle.timestamp <= ts_d.to_pydatetime())
+            .order_by(Candle.timestamp))).all()
+    pair_open = {p: _fx_close_series([r for r in rows if r.ticker == p])
+                 for p in pairs}
+    at_d: dict[str, tuple[float, pd.Timestamp]] = {}
+    for r in rows:  # exact date match only — no ffill, no stale close
+        if r.ticker not in wanted or r.open is None:
+            continue
+        ts = pd.Timestamp(r.timestamp)
+        if ts.tzinfo is not None:
+            ts = ts.tz_localize(None)
+        if ts == ts_d:
+            at_d[r.ticker] = (float(r.open), ts)
+    out: dict[str, float | None] = {}
+    for t in tickers:
+        hit = at_d.get(t)
+        if hit is None:
+            out[t] = None
+            continue
+        px, ts = hit
+        pm = fundamentals_mod._suffix_fx(t)
+        if pm:
+            px = _convert_usd(px, ts, pair_open.get(pm[0], pd.Series(dtype=float)), pm[1])
+        out[t] = px
+    return out
 
 
 async def deposit_allowance() -> dict[str, Any]:
@@ -870,10 +1039,20 @@ async def deposit_allowance() -> dict[str, Any]:
                 "month": month, "cash": acc.cash}
 
 
-async def _exec_buy(ticker: str, price: float, budget: float, reason: str) -> dict | None:
+def share_size(budget: float, price: float) -> float:
+    """Fractional-share size toward `budget` at `price`, floored to 4dp.
+
+    The ONE sizing formula for the factor engines: the live ``_exec_buy`` and
+    both persisted replays must size identical budgets identically, or the
+    golden parity (tests/test_cadence_parity.py) breaks. Returns 0.0 when the
+    leg is not executable (no positive price / sub-dollar budget)."""
     if price <= 0 or budget < 1:
-        return None
-    shares = math.floor(budget / price * 10000) / 10000
+        return 0.0
+    return math.floor(budget / price * 10000) / 10000
+
+
+async def _exec_buy(ticker: str, price: float, budget: float, reason: str) -> dict | None:
+    shares = share_size(budget, price)
     if shares < 0.0001:
         return None
     cost = shares * price
@@ -1004,27 +1183,129 @@ async def refresh_data(tickers: list[str]) -> tuple[list[str], dict[str, str]]:
     return refresh_errors, fund_status
 
 
-async def run_rebalance(force: bool = False) -> dict[str, Any]:
-    """One rebalance decision + execution (runs on the last trading day of the
-    month, or manually). Deposits the allowance first (no-op if the daily
-    scheduler already funded the account this month), refreshes data, picks
-    with hysteresis, then executes SELLs (freed slots) and equal-weight BUYs.
-    Idempotent per month unless ``force``."""
+def _prev_trading_day(today: datetime) -> datetime | None:
+    """The previous NYSE trading day strictly before ``today`` (calendar walk,
+    capped at two weeks so an unusable calendar can never spin). Naive-UTC:
+    the caller's clock may carry tzinfo, but every downstream comparison is
+    against naive stored timestamps."""
+    from .sim import is_trading_day
+    ts = pd.Timestamp(today)
+    if ts.tzinfo is not None:
+        ts = ts.tz_localize(None)
+    day = (ts.normalize() - pd.Timedelta(days=1)).to_pydatetime()
+    for _ in range(14):
+        if is_trading_day(day):
+            return day
+        day = day - timedelta(days=1)
+    return None
+
+
+def _candidate_month_end(s) -> datetime | None:
+    """ME <= S (the previous completed session) by the session calendar."""
+    ts = pd.Timestamp(s)
+    if ts.tzinfo is not None:
+        ts = ts.tz_localize(None)
+    d = ts.normalize()
+    me_this = pd.Timestamp(
+        month_last_trading_day(datetime(d.year, d.month, 1))).normalize()
+    if me_this <= d:
+        return me_this.to_pydatetime()
+    prev_y, prev_m = (d.year - 1, 12) if d.month == 1 else (d.year, d.month - 1)
+    return pd.Timestamp(month_last_trading_day(
+        datetime(prev_y, prev_m, 1))).to_pydatetime()
+
+
+def _split_csv(col: str | None) -> list[str]:
+    return [t for t in (col or "").split(",") if t]
+
+
+async def _candle_stored_on(tickers: list[str], d) -> bool:
+    """True when ANY of ``tickers`` has a stored bar exactly on ``d`` — the
+    live twin of the backfill's ``me in idx`` completion test (a data hole at
+    the decision day is never papered over)."""
+    ts = pd.Timestamp(d)
+    if ts.tzinfo is not None:
+        ts = ts.tz_localize(None)
+    async with Session() as s:
+        hit = await s.scalar(
+            select(func.count()).select_from(Candle)
+            .where(Candle.ticker.in_(list(tickers)),
+                   Candle.timestamp == ts.to_pydatetime()))
+    return bool(hit)
+
+
+async def _pending_rebuild(now: datetime) -> tuple[str, pd.Timestamp] | None:
+    """The pending monthly rebuild: ``(decision month key, month-end date)``
+    when the month-end before ``now`` has a decision that has not been fully
+    executed yet — the first session after the previous month-end, with
+    catch-up for any later session while it is still pending. None when
+    there is no completed month-end behind us, its candle is missing (a data
+    hole — never papered over), or the rebuild is already complete."""
+    s = _prev_trading_day(now)
+    if s is None:
+        return None
+    me = _candidate_month_end(s)
+    if me is None:
+        return None
+    tickers = universe_tickers(_strategy_universe())
+    if not await _candle_stored_on(tickers, me):
+        return None
+    key = pd.Timestamp(me).strftime("%Y-%m")
+    async with Session() as s2:
+        acc = await s2.get(MonthlyAccount, 1)
+        row = await s2.scalar(
+            select(MonthlyRebalance).where(MonthlyRebalance.rebal_month == key))
+        held = {p.ticker for p in await s2.scalars(select(MonthlyPosition))}
+    if acc is not None and acc.last_rebalance_month == key:
+        return None  # this decision's legs are all filled (or terminally unfillable)
+    if row is not None and held == set(_split_csv(row.picked)):
+        return None  # acted on; membership complete (marker write lagged)
+    return key, pd.Timestamp(me).normalize()
+
+
+async def run_rebalance(force: bool = False,
+                        now: datetime | None = None) -> dict[str, Any]:
+    """One monthly rebuild leg pass under the session fill contract
+    (adapted from app/session.py):
+
+      * the DECISION is the completed month-end's qv-mom ranking — the
+        eligibility frame is taken as of the last completed month-end <= S
+        (the previous completed session), never a newer frame;
+      * the FILLS execute at the current session's strict exact-date OPEN
+        per ticker (``_open_usd_map``) — a missing quote gives that leg no
+        fill and it is retried at the next session;
+      * the rebuild normally lands on the FIRST session of the month (one
+        session of cash drag); ``force`` re-runs it any day;
+      * audit rows keep the decision trading day (``rebal_date`` = the
+        month-end) distinct from the fill day (each trade's ``created_at``).
+
+    ``now`` is injectable so the parity tests can drive time; None = now."""
     # Non-blocking acquire: the idempotence gate below runs before the
     # multi-minute data refresh, so a queued second invocation would pass
     # the gate too and double-deposit / duplicate trades.
     if _rebalance_lock.locked():
         return {"skipped": True, "reason": "already running"}
     async with _rebalance_lock:
-        return await _run_rebalance_locked(force)
+        return await _run_rebalance_locked(force, now)
 
 
-async def _run_rebalance_locked(force: bool) -> dict[str, Any]:
-    month = datetime.now(UTC).strftime("%Y-%m")
-    async with Session() as s:
-        acc = await s.get(MonthlyAccount, 1)
-        if acc is not None and acc.last_rebalance_month == month and not force:
-            return {"skipped": True, "reason": f"already rebalanced {month}"}
+async def _run_rebalance_locked(force: bool, now: datetime | None) -> dict[str, Any]:
+    if now is None:
+        now = _now()
+    f_ts = pd.Timestamp(now)
+    f_date = (f_ts.tz_localize(None) if f_ts.tzinfo is not None else f_ts).normalize()
+    if not force:
+        pending = await _pending_rebuild(now)
+        if pending is None:
+            return {"skipped": True, "reason": "no pending month-end rebuild"}
+        month, me_ts = pending
+    else:
+        s = _prev_trading_day(now)
+        me = _candidate_month_end(s) if s is not None else None
+        if me is None:
+            return {"skipped": True, "reason": "no completed month-end yet"}
+        month = pd.Timestamp(me).strftime("%Y-%m")
+        me_ts = pd.Timestamp(me).normalize()
 
     allowance = await deposit_allowance()
     tickers = universe_tickers(_strategy_universe())
@@ -1035,89 +1316,111 @@ async def _run_rebalance_locked(force: bool) -> dict[str, Any]:
 
     close, vol = await load_frames(tickers, None, start=_live_history_start())
     fund = await fundamentals_mod.load_fundamentals(tickers)
-    # tz-naive date: candle timestamps are stored naive (UTC), so the slice
-    # index must be naive too (mixing tz-aware would raise in pandas).
-    d = pd.Timestamp(datetime.now(UTC).replace(tzinfo=None).date())
-    frame = await asyncio.to_thread(eligible_frame, d, close, vol, fund)
-    if frame is None:
+    # The decision frame is the COMPLETED month-end's (rule 1): eligible_frame
+    # truncates every candle to sessions <= the decision day, so F's bar —
+    # and anything after the month-end — can never inform it.
+    frame = await asyncio.to_thread(eligible_frame, me_ts, close, vol, fund)
+    if frame is None or not bool(frame["eligible"].any()):
+        # Terminal for the month: mark the decision attempted so ordinary
+        # sessions stop retrying a dead frame (matches the backfill's
+        # live_months filter — ineligible months are funded, not rebuilt).
+        async with Session() as s:
+            acc = await s.get(MonthlyAccount, 1)
+            if acc is not None:
+                acc.last_rebalance_month = month
+            await s.commit()
         return {"skipped": True, "reason": "no eligible frame",
+                "rebal_month": month, "decision_date": str(me_ts.date()),
                 "refresh_errors": refresh_errors, "fundamentals": fund_status}
 
     async with Session() as s:
         held_rows = (await s.scalars(select(MonthlyPosition))).all()
     held_before = sorted(p.ticker for p in held_rows)
-    picks, _ = await asyncio.to_thread(pick_portfolio, d, close, vol, fund, held_before, frame)
+    picks, _ = await asyncio.to_thread(
+        pick_portfolio, me_ts, close, vol, fund, held_before, frame)
 
     async with Session() as s:
         existing = await s.scalar(select(MonthlyRebalance).where(MonthlyRebalance.rebal_month == month))
-        reb = existing or MonthlyRebalance(rebal_month=month, rebal_date=d.to_pydatetime())
+        reb = existing or MonthlyRebalance(rebal_month=month, rebal_date=me_ts.to_pydatetime())
         reb.held_before = ",".join(held_before)
         reb.picked = ",".join(picks)
         reb.n_new = len(set(picks) - set(held_before))
         reb.snapshot = _snapshot_json(frame)
         if not existing:
             s.add(reb)
-        acc = await s.get(MonthlyAccount, 1)
-        if acc is not None:
-            acc.last_rebalance_month = month
         await s.commit()
 
     trades: list[dict] = []
-    # USD-converted prices for everything we might touch (held + picked):
-    # the decision ran on FX-converted closes, so trades must book the same
-    # USD prices — one DB pass, shared by SELLs and BUYs below.
-    price_map = await _price_usd_map(sorted(set(picks) | set(held_before)))
+    # Fill prices: the session's STRICT exact-date OPEN, USD-converted (never
+    # a stale/forward-filled close). A ticker without an F bar gets no fill;
+    # that leg is retried at the next session (pending_fill keeps the rebuild
+    # open, so the catch-up re-takes it at the next session's open).
+    fill_map = await _open_usd_map(sorted(set(picks) | set(held_before)), f_date)
     # SELLs first: held names no longer picked (frees cash for the BUYs).
-    # A held name without candles falls back to avg_cost (the valuation
-    # convention) — never sell at 0.
-    async with Session() as s:
-        costs = {p.ticker: p.avg_cost for p in
-                 (await s.scalars(select(MonthlyPosition))).all()}
+    pending_fill = False
     for t in held_before:
-        if t not in picks:
-            price = price_map.get(t)
-            if not price:
-                price = costs.get(t) or 0.0
-            r = await _exec_sell(t, price, "monthly rebalance: out of top band")
-            if r:
-                trades.append(r)
-    # BUYs: equal weight 1/N of total equity (top-ups included)
-    valuation = await monthly_valuate()
+        if t in picks:
+            continue
+        px = fill_map.get(t)
+        if not px:
+            pending_fill = True  # no executable quote this session
+            continue
+        r = await _exec_sell(t, px,
+                             f"monthly rebuild: out of top band (fill {f_date.date()})")
+        if r:
+            trades.append(r)
+    # BUYs: equal weight 1/N of total equity (top-ups included); the weight is
+    # marked at F's close (rule 3), the leg fills at F's open (rule 2).
+    valuation = await monthly_valuate(now=now)
     weight = valuation["total_equity"] / max(len(picks), 1)
     for t in picks:
-        price = price_map.get(t)
-        if not price:
+        px = fill_map.get(t)
+        if not px:
+            if t not in {p["ticker"] for p in valuation["positions"]}:
+                pending_fill = True  # an unfilled OPEN leg is pending work
             continue
         held_pos = next((p for p in valuation["positions"] if p["ticker"] == t), None)
         current_value = held_pos["value"] if held_pos else 0.0
         budget = weight - current_value
         if budget < 1:
             continue
-        r = await _exec_buy(t, price, budget,
-                            f"monthly rebalance: top-{settings.sim_monthly_target_n} qv-mom pick")
+        r = await _exec_buy(t, px, budget,
+                            f"monthly rebuild: top-{settings.sim_monthly_target_n} qv-mom pick")
         if r:
             trades.append(r)
 
-    post = await monthly_valuate()
+    post = await monthly_valuate(now=now)
     async with Session() as s:
         s.add(MonthlySnapshot(cash=post["cash"], positions_value=post["positions_value"],
                               total_equity=post["total_equity"],
                               allowance_total=post["allowance_total"]))
+        held_after = {p.ticker for p in await s.scalars(select(MonthlyPosition))}
+        acc = await s.get(MonthlyAccount, 1)
+        complete = (not pending_fill) and held_after == set(picks)
+        if acc is not None and complete:
+            acc.last_rebalance_month = month
         await s.commit()
 
     return {"rebalanced": True, "month": month, "allowance": allowance,
-            "picks": picks, "held_before": held_before, "trades": trades,
+            "decision_date": str(me_ts.date()), "picks": picks,
+            "held_before": held_before, "trades": trades,
+            "complete": complete,
             "valuation": post, "refresh_errors": refresh_errors,
             "fundamentals": fund_status}
 
 
-async def run_monthly_cycle() -> dict[str, Any]:
-    """Scheduler entry: only acts on the last trading day of the month."""
+async def run_monthly_cycle(now: datetime | None = None) -> dict[str, Any]:
+    """Scheduler entry: fills the pending monthly rebuild.
+
+    The trigger is the session fill contract's, not ``is_rebalance_day``:
+    the fill session is the FIRST session after the completed month-end (the
+    month-end tick is the decision, the next open is the execution), and any
+    later session fills it too while the rebuild is still pending (catch-up).
+    Legs that cannot fill retry at the following sessions; a newer month-end
+    ranking supersedes a pending one."""
     if not settings.sim_monthly_enabled:
         return {"skipped": True, "reason": "monthly portfolio disabled"}
-    if not is_rebalance_day():
-        return {"skipped": True, "reason": "not last trading day of month"}
-    return await run_rebalance()
+    return await run_rebalance(now=now)
 
 
 # ---------------------------------------------------------------------------
@@ -1141,13 +1444,29 @@ async def backfill(start: str | None = None,
     the portfolio state with the replay's end state.
 
     Wipes account/positions/trades/allowances/snapshots/rebalances, then
-    walks every stored month-end from `start` to today: deposits the
-    allowance on each month's FIRST trading day (same timing as the live
-    deposit_allowance so the contributed figures step in lockstep with the
-    other portfolios), picks the top-N with hysteresis at the month-end and
-    trades at that day's close. No fees: the replay mirrors the LIVE engine,
-    whose `_exec_buy`/`_exec_sell` charge no commission (the paper portfolios
-    are fee-free by design — see docs/brokers.md), so a backfill's end state
+    walks EVERY stored session from `start` to today as the live engine's
+    cycle stream (the session fill contract, app/session.py):
+
+      * the allowance is deposited on each calendar month's FIRST stored
+        session, unconditionally (the live engine funds the account monthly
+        even when no ranking exists — only the rebuild needs a frame);
+      * the pending rebuild decision is recomputed every session — the
+        newest completed month-end <= S (the previous stored session) whose
+        own candle is stored — so a newer month-end supersedes a
+        still-pending older one, and a data hole at a decision day is never
+        papered over;
+      * the decision's legs execute at the CURRENT session's strict
+        exact-date OPEN per ticker (never a stale or forward-filled close):
+        fills land on the FIRST session after the decision month-end (one
+        session of cash drag), and a leg without an executable quote this
+        session stays pending and is retried at the following sessions;
+      * the audit row is written at the FIRST pass with ``rebal_date`` = the
+        decision month-end — distinct from each trade's ``created_at`` (the
+        fill session).
+
+    No fees: the replay mirrors the LIVE engine, whose
+    `_exec_buy`/`_exec_sell` charge no commission (the paper portfolios are
+    fee-free by design — see docs/brokers.md), so a backfill's end state
     matches what the live engine would hold. Materialized as real
     trade/rebalance/snapshot rows the UI can render.
 
@@ -1160,10 +1479,11 @@ async def backfill(start: str | None = None,
         frame) — the long-view replay
 
     Paper-portfolio convenience, not a live track record. Point-in-time
-    discipline: a rebalance on date d only sees fundamentals public by then
-    (same EDGAR-first fact store as the backtest). A month only rebalances
-    on its ACTUAL US session calendar month-end (never the last stored
-    candle of a still-running month).
+    discipline: a decision on month-end ME only sees fundamentals public by
+    then (same EDGAR-first fact store as the backtest) and candles <= ME;
+    fills see only the strict same-session bar. A month only rebalances on
+    its ACTUAL US session calendar month-end (never the last stored candle
+    of a still-running month).
     """
     from sqlalchemy import delete as sa_delete
     from .db import (MonthlyAccount as Acc, MonthlyPosition as Pos,
@@ -1181,23 +1501,25 @@ async def backfill(start: str | None = None,
         settings.sim_daily_core_mom_variant = _strategy_variant()
         if preload is not None:
             tickers, fund = preload.tickers, preload.fund
-            close, vol = preload.close, preload.vol
+            open_px, close, vol = preload.open, preload.close, preload.vol
         else:
             tickers = universe_tickers(_strategy_universe())
             fund = await fundamentals_mod.load_fundamentals(tickers)
             load_start = ((pd.Timestamp(start) - timedelta(days=_BACKFILL_WARMUP_DAYS)).to_pydatetime()
                           if start else None)
-            close, vol = await load_frames(tickers, None, start=load_start)
+            open_px, close, vol = await load_ohlcv_frames(tickers, None, start=load_start)
         if not fund:
             return {"ok": False, "error": "no fundamentals loaded"}
         if close.empty:
             return {"ok": False, "error": "no candle data"}
 
-        idx = pd.DatetimeIndex(close.index)
+        full_idx = pd.DatetimeIndex(close.index).normalize()
+        idx = full_idx
         if start:
             idx = idx[idx >= pd.Timestamp(start)]
         if idx.empty:
             return {"ok": False, "error": f"no trading days since {start_note}"}
+        full_set = set(full_idx)
 
         # COMPLETED month-ends only, by the US session calendar (same rule
         # as the research backtests — completed_month_ends): a frame ending
@@ -1214,7 +1536,7 @@ async def backfill(start: str | None = None,
         d0 = idx[0]
         prev_y, prev_m = (d0.year - 1, 12) if d0.month == 1 else (d0.year, d0.month - 1)
         pme_sched = pd.Timestamp(month_last_trading_day(datetime(prev_y, prev_m, 1)))
-        prev_idx = pd.DatetimeIndex(close.index)[pd.DatetimeIndex(close.index) <= pme_sched]
+        prev_idx = full_idx[full_idx <= pme_sched]
         if len(prev_idx):
             prior_month_ends.append(prev_idx[-1])
         shared = preload.frames if preload is not None else {}
@@ -1230,17 +1552,10 @@ async def backfill(start: str | None = None,
                        and bool(f["eligible"].any())]
         if not live_months:
             return {"ok": False, "error": "no month with eligible names"}
-        # Trim the day index to the FIRST eligible month: months before it
-        # would only produce dead flat-zero snapshots (the replay deposits
-        # from the first eligible month), flooding the curve with ~9k empty
-        # points for start=all (1980-2017) and clipping the equity API's
-        # 4000-point cap to 2011. The momentum warmup still uses the full
-        # close frame — only the REPLAYED days start here.
-        idx = idx[idx >= pd.Timestamp(live_months[0].replace(day=1))]
 
         # contribution timing: first trading day of EVERY calendar month in the
         # replayed window (not just the eligible ones — the live engine deposits
-        # monthly even when no ranking exists; only the rebalance needs a frame).
+        # monthly even when no ranking exists; only the rebuild needs a frame).
         contrib_days: dict[str, pd.Timestamp] = {}
         for m in sorted({(d.year, d.month) for d in idx}):
             key = f"{m[0]}-{m[1]:02d}"
@@ -1248,11 +1563,19 @@ async def backfill(start: str | None = None,
             if len(month_days):
                 contrib_days[key] = month_days[0]
         # valuation closes: forward-filled so missing candles carry the last
-        # known close (never value a held position at 0)
+        # known close (never value a held position at 0) — MARKS ONLY. The
+        # fill prices read the STRICT open frame (never ffilled).
         close_val = close.ffill()
 
         def px_of(t: str, d: pd.Timestamp) -> float | None:
             return px_at(close_val, d, t)
+
+        def fill_px_of(t: str, d: pd.Timestamp) -> float | None:
+            # Session fill contract rule 2 (app/session.py): the strict
+            # exact-date OPEN per ticker — a stored bar on `d` or NOTHING (a
+            # missing quote is not an executable price; the leg is retried
+            # at the next session, never filled from a stale close).
+            return px_at(open_px, d, t)
 
         # --- wipe + reset (preserve the live month markers like daily-core) ---
         live_allowance_month: str | None = None
@@ -1272,108 +1595,151 @@ async def backfill(start: str | None = None,
             acc.last_allowance_month = None
             await s.commit()
 
-        # --- in-memory month-by-month replay ---
+        # --- in-memory session-by-session replay (the live engine's cycle
+        # stream) ---
         # Real share/cash bookkeeping (not the optimize backtest's
         # aggregate-value shortcut) so the trade log can carry actual
-        # shares/prices: each month-end, SELL dropped names at that day's
-        # close, then BUY the new picks to equal weight with the proceeds
-        # plus the month's contribution. Between rebalances the portfolio
-        # is untouched (the monthly engine trades once a month).
+        # shares/prices: a pending decision's legs trade at the fill
+        # session's open, marks value the book at that session's close.
+        # Between passes the portfolio is untouched (the monthly engine
+        # trades only when a month-end decision is pending).
         shares: dict[str, float] = {}
+        cost_basis: dict[str, float] = {}   # true average cost, as _exec_buy books it
+        opened_at: dict[str, str] = {}      # ticker -> actual first-buy date
         cash = 0.0
         contributed = 0.0
         deposited_months: set[str] = set()  # months the replay actually funded
+        marker: str | None = None           # the replay's last_rebalance_month
+        audit: dict[str, dict[str, Any]] = {}  # month key -> first-pass record
         rebalance_rows: list[tuple[str, str, str, str, int]] = []
         trade_rows: list[tuple[str, str, str, float, float, float]] = []
         snaps: list[tuple[str, float, float]] = []
 
-        # Replay from the first eligible month onward. Later window months are
-        # replayed even without an eligible ranking: the live engine still
-        # deposits monthly (deposit_allowance runs before the frame check), so
-        # their days are funded and snapshotted; only the rebalance is skipped.
-        # The window's TRAILING partial month (no completed month-end yet) is
-        # walked the same way — deposits + daily snapshots, no rebuild: the
-        # live engine won't rebalance until the scheduled month-end. A marker
-        # day (the last candle) outside frame_cache marks it rebuild-free.
-        last_key = (idx[-1].year, idx[-1].month)
-        if last_key not in {(m.year, m.month) for m in months}:
-            months.append(idx[-1].normalize())
-        replay_seq = [m for m in months if m >= live_months[0]]
-        for i, m in enumerate(replay_seq):
-            frame = frame_cache.get(m)
-            has_frame = frame is not None and bool(frame["eligible"].any())
-            picks, _ = (await asyncio.to_thread(
-                pick_portfolio, m, close, vol, fund, list(shares), frame)) \
-                if has_frame else (list(shares), None)
-            prev_td = replay_seq[i - 1] if i > 0 else None
-            month_days = [d for d in idx if (prev_td is None or d > prev_td) and d <= m]
+        locs = full_idx.get_indexer(idx)  # S = the stored session before each walk day
+        for i, d in enumerate(idx):
+            # 1) deposit (unconditional — see contrib_days above).
+            key = f"{d.year}-{d.month:02d}"
+            if contrib_days.get(key) == d:
+                cash += settings.sim_monthly_contribution
+                contributed += settings.sim_monthly_contribution
+                deposited_months.add(key)
 
-            # Chronological daily walk over the span: book the calendar
-            # month's contribution on its first trading day, then take that
-            # day's snapshot. A skipped interior month-end (its true
-            # calendar-end candle missing) makes ONE span cover several
-            # calendar months — booking all their contributions before the
-            # marks applied FUTURE money to earlier months' snapshots
-            # (February's marks carried March's deposit). Snapshots still
-            # value the holdings actually owned during this span — the picks
-            # from the PREVIOUS month-end rebalance (snapshotting after the
-            # rebuild below valued this month's days on this month's own
-            # month-end purchases: a look-ahead that made every month start
-            # distorted — the first point of a 2025 backfill read 91%).
-            for d in month_days:
-                key = f"{d.year}-{d.month:02d}"
-                if contrib_days.get(key) == d:
-                    cash += settings.sim_monthly_contribution
-                    contributed += settings.sim_monthly_contribution
-                    deposited_months.add(key)
-                eq = cash + sum(sh * (px_of(t, d) or 0.0) for t, sh in shares.items())
-                snaps.append((d.strftime("%Y-%m-%d"), eq, contributed))
+            # 2) pending decision, recomputed every session (the live
+            #    _pending_rebuild state machine): the newest month-end <= S
+            #    with its own candle stored. A newer month-end supersedes a
+            #    still-pending older one; a hole at the decision day means
+            #    NO decision this session (never papered over).
+            li = locs[i]
+            s_prev = full_idx[li - 1] if li > 0 else None
+            pending: tuple[str, pd.Timestamp] | None = None
+            if s_prev is not None:
+                me = _candidate_month_end(s_prev.to_pydatetime())
+                me_ts = pd.Timestamp(me).normalize() if me is not None else None
+                if me_ts is not None and me_ts in full_set:
+                    mkey = me_ts.strftime("%Y-%m")
+                    if marker != mkey:
+                        row = audit.get(mkey)
+                        if not (row is not None
+                                and set(shares) == set(row["picked"])):
+                            pending = (mkey, me_ts)  # supersede / first sight
 
-            # month-end rebuild (only when a ranking exists): SELL dropped names
-            # at the close, then BUY the picks to equal weight with proceeds +
-            # contribution. The live engine rebalances once EVERY month it has a
-            # frame (one audit row per month, no trades when already at weight),
-            # so this must not be gated on the pick set changing.
-            if has_frame:
-                adds = len(set(picks) - set(shares))
-                rebalance_rows.append((f"{m.year}-{m.month:02d}", m.strftime("%Y-%m-%d"),
-                                       ",".join(sorted(shares)), ",".join(sorted(picks)),
-                                       adds))
-                for t in list(shares):
-                    if t in picks:
-                        continue
-                    p = px_of(t, m)
-                    sh = shares.get(t, 0.0)
-                    if p is None or p <= 0 or sh <= 0:
-                        continue
-                    notional = sh * p
-                    cash += notional
-                    del shares[t]
-                    trade_rows.append((m.strftime("%Y-%m-%d"), "SELL", t, notional, sh, p))
-                equity_now = cash + sum(sh * (px_of(t, m) or 0.0)
-                                        for t, sh in shares.items())
-                weight = equity_now / max(len(picks), 1)
-                for t in picks:
-                    if t not in shares and len(shares) >= settings.sim_monthly_target_n:
-                        # Hard slot backstop: pick_portfolio plans the
-                        # post-release membership, so a FAILED release (no
-                        # usable price leaves `shares` unchanged) must not
-                        # let the replacement buys grow the book past the
-                        # target.
-                        continue
-                    p = px_of(t, m)
-                    if p is None or p <= 0:
-                        continue
-                    gap = weight - shares.get(t, 0.0) * p
-                    if gap > 1 and cash > 1:
-                        # Fee-free (mirrors the live _exec_buy).
-                        notional = min(gap, max(cash, 0.0))
-                        if notional < 1:
+            # 3) the decision's leg pass at THIS session's strict opens.
+            if pending is not None:
+                mkey, me_ts = pending
+                frame = frame_cache.get(me_ts)
+                if frame is None and me_ts not in frame_cache:
+                    # A restricted `start` can surface a month-end before the
+                    # precomputed set: compute it on demand — the live engine
+                    # would rank it from the same candles.
+                    frame = await asyncio.to_thread(eligible_frame, me_ts, close, vol, fund)
+                    frame_cache[me_ts] = frame
+                    shared[me_ts] = frame
+                if frame is None or not bool(frame["eligible"].any()):
+                    # Dead frame: terminal for the month (the live engine
+                    # marks the decision attempted so ordinary sessions stop
+                    # retrying) — no audit row, no trades.
+                    marker = mkey
+                else:
+                    held_before = sorted(shares)
+                    picks, _ = await asyncio.to_thread(
+                        pick_portfolio, me_ts, close, vol, fund, held_before, frame)
+                    if mkey not in audit:  # audit row: the FIRST pass only
+                        audit[mkey] = {"picked": picks}
+                        rebalance_rows.append(
+                            (mkey, me_ts.strftime("%Y-%m-%d"),
+                             ",".join(held_before), ",".join(picks),
+                             len(set(picks) - set(held_before))))
+                    fill_map = {t: fill_px_of(t, d)
+                                for t in sorted(set(picks) | set(held_before))}
+                    pending_fill = False
+                    # SELLs first: held names no longer picked (frees cash
+                    # for the BUYs). No fallback price: a leg without a bar
+                    # this session is retried next session.
+                    for t in held_before:
+                        if t in picks:
                             continue
-                        sh = notional / p
-                        cash -= notional
-                        shares[t] = shares.get(t, 0.0) + sh
-                        trade_rows.append((m.strftime("%Y-%m-%d"), "BUY", t, notional, sh, p))
+                        px = fill_map.get(t)
+                        if px is None or px <= 0:
+                            pending_fill = True  # no executable quote this session
+                            continue
+                        sh = shares.pop(t)
+                        proceeds = sh * px
+                        cash += proceeds
+                        cost_basis.pop(t, None)
+                        opened_at.pop(t, None)
+                        trade_rows.append((d.strftime("%Y-%m-%d"), "SELL", t,
+                                           proceeds, sh, px))
+                    # BUYs: equal weight 1/N of total equity marked at F's
+                    # close (rule 3); the leg fills at F's open (rule 2).
+                    # Mirrors the live engine exactly: ONE pre-trade
+                    # valuation, per-position values rounded to the cents it
+                    # reports, total equity rounded once.
+                    pos_value = 0.0
+                    pos_values: dict[str, float] = {}
+                    for t in sorted(shares):  # live reads positions ticker-ordered
+                        price = px_of(t, d)
+                        if price is None:
+                            price = cost_basis.get(t, 0.0)  # live: avg_cost fallback
+                        v = shares[t] * price
+                        pos_value += v
+                        pos_values[t] = round(v, 2)
+                    weight = round(cash + pos_value, 2) / max(len(picks), 1)
+                    for t in picks:
+                        px = fill_map.get(t)
+                        if px is None or px <= 0:
+                            if t not in shares:
+                                pending_fill = True  # an unfilled OPEN leg is pending work
+                            continue
+                        budget = weight - pos_values.get(t, 0.0)
+                        if budget < 1:
+                            continue
+                        sh = share_size(budget, px)
+                        if sh < 0.0001:
+                            continue  # live _exec_buy: sub-minimum leg → no fill
+                        cost = sh * px
+                        if cash < cost:
+                            continue  # live _exec_buy: insufficient cash → no fill
+                        if t in shares:
+                            new_sh = shares[t] + sh
+                            cost_basis[t] = (shares[t] * cost_basis[t] + cost) / new_sh
+                            shares[t] = new_sh
+                        else:
+                            shares[t] = sh
+                            cost_basis[t] = px
+                            opened_at[t] = d.strftime("%Y-%m-%d")
+                        cash -= cost
+                        trade_rows.append((d.strftime("%Y-%m-%d"), "BUY", t,
+                                           cost, sh, px))
+                    # The pass is complete when no leg waited on a quote and
+                    # the membership matches the plan — the marker is set
+                    # only then; an incomplete pass stays pending (its legs
+                    # retry at the following sessions' opens).
+                    if not pending_fill and set(shares) == set(picks):
+                        marker = mkey
+
+            # 4) the day's snapshot at marks (deposit → pass → snapshot).
+            eq = cash + sum(sh * (px_of(t, d) or 0.0) for t, sh in shares.items())
+            snaps.append((d.strftime("%Y-%m-%d"), eq, contributed))
 
         # --- persist the end state ---
         # allowance rows: exactly the months the replay funded (ineligible
@@ -1392,12 +1758,13 @@ async def backfill(start: str | None = None,
             acc = await s.get(Acc, 1)
             assert acc is not None  # created in the wipe step above
             # converge to the live engine's state shape: cash = replay cash,
-            # positions booked at their last close (avg_cost not tracked by
-            # the replay; the equity curve is what matters)
+            # positions with their true average cost and first-buy date —
+            # the same bookkeeping the live _exec_buy performs.
             acc.cash = cash
             for t, sh in shares.items():
-                p = px_of(t, idx[-1]) or 0.0
-                s.add(Pos(ticker=t, shares=sh, avg_cost=p))
+                opened = opened_at.get(t) or idx[-1].strftime("%Y-%m-%d")
+                s.add(Pos(ticker=t, shares=sh, avg_cost=cost_basis.get(t, 0.0),
+                          opened_at=pd.Timestamp(f"{opened} 16:00:00+00:00").to_pydatetime()))
             for td, side, t, notional, sh, pr in trade_rows:
                 s.add(Tr(ticker=t, side=side, shares=round(sh, 6), price=round(pr, 6),
                          cash_after=0.0,
@@ -1409,12 +1776,17 @@ async def backfill(start: str | None = None,
                 s.add(Rb(rebal_month=m_key, rebal_date=pd.Timestamp(f"{td} 16:00:00+00:00").to_pydatetime(),
                          held_before=held, picked=picked, n_new=n_new,
                          snapshot=""))
-            # Never let the marker lag the newest inserted row, or the next
-            # live deposit would duplicate that month.
+            # Never let the allowance marker lag the newest inserted row, or
+            # the next live deposit would duplicate that month.
             last_month = max(live_allowance_month or "",
                              replay_months[-1] if replay_months else "")
             acc.last_allowance_month = last_month or None
-            acc.last_rebalance_month = live_rebalance_month
+            # the rebalance marker: the replay's own completion state, never
+            # regressed below what the live engine had already recorded —
+            # _pending_rebuild gates on it, so a month the replay could not
+            # complete stays unmarked and the live engine retries it.
+            final_marker = max(live_rebalance_month or "", marker or "")
+            acc.last_rebalance_month = final_marker or None
             for sd, eq, contrib_at_day in snaps:
                 s.add(Sn(cash=0.0, positions_value=eq, total_equity=eq,
                          allowance_total=round(contrib_at_day, 2),

@@ -1447,13 +1447,17 @@ class TestDailyCoreMonthlyParity:
             for t in tickers
         }
 
-        async def fake_load_frames(_tickers, _asof, start=None):
-            return close, vol
+        async def fake_load_ohlcv(_tickers, _asof, start=None):
+            # open == close on this synthetic tape: the session-fill rule
+            # (F's STRICT open, no ffill) is exercised separately in
+            # tests/test_replay_fills.py; here the fixture stays a close tape
+            # so the overlay/parity assertions compare like for like.
+            return close, close, vol
 
         async def fake_load_fundamentals(_tickers):
             return fund
 
-        monkeypatch.setattr(monthly_mod, "load_frames", fake_load_frames)
+        monkeypatch.setattr(monthly_mod, "load_ohlcv_frames", fake_load_ohlcv)
         monkeypatch.setattr(fundamentals_mod, "load_fundamentals", fake_load_fundamentals)
         return {"tickers": tickers, "close": close}
 
@@ -1509,8 +1513,10 @@ class TestDailyCoreMonthlyParity:
 
 class TestFillBuy:
     """The daily-core BUY fill must reserve the one-way fee inside the spend
-    so a full-cash buy can never drive cash negative (milestone parity with
-    daily_core.backfill's do_buy)."""
+    so a full-cash buy can never drive cash negative AND floor the share
+    count through ``monthly.share_size`` (the live ``_exec_buy`` /
+    ``daily_core.backfill.do_buy`` rule) — research fills must be
+    byte-identical to the live executor's on the same budget/fill price."""
 
     def test_full_cash_buy_never_negative(self):
         fill = optimize._fill_buy(cash=1000.0, price=50.0,
@@ -1518,8 +1524,10 @@ class TestFillBuy:
         assert fill is not None
         notional, shares, cash_after = fill
         assert cash_after >= 0.0
-        assert notional == pytest.approx(1000.0 / 1.001)
-        assert shares == pytest.approx(notional / 50.0)
+        # 1000/1.001 = $999.001 of spend -> 19.98 shares at the 4dp floor
+        assert shares == pytest.approx(19.98)
+        assert notional == pytest.approx(19.98 * 50.0)
+        assert cash_after == pytest.approx(1000.0 - 999.0 * 1.001)
 
     def test_partial_buy_keeps_cash_positive(self):
         fill = optimize._fill_buy(cash=1000.0, price=50.0,
@@ -1528,6 +1536,30 @@ class TestFillBuy:
         notional, _shares, cash_after = fill
         assert notional == 300.0
         assert cash_after == pytest.approx(1000.0 - 300.0 - 0.3)
+
+    def test_shares_match_the_live_share_size_floor(self):
+        from app.monthly import share_size
+        fill = optimize._fill_buy(cash=1000.0, price=137.31,
+                                  delta_value=1000.0, cost=0.0)
+        assert fill is not None
+        notional, shares, _cash = fill
+        assert shares == share_size(min(1000.0, 1000.0), 137.31)
+        assert notional == pytest.approx(shares * 137.31)
+
+    def test_drops_the_leg_the_live_executor_would_reject(self):
+        """The live executor sizes from the ROUNDED cash and then refuses a
+        leg whose booked cost exceeds the exact cash. Real tape case
+        (tests/test_replay_fills.py, 2026-09-01): cash $1000.0054, budget
+        $1000.01 -> 10.0144 shares -> $1000.0059 booked -> the LIVE leg is
+        skipped and retried next session. The research fill must skip it too
+        (before this, it shrank the budget to the exact cash and filled)."""
+        assert optimize._fill_buy(cash=1000.005354, price=99.8567877,
+                                  delta_value=1000.01, cost=0.0) is None
+        # ... and the retry at the next session's price DOES fill
+        retry = optimize._fill_buy(cash=1000.005354, price=101.941213,
+                                   delta_value=1000.01, cost=0.0)
+        assert retry is not None
+        assert retry[1] == pytest.approx(9.8096)
 
     def test_too_small_returns_none(self):
         assert optimize._fill_buy(cash=0.5, price=50.0,
@@ -1666,8 +1698,11 @@ class TestMonthlyBacktestCalendarSettlement:
         assert m is not None
         assert m.contributed == pytest.approx(2000.0)  # was 1000 before
         assert m.window == ("2026-02-27", "2026-02-27")
-        # both deposits joined the book at February's month-end rebalance
-        assert m.final_value == pytest.approx(2 * 1000.0 * (1 - 0.001))
+        # The rebalance FILL is the first session after Feb-27 (Mar-2), which
+        # is outside the window: the deferred rebalance is PENDING, so both
+        # deposits stay parked and NO swap cost is charged on a decision that
+        # never filled (the pre-contract close-fill charged 10 bps here).
+        assert m.final_value == pytest.approx(2000.0)
 
     async def test_trailing_stretch_settles_every_funding_month(
             self, monkeypatch):
@@ -1685,8 +1720,12 @@ class TestMonthlyBacktestCalendarSettlement:
 
         assert m is not None
         assert m.contributed == pytest.approx(3000.0)  # was 2000 before
-        # flat market: the Jan-30 entry (cost) plus the parked Feb+Mar money
-        assert m.final_value == pytest.approx(1000.0 * (1 - 0.001) + 2000.0)
+        # Flat market. Jan-30's rebalance FILLS on Feb-2 (the deferred
+        # session) and that session is also February's deposit day, so both
+        # arrived deposits deploy there (2000 x one-way cost); March's
+        # deposit is parked until the (pending) next rebalance.
+        assert m.final_value == pytest.approx(
+            2000.0 * (1 - 0.001) + 1000.0)
 
     async def test_trailing_contributions_are_parked_not_invested(
             self, monkeypatch):
@@ -1708,15 +1747,18 @@ class TestMonthlyBacktestCalendarSettlement:
 
         assert m is not None
         assert m.contributed == pytest.approx(3000.0)
-        # invested at Jan-30: 1000 -> one-way cost on the full-entry swap
-        invested0 = 1000.0 * (1 - 0.001)
+        # invested at the deferred fill session (Feb-2, the first session
+        # after Jan-30): 2000 arrived deposits -> one-way cost on the
+        # full-entry swap
+        invested0 = 2000.0 * (1 - 0.001)
+        fill_day = pd.Timestamp("2026-02-02")
         gap = float(
-            (close.loc["2026-03-13"] / close.loc["2026-01-30"] - 1.0)
+            (close.loc["2026-03-13"] / close.loc[fill_day] - 1.0)
             .dropna().mean())
-        expected = invested0 * (1.0 + gap) + 2 * 1000.0  # parked earns 0%
+        expected = invested0 * (1.0 + gap) + 1000.0  # parked earns 0%
         assert m.final_value == pytest.approx(expected, rel=1e-9)
         # and the parked money clearly did NOT ride the gap return
-        lumped = (invested0 + 2 * 1000.0) * (1.0 + gap)
+        lumped = (invested0 + 1000.0) * (1.0 + gap)
         assert m.final_value < lumped
 
 
@@ -1790,13 +1832,17 @@ class TestDailyCoreRiskOverlays:
             for t in tickers
         }
 
-        async def fake_load_frames(_tickers, _asof, start=None):
-            return close, vol
+        async def fake_load_ohlcv(_tickers, _asof, start=None):
+            # open == close on this synthetic tape: the session-fill rule
+            # (F's STRICT open, no ffill) is exercised separately in
+            # tests/test_replay_fills.py; here the fixture stays a close tape
+            # so the overlay/parity assertions compare like for like.
+            return close, close, vol
 
         async def fake_load_fundamentals(_tickers):
             return fund
 
-        monkeypatch.setattr(monthly_mod, "load_frames", fake_load_frames)
+        monkeypatch.setattr(monthly_mod, "load_ohlcv_frames", fake_load_ohlcv)
         monkeypatch.setattr(fundamentals_mod, "load_fundamentals", fake_load_fundamentals)
         return {"tickers": tickers, "close": close}
 
@@ -1932,13 +1978,17 @@ class TestDailyCoreProtection:
             for t in tickers
         }
 
-        async def fake_load_frames(_tickers, _asof, start=None):
-            return close, vol
+        async def fake_load_ohlcv(_tickers, _asof, start=None):
+            # open == close on this synthetic tape: the session-fill rule
+            # (F's STRICT open, no ffill) is exercised separately in
+            # tests/test_replay_fills.py; here the fixture stays a close tape
+            # so the overlay/parity assertions compare like for like.
+            return close, close, vol
 
         async def fake_load_fundamentals(_tickers):
             return fund
 
-        monkeypatch.setattr(monthly_mod, "load_frames", fake_load_frames)
+        monkeypatch.setattr(monthly_mod, "load_ohlcv_frames", fake_load_ohlcv)
         monkeypatch.setattr(fundamentals_mod, "load_fundamentals", fake_load_fundamentals)
         return {"close": close}
 

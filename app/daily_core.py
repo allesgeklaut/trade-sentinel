@@ -14,11 +14,17 @@ Design (from the §10 backtest A/B, docs/llm-strategy-experiments.md):
     out-of-sample on all four walk-forward windows, see §10).
   * Band releases: same hysteresis as the monthly sim — a held name keeps
     its slot while it stays inside the top ``hold_band`` of the ranking.
-    Releases are evaluated at the month-end rebuild (the backtest showed
-    exit cadence is irrelevant; the band is sticky).
+    The RANKING is the completed month-end's frame (the month-end band
+    policy, session fill contract app/session.py): it changes only when a
+    newer month-end completes, so a release fires on the FIRST SESSION
+    after that month-end (at that session's strict exact-date open) and is
+    structurally empty in between. The backtest showed exit cadence is
+    irrelevant; the band is sticky.
 
-Point-in-time discipline mirrors the monthly sim: a decision on date d only
-sees fundamental facts with end < d and filed <= d. No look-ahead.
+Point-in-time discipline mirrors the monthly sim: a decision on month-end
+ME only sees fundamental facts with end < ME and filed <= ME, and candles
+<= S (the previous completed session) — F's bar never informs it. No
+look-ahead.
 
 Scheduler entry: ``run_daily_cycle()`` — deposits the allowance at the start
 of a new operator-local month (same timing as sim/monthly so the three
@@ -336,8 +342,18 @@ async def _recent_port_returns(days: int) -> list[float]:
             for p, c in zip(seq, seq[1:], strict=False)]
 
 
+def _now() -> datetime:
+    """The live decision path's clock (UTC) — injectable for tests.
+
+    Every ``datetime.now(UTC)`` on a decision path routes through this hook
+    so the golden parity tests (tests/test_cadence_parity.py) can drive the
+    live deployment session by session through a fake multi-session market;
+    production returns real UTC now."""
+    return datetime.now(UTC)
+
+
 def _local_now() -> datetime:
-    return datetime.now(_TZ)
+    return _now().astimezone(_TZ)
 
 
 def _current_month() -> str:
@@ -347,7 +363,72 @@ def _current_month() -> str:
 def _live_history_start() -> datetime:
     """Naive-UTC lower bound for the live ranking's candle load (~4y). Candle
     timestamps are stored naive, so the bound must be naive too."""
-    return datetime.now(UTC).replace(tzinfo=None) - timedelta(days=_LIVE_HISTORY_DAYS)
+    return _now().replace(tzinfo=None) - timedelta(days=_LIVE_HISTORY_DAYS)
+
+
+async def _stored_month_end(now: datetime) -> pd.Timestamp | None:
+    """The ranking decision's month-end under the month-end band policy.
+
+    The last calendar month-end <= S (the previous completed session —
+    monthly._prev_trading_day/_candidate_month_end, the same session
+    calendar as the monthly engine) whose own candle is stored (a data hole
+    at the decision day is never papered over — monthly._candle_stored_on).
+    One calendar walk + one count query — no frame load, so the per-session
+    cycle stays cheap; the expensive frame is the per-month-end cache
+    below. None when no completed month-end lies behind us."""
+    s = monthly_mod._prev_trading_day(now)
+    if s is None:
+        return None
+    me = monthly_mod._candidate_month_end(s)
+    if me is None:
+        return None
+    if not await monthly_mod._candle_stored_on(
+            universe_tickers(current_universe()), me):
+        return None
+    return pd.Timestamp(me).normalize()
+
+
+# The month-end ranking frame cache: the fundamentals math is the expensive
+# part (~7s full-universe), and under the month-end band policy the SAME
+# frame ranks every session of a month — compute it once per (universe,
+# variant, month-end) and reuse. Keyed by the resolved decision inputs so a
+# universe/variant switch cannot splice the old ranking in; entries for
+# older month-ends are pruned (only the newest decision ranks).
+_FRAME_CACHE: dict[tuple[str, str, pd.Timestamp],
+                   tuple[pd.DataFrame | None, list[str]]] = {}
+
+
+async def _core_frame(me: pd.Timestamp) -> tuple[pd.DataFrame | None, list[str]]:
+    """(eligibility frame, full ranking order) as of the completed month-end
+    `me` — cached per (universe, variant, month-end).
+
+    The frame is computed from candles <= me (eligible_frame truncates
+    internally), so appending later sessions can never change it: the
+    ranking is a month-end constant, which is exactly the deployment's band
+    policy. A dead frame (no eligible names) caches as (None, [])."""
+    key = (current_universe(), current_variant(), me)
+    if key in _FRAME_CACHE:
+        return _FRAME_CACHE[key]
+    tickers = universe_tickers(current_universe())
+    fund = await fundamentals_mod.load_fundamentals(tickers)
+    if not fund:
+        frame, order = None, []
+    else:
+        close, vol = await monthly_mod.load_frames(
+            tickers, pd.Timestamp(me).to_pydatetime(), start=_live_history_start())
+        if close.empty:
+            frame, order = None, []
+        else:
+            settings.sim_daily_core_mom_variant = current_variant()
+            frame = await asyncio.to_thread(monthly_mod.eligible_frame, me, close, vol, fund)
+            if frame is None or not bool(frame["eligible"].any()):
+                frame, order = None, []
+            else:
+                _elig, order = await asyncio.to_thread(monthly_mod._qv_order, frame)
+    for k in [k for k in _FRAME_CACHE if k[2] < me]:
+        _FRAME_CACHE.pop(k, None)
+    _FRAME_CACHE[key] = (frame, order)
+    return frame, order
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +446,9 @@ def _above_sma(mkt: pd.Series, days: int) -> bool:
 async def _protection_decision(band: list[str],
                                gate_sma: int | None,
                                gradient_active: bool,
-                               arm_sma: int | None) -> tuple[bool, bool]:
+                               arm_sma: int | None,
+                               close: pd.DataFrame | None = None,
+                               ) -> tuple[bool, bool]:
     """Evaluate the two independent protection overlays: ``(market_ok, basket_out)``.
 
     Market gate: the equal-weight universe index vs its `gate_sma`-day SMA.
@@ -380,11 +463,15 @@ async def _protection_decision(band: list[str],
     persisted) only when ``gradient_active`` so the cash-out is skipped while
     disabled. Streaks and the basket history persist in the daily-core state
     file so the signal is stable across cycles (the scheduler runs once a day).
-    """
-    tickers = universe_tickers(current_universe())
-    close, _vol = await monthly_mod.load_frames(
-        tickers, None, start=_live_history_start())
-    if close.empty or not band:
+
+    ``close`` is the candle frame the overlays advance on — session fill
+    contract rule 1: the caller passes it truncated to sessions <= S (the
+    previous completed session), so F's bar never informs the overlay. None
+    (test convenience) loads the universe's frame unbounded."""
+    if close is None:
+        close, _vol = await monthly_mod.load_frames(
+            universe_tickers(current_universe()), None, start=_live_history_start())
+    if close is None or close.empty or not band:
         return True, False
 
     mkt = close.ffill().mean(axis=1)
@@ -464,8 +551,12 @@ _targets_lock: asyncio.Lock = asyncio.Lock()
 # Valuation
 # ---------------------------------------------------------------------------
 
-async def valuate() -> dict:
-    """Value the daily-core portfolio (same shape as monthly.monthly_valuate)."""
+async def valuate(now: datetime | None = None) -> dict:
+    """Value the daily-core portfolio (same shape as monthly.monthly_valuate).
+
+    ``now`` bounds the marks' clock: prices use stored closes <= now (the
+    cycle's own session F — session fill contract rule 3); None keeps the
+    historical behavior (the latest stored close)."""
     async with Session() as s:
         acc = await _account(s)
         positions = (await s.scalars(
@@ -473,7 +564,8 @@ async def valuate() -> dict:
         allowance_total = (await s.scalar(
             select(func.sum(DailyCoreAllowance.amount)))) or 0.0
 
-    px_map = await monthly_mod._price_usd_map([p.ticker for p in positions])
+    px_map = await monthly_mod._price_usd_map([p.ticker for p in positions],
+                                              asof=now)
     positions_value = 0.0
     pos_list = []
     for p in positions:
@@ -600,36 +692,35 @@ async def _exec_sell(ticker: str, price: float, reason: str) -> dict | None:
 # The deployment decision
 # ---------------------------------------------------------------------------
 
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
-
-
 def _parse_list(col: str) -> list[str]:
     return [t for t in (col or "").split(",") if t]
 
 
-async def _load_stored_ranking(max_age_days: float = 1.0) -> tuple[list[str], list[str]] | None:
-    """The stored daily ranking, or None when absent/older than a day.
+async def _load_stored_ranking() -> tuple[datetime, list[str], list[str]] | None:
+    """The stored daily ranking row: ``(ranking_date, band, picks)``, or None
+    when absent.
 
-    The fundamentals math runs once per day in the cycle and persists its
-    output to the DailyCoreRanking row; every other consumer reads that.
-    """
+    No age gate: under the month-end band policy the stored ranking stays
+    authoritative for a whole month — the deployment's ME-match gate decides
+    when it is behind the resolved month-end and recomputes."""
     from .db import DailyCoreRanking
     async with Session() as s:
         row = await s.get(DailyCoreRanking, 1)
     if row is None:
         return None
-    age = _utcnow() - row.ranking_date.replace(tzinfo=UTC)
-    if age > timedelta(days=max_age_days):
-        return None
-    return _parse_list(row.band), _parse_list(row.picks)
+    return row.ranking_date, _parse_list(row.band), _parse_list(row.picks)
 
 
-async def _store_ranking(band: list[str], picks: list[str]) -> None:
+async def _store_ranking(band: list[str], picks: list[str], asof: datetime) -> None:
+    """Persist the decision: ``ranking_date`` = the decision's month-end (the
+    frame's as-of date), so consumers can tell WHICH month-end ranked."""
     from sqlalchemy.dialects.sqlite import insert as sqlite_insert
     from .db import DailyCoreRanking
+    asof_ts = pd.Timestamp(asof)
+    if asof_ts.tzinfo is not None:
+        asof_ts = asof_ts.tz_localize(None)
     stmt = sqlite_insert(DailyCoreRanking).values(
-        id=1, ranking_date=_utcnow().replace(tzinfo=None),
+        id=1, ranking_date=asof_ts.to_pydatetime(),
         band=",".join(band), picks=",".join(picks))
     stmt = stmt.on_conflict_do_update(
         index_elements=["id"],
@@ -642,7 +733,8 @@ async def _store_ranking(band: list[str], picks: list[str]) -> None:
         await s.commit()
 
 
-async def compute_targets(force: bool = False) -> tuple[list[str], list[str], pd.DataFrame | None]:
+async def compute_targets(force: bool = False, now: datetime | None = None
+                          ) -> tuple[list[str], list[str], pd.DataFrame | None]:
     """Compute (or read the stored) daily-core target portfolio.
 
     Returns (band, picks, frame): ``band`` is the full hold-band order
@@ -651,18 +743,28 @@ async def compute_targets(force: bool = False) -> tuple[list[str], list[str], pd
     applied. ``frame`` is the eligibility frame (None when no data or when
     the stored ranking was used).
 
-    The full-universe fundamentals math is expensive (~7s), so it runs once
-    per day during the daily cycle, which persists the result to the
-    ``daily_core_ranking`` row. Other consumers (status endpoint / UI) read
-    that stored ranking instead of recomputing. ``force=True`` recomputes
-    regardless — used by the deployment cycle and the manual refresh path
-    so trades always act on today's data.
+    Month-end band policy: the DECISION is the completed month-end's frame
+    (the last month-end <= S with its candle stored) — the same ranking
+    every session of the month, recomputed only when a NEWER month-end
+    completes. ``force=True`` recomputes (and re-stores) at the resolved
+    month-end; ``force=False`` reads the stored row when it already matches
+    the resolved month-end — no age gate (a whole month is one decision).
     """
+    now = now or _now()
+    me = await _stored_month_end(now)
+
+    def _matches(stored) -> bool:
+        if stored is None or me is None:
+            return False
+        rd = pd.Timestamp(stored[0])
+        if rd.tzinfo is not None:
+            rd = rd.tz_localize(None)
+        return rd.normalize() == me
+
     if not force:
         stored = await _load_stored_ranking()
-        if stored is not None:
-            band, picks = stored
-            return band, picks, None
+        if _matches(stored):
+            return stored[1], stored[2], None
     async with _targets_lock:
         # Double-check inside the lock: two concurrent callers (the UI's
         # duplicate status requests on first load) would otherwise both run
@@ -670,46 +772,49 @@ async def compute_targets(force: bool = False) -> tuple[list[str], list[str], pd
         # stored ranking.
         if not force:
             stored = await _load_stored_ranking()
-            if stored is not None:
-                band, picks = stored
-                return band, picks, None
-        tickers = universe_tickers(current_universe())
-        fund = await fundamentals_mod.load_fundamentals(tickers)
-        if not fund:
+            if _matches(stored):
+                return stored[1], stored[2], None
+        if me is None:
+            # No completed month-end decision behind the cycle: nothing to
+            # rank yet (the deployment also skips; no fabricated frame).
             return [], [], None
-        close, vol = await monthly_mod.load_frames(
-            tickers, None, start=_live_history_start())
-        if close.empty:
-            return [], [], None
-        iso = datetime.now(UTC).strftime("%Y-%m-%d")
-        d: pd.Timestamp = pd.Timestamp(iso)  # type: ignore[assignment]
-        # The runtime-selected momentum variant (UI dropdown, persisted)
-        # drives the frame math — eligible_frame reads this setting.
-        settings.sim_daily_core_mom_variant = current_variant()
-        frame = await asyncio.to_thread(monthly_mod.eligible_frame, d, close, vol, fund)
-        if frame is None or not bool(frame["eligible"].any()):
+        frame, order = await _core_frame(me)
+        if not order:
             return [], [], frame
-        _elig, order = await asyncio.to_thread(monthly_mod._qv_order, frame)
         band = order[:settings.sim_monthly_hold_band]
         async with Session() as s:
             held = [p.ticker for p in (await s.scalars(select(DailyCorePosition))).all()]
-        # Live always releases daily, so the pick pass always refills — but
+        # The pick pass always refills (deployment tops up toward the plan);
         # through _deploy_targets so the picks carry the hysteresis-selected
         # membership in RANKING order (deployment funds best rank first;
         # _band_fill's alphabetical sort is for the monthly display path).
         picks = monthly_mod._deploy_targets(
             order, held, settings.sim_monthly_target_n,
             settings.sim_monthly_hold_band, refill=True)
-        await _store_ranking(band, picks)
+        await _store_ranking(band, picks, me.to_pydatetime())
         return band, picks, frame
 
 
-async def run_deployment() -> dict:
-    """One daily-core deployment pass.
+async def run_deployment(now: datetime | None = None) -> dict:
+    """One daily-core deployment pass under the session fill contract
+    (app/session.py), month-end band policy:
 
-    1. Compute the qv-mom ranking + hysteresis picks (``compute_targets``).
-    2. SELL held names that fell out of the band (band release, same rule
-       as the monthly sim's rebalance).
+      * the DECISION is the completed month-end's qv-mom ranking — the same
+        frame every session of the month, recomputed only when a NEWER
+        month-end completes. The band therefore switches on the FIRST
+        SESSION after that month-end (one session behind the calendar
+        month-end, rule 1: data <= S only);
+      * releases: held names outside the CURRENT band are evaluated EVERY
+        session — structurally empty between month-ends (the band only
+        changes at a completed month-end) — and a release leg without an
+        executable quote this session retries at the next session;
+      * fills execute at the current session's strict exact-date OPEN per
+        ticker (rule 2 — never a stale or forward-filled close; no bar, no
+        fill);
+      * marks value the book at the current session's close (rule 3).
+
+    1. Resolve the month-end ranking + hysteresis picks.
+    2. SELL held names that are not in the band (band release).
     3. BUY: deploy all free cash into the hysteresis-selected ``picks``,
        topping each up toward the equal-weight target — best rank first,
        until cash or targets are exhausted. This is the backtest-winning
@@ -727,51 +832,103 @@ async def run_deployment() -> dict:
     the target_n cap) and exit naturally via the band rule.
 
     Optional protection overlays (`gate` + `gradient_arm` in the daily-core
-    state file, the §12-15 mechanisms), independent: the deployment gate parks
-    buys while the market index is below its SMA; the gradient cash-out sells
-    the whole book on a confirmed negative slope of the target basket, armed
-    only in good times (or ungated). The engine re-enters on its own rule — no
-    cooldown.
+    state file, the §12-15 mechanisms), independent, advancing on data <= S
+    (rule 1): the deployment gate parks buys while the market index is below
+    its SMA; the gradient cash-out sells the whole book on a confirmed
+    negative slope of the target basket, armed only in good times (or
+    ungated). The engine re-enters on its own rule — no cooldown.
     """
-    band, picks, frame = await compute_targets(force=True)
-    if not band:
-        return {"skipped": True, "reason": "no eligible ranking (fundamentals too thin?)"}
+    if now is None:
+        now = _now()
+    f_ts = pd.Timestamp(now)
+    f_date = (f_ts.tz_localize(None) if f_ts.tzinfo is not None else f_ts).normalize()
+
+    me = await _stored_month_end(now)
+    if me is None:
+        return {"skipped": True, "reason": "no completed month-end ranking yet"}
 
     async with Session() as s:
         held_rows = (await s.scalars(select(DailyCorePosition))).all()
     held_before = sorted(p.ticker for p in held_rows)
-    trades: list[dict] = []
-    # USD-converted prices for everything we might touch: the full band
-    # (the ranking behind the picks), the picks themselves (a fill can come
-    # from beyond the band when the band is thinner than target_n) and the
-    # held names (SELL proceeds + avg_cost fallback).
-    px_map = await monthly_mod._price_usd_map(sorted(set(band) | set(picks) | set(held_before)))
 
-    # --- protection overlays: independent deployment gate + gradient (§12-15) ---
+    # Ranking: the stored row when it already matches the resolved month-end
+    # (the whole month reuses one decision — no frame load); otherwise
+    # compute (cached per month-end) and persist the decision row.
+    stored = await _load_stored_ranking()
+    rd = pd.Timestamp(stored[0]) if stored else None
+    if rd is not None and rd.tzinfo is not None:
+        rd = rd.tz_localize(None)
+    if stored is not None and rd.normalize() == me:
+        band = stored[1]
+    else:
+        frame, order = await _core_frame(me)
+        if not order:
+            return {"skipped": True, "reason": "no eligible ranking (fundamentals too thin?)"}
+        band = order[:settings.sim_monthly_hold_band]
+    band_set = set(band)
+
+    # The hysteresis-selected deployment targets against the CURRENT held
+    # set (audit P0-D): held names inside the band keep their slots (ranks
+    # 11-20 included); new names fill open slots only when one is actually
+    # free. Planned ONCE per session, BEFORE the SELL pass, with the
+    # POST-RELEASE membership (``refill=True``: every pending release is
+    # assumed to succeed) so a replacement is bought the SAME session its
+    # slot frees — planning it with the PRE-release held count instead
+    # (refill=len(held_before) < target_n) deferred the replacement to the
+    # next session and diverged from the persisted replay, which plans
+    # against the post-SELL held set. The executor backstop below (skip
+    # new-name buys once the ACTUAL book is at target_n) enforces the
+    # ten-slot guarantee when a release fails (no executable quote).
+    picks = monthly_mod._deploy_targets(
+        band, held_before, settings.sim_monthly_target_n,
+        settings.sim_monthly_hold_band, refill=True)
+    if stored is None or rd.normalize() != me:
+        await _store_ranking(band, picks, me.to_pydatetime())
+
+    trades: list[dict] = []
+    # Fill prices: the session's STRICT exact-date OPEN, USD-converted (rule
+    # 2) — never a stale or forward-filled close. A ticker without an F bar
+    # gets no fill; that leg is retried at the next session.
+    fill_map = await monthly_mod._open_usd_map(
+        sorted(band_set | set(picks) | set(held_before)), f_date)
+
+    # --- protection overlays: independent deployment gate + gradient
+    # (§12-15), advancing on data <= S (rule 1): one load, truncated to S. ---
     gate_sma, gradient_active, arm_sma = current_protection_config()
 
     block_buys = False
     protection_note = None
-    if (gate_sma is not None or gradient_active) and frame is not None:
-        gate_ok, basket_out = await _protection_decision(
-            band, gate_sma, gradient_active, arm_sma)
+    if gate_sma is not None or gradient_active:
+        overlay_close = None
+        close_full, _vol = await monthly_mod.load_frames(
+            universe_tickers(current_universe()), f_date.to_pydatetime(),
+            start=_live_history_start())
+        if not close_full.empty:
+            from .session import prev_session
+            s_prev = prev_session(close_full.index, f_date)
+            if s_prev is not None:
+                overlay_close = close_full.loc[:s_prev]
+        if overlay_close is not None and not overlay_close.empty and band:
+            gate_ok, basket_out = await _protection_decision(
+                band, gate_sma, gradient_active, arm_sma, overlay_close)
+        else:
+            gate_ok, basket_out = True, False  # no completed data: don't block
         if not gate_ok:
             block_buys = True
             protection_note = "market below SMA — contributions parked"
         # The cash-out is independent of the gate (matching the backtest: the
         # gate only parks buys). Arming is what decides whether it can fire.
         if gradient_active and basket_out:
-            # Confirmed negative basket slope (armed): CASH OUT the book at the
-            # latest prices and park contributions until the signal clears (then
-            # the normal deployment re-enters — no cooldown; the signal IS the
-            # gate).
+            # Confirmed negative basket slope (armed): CASH OUT the book at
+            # the session's strict opens and park contributions until the
+            # signal clears (then the normal deployment re-enters — no
+            # cooldown; the signal IS the gate). A leg without an
+            # executable quote this session is retried next cycle (the
+            # signal persists in the state file).
             for t in held_before:
-                price = px_map.get(t)
+                price = fill_map.get(t)
                 if not price:
-                    async with Session() as s:
-                        pos = await s.scalar(select(DailyCorePosition)
-                                             .where(DailyCorePosition.ticker == t))
-                    price = pos.avg_cost if pos else 0.0
+                    continue
                 r = await _exec_sell(t, price, "daily-core: gradient cash-out")
                 if r:
                     trades.append(r)
@@ -779,15 +936,16 @@ async def run_deployment() -> dict:
             block_buys = True
             protection_note = "gradient cash-out — book moved to cash"
 
-    # SELLs: held names out of the band release their slot.
+    # SELLs: held names outside the band release their slot — evaluated
+    # every session (structurally empty between month-ends, since the band
+    # only changes at a completed month-end); a leg without an executable
+    # quote this session retries at the next session (no fallback price: a
+    # missing quote is not an executable price, rule 2).
     for t in held_before:
-        if t not in band:
-            price = px_map.get(t) or 0.0
+        if t not in band_set:
+            price = fill_map.get(t)
             if not price:
-                # No candles: fall back to avg_cost like the monthly sim — never sell at 0.
-                async with Session() as s:
-                    pos = await s.scalar(select(DailyCorePosition).where(DailyCorePosition.ticker == t))
-                price = pos.avg_cost if pos else 0.0
+                continue
             r = await _exec_sell(t, price, "daily-core: out of hold band")
             if r:
                 trades.append(r)
@@ -803,7 +961,7 @@ async def run_deployment() -> dict:
     # cash (the backtest-winning "rank deploy, boost=0" rule — fresh cash
     # reinforces the top of the ranking, never spreads pro-rata, never waits
     # for month-end).
-    valuation = await valuate()
+    valuation = await valuate(now=now)
     if block_buys:
         return {"deployed": True, "band": band, "picks": picks,
                 "held_before": held_before, "trades": trades,
@@ -822,18 +980,17 @@ async def run_deployment() -> dict:
     for t in picks:
         if room < 1:
             break
-        price = px_map.get(t)
+        price = fill_map.get(t)
         if not price:
             continue
         held_pos = next((p for p in valuation["positions"] if p["ticker"] == t), None)
         current_value = held_pos["value"] if held_pos else 0.0
         if held_pos is None and held_count >= settings.sim_monthly_target_n:
-            # No free slot. ``compute_targets`` planned this replacement
-            # BEFORE the SELL pass, assuming every release succeeds; a
-            # failed release (`_exec_sell` -> None: no usable price / zero
-            # avg_cost) leaves the old slot occupied, and filling the
-            # replacement anyway created an 11th holding. Top-ups of held
-            # picks are unaffected.
+            # No free slot. The picks planned this replacement BEFORE the
+            # SELL pass, assuming every release succeeds; a failed release
+            # (no executable quote) leaves the old slot occupied, and
+            # filling the replacement anyway created an 11th holding.
+            # Top-ups of held picks are unaffected.
             continue
         budget = min(weight - current_value, valuation["cash"], room)
         if budget < 1:
@@ -846,13 +1003,13 @@ async def run_deployment() -> dict:
             if held_pos is None:
                 held_count += 1
             # refresh cash so successive buys see the balance
-            valuation = await valuate()
+            valuation = await valuate(now=now)
 
     return {"deployed": True, "band": band, "picks": picks,
             "held_before": held_before, "trades": trades,
             "gate": current_gate(), "gradient": current_gradient(),
             "target_vol": target_vol,
-            "valuation": await valuate()}
+            "valuation": await valuate(now=now)}
 
 
 # ---------------------------------------------------------------------------
@@ -925,12 +1082,20 @@ async def backfill(start: str | None = None,
     REPLACE the portfolio state with the replay's end state.
 
     Wipes account/positions/trades/allowances/snapshots, then walks every
-    stored trading day from `start` to today, depositing the monthly
-    allowance and applying the rank-deployment rule at each day's close.
-    No fees: the replay mirrors the LIVE engine, whose `_exec_buy`/`_exec_sell`
-    charge no commission (the paper portfolios are fee-free by design — see
-    docs/brokers.md), so a backfill's end state matches what the live engine
-    would hold.
+    stored session from `start` to today as the live engine's cycle stream
+    (the session fill contract, app/session.py): deposits the monthly
+    allowance on each calendar month's first stored session (unconditional);
+    ranks against the newest ELIGIBLE completed month-end <= S (the previous
+    stored session — the month-end band policy, so the band switches on the
+    first session after a month-end); releases held names outside that band
+    (structurally empty between month-ends); fills SELLs and BUYs at the
+    CURRENT session's strict exact-date OPEN per ticker (never a stale or
+    forward-filled close — a missing quote gives that leg no fill and the
+    daily decision re-takes it next session); values the book at that
+    session's close. No fees: the replay mirrors the LIVE engine, whose
+    `_exec_buy`/`_exec_sell` charge no commission (the paper portfolios are
+    fee-free by design — see docs/brokers.md), so a backfill's end state
+    matches what the live engine would hold.
 
     ``start`` semantics:
       - explicit "YYYY-MM-DD": replay from that day (the UI's optional date)
@@ -943,8 +1108,10 @@ async def backfill(start: str | None = None,
     This is a paper-portfolio convenience, not a live track record: the
     trades never happened in real time. The final state converges to
     "what the strategy would hold today", and live cycles continue from
-    there. Point-in-time discipline: each day only sees fundamentals that
-    were public by then (same EDGAR-first fact store as the backtest).
+    there. Point-in-time discipline: each month-end ranking only sees
+    fundamentals that were public by then (same EDGAR-first fact store as
+    the backtest) and candles <= that month-end; the overlays advance on
+    candles <= S.
     """
     async with _cycle_lock:
         from . import optimize  # noqa: F401  (ensures strategy modules load)
@@ -965,20 +1132,22 @@ async def backfill(start: str | None = None,
         if preload is not None:
             tickers = preload.tickers
             fund = preload.fund
-            close, vol = preload.close, preload.vol
+            open_px, close, vol = preload.open, preload.close, preload.vol
             shared_frames = preload.frames
         else:
             tickers = universe_tickers(current_universe())
             fund = await fundamentals_mod.load_fundamentals(tickers)
             load_start = ((pd.Timestamp(start) - timedelta(days=_BACKFILL_WARMUP_DAYS)).to_pydatetime()
                           if start else None)
-            close, vol = await monthly_mod.load_frames(tickers, None, start=load_start)
+            open_px, close, vol = await monthly_mod.load_ohlcv_frames(
+                tickers, None, start=load_start)
         if not fund:
             return {"ok": False, "error": "no fundamentals loaded"}
         if close.empty:
             return {"ok": False, "error": "no candle data"}
 
-        idx = pd.DatetimeIndex(close.index)
+        full_idx = pd.DatetimeIndex(close.index).normalize()
+        idx = full_idx
         if start:
             idx = idx[idx >= pd.Timestamp(start)]
         if idx.empty:
@@ -992,7 +1161,6 @@ async def backfill(start: str | None = None,
         # windowed index" rule rebalanced on the replay's last candle when
         # the window ends inside a running month — a partial-month end
         # treated as a completed month-end.
-        full_idx = pd.DatetimeIndex(close.index)
         months = monthly_mod.completed_month_ends(close.index, idx[0], idx[-1])
 
         # Eligibility frames per month (same caching as the backtest), plus
@@ -1066,20 +1234,27 @@ async def backfill(start: str | None = None,
         # valued at its LAST known close instead of 0. Without this the
         # replay's equity collapses on days when held names lack candles —
         # the snapshot then records near-zero equity and the UI curve
-        # cliffs. Fills also use the carried price, the same convention as
-        # the monthly sim's USD-converted valuation.
+        # cliffs. MARKS ONLY: fills read the STRICT open frame below.
         close_val = close.ffill()
 
         # --- in-memory replay state ---
         shares: dict[str, float] = {}
+        cost_basis: dict[str, float] = {}   # true average cost, as _exec_buy books it
+        opened_at: dict[str, str] = {}      # ticker -> actual first-buy date
         cash = 0.0
         contributed = 0.0
-        n_contribs = 0
         trades: list[tuple[str, str, str, float, float, float]] = []
         snaps: list[tuple[str, float, float]] = []
 
         def px_of(t: str, d: pd.Timestamp) -> float | None:
             return monthly_mod.px_at(close_val, d, t)
+
+        def fill_px_of(t: str, d: pd.Timestamp) -> float | None:
+            # Session fill contract rule 2 (app/session.py): the strict
+            # exact-date OPEN per ticker — a stored bar on `d` or NOTHING
+            # (a missing quote is not an executable price; the leg retries
+            # at the next session, never a stale or forward-filled close).
+            return monthly_mod.px_at(open_px, d, t)
 
         # Protection replay state (same §12-15 mechanisms as the live engine
         # and the optimize backtest): independent deployment gate + gradient.
@@ -1089,8 +1264,8 @@ async def backfill(start: str | None = None,
                         if gate_sma else None)
         mkt_arm_map = (mkt_index.rolling(max(arm_sma, 2)).mean()
                        if (gradient_active and arm_sma) else None)
-        prev_day_r: pd.Timestamp | None = None
         grad_hist: list[float] = []
+        grad_folded: pd.Timestamp | None = None
         grad_neg = 0
         grad_pos = 0
         grad_out = False
@@ -1118,37 +1293,48 @@ async def backfill(start: str | None = None,
 
         cur_month: int | None = None
         deposited_months: set[str] = set()  # months the replay actually funded
-        for d in idx:
+        locs = full_idx.get_indexer(idx)  # S = the stored session before each walk day
+        for i, d in enumerate(idx):
             contrib_today = 0.0
-            # Point-in-time discipline: each day uses the ranking of the most
-            # recent month-end AT OR BEFORE d (the frame computed from facts
-            # public by then). Using a future month-end's frame would leak
-            # look-ahead into the replay.
-            prior = [m for m in ranking_months if m <= d]
-            if not prior:
-                continue  # before the first completed month-end — no ranking yet
-            month_td = prior[-1]
-            frame = frame_cache.get(month_td)
-            order: list[str] = []
-            if frame is not None and bool(frame["eligible"].any()):
-                _elig, order = await asyncio.to_thread(monthly_mod._qv_order, frame)
-            band = set(order[:hold_band])
+            li = locs[i]
+            s_prev = full_idx[li - 1] if li > 0 else None
 
-            # allowance: deposit on the first trading day of a new month
-            # (same timing as the live deposit_allowance). Tracked so the
-            # persisted allowance rows match the deposits exactly — the old
-            # code derived them from ALL window months (1980+ for start=all),
-            # creating ~440 phantom $1k rows that inflated allowance_total
-            # to $550k and broke every contributed-normalized UI metric.
+            # allowance: deposit on the first stored session of a new month
+            # (unconditional — the live engine funds the account monthly even
+            # when no ranking exists; only the deployment needs a frame).
+            # Tracked so the persisted allowance rows match the deposits
+            # exactly — the old code derived them from ALL window months
+            # (1980+ for start=all), creating ~440 phantom $1k rows that
+            # inflated allowance_total to $550k and broke every
+            # contributed-normalized UI metric.
             if cur_month is None or d.month != cur_month:
                 cur_month = d.month
                 cash += settings.sim_monthly_contribution
                 contributed += settings.sim_monthly_contribution
                 contrib_today = settings.sim_monthly_contribution
-                n_contribs += 1
                 deposited_months.add(d.strftime("%Y-%m"))
 
-            def do_buy(t: str, budget: float, day=d) -> None:
+            # Point-in-time discipline (month-end band policy): the band is
+            # the newest ELIGIBLE month-end <= S (the previous stored
+            # session) — the same frame every session of the month, so the
+            # band switches on the FIRST SESSION after a month-end. A dead
+            # month-end leaves the previous band ranking (the live engine
+            # keeps its stored decision row until a live frame returns).
+            prior = [m for m in ranking_months
+                     if s_prev is not None and m <= s_prev]
+            month_td = prior[-1] if prior else None
+            frame = frame_cache.get(month_td) if month_td is not None else None
+            order: list[str] = []
+            if frame is not None and bool(frame["eligible"].any()):
+                _elig, order = await asyncio.to_thread(monthly_mod._qv_order, frame)
+            band = set(order[:hold_band])
+
+            def do_buy(t: str, budget: float, day=d) -> float:
+                """One fee-free leg at the session's strict exact-date OPEN
+                (rule 2): 4dp-floored ``share_size`` on the caller's budget,
+                no fill when the cash cannot cover it (mirrors the live
+                _exec_buy). Returns the booked cost (the cents the live
+                executor reports), 0.0 when the leg didn't fill."""
                 nonlocal cash
                 if t not in shares and len(shares) >= target_n:
                     # Hard slot backstop: `_deploy_targets` plans the
@@ -1157,49 +1343,77 @@ async def backfill(start: str | None = None,
                     # executor must check the ACTUAL free capacity before
                     # opening a NEW name — a failed release (no usable
                     # price) leaves its slot occupied.
-                    return
-                p = px_of(t, day)
+                    return 0.0
+                p = fill_px_of(t, day)
                 if p is None or p <= 0:
-                    return
-                # Fee-free (mirrors the live _exec_buy): spend up to the
-                # budget from available cash, no commission reserved.
-                notional = min(budget, max(cash, 0.0))
-                if notional < 1:
-                    return
-                sh = notional / p
-                cash -= notional
-                shares[t] = shares.get(t, 0.0) + sh
-                trades.append((day.strftime("%Y-%m-%d"), "BUY", t, notional, sh, p))
+                    return 0.0  # rule 2: no bar on the fill session → no fill
+                sh = monthly_mod.share_size(budget, p)
+                if sh < 0.0001:
+                    return 0.0
+                cost = sh * p
+                if cash < cost:
+                    return 0.0  # live _exec_buy: insufficient cash → no fill
+                if t in shares:
+                    new_sh = shares[t] + sh
+                    cost_basis[t] = (shares[t] * cost_basis[t] + cost) / new_sh
+                    shares[t] = new_sh
+                else:
+                    shares[t] = sh
+                    cost_basis[t] = p
+                    opened_at[t] = day.strftime("%Y-%m-%d")
+                cash -= cost
+                trades.append((day.strftime("%Y-%m-%d"), "BUY", t, cost, sh, p))
+                return round(cost, 2)
 
-            def do_sell(t: str, day=d) -> None:
+            def do_sell(t: str, day=d) -> float:
+                """One fee-free release leg at the session's strict
+                exact-date OPEN (rule 2) — a missing quote gives the leg no
+                fill (it retries at the next session; never a stale close).
+                Returns the booked proceeds, 0.0 when the leg didn't fill."""
                 nonlocal cash
-                p = px_of(t, day)
+                p = fill_px_of(t, day)
                 sh = shares.get(t, 0.0)
                 if p is None or p <= 0 or sh <= 0:
-                    return
+                    return 0.0
                 notional = sh * p
                 cash += notional
                 del shares[t]
+                cost_basis.pop(t, None)
+                opened_at.pop(t, None)
                 trades.append((day.strftime("%Y-%m-%d"), "SELL", t, notional, sh, p))
+                return round(notional, 2)
 
             # --- protection overlays: independent gate + gradient arm ---
             # The deployment gate (park buys) and the gradient arm (allow the
-            # cash-out only in good times) are separate, matching the backtest.
-            protect_ok = _market_ok_r(d) if gate_sma else True
+            # cash-out only in good times) are separate, matching the
+            # backtest. Both advance on data <= S (rule 1): the gate reads
+            # the market's SMA at S.
+            protect_ok = _market_ok_r(s_prev) if gate_sma else True
             # The chain is built every day regardless of the arm; only the
             # TRIGGER is gated, and re-entry stays unconditional (as §15).
+            # Sessions <= S fold into the chained basket; F's close folds in
+            # only when F becomes S at the next cycle.
             if gradient_active:
-                armed = _market_armed_r(d)
-                rets = []
-                for t in order[:target_n]:
-                    p0 = px_of(t, prev_day_r) if prev_day_r is not None else None
-                    p1 = px_of(t, d)
-                    if p0 and p1 and p0 > 0 and p1 > 0:
-                        rets.append(float(np.log(p1 / p0)))
-                day_ret = float(np.mean(rets)) if rets else 0.0
-                if not grad_hist:
-                    grad_hist.append(100.0)
-                grad_hist.append(grad_hist[-1] * float(np.exp(day_ret)))
+                armed = True if s_prev is None else _market_armed_r(s_prev)
+                hi = full_idx.searchsorted(s_prev, side="right") \
+                    if s_prev is not None else 0
+                lo = 0 if grad_folded is None else \
+                    int(full_idx.searchsorted(grad_folded, side="right"))
+                for j in range(max(lo, 1), hi):
+                    d_prev, d_cur = full_idx[j - 1], full_idx[j]
+                    rets = []
+                    for t in order[:target_n]:
+                        p0, p1 = px_of(t, d_prev), px_of(t, d_cur)
+                        if p0 and p1 and p0 > 0 and p1 > 0:
+                            rets.append(float(np.log(p1 / p0)))
+                    if rets:  # live twin: a day with no priced pair doesn't fold
+                        if not grad_hist:
+                            grad_hist.append(100.0)
+                        grad_hist.append(grad_hist[-1]
+                                         * float(np.exp(float(np.mean(rets)))))
+                if s_prev is not None:
+                    grad_folded = s_prev
+                grad_hist = grad_hist[-260:]  # bounded history
                 if len(grad_hist) > _GRADIENT_DAYS:
                     slope = grad_hist[-1] / grad_hist[-1 - _GRADIENT_DAYS] - 1.0
                     if slope < 0:
@@ -1210,13 +1424,14 @@ async def backfill(start: str | None = None,
                         grad_out = True
                     elif grad_out and grad_pos >= _GRADIENT_CONFIRM:
                         grad_out = False
-                prev_day_r = d
 
-            # SELL band releases (month-end rebuild only, as in the backtest)
-            if d in months:
-                for t in list(shares):
-                    if t not in band:
-                        do_sell(t)
+            # SELL band releases (every session — the band only changes at a
+            # completed month-end, so between month-ends this is
+            # structurally empty; a leg without a strict-open quote this
+            # session retries at the next session)
+            for t in list(shares):
+                if t not in band:
+                    do_sell(t)
 
             # gradient cash-out (confirmed negative slope in good times)
             if gradient_active and grad_out and shares:
@@ -1228,9 +1443,9 @@ async def backfill(start: str | None = None,
             # ranking's top-10 even when ten held names already occupied the
             # slots, growing the book past the ten-slot target. Held names
             # inside the band keep their slots; new names fill open slots
-            # only when one is actually free — a rebuild day (the releases
-            # above freed slots) or an account below capacity. Between
-            # month-ends, with the deferred-release replay policy, no new
+            # only when one is actually free — a band-switch session (the
+            # releases above freed slots) or an account below capacity.
+            # Between month-ends, under the month-end band policy, no new
             # name is bought while an out-of-band release is still pending.
             # A FAILED release (no price) leaves `shares` unchanged while
             # `refill` is True, so the CAPACITY TEST alone does not cap the
@@ -1243,38 +1458,43 @@ async def backfill(start: str | None = None,
             else:
                 deploy_picks = []
 
-            equity = cash + sum((shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0)
-                                for t in shares)
-            weight = equity / max(target_n, 1)
+            # Marks at F's close (rule 3), mirrored from the live valuate():
+            # positions summed ticker-ordered, total equity rounded once.
+            positions_value = sum((shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0)
+                                  for t in sorted(shares))
+            total_equity = round(cash + positions_value, 2)
+            weight = total_equity / max(target_n, 1)
 
             # rank-deployment (boost=0): top up the hysteresis picks toward
-            # the equal-weight target, best rank first. On month-end days the
-            # full equal-weight rebuild also fills NEW names to weight.
-            # Blocked while the market gate says "bad times" (contributions
-            # park) — the gradient cash-out already emptied the book.
+            # the equal-weight target, best rank first, at the session's
+            # strict opens. Blocked while the market gate says "bad times"
+            # (contributions park) — the gradient cash-out already emptied
+            # the book. Mirrors the live loop: the budget clamps to the
+            # ROUNDED cash (valuate's output) and the room decrements by
+            # each booked cost.
             if deploy_picks and protect_ok and not grad_out:
-                room = (_vol_deploy_room(equity, cash, port_rets, target_vol)
+                room = (_vol_deploy_room(total_equity, round(cash, 2),
+                                         port_rets, target_vol)
                         if target_vol else float("inf"))
                 for t in deploy_picks:
                     if room < 1:
                         break
-                    p = px_of(t, d)
-                    if p is None:
+                    p = fill_px_of(t, d)
+                    if p is None or p <= 0:
                         continue
-                    cur = shares.get(t, 0.0) * p
+                    cur = round(shares.get(t, 0.0) * (px_of(t, d) or 0.0), 2)
                     gap = weight - cur
-                    budget = min(gap, room)
-                    if budget > 1 and cash > 1:
-                        cash_before = cash
-                        do_buy(t, budget)
-                        room -= max(cash_before - cash, 0.0)
+                    budget = min(gap, round(cash, 2), room)
+                    if budget < 1:
+                        continue
+                    booked = do_buy(t, budget)
+                    room -= booked
 
             # daily snapshot (one point per day). The snapshot carries the
             # contributed total AS OF that day — persisting the final total
             # for every row would make the % curve halve on early points
             # (999/2000 on day 1 instead of 999/1000).
-            equity_close = cash + sum((shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0)
-                                      for t in shares)
+            equity_close = total_equity
             if prev_equity_close is not None:
                 port_rets.append(_port_return(prev_equity_close, equity_close, contrib_today))
             prev_equity_close = equity_close
@@ -1302,10 +1522,13 @@ async def backfill(start: str | None = None,
             acc = await _account(s)
             acc.cash = cash
             for t, sh in shares.items():
-                # avg_cost is not tracked by the replay (irrelevant for the
-                # equity curve); book at the last close so valuation works.
-                p = px_of(t, idx[-1]) or 0.0
-                s.add(Pos(ticker=t, shares=sh, avg_cost=p))
+                # converge to the live engine's bookkeeping: true average
+                # cost and the actual first-buy date (the old code booked
+                # the last close into avg_cost and left opened_at defaulting
+                # to the write time).
+                opened = opened_at.get(t) or idx[-1].strftime("%Y-%m-%d")
+                s.add(Pos(ticker=t, shares=sh, avg_cost=cost_basis.get(t, 0.0),
+                          opened_at=pd.Timestamp(f"{opened} 16:00:00+00:00").to_pydatetime()))
             for td, side, t, notional, sh, pr in trades:
                 # created_at = the replay day (same reason as the snapshots
                 # below): the trade log must show when the synthetic trade
@@ -1339,13 +1562,14 @@ async def backfill(start: str | None = None,
                 "snapshots": len(snaps), "mom_variant": current_variant()}
 
 
-async def run_daily_cycle(force: bool = False) -> dict:
+async def run_daily_cycle(force: bool = False, now: datetime | None = None) -> dict:
     """Scheduler entry: one full daily-core cycle.
 
     deposit allowance (new month) -> refresh data -> deployment pass ->
     daily equity snapshot. Idempotent per day: the allowance gate is
     monthly and the deployment pass is idempotent by construction
     (top-ups stop when targets are met), so a re-run is harmless.
+    ``now`` is injectable for the parity tests; None = now.
     """
     if _cycle_lock.locked() and not force:
         return {"skipped": True, "reason": "already running"}
@@ -1357,7 +1581,7 @@ async def run_daily_cycle(force: bool = False) -> dict:
 
         refreshed, refresh_errors = await refresh_data()
 
-        deployment = await run_deployment()
+        deployment = await run_deployment(now=now)
 
         snap = await take_snapshot()
 

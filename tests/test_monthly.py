@@ -482,11 +482,11 @@ async def test_run_rebalance_executes_and_is_idempotent(mem_db, monkeypatch):
     from app.screener import tickers as universe_tickers
     uni = universe_tickers("diversified-plus")
     tickers = uni[:12]
-    rng = np.random.default_rng(11)
     dates = pd.bdate_range("2024-06-03", periods=400)
     prices = {}
     for i, t in enumerate(tickers):
-        prices[t] = 100 + rng.normal(0.0005, 0.012, len(dates)).cumsum() + i
+        # constant per-ticker price level: open == close on every session
+        prices[t] = 100.0 + i
     close = pd.DataFrame(prices, index=dates)
 
     # --- seed fundamentals: T00..T09 high quality (score desc by index),
@@ -519,14 +519,20 @@ async def test_run_rebalance_executes_and_is_idempotent(mem_db, monkeypatch):
 
     monkeypatch.setattr(monthly, "refresh_data", fake_refresh_data)
 
-    # --- run 1: deposits allowance + buys top-10
-    r1 = await monthly.run_rebalance()
+    # Constant fixture prices: the fill session's OPEN equals its close, so
+    # the equal-weight sizing (budget/OPEN) is exactly the post-trade mark
+    # (shares*CLOSE) — rounding and float-sum order can't skew the check.
+    # (The random-walk tape under the deferred-fill cadence marked at F's
+    # close against fills at F's open drifted past the 2% tolerance.)
+    # --- run 1: deposits allowance + buys top-10 at F's open
+    clock = dates[-1].to_pydatetime().replace(hour=23, minute=30, tzinfo=UTC)
+    r1 = await monthly.run_rebalance(now=clock)
     assert r1.get("rebalanced") is True
     assert len(r1["picks"]) == settings.sim_monthly_target_n
     assert "T10" not in r1["picks"] and "T11" not in r1["picks"]
     buys = [t for t in r1["trades"] if t["side"] == "BUY"]
     assert len(buys) == settings.sim_monthly_target_n
-    val = await monthly.monthly_valuate()
+    val = await monthly.monthly_valuate(now=clock)
     assert len(val["positions"]) == settings.sim_monthly_target_n
     # equal weight: each position ~ 1/10 of equity (allowance deposited)
     expected = val["total_equity"] / settings.sim_monthly_target_n
@@ -534,11 +540,11 @@ async def test_run_rebalance_executes_and_is_idempotent(mem_db, monkeypatch):
         assert p["value"] == pytest.approx(expected, rel=0.02)
 
     # --- run 2 same month: skipped
-    r2 = await monthly.run_rebalance()
+    r2 = await monthly.run_rebalance(now=clock)
     assert r2.get("skipped") is True
 
     # --- forced re-run with unchanged data: no churn (hysteresis keeps picks)
-    r3 = await monthly.run_rebalance(force=True)
+    r3 = await monthly.run_rebalance(force=True, now=clock)
     assert r3.get("rebalanced") is True
     assert r3["picks"] == r1["picks"]
     assert r3["trades"] == []  # fully rebalanced portfolio -> no trades
@@ -552,27 +558,26 @@ async def test_run_rebalance_executes_and_is_idempotent(mem_db, monkeypatch):
 
 
 async def test_run_monthly_cycle_gate(mem_db, monkeypatch):
-    """run_monthly_cycle only acts on the last trading day."""
-    async def fail_rebalance(force=False):
-        raise AssertionError("should not rebalance off-schedule")
+    """run_monthly_cycle is the scheduler entry: disabled portfolio skips;
+    enabled, it delegates to run_rebalance — which fills the PENDING
+    month-end rebuild under the session fill contract (the trigger is not
+    ``is_rebalance_day``; the fill lands on the first session after the
+    completed month-end)."""
+    seen: dict = {}
 
-    monkeypatch.setattr(monthly, "run_rebalance", fail_rebalance)
-    # inject the clock: 2026-08-28 is a Friday but NOT the last trading day
-    # of Aug 2026 — real now() would make this flaky on month-end weekdays
-    monkeypatch.setattr(monthly, "is_rebalance_day", lambda today=None: False)
-    assert monthly.is_rebalance_day(
-        datetime(2026, 8, 28, 22, 0, tzinfo=UTC)) is False  # sanity
-    out = await monthly.run_monthly_cycle()
-    assert out["skipped"] is True
-
-    # on a rebalance day the cycle delegates to run_rebalance
-    async def ok_rebalance(force=False):
+    async def fake_rebalance(force=False, now=None):
+        seen["force"], seen["now"] = force, now
         return {"rebalanced": True}
 
-    monkeypatch.setattr(monthly, "is_rebalance_day", lambda today=None: True)
-    monkeypatch.setattr(monthly, "run_rebalance", ok_rebalance)
-    out2 = await monthly.run_monthly_cycle()
-    assert out2 == {"rebalanced": True}
+    monkeypatch.setattr(monthly, "run_rebalance", fake_rebalance)
+    clock = datetime(2026, 8, 28, 22, 0, tzinfo=UTC)
+    out = await monthly.run_monthly_cycle(now=clock)
+    assert out == {"rebalanced": True}
+    assert seen["force"] is False and seen["now"] is clock
+
+    monkeypatch.setattr(settings, "sim_monthly_enabled", False)
+    out2 = await monthly.run_monthly_cycle(now=clock)
+    assert out2 == {"skipped": True, "reason": "monthly portfolio disabled"}
 
 
 # ---------------------------------------------------------------------------
@@ -1022,6 +1027,11 @@ async def test_run_rebalance_lock_serializes(mem_db, monkeypatch):
 
     monkeypatch.setattr(monthly, "refresh_data", fake_refresh_data)
 
+    async def fake_pending(now):
+        return "2026-08", pd.Timestamp("2026-08-31")
+
+    monkeypatch.setattr(monthly, "_pending_rebuild", fake_pending)
+
     t1 = asyncio.create_task(monthly.run_rebalance())
     await in_refresh.wait()          # t1 is inside the locked region
     t2 = await monthly.run_rebalance()
@@ -1029,6 +1039,237 @@ async def test_run_rebalance_lock_serializes(mem_db, monkeypatch):
     release.set()
     r1 = await t1
     assert r1.get("rebalanced") is True or r1.get("skipped") is True
+
+
+# ---------------------------------------------------------------------------
+# Deferred-fill cadence (LIVE engine, session fill contract rule 2/5):
+# the month-end tick is the DECISION; the fill lands on the FIRST session
+# after the month-end at THAT session's strict exact-date OPEN; a leg
+# without an executable quote retries at the following sessions; a newer
+# month-end supersedes a still-pending decision.
+# ---------------------------------------------------------------------------
+
+def _const_bars(start: str, end: str, o: float, c: float,
+                drop: tuple[str, ...] = ()) -> list[tuple[str, float, float]]:
+    """(YYYY-MM-DD, open, close) rows at a constant price over the business
+    days of [start, end], minus `drop` dates (candle holes)."""
+    return [(d.strftime("%Y-%m-%d"), o, c) for d in pd.bdate_range(start, end)
+            if d.strftime("%Y-%m-%d") not in drop]
+
+
+async def _seed_candle_bars(bars: dict[str, list[tuple[str, float, float]]]):
+    """Seed Candle rows for bars[ticker] = [(date, open, close), ...]."""
+    from app.db import Candle
+    async with monthly.Session() as s:
+        for t, series in bars.items():
+            for d, o, c in series:
+                s.add(Candle(ticker=t, timestamp=pd.Timestamp(d).to_pydatetime(),
+                             open=o, high=max(o, c), low=min(o, c), close=c,
+                             volume=1e6))
+        await s.commit()
+
+
+async def _seed_roe_fundamentals(quality: dict[str, float]):
+    """Point-in-time facts public well before the decision month-ends:
+    equity 1e9, 12-month NI = quality x 1e9 (ROE = quality), 1e8 shares.
+    No OCF/capex on purpose: P/FCF is missing everywhere, so the score is
+    the degenerate roe+mom path and the ranking is quality-determined.
+    filed 2025-07-15 < the July month-end, so both frames see the same facts."""
+    from app.db import Fundamental
+    async with monthly.Session() as s:
+        for t, q in quality.items():
+            s.add(Fundamental(ticker=t, tag="StockholdersEquity", start=None,
+                              end="2025-06-30", filed="2025-07-15", val=1e9,
+                              currency="USD"))
+            s.add(Fundamental(ticker=t, tag="NetIncomeLoss", start="2024-07-01",
+                              end="2025-06-30", filed="2025-07-15",
+                              val=1e9 * q, currency="USD"))
+            s.add(Fundamental(ticker=t, tag="CommonStockSharesOutstanding",
+                              start=None, end="2025-06-30", filed="2025-07-15",
+                              val=1e8, currency="shares"))
+        await s.commit()
+
+
+def _deferred_env(mem_db, monkeypatch, bars, quality):
+    """Common patches for the deferred-cadence tests: the fixture universe is
+    the two tape tickers, data refresh is a no-op, and the operator-local
+    month tracks the test's clock holder."""
+    monkeypatch.setattr(monthly, "universe_tickers", lambda _u: list(bars))
+    monkeypatch.setattr(monthly, "refresh_data", fake_refresh_noop)
+    clock = {"month": "2025-08"}
+    monkeypatch.setattr(monthly, "_current_month", lambda: clock["month"])
+    return clock
+
+
+async def fake_refresh_noop(_tickers):
+    return [], {}
+
+
+class TestDeferredFillCadence:
+    async def test_decision_fills_first_session_after_month_end_at_that_open(
+            self, mem_db, monkeypatch):
+        """The July month-end (2025-07-31) is the decision; its fills land on
+        the FIRST session after it (2025-08-01) at THAT session's OPEN. AAA's
+        tape makes all three price anchors distinct: July-ME close 100 (the
+        stale-close trap), fill-session open 110, fill-session close 120 —
+        the booked fill price must be 110."""
+        from app.db import MonthlyRebalance as Rb
+        from app.db import MonthlyTrade as Tr
+
+        bars = {
+            "AAA": _const_bars("2024-06-03", "2025-07-31", 100.0, 100.0)
+                   + _const_bars("2025-08-01", "2025-09-30", 110.0, 120.0),
+            "BBB": _const_bars("2024-06-03", "2025-09-30", 100.0, 100.0),
+        }
+        await _seed_candle_bars(bars)
+        await _seed_roe_fundamentals({"AAA": 0.5, "BBB": 0.1})
+        _deferred_env(mem_db, monkeypatch, bars, None)
+
+        r1 = await monthly.run_rebalance(
+            now=datetime(2025, 8, 1, 23, 30, tzinfo=UTC))
+        assert r1.get("rebalanced") is True
+        assert r1["month"] == "2025-07"          # the DECISION month...
+        assert r1["decision_date"] == "2025-07-31"   # ...decided at its ME
+        assert r1["picks"] == ["AAA", "BBB"]
+
+        async def check():
+            async with mem_db() as s:
+                trs = (await s.scalars(
+                    select(Tr).order_by(Tr.created_at, Tr.ticker))).all()
+                assert [(t.ticker, t.side, t.price) for t in trs] == \
+                    [("AAA", "BUY", 110.0), ("BBB", "BUY", 100.0)]
+                # (live trades stamp the real write time in created_at; the
+                # FILL SESSION is pinned by the strict-open price: 110 is
+                # the 2025-08-01 OPEN — no other session quotes it)
+                rbs = (await s.scalars(select(Rb))).all()
+                assert len(rbs) == 1
+                # the audit row keeps the DECISION day distinct from the fill day
+                assert rbs[0].rebal_date.strftime("%Y-%m-%d") == "2025-07-31"
+                acc = await s.get(MonthlyAccount, 1)
+                assert acc.last_rebalance_month == "2025-07"  # pass complete
+        await check()
+
+        # idempotent: the decision is complete, a second cycle is a no-op
+        r2 = await monthly.run_rebalance(
+            now=datetime(2025, 8, 1, 23, 30, tzinfo=UTC))
+        assert r2.get("skipped") is True
+
+    async def test_leg_without_a_quote_retries_next_session(
+            self, mem_db, monkeypatch):
+        """BBB has NO candle on the fill session (2025-08-01): its leg gets
+        NO fill (a missing quote is not an executable price — never a stale
+        or forward-filled close), the decision stays pending, and the leg is
+        retried on the NEXT session (2025-08-04) at THAT session's open (90
+        — not the month-end's 100 close)."""
+        from app.db import MonthlyRebalance as Rb
+        from app.db import MonthlyTrade as Tr
+
+        bars = {
+            "AAA": _const_bars("2024-06-03", "2025-09-30", 100.0, 100.0),
+            "BBB": _const_bars("2024-06-03", "2025-07-31", 100.0, 100.0)
+                   + _const_bars("2025-08-04", "2025-09-30", 90.0, 90.0),
+        }
+        await _seed_candle_bars(bars)
+        await _seed_roe_fundamentals({"AAA": 0.5, "BBB": 0.1})
+        _deferred_env(mem_db, monkeypatch, bars, None)
+
+        r1 = await monthly.run_rebalance(
+            now=datetime(2025, 8, 1, 23, 30, tzinfo=UTC))
+        assert r1.get("rebalanced") is True
+        assert r1["complete"] is False          # a leg is still pending
+        assert [t["ticker"] for t in r1["trades"]] == ["AAA"]  # BBB got no fill
+
+        async def check1():
+            async with mem_db() as s:
+                acc = await s.get(MonthlyAccount, 1)
+                # the decision is NOT marked complete while a leg is open
+                assert acc.last_rebalance_month is None
+                trs = (await s.scalars(
+                    select(Tr).order_by(Tr.created_at, Tr.ticker))).all()
+                assert [(t.ticker, t.side, t.price) for t in trs] == \
+                    [("AAA", "BUY", 100.0)]
+        await check1()
+
+        # catch-up: the next session re-takes the pending decision
+        r2 = await monthly.run_rebalance(
+            now=datetime(2025, 8, 4, 23, 30, tzinfo=UTC))
+        assert r2.get("rebalanced") is True
+        assert r2["complete"] is True
+
+        async def check2():
+            async with mem_db() as s:
+                trs = (await s.scalars(
+                    select(Tr).order_by(Tr.created_at, Tr.ticker))).all()
+                # AAA filled on the 08-01 session; BBB's retry filled on the
+                # 08-04 session at THAT session's strict open (90 — the
+                # month-end's close 100 was never an executable price)
+                assert [(t.ticker, t.side, t.price) for t in trs] == \
+                    [("AAA", "BUY", 100.0), ("BBB", "BUY", 90.0)]
+                # the retry re-used the first-pass audit row — no duplicate
+                rbs = (await s.scalars(select(Rb))).all()
+                assert len(rbs) == 1
+                assert rbs[0].rebal_date.strftime("%Y-%m-%d") == "2025-07-31"
+                acc = await s.get(MonthlyAccount, 1)
+                assert acc.last_rebalance_month == "2025-07"
+        await check2()
+
+    async def test_newer_month_end_supersedes_a_pending_decision(
+            self, mem_db, monkeypatch):
+        """AAA's tape is holed until 2025-08-29, so the July decision's AAA
+        leg stays pending. When the August month-end (2025-08-29) completes,
+        the NEXT session (2025-09-02, after Labor Day) re-resolves the
+        pending rebuild to the NEWER month-end: the decision is August's
+        (rebal_date 2025-08-29), and the stuck July leg fills under it at the
+        CURRENT session's strict open (130 — not the Aug-29 open 140 and not
+        the July-ME close 100)."""
+        from app.db import MonthlyRebalance as Rb
+        from app.db import MonthlyTrade as Tr
+
+        bars = {
+            "AAA": _const_bars("2024-06-03", "2025-07-31", 100.0, 100.0)
+                   + _const_bars("2025-08-29", "2025-08-29", 140.0, 140.0)
+                   + _const_bars("2025-09-02", "2025-09-02", 130.0, 130.0),
+            "BBB": _const_bars("2024-06-03", "2025-09-02", 100.0, 100.0),
+        }
+        await _seed_candle_bars(bars)
+        await _seed_roe_fundamentals({"AAA": 0.5, "BBB": 0.1})
+        clock = _deferred_env(mem_db, monkeypatch, bars, None)
+
+        r1 = await monthly.run_rebalance(
+            now=datetime(2025, 8, 1, 23, 30, tzinfo=UTC))
+        assert r1.get("rebalanced") is True
+        assert r1["complete"] is False          # AAA's leg: no quote on 08-01
+        assert [t["ticker"] for t in r1["trades"]] == ["BBB"]
+
+        # September begins: the newest completed month-end now ranks
+        clock["month"] = "2025-09"
+        r2 = await monthly.run_rebalance(
+            now=datetime(2025, 9, 2, 23, 30, tzinfo=UTC))
+        assert r2.get("rebalanced") is True
+        # the PENDING decision was superseded by the newer month-end
+        assert r2["month"] == "2025-08"
+        assert r2["decision_date"] == "2025-08-29"
+
+        async def check():
+            async with mem_db() as s:
+                rbs = (await s.scalars(
+                    select(Rb).order_by(Rb.rebal_month))).all()
+                assert [(r.rebal_month, r.rebal_date.strftime("%Y-%m-%d"))
+                        for r in rbs] == \
+                    [("2025-07", "2025-07-31"), ("2025-08", "2025-08-29")]
+                trs = (await s.scalars(
+                    select(Tr).order_by(Tr.created_at, Tr.ticker))).all()
+                buys = [(t.ticker, t.side, t.price) for t in trs]
+                # BBB filled under the July decision (100 = its open);
+                # AAA's stuck July leg filled under the SUPERSEDING August
+                # decision at the 09-02 session's strict open (130 — not the
+                # 08-29 open 140 and not the July-ME close 100)
+                assert ("BBB", "BUY", 100.0) in buys
+                assert ("AAA", "BUY", 130.0) in buys
+                assert not any(price == 140.0 for _, _, price in buys)
+                acc = await s.get(MonthlyAccount, 1)
+                assert acc.last_rebalance_month == "2025-08"
+        await check()
 
 
 async def test_refresh_data_reuses_the_nightly_prefetch(monkeypatch):
@@ -1144,11 +1385,16 @@ def test_qv_order_lowvol_tilt():
 def fake_market(monkeypatch):
     """Patch monthly's market/fundamentals loaders so backfill replays a tiny
     deterministic two-ticker market (no network, no real DB rows)."""
-    # Two COMPLETE months: 2026-08-31 is the real US session month-end, so
-    # the replay rebalances on scheduled month-ends — a frame ending inside
-    # a running month has none (see monthly.completed_month_ends).
+    # Two COMPLETE months: 2026-07-31 and 2026-08-31 are the real US session
+    # month-ends, so the replay rebalances on scheduled month-ends — a frame
+    # ending inside a running month has none (see monthly.completed_month_ends).
+    # Under the deferred-fill cadence the July decision's fills land on the
+    # FIRST session after the month-end (2026-08-03) at that session's open;
+    # August's decision fills on 2026-09-01 — OUTSIDE the replayed window, so
+    # a window ending on the August month-end leaves August pending.
     dates = pd.bdate_range("2026-07-01", "2026-08-31")
     close = pd.DataFrame({"AAA": 100.0, "BBB": 50.0}, index=dates)
+    open_px = pd.DataFrame({"AAA": 100.0, "BBB": 50.0}, index=dates)
     vol = pd.DataFrame(1e6, index=dates, columns=["AAA", "BBB"])
 
     def fake_frame(m, c, v, f):
@@ -1158,8 +1404,8 @@ def fake_market(monkeypatch):
             "vol": [0.2, 0.25], "eligible": [True, True],
         }, index=pd.Index(["AAA", "BBB"], name="ticker"))
 
-    async def fake_load_frames(_tickers, _asof, start=None):
-        return close, vol
+    async def fake_load_ohlcv_frames(_tickers, _asof, start=None):
+        return open_px, close, vol
 
     async def fake_load_fundamentals(_tickers):
         return {"AAA": {"x": []}, "BBB": {"x": []}}
@@ -1167,7 +1413,7 @@ def fake_market(monkeypatch):
     monkeypatch.setattr(monthly, "universe_tickers", lambda _u: ["AAA", "BBB"])
     monkeypatch.setattr(monthly.fundamentals_mod, "load_fundamentals",
                         fake_load_fundamentals)
-    monkeypatch.setattr(monthly, "load_frames", fake_load_frames)
+    monkeypatch.setattr(monthly, "load_ohlcv_frames", fake_load_ohlcv_frames)
     monkeypatch.setattr(monthly, "eligible_frame", fake_frame)
     return {"close": close}
 
@@ -1203,10 +1449,12 @@ class TestBackfill:
                 assert len(pos) == 2
                 for p in pos:
                     assert p.shares > 0 and p.avg_cost > 0
-                # rebalance audit rows: one per replayed month (the live engine
-                # rebalances monthly, no-op months included)
+                # rebalance audit rows: one row per decision whose FILLS
+                # completed inside the window — July's decision fills on
+                # 2026-08-03; August's would fill 2026-09-01 (outside the
+                # window), so August stays pending under the deferred cadence
                 rbs = (await s.scalars(select(Rb))).all()
-                assert sorted(x.rebal_month for x in rbs) == ["2026-07", "2026-08"]
+                assert sorted(x.rebal_month for x in rbs) == ["2026-07"]
                 assert all(x.picked for x in rbs)
                 # trades carry the replay day
                 trs = (await s.scalars(select(Tr))).all()
@@ -1307,11 +1555,12 @@ class TestBackfill:
         # truncate the market to a mid-August last candle
         truncated = fake_market["close"].loc[:"2026-08-21"]
 
-        async def fake_load_frames(_tickers, _asof, start=None):
-            return truncated, pd.DataFrame(1e6, index=truncated.index,
-                                           columns=["AAA", "BBB"])
+        async def fake_load_ohlcv(_tickers, _asof, start=None):
+            return (pd.DataFrame({"AAA": 100.0, "BBB": 50.0}, index=truncated.index),
+                    truncated,
+                    pd.DataFrame(1e6, index=truncated.index, columns=["AAA", "BBB"]))
 
-        monkeypatch.setattr(monthly, "load_frames", fake_load_frames)
+        monkeypatch.setattr(monthly, "load_ohlcv_frames", fake_load_ohlcv)
         monkeypatch.setattr(monthly, "_current_month", lambda: "2026-08")
 
         r = asyncio.run(monthly.backfill(start="2026-07-01"))
@@ -1341,11 +1590,12 @@ class TestBackfill:
         from app.db import MonthlyRebalance as Rb
         from app.db import MonthlySnapshot as Sn
 
-        dates = pd.bdate_range("2026-01-02", "2026-03-31")
+        dates = pd.bdate_range("2026-01-02", "2026-04-30")
         hole = pd.Timestamp("2026-02-27")  # February's scheduled month-end
         assert hole in dates
         dates = dates.delete(dates.get_loc(hole))
         close = pd.DataFrame({"AAA": 100.0, "BBB": 50.0}, index=dates)
+        open_px = pd.DataFrame({"AAA": 100.0, "BBB": 50.0}, index=dates)
         vol = pd.DataFrame(1e6, index=dates, columns=["AAA", "BBB"])
 
         def fake_frame(m, c, v, f):
@@ -1356,8 +1606,8 @@ class TestBackfill:
                 "eligible": [True, True],
             }, index=pd.Index(["AAA", "BBB"], name="ticker"))
 
-        async def fake_load_frames(_tickers, _asof, start=None):
-            return close, vol
+        async def fake_load_ohlcv(_tickers, _asof, start=None):
+            return open_px, close, vol
 
         async def fake_load_fundamentals(_tickers):
             return {"AAA": {"x": []}, "BBB": {"x": []}}
@@ -1365,24 +1615,26 @@ class TestBackfill:
         monkeypatch.setattr(monthly, "universe_tickers", lambda _u: ["AAA", "BBB"])
         monkeypatch.setattr(monthly.fundamentals_mod, "load_fundamentals",
                             fake_load_fundamentals)
-        monkeypatch.setattr(monthly, "load_frames", fake_load_frames)
+        monkeypatch.setattr(monthly, "load_ohlcv_frames", fake_load_ohlcv)
         monkeypatch.setattr(monthly, "eligible_frame", fake_frame)
         monkeypatch.setattr(monthly, "_current_month", lambda: "2026-03")
 
         r = asyncio.run(monthly.backfill(start="2026-01-02"))
         assert r["ok"] is True
-        # Jan + Feb + Mar all funded despite February's missing month-end
+        # Jan + Feb + Mar + Apr all funded despite February's missing month-end
         assert r["contributed"] == \
-            pytest.approx(3 * settings.sim_monthly_contribution)
+            pytest.approx(4 * settings.sim_monthly_contribution)
 
         async def check():
             async with mem_db() as s:
                 al = sorted(x.month for x in (await s.scalars(select(Al))).all())
-                assert al == ["2026-01", "2026-02", "2026-03"]
+                assert al == ["2026-01", "2026-02", "2026-03", "2026-04"]
                 rbs = sorted(x.rebal_month
                              for x in (await s.scalars(select(Rb))).all())
-                # only months with a STORED month-end rebalance — no
-                # fabricated February rebuild
+                # only months with a STORED month-end decision AND completed
+                # fills — no fabricated February rebuild; March's fills land
+                # on Apr-1 (the first session after its month-end), inside
+                # the now-extended window; April's would fill May-1 (outside)
                 assert rbs == ["2026-01", "2026-03"]
                 snaps = (await s.scalars(
                     select(Sn).order_by(Sn.created_at))).all()
@@ -1395,6 +1647,7 @@ class TestBackfill:
                 assert by_day["2026-02-26"] == pytest.approx(2000.0)
                 assert "2026-02-27" not in by_day
                 assert by_day["2026-03-02"] == pytest.approx(3000.0)
+                assert by_day["2026-04-01"] == pytest.approx(4000.0)
         asyncio.run(check())
 
 
@@ -1488,14 +1741,17 @@ async def test_first_snapshot_is_parked_contribution(mem_db, monkeypatch):
             "vol": [0.2, 0.25], "eligible": [True, True],
         }, index=pd.Index(["AAA", "BBB"], name="ticker"))
 
-    async def fake_load_frames(_t, _a, start=None):
-        return close, vol
+    async def fake_load_ohlcv(_t, _a, start=None):
+        return (pd.DataFrame({"AAA": rising, "BBB": [x / 2 for x in rising]},
+                             index=dates),
+                close,
+                vol)
 
     async def fake_load_fundamentals(_t):
         return {"AAA": {"x": []}, "BBB": {"x": []}}
 
     monkeypatch.setattr(monthly, "universe_tickers", lambda _u: ["AAA", "BBB"])
-    monkeypatch.setattr(monthly, "load_frames", fake_load_frames)
+    monkeypatch.setattr(monthly, "load_ohlcv_frames", fake_load_ohlcv)
     monkeypatch.setattr(monthly.fundamentals_mod, "load_fundamentals", fake_load_fundamentals)
     monkeypatch.setattr(monthly, "eligible_frame", fake_frame)
 

@@ -2,11 +2,12 @@
 
 Date: 2026-10-21. Reviewed checkout: `ba37afa`.
 
-Status addendum (2026-10-21): Phase 1 corrections are in progress on
-`feature/phase-1-financial-correctness` and are **not yet accepted** — see
-"Phase 1 implementation status" at the end of this document. The findings
-below are unchanged and describe the reviewed checkout `ba37afa`; their
-file/line references are intentionally left as written.
+Status addendum (2026-10-21): Phase 1 corrections are **code-complete and
+independently verified** on `feature/phase-1-financial-correctness`, with
+acceptance still pending — see "Phase 1 implementation status" at the end of
+this document. The findings below are unchanged and describe the reviewed
+checkout `ba37afa`; their file/line references are intentionally left as
+written.
 
 ## Bottom line
 
@@ -355,17 +356,17 @@ substitute for multi-regime validation.
 Each should be independently reviewed. No commits, deployment, data migration,
 strategy switch or deletion is authorized by this audit alone.
 
-## Phase 1 implementation status — 2026-10-21 (in progress, not accepted)
+## Phase 1 implementation status — 2026-10-21 (code complete, not yet accepted)
 
 **Status date: 2026-10-21.** Branch: `feature/phase-1-financial-correctness`
-(base commit `ba37afa`). Phase 1 of the plan in section 5 is **in progress**:
-the initial batch of corrections is **written on the branch** and has now been
-**independently verified** (see the checkpoint below). That is a statement
-about the batch only — it is **not** an acceptance of Phase 1 as a whole, and
-the remaining acceptance list further down is unchanged. The findings above
-remain the **original state** of the reviewed checkout (`ba37afa`); their line
-references are deliberately left as written and are not rewritten to the
-branch.
+(base commit `ba37afa`; commit `888c919` plus three uncommitted follow-up
+batches). Phase 1 of the plan in section 5 is **code-complete** and
+**independently verified** (see the checkpoint below). The acceptance criteria
+of section 5 are met in code apart from the honest residual list further down;
+formal acceptance is a separate decision, so this note does not declare Phase 1
+accepted. The findings above remain the **original state** of the reviewed
+checkout (`ba37afa`); their line references are deliberately left as written
+and are not rewritten to the branch.
 
 No commit, deployment, data migration, strategy switch, or new parameter
 selection is authorized by this note, and no production data was changed.
@@ -382,15 +383,22 @@ selection is authorized by this note, and no production data was changed.
 | Prior-known ATR reference, entry guard, no same-cycle SELL/BUY churn | `app/analysis.py` — the reference level is built from the previous completed bar only; `app/strategy.py` — an entry must be above the published level, and a ticker sold in a cycle is not bought back in the same cycle | Code implemented — independently verified |
 | Actual ten picks, rank-first (live / backfill / research) | `app/monthly.py` `_deploy_targets` returns the hysteresis membership in ranking order; `app/daily_core.py` deploys those picks in the live and the backfill path instead of the raw top-N band | Code implemented — independently verified |
 | Prior-window ranking, shared completed-month-end calendar, replay adapter | `app/optimize.py` — `month_for` uses the pre-window month-end frame and never the first in-window one; `monthly.completed_month_ends` is the shared calendar for backfill, research and sweep; the replay adapter supplies `net_score` / `trend_up` / `trend_down` / `weekly_trend_up` | Code implemented — independently verified |
+| Frozen session fill contract | `app/session.py` — one documented, frozen contract: decision inputs are data ≤ the previous completed session S; fills use F's strict exact-date open (never forward-filled; a missing quote is no fill and the decision is re-taken next session); a stop level known at S's close is a standing order for F (open through the level → the open, else the low → the level, else nothing); a per-session guard makes a second cycle in the same session a no-op | Code implemented — independently verified |
+| Entry-frozen percent stop and monotone ATR ratchet (sim) | `app/db.py` adds a nullable `SimPosition.stop_price` in place (additive `ALTER TABLE`, no migration; legacy rows keep the documented avg-cost fallback); `app/sim.py` persists the stop at entry and never re-anchors it on a top-up; `sim._atr_ratchets` takes the max prior-known ATR candidate over every completed bar since `opened_at`, so it can only tighten; the backfills write the actual first-buy session into `opened_at` instead of wall-clock now | Code implemented — independently verified |
+| Strict-open USD fills and deferred month-end rebuild (monthly + daily-core) | `app/monthly.py` fills at the session's exact-date open converted to USD (`_open_usd_map`); a pending month-end rebuild is deferred to the first session of the next month with per-leg retry and an audit `rebal_date` kept distinct from the fill day; `app/daily_core.py` runs the documented month-end band policy with an injectable `_now()` clock; both backfills stamp `opened_at` with the actual first-buy date | Code implemented — independently verified |
+| Research replay on the same contract | `app/optimize.py` — decisions on S closes, with the ATR entry gate judged against the price actually paid (F's open); the research-only cost parameter is explicit (`cost_oneway`, default `settings.sim_monthly_cost_oneway` = 10 bps one-way, documented as not the live fee model) and the fee is reserved inside the spend so a full-cash buy cannot drive cash negative | Code implemented — independently verified |
+| TWR series and dated XIRR, honest UI chips | `app/performance.py` supplies the unitized NAV series and dated external flows; `GET /api/metrics/twr` returns the TWR series and `GET /api/metrics/xirr` a dated money-weighted XIRR; the Daily-Core, Monthly and Sim tabs read both chips and label the `%` view as gain on contributed capital, explicitly not a TWR | Code implemented — independently verified |
+| Golden live/backfill and research/backfill parity | `tests/test_cadence_parity.py` drives the live engines session by session against the persisted backfill on one synthetic tape with real month-end rank flips and asserts identical trade sets plus `opened_at` = the actual first-buy date; `tests/test_replay_fills.py` pins the research replay to the live backfill over the same kind of tape with `open != close`, including that mutating F's own bar cannot change F's fills | Code implemented — independently verified |
 
-### Verification checkpoint (initial batch)
+### Verification checkpoint
 
-A final independent integration run over the batch reported **707 tests passed
-in 54.49 s**, a clean `ruff` check over `app/` and `tests/`, and a clean
-`git diff` check. The run used local and synthetic fixtures with a temporary
-database only — **no external data pull**. The two final-review defects listed
-below were fixed with regression tests before that run, so the initial batch
-is now independently verified.
+The final independent integration run over the whole Phase 1 code scope
+reported **783 tests passed in 103.02 s**, a clean `ruff` check over `app/` and
+`tests/`, and a clean `git diff --check`. The run used local and synthetic
+fixtures with temporary databases only — **no external data pull**. The two
+final-review defects listed below were fixed with regression tests before that
+run, and the follow-up batches above carry their own regression modules under
+`tests/`.
 
 ### Final-review defects — fixed and covered by regression tests
 
@@ -409,37 +417,41 @@ is now independently verified.
   `TestDeadMonthCausality` and `TestMonthlyBacktestCalendarSettlement`
   (leading and trailing funding holes, parked-vs-invested money).
 
-### Still required before Phase 1 can be accepted
+### Phase 1 status
 
-- **Executable, fresh next-session fills.** Decisions are still taken on a
-  completed bar and filled at that same close. A decision made after the final
-  bar needs a later attainable execution price; same-close fills are not
-  executable merely because they are paper. A missing or stale quote must not
-  be used as a fill price, and an indefinitely stale listing must not remain
-  silently eligible.
-- **Live/replay daily-vs-monthly cadence parity and a shared fee contract.**
-  The live engine and the replay must agree on the ranking and release cadence
-  they use, and live, backfill and research must share one explicit fee/cost
-  model (today the live and backfill factor accounts are fee-free while the
-  optimizer applies a default one-way cost).
-- **Monotone, position-specific stop semantics and golden kernel parity.** A
-  live-frozen percent stop, a position-specific monotone ATR stop, and golden
-  live/replay tests over one shared decision kernel, with fixtures where daily
-  and monthly facts/ranks deliberately differ.
-- **TWR charts and dated XIRR are not delivered.** The chart "%" view is still
-  gain on contributed capital rather than a time-weighted return, and no dated
-  money-weighted XIRR is produced.
+The code scope of Phase 1 is **complete and independently verified**: the
+acceptance criteria in section 5 are met in code, with this honest residual
+list. The residuals are documented exclusions, not silent gaps, and none of
+them reopens the corrected decision/fill path for the four strategies that
+Phase 4 compares.
+
+- **Savings mirror and chat trade paths keep legacy same-close fills.** The
+  mirror allocates at the latest available close, and `sim.sim_chat` books
+  chat-initiated trades at `_latest_close`; neither is one of the four
+  research strategies, so neither is wired to the session contract.
+- **The LLM decision ledger is deferred to Phase 2.** Frozen `decided_at` /
+  `filled_at` per order is a Phase 2 accounting item (recorded in
+  `app/session.py`, rule 7). The LLM path already uses data ≤ S and fills at
+  F's open, but its reasoning is timestamped to the cycle that produced it.
+- **Published performance and experiment numbers remain stale** until they are
+  re-run on the corrected engine; that re-run is Phase 4 evidence work, not
+  Phase 1.
+- **Live `created_at` / `opened_at` are write-time on manual runs.** Only the
+  backfills stamp the actual session / first-buy date; a manual cycle books
+  the wall-clock write time.
 
 ### Notes and limits of this batch
 
-- The ATR reference is **prior-known and reachable** — today's close can break
-  a level that was already known before today's bar closed — but it is
-  recomputed per bar and can move *down* as well as up. It is therefore an
-  indicator candidate, **not a ratchet**, and must not be described as one.
-  The percent stop is entry-frozen only in the optimizer replay, which carries a
-  `stop_price` per ticker; the live sim passes `stop_price = None` and recomputes
-  the stop from the position's blended average cost every cycle, so a top-up can
-  loosen it — that live/replay divergence is still outstanding.
+- The per-bar ATR reference is **prior-known and reachable** — today's close
+  can break a level that was already known before today's bar closed — but it
+  is recomputed per bar and can move *down* as well as up. That snapshot value
+  is therefore an indicator candidate, **not a ratchet**, and must not be
+  described as one. The monotone behaviour lives in the caller-computed
+  position-specific ratchet (the max candidate level over every completed bar
+  since `opened_at`), which can only tighten. The percent stop is now frozen at
+  entry and persisted on the position (`SimPosition.stop_price`) in the live
+  sim and the replay alike, so a top-up cannot loosen it; legacy rows without
+  the column keep the documented avg-cost fallback.
 - **No new "winning" parameter or strategy selection** until the whole of
   Phase 1 is complete and accepted.
 - **The previously published performance and experiment results are

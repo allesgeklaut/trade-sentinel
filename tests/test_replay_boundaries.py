@@ -4,8 +4,11 @@ The daily-core replay and its research backtest must behave like the live
 engine at calendar boundaries:
 
 - every day ranks against the most recent COMPLETED month-end at or before
-  it — the PRE-window month-end frame for days before the window's first
-  month-end, never a future frame (audit P0-E);
+  ``S`` (the previous stored session) — the PRE-window month-end frame for
+  days before the window's first month-end, never a future frame (audit
+  P0-E). Deferring the decision by one session is the session fill contract
+  (app/session.py): the band switches, and the month-end rebuild/release
+  pass runs, on the FIRST session after the month-end;
 - a month rebalances only on its US session calendar month-end, and only
   when that candle is stored — never on a partial month's last candle;
   appending future candles cannot change any decision inside the window;
@@ -13,11 +16,16 @@ engine at calendar boundaries:
   and deploys against the pre-window frame;
 - deployment funds the hysteresis-selected picks (ten-slot target),
   rank-first, never the raw ``band[:target_n]`` (audit P0-D), and gated
-  entries respect capacity + selected membership.
+  entries respect capacity + selected membership (the entry gate is read on
+  S's close, never on the session it fills);
+- a release with no executable bar on the fill session gets NO fill and
+  retries at the next session (never a stale close).
 
 The tests use flat synthetic prices and canned eligibility frames (roe
 distinct per rank, everything else equal) so ``_qv_order`` is fully
-determined and every printed trade is exact.
+determined and every printed trade is exact. The FILL PRICE is not the
+subject here — the canned tapes run with open == close; the strict-open rule
+is pinned in tests/test_replay_fills.py.
 """
 
 from __future__ import annotations
@@ -96,8 +104,10 @@ async def mem_db(monkeypatch):
 def jumped_market(monkeypatch):
     """close with per-name jumps: A01 jumps on 2025-02-10, B02 on 2025-03-10,
     C03 on 2025-03-14 (each opens the above-sma50 entry gate for that name
-    on that day)."""
-    close, vol = _flat_market("2025-03-14")
+    once the SESSION'S CLOSE is known). The tape runs one session past
+    C03's jump because the gate is a decision input: it can only fill at the
+    NEXT session's strict open."""
+    close, vol = _flat_market("2025-03-17")
     close.loc["2025-02-10":, "A01"] = 130.0
     close.loc["2025-03-10":, "B02"] = 130.0
     close.loc["2025-03-14":, "C03"] = 130.0
@@ -106,8 +116,14 @@ def jumped_market(monkeypatch):
 
 def _run_optimizer(monkeypatch, close, vol, frames, *, start, end=None,
                    dca="rank", entry_gate="none", exit_cadence="monthly",
-                   verbose=True, frame_cache=None):
-    """Run the deterministic daily-core backtest on canned frames."""
+                   verbose=True, frame_cache=None, open_px=None):
+    """Run the deterministic daily-core backtest on canned frames.
+
+    ``open_px`` defaults to the close tape (open == close): these boundary
+    tests pin the DECISION calendar (which session decides, which session
+    fills), not the fill price — the strict-open/no-ffill rule is pinned in
+    tests/test_replay_fills.py.
+    """
     monkeypatch.setattr(
         monthly_mod, "eligible_frame",
         lambda d, c, v, f: frames.get(pd.Timestamp(d).normalize()))
@@ -115,7 +131,8 @@ def _run_optimizer(monkeypatch, close, vol, frames, *, start, end=None,
         start, end, "diversified-plus", 1000.0, verbose,
         entry_gate, exit_cadence, False, dca,
         frame_cache=frame_cache, close_preloaded=(close, vol),
-        fund_preloaded={}, with_baseline=False))
+        fund_preloaded={}, with_baseline=False,
+        open_preloaded=close if open_px is None else open_px))
 
 
 _TRADE_RE = re.compile(r"^  (\d{4}-\d{2}-\d{2})\s+(BUY|SELL)\s+(\S+)\s+\$")
@@ -179,10 +196,12 @@ class TestPriorWindowRanking:
                              start="2024-01-02")
         trades = _printed_trades(capsys)
         # Jan 2-30 has NO prior month-end frame: no trades at all —
-        # months[0] (Jan-31) is never leaked backwards
-        assert not any(d < "2024-01-31" for (d, _, _) in trades)
+        # months[0] (Jan-31) is never leaked backwards. The decision made at
+        # Jan-31's close fills on the FIRST session after it (the deferred
+        # session-fill convention).
+        assert not any(d < "2024-02-01" for (d, _, _) in trades)
         # from the January month-end onward the ranking exists and deploys
-        assert any(d == "2024-01-31" for (d, side, _) in trades
+        assert any(d == "2024-02-01" for (d, side, _) in trades
                    if side == "BUY")
         assert res is not None
 
@@ -198,8 +217,9 @@ class TestFutureDataInvariance:
     def test_truncation_at_month_end_endpoint_keeps_decisions(
             self, small_slots, monkeypatch, capsys):
         """Candles truncated EXACTLY at the January month-end: the endpoint
-        still rebalances (the old later-candle rule LOST the truncated
-        run's own month-end) and every decision through it is identical."""
+        still rebalances — on the FIRST session after it (the deferred fill
+        convention), so the truncated tape must carry that session too — and
+        every decision through it is identical."""
         close, vol = _flat_market("2025-02-28")
         rotated = ["D04", "E05", "F06", "G07", "H08", "A01", "B02", "C03"]
         frames = self._frames(["2024-12-31", "2025-01-31", "2025-02-28"],
@@ -208,20 +228,26 @@ class TestFutureDataInvariance:
         _run_optimizer(monkeypatch, close, vol, frames, start="2025-01-15")
         full_trades = _printed_trades(capsys)
 
-        close_t = close.loc[:"2025-01-31"]
-        vol_t = vol.loc[:"2025-01-31"]
+        # The deferred fill session of the Jan-31 decision is Feb-3 (the
+        # next stored session): the truncated tape ends there, not at the
+        # month-end, because a decision whose fill session is missing is
+        # PENDING (nothing is fabricated on the month-end itself).
+        close_t = close.loc[:"2025-02-03"]
+        vol_t = vol.loc[:"2025-02-03"]
         frames_t = {pd.Timestamp("2024-12-31"): frames[pd.Timestamp("2024-12-31")],
                     pd.Timestamp("2025-01-31"): frames[pd.Timestamp("2025-01-31")]}
         _run_optimizer(monkeypatch, close_t, vol_t, frames_t, start="2025-01-15")
         trunc_trades = _printed_trades(capsys)
 
-        cut = "2025-01-31"
+        cut = "2025-02-03"
         assert [t for t in trunc_trades if t[0] <= cut] == \
             [t for t in full_trades if t[0] <= cut]
-        # the endpoint itself rebalances in the truncated run: July's picks
-        # B02/C03 fell out of January's band and are released there
+        # the deferred fill session rebalances in the truncated run: July's
+        # picks B02/C03 fell out of January's band and are released there
         assert any(d == cut and side == "SELL" and t in ("B02", "C03")
                    for (d, side, t) in trunc_trades)
+        # ... and nothing rebalanced ON the month-end itself
+        assert not any(d == "2025-01-31" for (d, _, _) in trunc_trades)
 
     def test_appended_future_candles_change_nothing_before_the_cut(
             self, small_slots, monkeypatch, capsys):
@@ -307,9 +333,11 @@ class TestPartialMonthBoundaries:
 class TestReplayTenSlotContract:
     def test_rebuild_releases_and_fills_in_rank_order(
             self, small_slots, monkeypatch, capsys):
-        """At the January month-end the ranking rotates: the held band
+        """After the January month-end the ranking rotates: the held band
         members keep their slots, the out-of-band releases free exactly
-        their slots, and the fills are bought rank-first. The book never
+        their slots, and the fills are bought rank-first. The deferred
+        session-fill convention puts all of it on the FIRST session after
+        the month-end (Feb-3), not on the month-end itself. The book never
         exceeds the target between month-ends."""
         close, vol = _flat_market("2025-02-28")
         rotated = ["D04", "E05", "F06", "G07", "H08", "A01", "B02", "C03"]
@@ -321,18 +349,23 @@ class TestReplayTenSlotContract:
         _run_optimizer(monkeypatch, close, vol, frames, start="2025-01-15")
         trades = _printed_trades(capsys)
 
+        fill_day = "2025-02-03"  # first session after the Jan-31 month-end
+        assert not any(d == "2025-01-31" for (d, _, _) in trades)
         jan31_sells = [t for (d, side, t) in trades
-                       if d == "2025-01-31" and side == "SELL"]
+                       if d == fill_day and side == "SELL"]
         jan31_buys = [t for (d, side, t) in trades
-                      if d == "2025-01-31" and side == "BUY"]
+                      if d == fill_day and side == "BUY"]
         # releases: B02/C03 fell out of the 6-band; fills: D04/E05 (the top
-        # of the ranking) — NOT the alphabetical-first names
+        # of the ranking) — NOT the alphabetical-first names. The same
+        # session is February's deposit day, so the held A01 is also topped
+        # up toward its new (higher) target weight.
         assert set(jan31_sells) == {"B02", "C03"}
-        assert set(jan31_buys) == {"D04", "E05"}
-        # between month-ends: no new name while the book is at capacity
         held_after_jan31 = {"A01", "D04", "E05"}
+        assert {"D04", "E05"} <= set(jan31_buys)
+        assert set(jan31_buys) <= held_after_jan31
+        # between month-ends: no new name while the book is at capacity
         mid_buys = [t for (d, side, t) in trades
-                    if "2025-01-31" < d < "2025-02-28" and side == "BUY"]
+                    if fill_day < d < "2025-02-28" and side == "BUY"]
         assert set(mid_buys) <= held_after_jan31
 
 
@@ -352,7 +385,7 @@ class TestPendingReleaseExecutionGuard:
 
     def test_failed_release_occupies_slot_and_only_one_fill_buys(
             self, small_slots, monkeypatch, capsys):
-        close, vol = _flat_market("2025-02-28")
+        close, vol = _flat_market("2025-03-03")
         rotated = ["A01", "D04", "E05", "F06", "G07", "H08", "B02", "C03"]
         frames = {
             pd.Timestamp("2024-12-31"): _canned_frame(STABLE_ORDER),
@@ -365,8 +398,10 @@ class TestPendingReleaseExecutionGuard:
         # optimistic about.
         close.loc["2025-02-21":, "B02"] = 0.0
 
+        # Deferred fills: the Feb-28 decision executes on Mon Mar-3, so the
+        # tape/window must carry that session for the release legs to exist.
         _run_optimizer(monkeypatch, close, vol, frames,
-                       start="2025-01-02", end="2025-02-28", dca="monthly")
+                       start="2025-01-02", end="2025-03-03", dca="monthly")
         trades = _printed_trades(capsys)
 
         # book simulation: the held set never exceeds the target
@@ -377,10 +412,11 @@ class TestPendingReleaseExecutionGuard:
             else:
                 held.discard(t)
             assert len(held) <= 3
-        # Feb-28: C03 released successfully, B02's release FAILED (stays);
+        # Mar-3: C03 released successfully, B02's release FAILED (stays);
         # the plan queued TWO fills (D04, E05) but only ONE slot was free —
         # the capacity guard skipped E05 instead of growing the book to 4
-        feb28 = [(side, t) for (d, side, t) in trades if d == "2025-02-28"]
+        fill_day = "2025-03-03"
+        feb28 = [(side, t) for (d, side, t) in trades if d == fill_day]
         assert ("SELL", "C03") in feb28
         assert ("SELL", "B02") not in feb28
         assert ("BUY", "D04") in feb28          # the one affordable fill
@@ -388,8 +424,10 @@ class TestPendingReleaseExecutionGuard:
         assert not any(side == "BUY" and t == "E05"
                        for (_, side, t) in trades)
         assert held == {"A01", "B02", "D04"}
-        # the parked February contribution deploys only at the rebuild
-        assert not any("2025-02-03" <= d < "2025-02-28"
+        # dca="monthly" deploys only on rebuild sessions: the Feb-3 deposit
+        # is spent at the Jan-31 rebuild fill (same session), then cash sits
+        # until the NEXT rebuild fill (the deferred Feb-28 session).
+        assert not any("2025-02-04" <= d < fill_day
                        for (d, _, _) in trades)
 
 
@@ -410,29 +448,32 @@ class TestDeadMonthCausality:
         trim cut January's days entirely when Feb's frame was alive, so the
         prior frame never funded Jan-2 and January's contribution vanished
         — the replay's START depended on FUTURE eligibility."""
-        close, vol = _flat_market("2025-02-28")
+        close, vol = _flat_market("2025-03-03")
         frames = {
             pd.Timestamp("2024-12-31"): _canned_frame(STABLE_ORDER),
             # Jan-31's frame missing from the dict -> dead anchor
             pd.Timestamp("2025-02-28"): _canned_frame(STABLE_ORDER),
         }
+        # The Feb-28 decision's fill session (Mar-3) must be in the window,
+        # or its rebuild is pending and nothing is deployed.
         res = _run_optimizer(monkeypatch, close, vol, frames,
-                             start="2025-01-02", end="2025-02-28")
+                             start="2025-01-02", end="2025-03-03")
         trades = _printed_trades(capsys)
 
         jan2_buys = [t for (d, side, t) in trades
                      if side == "BUY" and d == "2025-01-02"]
         assert jan2_buys == ["A01", "B02", "C03"]  # the prior frame's picks
         assert res is not None
-        assert res.contributed == pytest.approx(2000.0)  # Jan NOT defunded
-        # the dead January anchor yields no ranking: cash sits in February
-        # until Feb-28's valid frame becomes current
-        assert not any("2025-01-31" < d < "2025-02-28"
+        assert res.contributed == pytest.approx(3000.0)  # Jan NOT defunded
+        # the dead January anchor yields no ranking: cash sits until
+        # Feb-28's valid frame becomes current at the next session
+        assert not any("2025-01-31" < d < "2025-03-03"
                        for (d, _, _) in trades)
-        # Feb-28: the valid ranking resumes — top-ups of the held names
-        feb28_buys = [t for (d, side, t) in trades
-                      if d == "2025-02-28" and side == "BUY"]
-        assert set(feb28_buys) == {"A01", "B02", "C03"}
+        # Mar-3 (first session after the valid Feb-28 anchor): the ranking
+        # resumes — top-ups of the held names
+        resume_buys = [t for (d, side, t) in trades
+                       if d == "2025-03-03" and side == "BUY"]
+        assert set(resume_buys) == {"A01", "B02", "C03"}
 
     def test_future_frames_cannot_change_the_january_prefix(
             self, small_slots, monkeypatch, capsys):
@@ -512,9 +553,16 @@ class TestGatedEntryBoundaries:
         # nothing is bought while the gate is closed (the parked
         # contributions are NOT force-deployed)
         assert not any(d < "2025-02-10" for (d, _) in buys)
-        # each gated fill opens in its own turn: A01 (02-10), B02 (03-10),
-        # C03 (03-14)
+        # each gated fill opens in its own turn, at the session AFTER the
+        # gate opened (the gate is a decision input read on S's close):
+        # A01 (jumped 02-10 -> first filled 02-11), B02 (03-10 -> 03-11),
+        # C03 (03-14 -> 03-17)
         assert {t for (_, t) in buys} == {"A01", "B02", "C03"}
+        first_buy: dict[str, str] = {}
+        for d, t in buys:
+            first_buy.setdefault(t, d)
+        assert first_buy == {"A01": "2025-02-11", "B02": "2025-03-11",
+                             "C03": "2025-03-17"}
         assert not any(side == "SELL" for (_, side, _) in trades)
 
     def test_rank_mode_respects_the_entry_gate(
@@ -534,7 +582,13 @@ class TestGatedEntryBoundaries:
 
         buys = [(d, t) for (d, side, t) in trades if side == "BUY"]
         assert not any(d < "2025-02-10" for (d, _) in buys)
-        assert {t for (_, t) in buys} == {"A01", "B02", "C03"}
+        # a fill never lands on the session whose own close opens its gate:
+        # A01 02-11, B02 03-11, C03 03-17
+        first_buy: dict[str, str] = {}
+        for d, t in buys:
+            first_buy.setdefault(t, d)
+        assert first_buy == {"A01": "2025-02-11", "B02": "2025-03-11",
+                             "C03": "2025-03-17"}
 
 
 # ------------------------------------------------------------------
@@ -577,7 +631,7 @@ class TestSweepCacheParity:
 # ------------------------------------------------------------------
 
 @pytest.fixture
-def rotating_backfill_market(monkeypatch):
+def rotating_backfill_market(monkeypatch, tmp_path):
     """8-name market with a ranking that ROTATES on the August month-end:
     July's picks B02/C03 fall out of the August band. The fixture returns
     an ``install_market(last_day, orders)`` hook — `orders` maps
@@ -599,6 +653,7 @@ def rotating_backfill_market(monkeypatch):
         close = pd.DataFrame(100.0, index=dates, columns=TICKERS)
         vol = pd.DataFrame(1e6, index=dates, columns=TICKERS)
 
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
         monkeypatch.setattr(daily_core, "universe_tickers",
                             lambda _u: list(TICKERS))
 
@@ -607,9 +662,11 @@ def rotating_backfill_market(monkeypatch):
         monkeypatch.setattr(daily_core.fundamentals_mod, "load_fundamentals",
                             fake_load_fundamentals)
 
-        async def fake_load_frames(_tickers, _asof, start=None):
-            return close, vol
-        monkeypatch.setattr(monthly_mod, "load_frames", fake_load_frames)
+        async def fake_load_ohlcv_frames(_tickers, _asof, start=None):
+            # strict OPEN fill series == the flat close (constant tape)
+            return close.copy(), close, vol
+        monkeypatch.setattr(monthly_mod, "load_ohlcv_frames",
+                            fake_load_ohlcv_frames)
         monkeypatch.setattr(
             monthly_mod, "eligible_frame",
             lambda d, c, v, f: frames.get(pd.Timestamp(d).normalize()))
@@ -645,8 +702,10 @@ class TestDailyCoreBackfillBoundaries:
     def test_no_release_on_partial_last_candle(
             self, mem_db, small_slots, rotating_backfill_market, monkeypatch):
         """Data ends mid-August (2026-08-21): August has no month-end, so
-        July's picks that August's ranking dropped stay HELD — the persisted
-        replay no longer releases/rebalances on the replay's last candle."""
+        July's picks that August's ranking dropped stay HELD. Under the
+        deferred-fill cadence July's rebuild fills on 2026-08-03 (the first
+        session after the July month-end) and nothing out-of-band is ever
+        released because August's month-end never arrives."""
         rotating_backfill_market("2026-08-21", {"2026-07-31": TICKERS})
         monkeypatch.setattr(daily_core, "_current_month", lambda: "2026-08")
 
@@ -655,17 +714,19 @@ class TestDailyCoreBackfillBoundaries:
 
         trades = _backfill_trades()
         sells = [(d, t) for (d, side, t) in trades if side == "SELL"]
-        # July's rebuild bought A01/B02/C03; nothing out-of-band is ever
-        # released because August's month-end never arrives
+        # July's rebuild (fills 2026-08-03) bought A01/B02/C03; no release
         assert sells == []
         assert _backfill_positions() == ["A01", "B02", "C03"]
 
-    def test_release_at_the_true_month_end_when_candle_stored(
+    def test_release_fills_first_session_after_the_month_end(
             self, mem_db, small_slots, rotating_backfill_market, monkeypatch):
-        """Same replay with candles through 2026-08-31 (the true US session
-        month-end): the August month-end releases the out-of-band names and
-        refills rank-first."""
-        rotating_backfill_market("2026-08-31", {
+        """Candles through 2026-09-01 (the first session after the true
+        August month-end): the month-end SESSION (2026-08-31) is decision
+        only — no trades — and the August rebuild's legs (the out-of-band
+        releases B02/C03, the rank-first refills G07/H08) execute on
+        2026-09-01 at that session's strict open. The old replay released on
+        the month-end candle itself."""
+        rotating_backfill_market("2026-09-01", {
             "2026-07-31": TICKERS,
             "2026-08-31": ["G07", "H08", "D04", "E05", "F06", "A01", "B02",
                            "C03"]})
@@ -674,9 +735,16 @@ class TestDailyCoreBackfillBoundaries:
         r = asyncio.run(daily_core.backfill(start="2026-07-01"))
         assert r["ok"] is True
 
-        sells = _backfill_trades("SELL")
-        assert sorted(t for (_, _, t) in sells) == ["B02", "C03"]
-        aug31_buys = sorted(t for (d, side, t) in _backfill_trades("BUY")
-                            if d == "2026-08-31")
-        assert aug31_buys == ["G07", "H08"]
+        trades = _backfill_trades()
+        # the month-end session itself never trades (decision only, rule 1)
+        assert not any(d == "2026-08-31" for (d, _, _) in trades)
+        sells = [(d, t) for (d, side, t) in trades if side == "SELL"]
+        # releases land on the FIRST SESSION after the month-end
+        assert sorted(sells) == [("2026-09-01", "B02"), ("2026-09-01", "C03")]
+        sep1_buys = sorted(t for (d, side, t) in trades
+                           if d == "2026-09-01" and side == "BUY")
+        # G07/H08 rank-first refills + A01's equal-weight top-up of the
+        # September deposit (the deposit lands on this first session of the
+        # month in BOTH engines)
+        assert sep1_buys == ["A01", "G07", "H08"]
         assert _backfill_positions() == ["A01", "G07", "H08"]
