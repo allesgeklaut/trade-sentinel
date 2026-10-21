@@ -3201,7 +3201,16 @@
 
         async function loadDailyCoreStatus(status, snaps, monthlyStatus, bench) {
             try {
-                const s = status || await api('dailycore/status');
+                // Metrics chips: XIRR (money-weighted, dated external flows)
+                // and TWR (time-weighted unitized NAV) come from the
+                // read-only /api/metrics endpoints. They are fetched here, in
+                // parallel with status, so the chips stay consistent with the
+                // same snapshot set even when status was pre-fetched.
+                const [s, metricsXirr, metricsTwr] = await Promise.all([
+                    status || api('dailycore/status'),
+                    api('metrics/xirr?scope=daily_core').catch(() => null),
+                    api('metrics/twr?scope=daily_core').catch(() => null),
+                ]);
                 const v = s.valuation || {};
                 const gain = v.allowance_total > 0 ? (v.total_equity / v.allowance_total * 100 - 100) : null;
                 // Risk metrics from the already-fetched curves (no extra
@@ -3223,6 +3232,14 @@
                     ? bench.total_equity / bench.allowance_total * 100 - 100 : null;
                 const alphaM = (dcGain != null && mLive != null) ? dcGain - mLive : null;
                 const alphaB = (dcGain != null && bLive != null) ? dcGain - bLive : null;
+                // XIRR/TWR chips: money-weighted (dated external flows) and
+                // time-weighted (unitized NAV) returns. XIRR is a fraction and
+                // is suppressed for windows shorter than a month — annualizing
+                // a few days is noise, not a return.
+                const xirrVal = (metricsXirr && metricsXirr.xirr != null
+                    && metricsXirr.window_days != null && metricsXirr.window_days >= 30)
+                    ? metricsXirr.xirr : null;
+                const twrVal = (metricsTwr && metricsTwr.twr_pct != null) ? metricsTwr.twr_pct : null;
                 const rankingDate = s.ranking_date;
                 const stale = rankingDate && rankingDate < new Date().toISOString().slice(0, 10);
                 const m = [
@@ -3230,6 +3247,8 @@
                     ['Contributed', v.allowance_total != null ? '$' + v.allowance_total.toFixed(2) : '—'],
                     ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(1) + '%' : '—', '', 'Gain on contributed capital (equity / contributed - 1) - NOT a time-weighted return'],
                     ['Max DD', mdd != null ? '-' + mdd.toFixed(1) + '%' : '—', '', 'Cash-flow-neutral drawdown of the unitized (time-weighted) NAV - deposits and withdrawals do not count as losses'],
+                    ['XIRR', xirrVal != null ? (xirrVal >= 0 ? '+' : '') + (xirrVal * 100).toFixed(1) + '%/yr' : '—', '', 'money-weighted annualized return from dated external flows — deposits and withdrawals as the day-over-day change of contributed capital, terminal value = latest equity, actual/365 day counts; shown once the window is at least 30 days'],
+                    ['TWR', twrVal != null ? (twrVal >= 0 ? '+' : '') + twrVal.toFixed(1) + '%' : '—', '', 'Time-weighted return of the unitized (cash-flow-adjusted) NAV over the plotted window - deposits and withdrawals do not count as returns'],
                     ['vs Monthly', alphaM != null ? (alphaM >= 0 ? '+' : '') + alphaM.toFixed(1) + 'pp' : '—', '', 'Difference in gain-on-contributions vs the monthly sim - NOT a risk-adjusted alpha'],
                     ['vs DCA', alphaB != null ? (alphaB >= 0 ? '+' : '') + alphaB.toFixed(1) + 'pp' : '—', '', 'Difference in gain-on-contributions vs the DCA benchmark - NOT a risk-adjusted alpha'],
                     ['Cash', v.cash != null ? '$' + v.cash.toFixed(2) : '—'],
@@ -4049,15 +4068,27 @@
 
         async function loadMonthlyStatus(snaps) {
             try {
-                const s = await api('monthly/status');
+                // Same read-only metrics pair as the other two tabs: XIRR
+                // (money-weighted, dated external flows) + TWR (unitized NAV).
+                const [s, metricsXirr, metricsTwr] = await Promise.all([
+                    api('monthly/status'),
+                    api('metrics/xirr?scope=monthly').catch(() => null),
+                    api('metrics/twr?scope=monthly').catch(() => null),
+                ]);
                 const gain = s.allowance_total > 0 ? (s.total_equity / s.allowance_total * 100 - 100) : null;
                 const points = (snaps || []).map(x => ({ value: x.total_equity, contributed: x.allowance_total }));
                 const mdd = points.length ? mddOf(points) : null;
+                const xirrVal = (metricsXirr && metricsXirr.xirr != null
+                    && metricsXirr.window_days != null && metricsXirr.window_days >= 30)
+                    ? metricsXirr.xirr : null;
+                const twrVal = (metricsTwr && metricsTwr.twr_pct != null) ? metricsTwr.twr_pct : null;
                 const m = [
                     ['Total Equity', s.total_equity != null ? '$' + s.total_equity.toFixed(2) : '—'],
                     ['Contributed', s.allowance_total != null ? '$' + s.allowance_total.toFixed(2) : '—'],
                     ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(1) + '%' : '—', '', 'Gain on contributed capital (equity / contributed - 1) - NOT a time-weighted return'],
                     ['Max DD', mdd != null ? '-' + mdd.toFixed(1) + '%' : '—', '', 'Cash-flow-neutral drawdown of the unitized (time-weighted) NAV - deposits and withdrawals do not count as losses'],
+                    ['XIRR', xirrVal != null ? (xirrVal >= 0 ? '+' : '') + (xirrVal * 100).toFixed(1) + '%/yr' : '—', '', 'money-weighted annualized return from dated external flows — deposits and withdrawals as the day-over-day change of contributed capital, terminal value = latest equity, actual/365 day counts; shown once the window is at least 30 days'],
+                    ['TWR', twrVal != null ? (twrVal >= 0 ? '+' : '') + twrVal.toFixed(1) + '%' : '—', '', 'Time-weighted return of the unitized (cash-flow-adjusted) NAV over the plotted window - deposits and withdrawals do not count as returns'],
                     ['Cash', s.cash != null ? '$' + s.cash.toFixed(2) : '—'],
                     ['Universe', s.sim_monthly_universe || '—'],
                     ['Next Rebalance', s.next_rebalance || '—'],
@@ -4258,9 +4289,11 @@
 
         async function loadSimStatus() {
             try {
-                const [s, bench, snaps] = await Promise.all([
+                const [s, bench, snaps, metricsXirr, metricsTwr] = await Promise.all([
                     api('sim/status'), api('sim/benchmark').catch(() => null),
-                    api('sim/equity?limit=12000').catch(() => null)]);
+                    api('sim/equity?limit=12000').catch(() => null),
+                    api('metrics/xirr?scope=sim').catch(() => null),
+                    api('metrics/twr?scope=sim').catch(() => null)]);
                 const benchEquity = bench && bench.total_equity != null ? '$' + bench.total_equity.toFixed(2) : '—';
                 // Gain-on-contributions + cash-flow-neutral max drawdown; the
                 // DCA chip is the difference in gain-on-contributions (not a
@@ -4274,11 +4307,21 @@
                 const bGain = (bench && bench.total_equity != null && bench.allowance_total > 0)
                     ? bench.total_equity / bench.allowance_total * 100 - 100 : null;
                 const alpha = (gain != null && bGain != null) ? gain - bGain : null;
+                // Money-weighted (dated external flows) and time-weighted
+                // (unitized NAV) returns from the read-only metrics endpoints.
+                // XIRR is a fraction and is suppressed for windows shorter
+                // than a month — annualizing a few days is noise.
+                const xirrVal = (metricsXirr && metricsXirr.xirr != null
+                    && metricsXirr.window_days != null && metricsXirr.window_days >= 30)
+                    ? metricsXirr.xirr : null;
+                const twrVal = (metricsTwr && metricsTwr.twr_pct != null) ? metricsTwr.twr_pct : null;
                 const m = [
                     ['Total Equity', s.total_equity != null ? '$' + s.total_equity.toFixed(2) : '—'],
                     ['Bench Equity', benchEquity, 'bench-metric'],
                     ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(1) + '%' : '—', '', 'Gain on contributed capital (equity / contributed - 1) - NOT a time-weighted return'],
                     ['Max DD', mdd != null ? '-' + mdd.toFixed(1) + '%' : '—', '', 'Cash-flow-neutral drawdown of the unitized (time-weighted) NAV - deposits and withdrawals do not count as losses'],
+                    ['XIRR', xirrVal != null ? (xirrVal >= 0 ? '+' : '') + (xirrVal * 100).toFixed(1) + '%/yr' : '—', '', 'money-weighted annualized return from dated external flows — deposits and withdrawals as the day-over-day change of contributed capital, terminal value = latest equity, actual/365 day counts; shown once the window is at least 30 days'],
+                    ['TWR', twrVal != null ? (twrVal >= 0 ? '+' : '') + twrVal.toFixed(1) + '%' : '—', '', 'Time-weighted return of the unitized (cash-flow-adjusted) NAV over the plotted window - deposits and withdrawals do not count as returns'],
                     ['vs DCA', alpha != null ? (alpha >= 0 ? '+' : '') + alpha.toFixed(1) + 'pp' : '—', '', 'Difference in gain-on-contributions vs the DCA benchmark - NOT a risk-adjusted alpha'],
                     ['Cash', s.cash != null ? '$' + s.cash.toFixed(2) : '—'],
                     ['Positions Value', s.positions_value != null ? '$' + s.positions_value.toFixed(2) : '—'],

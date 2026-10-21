@@ -1,4 +1,4 @@
-import asyncio, json, logging, re
+import asyncio, json, logging, math, re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, UTC
 from pathlib import Path
@@ -998,6 +998,223 @@ async def daily_core_backfill(start: str | None = Query(default=None)):
     if not r.get("ok"):
         raise HTTPException(400, r.get("error", "backfill failed"))
     return r
+
+# =====================================================================
+# Portfolio performance metrics (read-only): dated XIRR + TWR
+#
+# The audit's outstanding Phase 1 item — "TWR charts and dated XIRR are not
+# delivered" — needs two numbers the tabs did not have:
+#
+#   * XIRR — the money-weighted annualized return of the account's actual
+#     cash-flow schedule (deposits/withdrawals + terminal value, actual/365).
+#   * TWR  — the time-weighted return of the unitized (cash-flow-adjusted)
+#     NAV, so the weeks BEFORE a deposit weigh the same as the weeks after.
+#
+# Both are read-only: unlike the per-tab status endpoints they never deposit
+# an allowance or write a snapshot, so calling them cannot mutate a paper
+# portfolio's history.
+# =====================================================================
+
+_METRIC_SCOPES = ("daily_core", "monthly", "sim")
+
+
+def _validated_scope(scope: str) -> str:
+    if scope not in _METRIC_SCOPES:
+        raise HTTPException(
+            422, f"invalid scope: {scope!r} (use one of {', '.join(_METRIC_SCOPES)})")
+    return scope
+
+
+def _finite_or_none(value) -> float | None:
+    """JSON-safe float: NaN/Infinity/None/non-numeric -> None.
+
+    Starlette serialises with ``allow_nan=False``, so an invalid stored
+    observation must never reach the response as NaN.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+async def _metric_snapshot_points(scope: str, limit: int) -> list[dict]:
+    """Per-day snapshot points for one paper portfolio, oldest-first.
+
+    Reuses the existing equity-curve readers (``sim``/``monthly``/
+    ``daily_core`` ``get_equity_curve``) rather than duplicating their
+    queries.  Intraday duplicates — the monthly and daily-core portfolios
+    write one mark per day plus one after a rebalance — collapse to that
+    day's LAST snapshot, the same rule the charts use.
+    """
+    _validated_scope(scope)
+    if scope == "sim":
+        rows = await sim.get_equity_curve(limit)
+    elif scope == "monthly":
+        from . import monthly
+        rows = await monthly.get_equity_curve(limit)
+    else:
+        from . import daily_core
+        rows = await daily_core.get_equity_curve(limit)
+
+    by_day: dict[str, dict] = {}
+    for row in rows:
+        day = row.get("date") or (row.get("at") or "")[:10]
+        if not day:
+            continue
+        by_day[day] = {
+            "date": day,
+            "total_equity": row.get("total_equity"),
+            "contributed": row.get("allowance_total"),
+        }
+    return [by_day[day] for day in sorted(by_day)]
+
+
+@app.get('/api/metrics/xirr')
+async def metrics_xirr(scope: str = Query(default='daily_core'),
+                       limit: int = Query(default=12000, ge=1, le=12000)):
+    """Dated money-weighted annualized return (XIRR) for one paper portfolio.
+
+    ``scope``: ``daily_core`` | ``monthly`` | ``sim``.
+
+    Flows are the day-over-day deltas of the account's cumulative
+    contribution (``allowance_total``, the same series the drawdown uses);
+    the terminal value is the latest ``total_equity`` on the latest snapshot
+    date.  Actual/365 day counts, solved by bisection on NPV=0 — see
+    ``app.performance.xirr``.
+
+    ``xirr`` is a FRACTION (0.10 = +10%/yr); ``xirr_pct`` is the same number
+    in percent for display.  Both are null when the money-weighted return is
+    undefined (empty account, no dated external flows, no positive terminal
+    value); ``reason`` then says why.  ``window_days`` reports the span the
+    rate annualizes (a handful of days annualizes into noise — the UI only
+    shows XIRR once the window is at least a month).
+    ``limit`` truncates the window.  The first point's cumulative
+    contribution counts as the window's opening inflow — the convention the
+    cash-flow series supports.  A window that starts mid-history cannot see
+    market gains made before the window, so the default (full history) is the
+    meaningful measurement; a shorter ``limit`` is for inspecting a slice,
+    with that caveat.
+
+    Caveat: the contribution ledger is the only dated record of external
+    money.  Capital seeded into an account WITHOUT a contribution row cannot
+    be dated, so it would inflate the rate; the shipped start-cash defaults
+    are 0 and the backfills record their start cash as a contribution.
+    """
+    from .performance import dated_external_flows, xirr
+
+    scope = _validated_scope(scope)
+    points = await _metric_snapshot_points(scope, limit)
+    flows = dated_external_flows(
+        [p["date"] for p in points], [p["contributed"] for p in points])
+
+    final_date = points[-1]["date"] if points else None
+    final_value = _finite_or_none(points[-1]["total_equity"]) if points else None
+    window_days = None
+    if len(points) > 1:
+        first = date.fromisoformat(points[0]["date"])
+        last = date.fromisoformat(points[-1]["date"])
+        window_days = (last - first).days
+    rate: float | None = None
+    reason: str | None = None
+    if not points:
+        reason = "no equity snapshots for this scope yet"
+    elif final_value is None:
+        reason = "latest snapshot has no usable total_equity"
+    elif not flows:
+        reason = "no dated external flows (the contributed total never changed)"
+    else:
+        rate = xirr([d for d, _ in flows], [a for _, a in flows], final_value, final_date)
+        if rate is None:
+            reason = ("no NPV=0 solution — e.g. no positive terminal value "
+                      "(a total loss cannot be annualized)")
+
+    return {
+        "ok": True,
+        "scope": scope,
+        "xirr": rate,
+        "xirr_pct": None if rate is None else rate * 100.0,
+        "final_value": final_value,
+        "final_date": final_date,
+        "window_days": window_days,
+        "contributed": _finite_or_none(points[-1]["contributed"]) if points else None,
+        "points": len(points),
+        "flows": [{"date": d.isoformat(), "amount": a} for d, a in flows],
+        "reason": reason,
+    }
+
+
+@app.get('/api/metrics/twr')
+async def metrics_twr(scope: str = Query(default='daily_core'),
+                      limit: int = Query(default=12000, ge=1, le=12000)):
+    """Time-weighted return (unitized NAV) series for one paper portfolio.
+
+    ``nav`` is the chained cash-flow-adjusted NAV from
+    ``app.performance.unitized_nav``: 1.0 at the first funded point, and a
+    deposit or withdrawal that leaves the portfolio value unchanged leaves
+    the NAV unchanged.  ``return_pct`` is that point's cumulative return since
+    the chain start (null before funding).
+
+    ``twr_pct`` is the cumulative TWR of the returned window (last NAV /
+    first funded NAV - 1).  It is null — with a ``reason`` — for an empty or
+    never-funded account, and when the NAV chain restarted after a wipeout
+    inside the window (then no single cumulative number is honest; the
+    per-point ``nav`` still shows both chains).  ``scope``/``limit`` behave
+    as on ``/api/metrics/xirr``.
+    """
+    from .performance import unitized_nav
+
+    scope = _validated_scope(scope)
+    points = await _metric_snapshot_points(scope, limit)
+    nav = unitized_nav([p["total_equity"] for p in points],
+                       [p["contributed"] for p in points]) if points else []
+
+    start_index = next((i for i, v in enumerate(nav) if v > 0.0), None)
+    base = nav[start_index] if start_index is not None else None
+
+    # A wipeout (NAV 0 on a positive base) followed by another positive NAV
+    # means the chain restarted at 1.0; a terminal wipeout is a real -100%.
+    zeros = [i for i in range((start_index or 0) + 1, len(nav))
+             if nav[i] == 0.0 and nav[i - 1] > 0.0]
+    restarted = bool(zeros) and any(v > 0.0 for v in nav[zeros[-1] + 1:])
+
+    twr_pct: float | None = None
+    reason: str | None = None
+    if not points:
+        reason = "no equity snapshots for this scope yet"
+    elif base is None:
+        reason = "the account was never funded (no positive equity point)"
+    elif restarted:
+        reason = ("the unitized NAV hit zero (total loss) inside this window and "
+                  "restarted — no single cumulative TWR is meaningful")
+    else:
+        twr_pct = (nav[-1] / base - 1.0) * 100.0
+
+    series = []
+    for i, (point, value) in enumerate(zip(points, nav, strict=True)):
+        return_pct: float | None = None
+        if (base is not None and start_index is not None
+                and i >= start_index and math.isfinite(value)):
+            return_pct = (value / base - 1.0) * 100.0
+        series.append({
+            "date": point["date"],
+            "nav": _finite_or_none(value),
+            "return_pct": return_pct,
+            "total_equity": _finite_or_none(point["total_equity"]),
+            "contributed": _finite_or_none(point["contributed"]),
+        })
+
+    return {
+        "ok": True,
+        "scope": scope,
+        "points": series,
+        "twr_pct": twr_pct,
+        "nav_start": base,
+        "start": points[start_index]["date"] if start_index is not None else None,
+        "end": points[-1]["date"] if points else None,
+        "reason": reason,
+    }
+
 
 # =====================================================================
 # Savings tracker endpoints (real money, EUR — no backfill, no reset-all)
