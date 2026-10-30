@@ -1,6 +1,6 @@
 from datetime import datetime, UTC
 
-from sqlalchemy import String, Float, Integer, UniqueConstraint, Text, Boolean, event
+from sqlalchemy import String, Float, Integer, UniqueConstraint, Text, Boolean, event, text
 from sqlalchemy import DateTime as _DateTime
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -67,6 +67,17 @@ class Watchlist(Base):
 
 
 class Candle(Base):
+    """One cached daily OHLCV bar plus where it came from.
+
+    ``source`` / ``adjustment_basis`` / ``ingested_at`` record the provenance
+    of the values CURRENTLY stored in the row (see ``market._store_candles``):
+    which provider actually served them, under which adjustment contract, and
+    when they were written. All three are nullable on purpose: rows cached
+    before provenance tracking keep NULL = unknown. Nothing is backfilled —
+    the source, adjustment basis and fetch time of a historical pull were
+    never observed, so asserting them would be fabrication.
+    """
+
     __tablename__ = "candles"
     __table_args__ = (UniqueConstraint("ticker", "timestamp"),)
 
@@ -78,6 +89,12 @@ class Candle(Base):
     low: Mapped[float] = mapped_column(Float)
     close: Mapped[float] = mapped_column(Float)
     volume: Mapped[float] = mapped_column(Float, default=0)
+    # Provenance of the stored OHLCV (request contract, not a verified
+    # corporate-action history). NULL = unknown (legacy rows, or a write that
+    # did not declare a source). See market.SOURCE_* / ADJUSTMENT_SPLIT_DIVIDEND.
+    source: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    adjustment_basis: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    ingested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class Signal(Base):
@@ -125,6 +142,11 @@ class SimAccount(Base):
     last_allowance_month: Mapped[str | None] = mapped_column(String(7), nullable=True)  # YYYY-MM
     last_review_week: Mapped[str | None] = mapped_column(String(8), nullable=True)  # YYYY-Www (ISO week)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # The REAL seed this account was created/reset with (current state, not a
+    # ledger). NULL = unknown: the row predates the column, so the seed is
+    # NEVER inferred from the first paper execution (settings can change
+    # between account creation and that run — the drift this column closes).
+    opening_seed: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class SimPosition(Base):
@@ -160,17 +182,37 @@ class SimTrade(Base):
     cash_after: Mapped[float] = mapped_column(Float)
     reason: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # Run provenance (Phase 2, app/run_config.py). mode/config_id are NULL on
+    # rows written before stamping existed; epoch is ALWAYS set — legacy rows
+    # migrate to 1, the pre-reset epoch (NULL is not a provenance value).
+    mode: Mapped[str | None] = mapped_column(String(16), nullable=True)  # paper | backfill
+    config_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # run_configs.id
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
 
 
 class SimAllowance(Base):
-    """Monthly imaginary deposit log."""
+    """Monthly imaginary deposit log.
+
+    ``UNIQUE (month, epoch)`` replaces the old ``UNIQUE (month)`` so a closed
+    epoch's deposit for a month SURVIVES while a later epoch (or a later
+    backfill replay) logs that same month again. Legacy rows are migrated to
+    epoch 1 — the pre-reset book — so the key stays TOTAL (no NULL epoch, no
+    duplicate-month hole) and a second deposit inside ONE epoch is rejected.
+    """
 
     __tablename__ = "sim_allowances"
+    __table_args__ = (UniqueConstraint("month", "epoch"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     amount: Mapped[float] = mapped_column(Float)
-    month: Mapped[str] = mapped_column(String(7), unique=True)  # YYYY-MM
+    month: Mapped[str] = mapped_column(String(7))  # YYYY-MM
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # Run provenance (Phase 2, app/run_config.py). mode/config_id are NULL on
+    # rows written before stamping existed; epoch is ALWAYS set — legacy rows
+    # migrate to 1, the pre-reset epoch (NULL is not a provenance value).
+    mode: Mapped[str | None] = mapped_column(String(16), nullable=True)  # paper | backfill
+    config_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # run_configs.id
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
 
 
 class SimSnapshot(Base):
@@ -184,6 +226,12 @@ class SimSnapshot(Base):
     positions_value: Mapped[float] = mapped_column(Float)
     total_equity: Mapped[float] = mapped_column(Float)
     allowance_total: Mapped[float] = mapped_column(Float, default=0)
+    # Run provenance (Phase 2, app/run_config.py). mode/config_id are NULL on
+    # rows written before stamping existed; epoch is ALWAYS set — legacy rows
+    # migrate to 1, the pre-reset epoch (NULL is not a provenance value).
+    mode: Mapped[str | None] = mapped_column(String(16), nullable=True)  # paper | backfill
+    config_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # run_configs.id
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
 
 
 class SimBenchmarkAccount(Base):
@@ -225,6 +273,60 @@ class SimChatMessage(Base):
     role: Mapped[str] = mapped_column(String(16))  # user | assistant
     content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+
+class SimLlmDecision(Base):
+    """Append-only ledger of the LLM's own decisions (session fill contract, rule 7).
+
+    One row per LLM decision — hybrid review, pure-LLM cycle, or chat
+    ``[[ACTION]]``:
+
+      * ``decided_at`` is FROZEN when the LLM response is parsed. It is
+        captured once, before any of the decision's orders can execute, and
+        always written from that capture — a later write never re-stamps it.
+      * ``relation`` places the decision next to the deterministic engine:
+        ``confirmation`` (same side as the proposal), ``change`` (a flip —
+        the proposal is vetoed and the flipped order is engine-excluded),
+        ``veto`` (HOLD on a proposed ticker), ``hold`` (HOLD on a ticker the
+        engine did not propose), ``addition`` (LLM-initiated — the pure-LLM
+        path has no proposals) or ``chat_action`` (an operator chat action).
+      * ``det_side`` / ``det_reason`` are the deterministic proposal's side
+        and reason for that ticker — NULL when there was no proposal (all
+        pure-LLM and chat rows).
+      * The FILL columns (``filled_at``, ``shares``, ``price``,
+        ``cash_after``) are written ONCE, when the decision's trade actually
+        executes. ``filled_at`` is stamped when that executed fill is folded
+        into the ledger — after the trade committed, so it is always >=
+        ``decided_at`` (the decision is parsed before any of its orders run).
+
+    An unfilled decision keeps all four fill columns NULL, and that is the
+    honest record, not a gap: there is no pending-order persistence (rule 7),
+    so an unfilled decision is simply dropped and re-taken at the next cycle —
+    the row says "decided, never filled". Rows are NEVER updated or deleted
+    (the pre-existing destructive reset/backfill paths that replace the whole
+    sim portfolio are outside this ledger's scope).
+    """
+
+    __tablename__ = "sim_llm_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    decided_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    mode: Mapped[str] = mapped_column(String(8))  # cycle | chat
+    # Operator-local "YYYY-MM-DD": the cycle's session F date for cycle rows,
+    # the chat turn's local date for chat rows.
+    session_date: Mapped[str] = mapped_column(String(10))
+    ticker: Mapped[str] = mapped_column(String(32))
+    action: Mapped[str] = mapped_column(String(4))  # BUY | SELL | HOLD
+    reason: Mapped[str] = mapped_column(Text, default="")
+    # The deterministic proposal this decision relates to (NULL = none).
+    det_side: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    det_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    relation: Mapped[str] = mapped_column(String(12))
+    # Frozen fill — all four are NULL together when the decision never filled.
+    filled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    shares: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cash_after: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 # =====================================================================
@@ -294,6 +396,9 @@ class MonthlyAccount(Base):
     last_allowance_month: Mapped[str | None] = mapped_column(String(7), nullable=True)  # YYYY-MM
     last_rebalance_month: Mapped[str | None] = mapped_column(String(7), nullable=True)  # YYYY-MM
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # The REAL seed this account was created/reset with (current state, not a
+    # ledger). NULL = unknown legacy row — never inferred or backfilled.
+    opening_seed: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class MonthlyPosition(Base):
@@ -322,17 +427,37 @@ class MonthlyTrade(Base):
     cash_after: Mapped[float] = mapped_column(Float)
     reason: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # Run provenance (Phase 2, app/run_config.py). mode/config_id are NULL on
+    # rows written before stamping existed; epoch is ALWAYS set — legacy rows
+    # migrate to 1, the pre-reset epoch (NULL is not a provenance value).
+    mode: Mapped[str | None] = mapped_column(String(16), nullable=True)  # paper | backfill
+    config_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # run_configs.id
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
 
 
 class MonthlyAllowance(Base):
-    """Monthly imaginary deposit log for the monthly portfolio."""
+    """Monthly imaginary deposit log for the monthly portfolio.
+
+    ``UNIQUE (month, epoch)`` replaces the old ``UNIQUE (month)`` so a closed
+    epoch's deposit for a month SURVIVES while a later epoch (or a later
+    backfill replay) logs that same month again. Legacy rows are migrated to
+    epoch 1 — the pre-reset book — so the key stays TOTAL (no NULL epoch, no
+    duplicate-month hole) and a second deposit inside ONE epoch is rejected.
+    """
 
     __tablename__ = "monthly_allowances"
+    __table_args__ = (UniqueConstraint("month", "epoch"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     amount: Mapped[float] = mapped_column(Float)
-    month: Mapped[str] = mapped_column(String(7), unique=True)  # YYYY-MM
+    month: Mapped[str] = mapped_column(String(7))  # YYYY-MM
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # Run provenance (Phase 2, app/run_config.py). mode/config_id are NULL on
+    # rows written before stamping existed; epoch is ALWAYS set — legacy rows
+    # migrate to 1, the pre-reset epoch (NULL is not a provenance value).
+    mode: Mapped[str | None] = mapped_column(String(16), nullable=True)  # paper | backfill
+    config_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # run_configs.id
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
 
 
 class MonthlySnapshot(Base):
@@ -352,6 +477,12 @@ class MonthlySnapshot(Base):
     positions_value: Mapped[float] = mapped_column(Float)
     total_equity: Mapped[float] = mapped_column(Float)
     allowance_total: Mapped[float] = mapped_column(Float, default=0)
+    # Run provenance (Phase 2, app/run_config.py). mode/config_id are NULL on
+    # rows written before stamping existed; epoch is ALWAYS set — legacy rows
+    # migrate to 1, the pre-reset epoch (NULL is not a provenance value).
+    mode: Mapped[str | None] = mapped_column(String(16), nullable=True)  # paper | backfill
+    config_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # run_configs.id
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
 
 
 class MonthlyRebalance(Base):
@@ -360,10 +491,17 @@ class MonthlyRebalance(Base):
     ``picked`` / ``held_before`` are comma-joined ticker lists; ``snapshot``
     holds the JSON eligibility frame (factor values per ticker) so every
     decision is explainable after the fact, like stockstrat's holdings.csv.
+
+    ``UNIQUE (rebal_month, epoch)`` replaces the old ``UNIQUE (rebal_month)``
+    for the same reason as the allowance tables: a closed epoch's rebalance
+    decision for month M must SURVIVE while the fresh epoch rebalances M
+    again. Legacy rows are migrated to epoch 1 (the pre-reset book), so the
+    key stays total and two decisions for the same month within ONE epoch are
+    still rejected.
     """
 
     __tablename__ = "monthly_rebalances"
-    __table_args__ = (UniqueConstraint("rebal_month",),)
+    __table_args__ = (UniqueConstraint("rebal_month", "epoch"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     rebal_month: Mapped[str] = mapped_column(String(7))  # YYYY-MM (decision month)
@@ -373,6 +511,12 @@ class MonthlyRebalance(Base):
     n_new: Mapped[int] = mapped_column(Integer, default=0)
     snapshot: Mapped[str] = mapped_column(Text, default="")  # JSON eligibility frame
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # Run provenance (Phase 2, app/run_config.py). mode/config_id are NULL on
+    # rows written before stamping existed; epoch is ALWAYS set — legacy rows
+    # migrate to 1, the pre-reset epoch (NULL is not a provenance value).
+    mode: Mapped[str | None] = mapped_column(String(16), nullable=True)  # paper | backfill
+    config_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # run_configs.id
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
 
 
 # =====================================================================
@@ -388,6 +532,9 @@ class DailyCoreAccount(Base):
     cash: Mapped[float] = mapped_column(Float, default=0)
     last_allowance_month: Mapped[str | None] = mapped_column(String(7), nullable=True)  # YYYY-MM
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # The REAL seed this account was created/reset with (current state, not a
+    # ledger). NULL = unknown legacy row — never inferred or backfilled.
+    opening_seed: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class DailyCorePosition(Base):
@@ -416,17 +563,38 @@ class DailyCoreTrade(Base):
     cash_after: Mapped[float] = mapped_column(Float)
     reason: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # Run provenance (Phase 2, app/run_config.py). mode/config_id are NULL on
+    # rows written before stamping existed; epoch is ALWAYS set — legacy rows
+    # migrate to 1, the pre-reset epoch (NULL is not a provenance value).
+    mode: Mapped[str | None] = mapped_column(String(16), nullable=True)  # paper | backfill
+    config_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # run_configs.id
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
 
 
 class DailyCoreAllowance(Base):
-    """Monthly imaginary deposit log for the daily-core portfolio."""
+    """Monthly imaginary deposit log for the daily-core portfolio.
+
+    ``UNIQUE (month, epoch)`` replaces the old ``UNIQUE (month)`` so a closed
+    epoch's deposit for a month SURVIVES while a later epoch (or a later
+    backfill replay) logs that same month again. Legacy rows are migrated to
+    epoch 1 — the pre-reset book — so the key stays TOTAL (no NULL epoch, no
+    duplicate-month hole) and a second deposit inside ONE epoch is rejected
+    (the race the deposit path relies on: both writers stamp the same epoch).
+    """
 
     __tablename__ = "daily_core_allowances"
+    __table_args__ = (UniqueConstraint("month", "epoch"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     amount: Mapped[float] = mapped_column(Float)
-    month: Mapped[str] = mapped_column(String(7), unique=True)  # YYYY-MM
+    month: Mapped[str] = mapped_column(String(7))  # YYYY-MM
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # Run provenance (Phase 2, app/run_config.py). mode/config_id are NULL on
+    # rows written before stamping existed; epoch is ALWAYS set — legacy rows
+    # migrate to 1, the pre-reset epoch (NULL is not a provenance value).
+    mode: Mapped[str | None] = mapped_column(String(16), nullable=True)  # paper | backfill
+    config_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # run_configs.id
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
 
 
 class DailyCoreSnapshot(Base):
@@ -440,6 +608,12 @@ class DailyCoreSnapshot(Base):
     positions_value: Mapped[float] = mapped_column(Float)
     total_equity: Mapped[float] = mapped_column(Float)
     allowance_total: Mapped[float] = mapped_column(Float, default=0)
+    # Run provenance (Phase 2, app/run_config.py). mode/config_id are NULL on
+    # rows written before stamping existed; epoch is ALWAYS set — legacy rows
+    # migrate to 1, the pre-reset epoch (NULL is not a provenance value).
+    mode: Mapped[str | None] = mapped_column(String(16), nullable=True)  # paper | backfill
+    config_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # run_configs.id
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
 
 
 class DailyCoreRanking(Base):
@@ -459,6 +633,12 @@ class DailyCoreRanking(Base):
     band: Mapped[str] = mapped_column(Text, default="")       # comma-joined hold band (top-20)
     picks: Mapped[str] = mapped_column(Text, default="")      # comma-joined top-10 with hysteresis
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # Run provenance (Phase 2, app/run_config.py). mode/config_id are NULL on
+    # rows written before stamping existed; epoch is ALWAYS set — legacy rows
+    # migrate to 1, the pre-reset epoch (NULL is not a provenance value).
+    mode: Mapped[str | None] = mapped_column(String(16), nullable=True)  # paper | backfill
+    config_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # run_configs.id
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
 
 
 # =====================================================================
@@ -528,8 +708,68 @@ class SavingsPlan(Base):
 class SavingsEvent(Base):
     """Immutable ledger of everything that moved money in the tracker.
 
-    kind: INIT | TRANSFER | INTEREST_PAYOUT | SPARPLAN_BUY | MANUAL_BUY |
-          SAVEBACK | TRUEUP | WARN
+    kind: INIT | TRANSFER | WITHDRAWAL | INTEREST_PAYOUT | SPARPLAN_BUY |
+          MANUAL_BUY | SAVEBACK | TRUEUP | SELL | WARN | DIVIDEND | FEE | TAX |
+          SETTLEMENT | SPLIT | CORRECTION | RESET
+
+    A ``SELL`` row is a DISPOSAL RECORD, not settlement: the operator sold a
+    position in Trade Republic, but the tracker books no proceeds (they arrive
+    via the next true-up), so the row carries ``amount=0`` and instead records
+    WHAT was disposed — when (operator-local date), how many shares, at which
+    average cost, and the execution price only if the operator supplied one.
+    It never invents a valuation, and it never moves cash or contributed
+    capital. The four disposal columns are NULL on every other kind, and on
+    rows written before disposals were recorded (those were never observed).
+
+    A ``WITHDRAWAL`` row is a dated external flow OUT: ``amount`` is signed
+    negative, ``occurred_on`` carries the operator-local date, and it lowers
+    NET contributed capital (contributions − withdrawals) — it is never an
+    investment loss.
+
+    A ``DIVIDEND`` row is cash income INTO the tracked cash: ``amount`` is
+    signed positive and classified ``dividend``. It is investment income, not
+    fresh capital, so it never raises NET contributed.
+
+    A ``FEE`` row is a cost the operator PAID from the tracked cash (e.g. TR's
+    FX fee): ``amount`` is signed negative and classified ``fee``. The money
+    stays inside the tracker (cash → fee), so it is not an external flow and
+    hits the return honestly instead of netting against contributed capital.
+    A ``TAX`` row is the same kind of cost (cash → tax, classified ``tax``;
+    ``savings.add_tax``): real money out, but part of the RETURN, never of
+    contributed capital.
+
+    A ``SETTLEMENT`` row is the second half of a disposal PAIR: the proceeds of
+    a manually sold position that are now in the tracked cash (``amount``
+    signed positive, classified ``sale_settlement``). Like the TRUEUP and
+    reconciliation classes it is NOT an external flow, so the pair reads
+    honestly — the SELL record showed the temporary mark-down while the money
+    was in flight and this row books the proceeds; the net over the pair is the
+    realized outcome. A settlement does not require a prior SELL row: legacy
+    disposals predate the record, so the note carries the attribution instead.
+    When it DOES settle a recorded disposal, ``settlement_of`` carries that
+    SELL row's id — and it is UNIQUE, so one disposal can never be settled
+    twice (a repeated settle would double-credit the proceeds).
+
+    ``SPLIT`` and ``CORRECTION`` are dated bookkeeping records with
+    ``amount=0``: they record a corporate action (a share split) and a
+    corrected holding, using the SAME dated-record columns as a disposal but
+    holding the NEW values — ``shares`` is the post-event share count and
+    ``cost_basis`` the post-event per-share average cost. Neither moves cash or
+    contributed capital, and either column stays NULL when that field was not
+    part of the event (a correction may fix only one of the two).
+
+    A ``RESET`` row is the EPOCH BOUNDARY of a history-safe reset: ``amount=0``,
+    classified ``audit``, dated operator-local. Every event and snapshot before
+    it is PRESERVED (the audit's "no history rewritten by resets"); contributed
+    capital and the metrics series read only the rows after the LAST ``RESET``
+    row, so the preserved pre-reset history never contaminates the new epoch.
+
+    ``flow_class`` is the write-time snapshot of the ONE flow classification
+    (``savings.flow_class_of``: contribution | withdrawal | investment |
+    reward | interest | reconciliation | sale | dividend | fee | tax |
+    sale_settlement | corporate_action | correction | audit). Rows written
+    before classification carry NULL and are classified on read through that
+    one function — never guessed, never backfilled.
     """
 
     __tablename__ = "savings_events"
@@ -540,6 +780,27 @@ class SavingsEvent(Base):
     ticker: Mapped[str | None] = mapped_column(String(32), nullable=True)
     note: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    # --- Dated record columns (SELL/WITHDRAWAL rows; NULL elsewhere) --------
+    # Operator-local calendar date of the event, "YYYY-MM-DD" (the
+    # String-style marker convention of SavingsPlan.last_executed_month).
+    occurred_on: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    shares: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Execution price per share in EUR — operator-supplied. NULL means
+    # unknown; a removal must never invent a valuation.
+    price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Per-share average cost in EUR at disposal
+    # (SavingsPosition.avg_cost semantics).
+    cost_basis: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Write-time snapshot of savings.flow_class_of (see the class docstring).
+    flow_class: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # The SELL event row this SETTLEMENT row settles (SETTLEMENT only; NULL on
+    # every other kind and on rows written before the link existed — the
+    # disposal they settle predates the column, so it was never observed and
+    # is NOT backfilled). UNIQUE so the same disposal can never be settled
+    # twice (a repeated settle would double-credit the proceeds); SQLite
+    # permits any number of NULLs in a unique index, so every unlinked row
+    # stays legal.
+    settlement_of: Mapped[int | None] = mapped_column(Integer, nullable=True, unique=True)
 
 
 class SavingsSnapshot(Base):
@@ -554,6 +815,13 @@ class SavingsSnapshot(Base):
     accrued_interest: Mapped[float] = mapped_column(Float, default=0)
     total_equity: Mapped[float] = mapped_column(Float)
     contributed: Mapped[float] = mapped_column(Float, default=0)
+    # Operator-local "YYYY-MM-DD" this point is AS OF. A snapshot written just
+    # after midnight (or by a catch-up pass) belongs to the day it MEASURES,
+    # not to the wall-clock day it happened to be written. NULL on rows written
+    # before the column existed — those fall back to the created_at
+    # operator-local date on read, no backfill (the true day was never
+    # recorded).
+    as_of: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
 
 class SavingsMirrorEntry(Base):
@@ -602,6 +870,335 @@ class SavingsMirrorPending(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
 
 
+# =====================================================================
+# Run configuration registry (Phase 2 of the strategy audit)
+#
+# Every run is identified by an IMMUTABLE configuration: engine, mode and the
+# canonical JSON of its settings, deduped by content hash. A reset is not a
+# delete — it appends a RunEpoch boundary, so historical rows keep the epoch
+# they were written in and a fresh epoch can never be confused with (or
+# overwrite) a forward paper record. Nothing writes these tables yet; the
+# engine adoption batch (R2) does, through app/run_config.py only.
+# =====================================================================
+
+class RunConfig(Base):
+    """Append-only registry of IMMUTABLE run configurations.
+
+    A run's configuration is FROZEN when the run starts: ``content`` holds the
+    canonical JSON (sorted keys, tight separators) and ``config_hash`` its
+    sha256, so the same (engine, mode, content) always resolves to the SAME
+    row — the UNIQUE constraint is the dedupe and ``get_or_create`` inserts
+    with ON CONFLICT DO NOTHING, which makes it race-safe.
+
+    Rows are NEVER updated or deleted. Counting rows per engine therefore
+    reports the number of DISTINCT CONFIGURATIONS REGISTERED — not the number
+    of execution runs (a scheduler that runs an unchanged configuration every
+    day reuses one row) and not the number of experiments (two configurations
+    that never executed are still two rows).
+
+    ``mode`` is the run vocabulary, not the history-row vocabulary:
+    ``backfill`` (a synthetic replay) or ``paper`` (a live forward record).
+    """
+
+    __tablename__ = "run_configs"
+    __table_args__ = (UniqueConstraint("engine", "mode", "config_hash"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    engine: Mapped[str] = mapped_column(String(16))  # daily_core | monthly | sim
+    mode: Mapped[str] = mapped_column(String(16))    # paper | backfill
+    config_hash: Mapped[str] = mapped_column(String(64))  # sha256 hex of canonical(content)
+    content: Mapped[str] = mapped_column(Text)       # the canonical JSON itself (provenance)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class RunEpoch(Base):
+    """One reset boundary of one engine's paper book ("history is not rewritten").
+
+    Each row bumps that engine's epoch by one: history rows written before the
+    reset keep epoch N, rows written after it are stamped N+1, and every
+    epoch-scoped reader (``app.run_config.epoch_clause``) sees only its own
+    epoch. CONVENTION: no RunEpoch row for an engine means the current epoch
+    is 1; history rows that predate epoch stamping were MIGRATED to 1 at the
+    schema upgrade (the logical pre-reset book — no NULL epoch was invented),
+    and ``epoch_clause`` still matches NULL for synthetic fixtures.
+    Row ids are append-only; ``UNIQUE (engine, epoch)`` makes a duplicate
+    boundary impossible, and ``record_boundary`` allocates the next epoch in a
+    single statement so concurrent resets cannot both land on the same number.
+    """
+
+    __tablename__ = "run_epochs"
+    __table_args__ = (UniqueConstraint("engine", "epoch"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    engine: Mapped[str] = mapped_column(String(16))  # daily_core | monthly | sim
+    epoch: Mapped[int] = mapped_column(Integer)
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class RunExecution(Base):
+    """One row per EXECUTION: append-only and deliberately NOT deduped.
+
+    ``RunConfig`` answers "which configuration is this?" (deduped by content
+    hash); a ``RunExecution`` answers "when did this run happen, and on which
+    data?". Two runs of the identical configuration are therefore TWO rows —
+    the honest count of executions — while the configuration registry keeps
+    one. Nothing here is inferred: ``provenance`` is the canonical JSON of the
+    per-run cache provenance summary the caller passed (sources, adjustment
+    bases, fetch/ingest times, staleness notes — whatever the summarizer
+    observed), and ``data_asof`` is the market-data cut-off the run saw.
+
+    ``config_id`` references ``run_configs.id`` (no FK: SQLite cannot rebuild
+    a table around one, and the columns are written together by R2);
+    ``epoch`` is the engine epoch the run executed in (>= 1, default 1 — the
+    pre-reset epoch). Rows are never updated or deleted.
+    """
+
+    __tablename__ = "run_executions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    engine: Mapped[str] = mapped_column(String(16))  # daily_core | monthly | sim
+    mode: Mapped[str] = mapped_column(String(16))    # paper | backfill
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
+    config_id: Mapped[int] = mapped_column(Integer, nullable=False)  # run_configs.id
+    # The market-data cut-off this run saw (NULL = the run did not declare one)
+    data_asof: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    provenance: Mapped[str] = mapped_column(Text)  # canonical JSON of the run's provenance
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+# History tables that carry the run-provenance stamps (mode/config_id/epoch).
+# Current-state tables (accounts, positions) deliberately do NOT: they are not
+# history, and R2 replaces them per epoch instead of tagging them.
+_RUN_STAMP_MODELS = (
+    SimTrade, SimAllowance, SimSnapshot,
+    MonthlyTrade, MonthlyAllowance, MonthlySnapshot, MonthlyRebalance,
+    DailyCoreTrade, DailyCoreAllowance, DailyCoreSnapshot, DailyCoreRanking,
+)
+_RUN_STAMP_COLUMNS = (
+    ("mode", "VARCHAR(16)"),
+    ("config_id", "INTEGER"),
+)
+# epoch is NOT NULL with a DEFAULT: every row ever stored has a real epoch
+# (legacy rows are epoch 1, the pre-reset book). An ALTER can add it directly;
+# a partial upgrade that made it nullable must be rebuilt to the model shape.
+_EPOCH_ALTER_DDL = "INTEGER NOT NULL DEFAULT 1"
+
+# Tables whose legacy single-column UNIQUE key is too narrow for epoch-safe
+# history. Detecting it is the migration gate: any UNIQUE index covering
+# exactly this key (and nothing else) means the pre-R1 shape.
+_LEGACY_UNIQUE_KEYS = {
+    SimAllowance: ("month",),
+    MonthlyAllowance: ("month",),
+    DailyCoreAllowance: ("month",),
+    MonthlyRebalance: ("rebal_month",),
+}
+
+
+def _sqlite_columns(sync_conn, table: str) -> list[str]:
+    """Column names of *table*, in declaration order (PRAGMA table_info)."""
+    return [row[1] for row in _sqlite_column_info(sync_conn, table)]
+
+
+def _sqlite_column_info(sync_conn, table: str) -> list[tuple]:
+    """Raw PRAGMA table_info rows: (cid, name, type, notnull, default, pk)."""
+    return sync_conn.exec_driver_sql(f'PRAGMA table_info("{table}")').fetchall()
+
+
+def _epoch_default_is_one(raw) -> bool:
+    """True when PRAGMA's DEFAULT text is the integer 1 in a known spelling.
+
+    SQLite stores the DEFAULT expression text verbatim, so ``1``, ``'1'`` and
+    ``(1)`` are all the same default. Anything else — including NO default at
+    all — cannot be trusted as "new rows get epoch 1", so that shape is
+    rebuilt to the model's ``DEFAULT 1``.
+    """
+    if raw is None:
+        return False
+    value = str(raw).strip()
+    while len(value) >= 2 and value[0] == "(" and value[-1] == ")":
+        value = value[1:-1].strip()
+    value = value.strip("'\"")
+    try:
+        return float(value) == 1.0
+    except ValueError:
+        return False
+
+
+def _epoch_needs_rebuild(sync_conn, table: str) -> bool:
+    """True unless ``epoch`` is exactly ``NOT NULL DEFAULT 1``.
+
+    A partially upgraded DB can carry a nullable epoch column (NULLs are the
+    pre-reset book) or a NOT NULL column with no default (a writer that omits
+    it would fail). SQLite cannot alter a column in place, so the shape is
+    rebuilt from the model; NULLs are normalized to 1 first.
+    """
+    info = {row[1]: row for row in _sqlite_column_info(sync_conn, table)}
+    epoch = info.get("epoch")
+    if epoch is None:
+        return False
+    return not epoch[3] or not _epoch_default_is_one(epoch[4])
+
+
+def _sqlite_unique_index_columns(sync_conn, table: str) -> list[tuple[str, ...]]:
+    """Column list of every UNIQUE index on *table* (PRAGMA index_list/info).
+
+    ``unique=True`` and ``UniqueConstraint`` both land here as (auto)indexes,
+    so this is the one predicate that works for legacy and current shapes.
+    """
+    out: list[tuple[str, ...]] = []
+    for row in sync_conn.exec_driver_sql(f'PRAGMA index_list("{table}")').fetchall():
+        if not row[2]:  # 0 = a plain (non-unique) index
+            continue
+        name = str(row[1]).replace("'", "''")
+        cols = tuple(
+            r[2]
+            for r in sync_conn.exec_driver_sql(f"PRAGMA index_info('{name}')").fetchall()
+        )
+        out.append(cols)
+    return out
+
+
+def _rebuild_to_model_shape(sync_conn, model) -> int:
+    """Rewrite a legacy table into *model*'s exact shape, preserving every row.
+
+    SQLite cannot drop or widen a UNIQUE constraint in place, so the only
+    history-preserving path is CREATE (staging, model shape) -> INSERT SELECT
+    -> DROP -> RENAME. Everything destructive happens inside the caller's
+    transaction (the INSERT opens it), so any failure leaves the original
+    table and every row untouched; the worst residue is an EMPTY staging table
+    from an attempt that died before the transaction opened, and the next
+    attempt drops it first.
+
+    Every column present in BOTH the legacy table and the model is copied, so
+    a partially upgraded DB keeps mode/config_id values it already stamped;
+    an ``epoch`` that is present but NULL is the PRE-RESET book and is
+    materialized as 1 (the column is NOT NULL in the final shape); columns
+    that are new in the model stay at their model default; a legacy column the
+    model does not know raises instead of being dropped silently.
+
+    The model's explicit indexes (``index=True`` columns) are recreated after
+    the rename — dropping the table drops them with it, and a rebuild must
+    leave exactly the schema ``create_all`` would have produced.
+    """
+    from sqlalchemy import MetaData
+    from sqlalchemy.schema import CreateIndex, CreateTable
+
+    name = model.__tablename__
+    staging = f"{name}__r1_mig"
+    existing = _sqlite_columns(sync_conn, name)
+    target = [col.name for col in model.__table__.columns]
+    unknown = [col for col in existing if col not in target]
+    if unknown:
+        raise RuntimeError(
+            f"cannot rebuild {name}: legacy column(s) {unknown} are not in the model"
+        )
+    before = sync_conn.exec_driver_sql(f'SELECT COUNT(*) FROM "{name}"').scalar_one()
+    # A staging table can only survive a failed prior attempt.
+    sync_conn.exec_driver_sql(f'DROP TABLE IF EXISTS "{staging}"')
+    ddl = str(
+        CreateTable(model.__table__.to_metadata(MetaData(), name=staging)).compile(
+            dialect=sync_conn.dialect
+        )
+    )
+    sync_conn.exec_driver_sql(ddl)
+    carried = [col for col in target if col in existing]
+    columns = ", ".join(f'"{col}"' for col in carried)
+    values = ", ".join(
+        'COALESCE("epoch", 1)' if col == "epoch" else f'"{col}"' for col in carried
+    )
+    sync_conn.exec_driver_sql(
+        f'INSERT INTO "{staging}" ({columns}) SELECT {values} FROM "{name}"'
+    )
+    sync_conn.exec_driver_sql(f'DROP TABLE "{name}"')
+    sync_conn.exec_driver_sql(f'ALTER TABLE "{staging}" RENAME TO "{name}"')
+    for index in model.__table__.indexes:
+        sync_conn.exec_driver_sql(
+            str(CreateIndex(index).compile(dialect=sync_conn.dialect))
+        )
+    after = sync_conn.exec_driver_sql(f'SELECT COUNT(*) FROM "{name}"').scalar_one()
+    if after != before:
+        raise RuntimeError(f"rebuild of {name} lost rows: {before} -> {after}")
+    return int(after)
+
+
+async def _migrate_phase2_schema(conn) -> None:
+    """Converge the run-configuration/epoch schema — idempotent, no backfill.
+
+    ORDER MATTERS: a table whose UNIQUE key or ``epoch`` column needs the
+    rebuild runs FIRST because the rebuild creates the full final column set
+    itself (stamped values included when a partial upgrade already has them),
+    so the generic additive-ALTER loop that follows no-ops there.
+
+    ``mode`` / ``config_id`` are NULL on rows written before stamping existed
+    (unknown provenance — never invented). ``epoch`` is always a real value:
+    legacy rows become 1 (the logical pre-reset epoch, not invented history),
+    and the DEFAULT 1 covers rows a writer forgets to stamp.
+    """
+    def _sync(sync_conn):
+        for model in _RUN_STAMP_MODELS:
+            table = model.__tablename__
+            legacy_key = _LEGACY_UNIQUE_KEYS.get(model)
+            needs_rebuild = _epoch_needs_rebuild(sync_conn, table) or (
+                legacy_key is not None
+                and legacy_key in _sqlite_unique_index_columns(sync_conn, table)
+            )
+            if needs_rebuild:
+                # Normalize before the copy: a NULL epoch is the pre-reset
+                # book (1), and the final column is NOT NULL.
+                if "epoch" in _sqlite_columns(sync_conn, table):
+                    sync_conn.exec_driver_sql(
+                        f'UPDATE "{table}" SET epoch = 1 WHERE epoch IS NULL'
+                    )
+                _rebuild_to_model_shape(sync_conn, model)
+            existing = set(_sqlite_columns(sync_conn, table))
+            # Stamp order matters only for shape parity with create_all:
+            # mode/config_id first, epoch last, exactly like the model.
+            for col, coltype in _RUN_STAMP_COLUMNS:
+                if col not in existing:
+                    sync_conn.exec_driver_sql(
+                        f'ALTER TABLE "{table}" ADD COLUMN {col} {coltype}'
+                    )
+            if "epoch" not in existing:
+                sync_conn.exec_driver_sql(
+                    f'ALTER TABLE "{table}" ADD COLUMN epoch {_EPOCH_ALTER_DDL}'
+                )
+        # Settlement link (savings): the SELL row a SETTLEMENT settles. NULL
+        # on legacy rows and every other kind — never backfilled, because a
+        # pre-column settlement's disposal was never observed. UNIQUE so one
+        # disposal cannot be settled twice (SQLite allows many NULLs).
+        savings_events = SavingsEvent.__tablename__
+        if "settlement_of" not in set(_sqlite_columns(sync_conn, savings_events)):
+            sync_conn.exec_driver_sql(
+                f"ALTER TABLE {savings_events} ADD COLUMN settlement_of INTEGER"
+            )
+        # create_all already enforces the uniqueness inline on a fresh DB, so
+        # the NAMED index is added only when no unique index covers the column
+        # yet (a legacy table) — otherwise both paths would carry two
+        # identical unique indexes.
+        if ("settlement_of",) not in _sqlite_unique_index_columns(
+            sync_conn, savings_events
+        ):
+            sync_conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_savings_events_settlement_of "
+                "ON savings_events (settlement_of)"
+            )
+        # Account opening seed (capital contract): the REAL seed an account was
+        # created/reset with. CURRENT STATE, so the reset path overwrites it in
+        # the same transaction (it is deliberately NOT a history stamp). Purely
+        # additive and nullable: a legacy account row keeps NULL = unknown —
+        # the seed is never inferred from the first paper execution (settings
+        # can change between account creation and that run) and never
+        # backfilled from cash.
+        for model in (SimAccount, MonthlyAccount, DailyCoreAccount):
+            table = model.__tablename__
+            if "opening_seed" not in set(_sqlite_columns(sync_conn, table)):
+                sync_conn.exec_driver_sql(
+                    f'ALTER TABLE "{table}" ADD COLUMN opening_seed FLOAT'
+                )
+
+    await conn.run_sync(_sync)
+
 
 def _configure_sqlite_pragmas(dbapi_conn, _record) -> None:
     """Set durability/concurrency pragmas on every new SQLite connection."""
@@ -638,18 +1235,44 @@ engine = create_db_engine(settings.database_url)
 Session = async_sessionmaker(engine, expire_on_commit=False)
 
 
-async def init_db():
-    async with engine.begin() as conn:
+async def init_db(db_engine=None):
+    """Create the schema and converge existing databases (idempotent).
+
+    ``db_engine`` exists for tests and maintenance scripts that run the
+    migrations against their own engine; the app always uses ``engine``.
+    """
+    target = db_engine if db_engine is not None else engine
+    async with target.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Phase 2 run provenance: the run_configs/run_epochs registry and the
+        # mode/config_id/epoch stamps on every history table, plus the
+        # UNIQUE-key reshaping that lets a reset-starting epoch log a month /
+        # rebalance month a closed epoch already logged. Runs before the
+        # additive ALTER loops below and is a complete no-op on a current DB.
+        await _migrate_phase2_schema(conn)
         # Manual migration for screener_results: add action/strength columns
         # for existing DBs created before these columns existed. SQLAlchemy's
         # create_all does not alter existing tables. Idempotent: sqlite raises
         # OperationalError if the column already exists.
-        from sqlalchemy import text
         for col, coltype in [("action", "TEXT"), ("strength", "REAL")]:
             try:
                 await conn.execute(
                     text(f"ALTER TABLE screener_results ADD COLUMN {col} {coltype}")
+                )
+            except Exception:
+                pass  # column already exists — expected on subsequent starts
+        # Migration for candles: provenance metadata. Purely additive and
+        # nullable — rows cached before this tracking keep NULL (unknown
+        # source/basis/fetch time). Deliberately NO backfill: nobody observed
+        # those historical pulls, so any value would be fabricated.
+        for col, coltype in [
+            ("source", "VARCHAR(32)"),
+            ("adjustment_basis", "VARCHAR(32)"),
+            ("ingested_at", "DATETIME"),
+        ]:
+            try:
+                await conn.execute(
+                    text(f"ALTER TABLE candles ADD COLUMN {col} {coltype}")
                 )
             except Exception:
                 pass  # column already exists — expected on subsequent starts
@@ -696,6 +1319,36 @@ async def init_db():
             )
         except Exception:
             pass  # column (or table) already exists
+        # Migration for savings_events: the append-only disposal record (the
+        # SELL row written when a position is removed manually) needs the
+        # disposal facts. Purely additive and nullable, deliberately NO
+        # backfill: removals that happened before this tracking were never
+        # observed — what/when/at which price would be fabricated — so those
+        # rows keep NULL in all five columns.
+        for col, coltype in [
+            ("occurred_on", "VARCHAR(10)"),
+            ("shares", "FLOAT"),
+            ("price", "FLOAT"),
+            ("cost_basis", "FLOAT"),
+            ("flow_class", "VARCHAR(16)"),
+        ]:
+            try:
+                await conn.execute(
+                    text(f"ALTER TABLE savings_events ADD COLUMN {col} {coltype}")
+                )
+            except Exception:
+                pass  # column (or table) already exists — expected on subsequent starts
+        # Migration for savings_snapshots: the operator-local "as of" day of an
+        # equity point (a snapshot written just after midnight attributes to the
+        # day it measures, not to the wall clock). Purely additive and nullable,
+        # deliberately NO backfill: the day a legacy point measured was never
+        # recorded, so it keeps NULL and readers fall back to created_at.
+        try:
+            await conn.execute(
+                text("ALTER TABLE savings_snapshots ADD COLUMN as_of VARCHAR(10)")
+            )
+        except Exception:
+            pass  # column (or table) already exists — expected on subsequent starts
         # Migration for deferred mirror €: pre-release dev builds parked it
         # in a scalar savings_account.mirror_pending column with no source
         # attribution (a removed position could not release its parked €).

@@ -46,7 +46,10 @@ from .analysis import (
     strength_for,
 )
 from .config import settings
+from . import factor_fills
 from . import llm as llm_mod
+from . import market_index as market_index_mod
+from . import price_freshness
 from .db import Candle, Session
 from .screener import tickers as universe_tickers
 from .strategy import (
@@ -2863,15 +2866,20 @@ def _fill_buy(cash: float, price: float, delta_value: float,
     """One BUY fill: ``(notional, shares, cash_after)`` or None when the
     spend would be under $1 or the booked cost exceeds the exact cash.
 
-    Sizing mirrors the live executor exactly (``daily_core.backfill.do_buy`` /
-    ``daily_core._exec_buy``, and the monthly engines' ``share_size`` call):
-    ``shares = floor4(budget / price)``, ``cost = shares * price``, and the
-    leg is DROPPED when the account cash cannot cover that booked cost — the
-    live engine skips it and re-takes the decision next session. That guard
-    matters at ``cost=0`` in the razor-thin case where the caller's budget is
-    the ROUNDED cash (``round(cash, 2)``) and the 4dp share floor lands a
-    fraction of a cent above the exact cash: shrinking the budget to the exact
-    cash instead would book a fill the live engine never makes
+    The zero-fee fill itself — 4dp-floored sizing, the $1 / ``0.0001``-share
+    minimums and the EXACT-cash guard — is ``factor_fills.buy_fill``
+    (app/factor_fills.py); this wrapper adds ONLY the research replay's
+    one-way ``cost`` around it, because a fee-aware adaptation belongs outside
+    the primitives and never as mutated sizes there. ``shares =
+    floor4(budget / price)`` and ``notional = shares * price`` are therefore
+    identical to the live executor (``daily_core.backfill.do_buy`` /
+    ``daily_core._exec_buy``, and the monthly engines' ``share_size`` call),
+    and the leg is DROPPED when the account cash cannot cover that booked cost
+    — the live engine skips it and re-takes the decision next session. That
+    guard matters at ``cost=0`` in the razor-thin case where the caller's
+    budget is the ROUNDED cash (``round(cash, 2)``) and the 4dp share floor
+    lands a fraction of a cent above the exact cash: shrinking the budget to
+    the exact cash instead would book a fill the live engine never makes
     (tests/test_replay_fills.py pins the golden parity).
 
     With a non-zero ``cost`` the one-way fee is reserved INSIDE the spend, so
@@ -2884,17 +2892,22 @@ def _fill_buy(cash: float, price: float, delta_value: float,
         budget = min(budget, max(cash, 0.0) / (1.0 + cost))
     if budget < 1.0:
         return None
-    from .monthly import share_size  # lazy: monthly imports db/analysis only
-    shares = share_size(budget, price)
-    if shares < 0.0001:
+    fill = factor_fills.buy_fill(cash, budget, price)
+    if fill is None:
         return None
-    notional = shares * price
-    if cash < notional * (1.0 + cost):
-        # The live executor's own guard. A missing fill is NOT forced: the
-        # research replay retries the leg at the next session, exactly like
-        # the live cycle.
+    if cash < fill.notional * (1.0 + cost):
+        # The FEE-aware head-room check on top of the primitive's zero-fee
+        # EXACT-cash guard. Even with the budget capped above, the float
+        # rounding of ``notional * (1.0 + cost)`` can exceed the cash by an
+        # ULP; only this guard stops a negative-cash booking at cost > 0.
+        # At cost=0 it is the primitive's own guard (already satisfied).
+        # A missing fill is NOT forced: the research replay retries the leg
+        # at the next session, exactly like the live cycle.
         return None
-    return notional, shares, cash - notional * (1.0 + cost)
+    # The fee comes out of CASH only — the size is never re-floored. At
+    # cost=0 ``notional * (1.0 + 0.0)`` is exactly ``notional``, so this is
+    # bit-identical to the old expression and to ``fill.cash_after``.
+    return fill.notional, fill.shares, cash - fill.notional * (1.0 + cost)
 
 
 def _contribution_days(days: pd.DatetimeIndex,
@@ -2997,11 +3010,24 @@ async def _daily_core_backtest(
         session — ``rebuild``), and every overlay (crash-pause breadth,
         exposure gate, portfolio-stop drawdown, entry gate, vol management)
         reads S's close. F's own bar never changes the decision.
+      * SIZING on data <= S: the deployment budgets (target weight, the
+        current held value behind every gap, the vol-cap's deployment room)
+        are marked at S's close with the causal prior-close carry
+        (``sizing_px_of``). The order is placed at F's open, so F's own
+        close — known only after the fill — can never size it; a mutated
+        F-day close leaves that F-day's legs untouched and becomes visible
+        only when it IS the next session's S. F's close still marks the
+        EOD/reporting equity and the vol/drawdown observations (after the
+        fills), and advances the trailing-stop peaks for the next session.
       * FILLS at F's strict exact-date OPEN per ticker (``session.open_at``):
         never forward-filled, never a stale close. A ticker without a bar on
         F has NO fill and the decision is re-taken next session (the band
         release / deployment retries). Marks/valuation use the
-        forward-filled CLOSE.
+        forward-filled CLOSE, but only while the print behind the cell is
+        younger than ``settings.factor_price_max_age_days``
+        (``app/price_freshness.py``); a stale print marks at the position's
+        cost basis — the same fallback ``daily_core.backfill`` and the live
+        ``valuate()`` use.
       * The trailing stop is a standing order: the level known at S's close
         fills at F's open when the open is already through it. There is no
         low/high frame in this loader, so an intrabar breach that closes back
@@ -3194,6 +3220,10 @@ async def _daily_core_backtest(
     # --- Portfolio state ---
     shares: dict[str, float] = {}     # ticker -> shares held
     peak_px: dict[str, float] = {}    # ticker -> highest close since entry (trailing stop)
+    # True average cost per holding, tracked exactly like daily_core's
+    # do_buy/do_sell bookkeeping: the fallback mark when a position has no
+    # USABLE market print (price-age policy — a stale print is not a mark).
+    cost_basis: dict[str, float] = {}
     cash = 0.0
     contributed = 0.0
     n_contribs = 0
@@ -3217,6 +3247,22 @@ async def _daily_core_backtest(
     # IRR to -100%.
     close_val = close.ffill()
 
+    # Price-age policy (app/price_freshness.py): a forward-filled cell is a
+    # mark only while the print BEHIND it is younger than
+    # settings.factor_price_max_age_days. Computed ONCE from the RAW close
+    # frame (never from close_val — ffill erases the print dates) and read
+    # per day; a stale cell behaves like a missing close: the position is
+    # marked at its cost basis (the same fallback daily_core.backfill and the
+    # live valuate() use), never at the ancient print.
+    fresh_marks = price_freshness.freshness_mask(
+        close, None, settings.factor_price_max_age_days)
+
+    def _mark_is_fresh(t: str, d: pd.Timestamp) -> bool:
+        try:
+            return bool(fresh_marks.at[d, t])
+        except KeyError:
+            return False
+
     def px_of(t: str, d: pd.Timestamp) -> float | None:
         return monthly_mod.px_at(close_val, d, t)
 
@@ -3227,15 +3273,51 @@ async def _daily_core_backtest(
         # (never a stale or forward-filled close).
         return monthly_mod.px_at(open_px, d, t)
 
+    def sizing_px_of(t: str, s_ref: pd.Timestamp | None) -> float | None:
+        """The SIZING mark: ticker t's last valid close at/before S.
+
+        Target weights, cash gaps and current held values are all struck at
+        F's OPEN, so they may only read prices already known when the order
+        is placed — S's completed close. Reading F's own close instead made
+        the budget depend on the session's OUTCOME (a name that rallied into
+        the close sized its own top-up differently, and the whole book's
+        weight moved with it), which is the look-ahead this helper removes.
+        The mark is carried forward from the last stored close <= S
+        (``close_val`` is the point-in-time ffill the eligibility frame and
+        every overlay use), never from F's bar. ``None`` when the window has
+        no previous stored session: the book is empty then, so nothing is
+        marked.
+
+        PRICE-AGE POLICY (``app/price_freshness.py``): the carried-forward
+        cell is a mark only while the print behind it is fresh. A stale
+        print falls to the SAME cost-basis fallback the persisted replay and
+        the live valuate() use (``None`` when even that is unknown, which the
+        callers read as 0.0 for an unheld name).
+        """
+        if s_ref is None:
+            return None
+        if not _mark_is_fresh(t, s_ref):
+            return cost_basis.get(t)
+        return px_of(t, s_ref)
+
+    def eod_px_of(t: str, d: pd.Timestamp) -> float | None:
+        """The EOD/reporting mark: F's close while its print is fresh; a
+        stale print is not a mark, so the cost basis reports instead (same
+        rule as the persisted replay's ``mark_f``)."""
+        if not _mark_is_fresh(t, d):
+            return cost_basis.get(t)
+        return px_of(t, d)
+
     def trade(d: pd.Timestamp, t: str, side: str, delta_value: float) -> float:
         """Execute one fill at d's strict exact-date OPEN.
 
         Returns the BOOKED notional rounded to cents (0.0 when the leg did
         not fill) so deployment callers can decrement their room exactly as
         ``daily_core.backfill`` does. ``delta_value`` caps the spend; shares
-        are 4dp-floored through ``monthly.share_size`` on the open, so at
-        ``cost=0`` the booked ticker/side/shares/price rows are identical to
-        the live executor's (tests/test_replay_fills.py pins that parity).
+        are 4dp-floored through the shared ``factor_fills`` primitives on
+        the open, so at ``cost=0`` the booked ticker/side/shares/price rows
+        are identical to the live executor's (tests/test_replay_fills.py
+        pins that parity).
         """
         nonlocal cash, month_buys, month_sells
         p = fill_px_of(t, d)
@@ -3254,7 +3336,14 @@ async def _daily_core_backtest(
             if fill is None:
                 return 0.0
             notional, sh, cash = fill
-            shares[t] = shares.get(t, 0.0) + sh
+            prev_sh = shares.get(t, 0.0)
+            shares[t] = prev_sh + sh
+            # True average cost, booked exactly like daily_core's do_buy
+            # (shares-weighted at the booked notional). It is only the
+            # fallback MARK for a position whose print went stale — never a
+            # decision input.
+            cost_basis[t] = ((prev_sh * cost_basis[t] + notional) / shares[t]
+                             if prev_sh > 0 else p)
             # trailing-stop peak: a fresh position starts at its entry price;
             # an add to an existing one keeps the higher peak.
             peak_px[t] = max(peak_px.get(t, p), p)
@@ -3264,10 +3353,20 @@ async def _daily_core_backtest(
         sh = shares.get(t, 0.0)
         if sh <= 0:
             return 0.0
-        notional = sh * p
-        cash += notional * (1.0 - cost)
+        # The zero-fee sell liquidates EVERY positive supplied share as-is
+        # (no re-flooring, no rounding — the position owns the quantity) and
+        # is ``factor_fills.sell_fill``; the one-way ``cost`` is applied here,
+        # around the primitive, exactly as before. At cost=0
+        # ``notional * 1.0`` is exactly ``notional``, so the cash update is
+        # bit-identical to the old expression and to ``fill.cash_after``.
+        fill = factor_fills.sell_fill(cash, sh, p)
+        if fill is None:
+            return 0.0
+        notional = fill.notional
+        cash = cash + fill.notional * (1.0 - cost)
         del shares[t]
         peak_px.pop(t, None)
+        cost_basis.pop(t, None)
         month_sells += notional
         trades_log.append((d.strftime("%Y-%m-%d"), side, t, notional, sh, p))
         return round(notional, 2)
@@ -3391,9 +3490,13 @@ async def _daily_core_backtest(
     if basket_arm_sma is None:
         basket_arm_sma = settings.sim_daily_core_basket_arm_sma
 
-    # Equal-weight universe price index (closes, forward-filled) and its SMA.
-    # Point-in-time safe: a rolling mean of closes at/ before d only.
-    mkt_index = close_val.mean(axis=1)
+    # Shared synthetic equal-weight return index (app/market_index) and its
+    # SMA. NOT close.ffill().mean(axis=1): a nominal-price average weights a
+    # $1,000 share 100x a $10 share, so units/splits moved the gate without an
+    # economic return (audit P1-A). The same series arms the gradient filter,
+    # the deployment trend gate and the portfolio-stop re-entry test.
+    # Point-in-time safe: the chain at d uses rows <= d only.
+    mkt_index = market_index_mod.equal_weight_return_index(close)
     mkt_sma = (mkt_index.rolling(exposure_trend_days).mean()
                if exposure_trend_days and exposure_trend_days > 0 else None)
     # Market SMA used to ARM the gradient filter in "good times"
@@ -3600,14 +3703,17 @@ async def _daily_core_backtest(
                     pending_pick.pop(t, None)
 
         # --- BUY phase: keep the portfolio at target weights ---
-        # Marks at F's close (contract rule 3), summed ticker-ordered and
-        # rounded once — the same arithmetic daily_core.backfill uses, so a
-        # rank-deploy run's budgets (and therefore its fills) match it.
+        # SIZING equity: marked at S's close (session fill contract rule 1 —
+        # the budget is struck at F's open, so F's own close cannot size it),
+        # summed ticker-ordered and rounded once. This is deliberately NOT
+        # the end-of-session reporting equity below (``equity_close``), which
+        # stays on F's closes after the fills: one number decides the order,
+        # the other reports the day.
         positions_value = sum(
-            (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0)
+            (shares.get(t, 0.0) or 0.0) * (sizing_px_of(t, s_prev) or 0.0)
             for t in sorted(shares))
-        equity_now = round(cash + pending_cash + positions_value, 2)
-        weight = equity_now / max(target_n, 1)
+        sizing_equity = round(cash + pending_cash + positions_value, 2)
+        weight = sizing_equity / max(target_n, 1)
 
         # The hysteresis-selected deployment targets (audit P0-D). On a
         # rebuild day the releases above freed slots and the picks refill
@@ -3641,13 +3747,16 @@ async def _daily_core_backtest(
         # Barroso-Santa-Clara vol management: cap deployment when the
         # portfolio's own recent vol exceeds the target. Only scales DOWN
         # (a calm portfolio stays fully invested); the excess sits in cash
-        # until vol normalises.
+        # until vol normalises. Both sides of the cap use the SIZING equity
+        # (S's marks) and `port_rets` through S only — `_record_equity` for
+        # F runs after the fills, so F's just-closed return can never size
+        # F's own order.
         room = float("inf")
         if target_vol and len(port_rets) >= 21:
             rv = realized_vol(21)
             if rv is not None and rv > target_vol:
-                deploy_cap = equity_now * (target_vol / rv)
-                deployed_now = equity_now - cash - pending_cash
+                deploy_cap = sizing_equity * (target_vol / rv)
+                deployed_now = sizing_equity - cash - pending_cash
                 room = max(deploy_cap - deployed_now, 0.0)
 
         # --- Rank-weighted cash deployment (dca="rank") ---
@@ -3675,10 +3784,13 @@ async def _daily_core_backtest(
                 boost = 1.0 + settings.sim_monthly_rank_boost * (
                     1.0 - rank_i / max(target_n - 1, 1))
                 tgt = weight_of(t, weight, frame) * boost
-                # `cur` is marked at F's close and rounded to cents — the
-                # exact arithmetic daily_core.backfill uses, so a rank-deploy
-                # replay books byte-identical fills on the same tape.
-                cur = round((shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0), 2)
+                # `cur` is marked at S's close and rounded to cents: the
+                # budget is placed at F's open, so F's own close must not
+                # move the gap. (daily_core.backfill sizes with the same S
+                # mark since the sizing-clock fix — the golden parity in
+                # tests/test_replay_fills.py compares the two.)
+                cur = round((shares.get(t, 0.0) or 0.0)
+                            * (sizing_px_of(t, s_prev) or 0.0), 2)
                 gap = tgt - cur
                 if t not in shares and len(shares) >= target_n:
                     continue  # no free slot: a failed release occupies it
@@ -3708,7 +3820,10 @@ async def _daily_core_backtest(
                     continue  # no free slot: a failed release occupies it
                 if fill_px_of(t, d) is None:
                     continue
-                cur = round((shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0), 2)
+                # pro-rata gap: current value at S's close (the sizing clock),
+                # never F's own close — the fills happen at F's open.
+                cur = round((shares.get(t, 0.0) or 0.0)
+                            * (sizing_px_of(t, s_prev) or 0.0), 2)
                 gap = weight_of(t, weight, frame) - cur
                 budget = min(gap, round(cash, 2), room)
                 if budget < 1:
@@ -3730,8 +3845,11 @@ async def _daily_core_backtest(
                     continue
                 if fill_px_of(t, d) is None:
                     continue
+                # current value at S's close (the sizing clock): the top-up is
+                # spent at F's open, so F's close cannot move the gap.
                 gap = weight_of(t, weight, frame) - round(
-                    (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0), 2)
+                    (shares.get(t, 0.0) or 0.0)
+                    * (sizing_px_of(t, s_prev) or 0.0), 2)
                 if gap > worst_gap:
                     worst_t, worst_gap = t, gap
             if worst_t is not None and worst_gap > 1.0:
@@ -3787,7 +3905,7 @@ async def _daily_core_backtest(
         # contribution days subtract the deposit from the base so a fresh
         # $1000 doesn't read as a +x% return.
         equity_close = round(cash + pending_cash + sum(
-            (shares.get(t, 0.0) or 0.0) * (px_of(t, d) or 0.0)
+            (shares.get(t, 0.0) or 0.0) * (eod_px_of(t, d) or 0.0)
             for t in sorted(shares)), 2)
         contrib_today = contribution if d in contrib_days else 0.0
         _record_equity(d, equity_close, contrib_today)
@@ -3858,9 +3976,10 @@ async def _daily_core_backtest(
                     basket_out = False
         prev_day = d
 
-    # final valuation
+    # final valuation (EOD mark policy: a stale print is not a mark — the
+    # position reports at its cost basis, like every other EOD mark)
     value = cash + pending_cash + sum(
-        (shares.get(t, 0.0) or 0.0) * (px_of(t, last_day) or 0.0) for t in shares)
+        (shares.get(t, 0.0) or 0.0) * (eod_px_of(t, last_day) or 0.0) for t in shares)
 
     def irr_of(v: float, n: int) -> float:
         def f(r: float) -> float:

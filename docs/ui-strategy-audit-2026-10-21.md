@@ -9,6 +9,14 @@ this document. The findings below are unchanged and describe the reviewed
 checkout `ba37afa`; their file/line references are intentionally left as
 written.
 
+Subsequent verification (2026-10-30) **reopened a Phase 1 causal acceptance
+gap**: factor order sizing read F's close before filling at F's open. The
+October 21 checkpoint below remains a historical test record, not proof of
+that missing invariant. All three engines were repaired the same day and
+independently verified — sizing reads S, fills read F's open, reporting reads
+F's close — with funded, nonempty-book mutation regressions; see the Phase 2
+progress addendum.
+
 ## Bottom line
 
 Trade Sentinel is useful as a research terminal and paper laboratory. Its best
@@ -298,6 +306,11 @@ Do not select new “winning” parameters until this phase is complete.
 
 ### Phase 2 — Consolidate the portfolio model and accounting (P1)
 
+**Status: complete and independently verified, 2026-10-30.** See
+[final acceptance](#phase-2-final-acceptance--2026-10-30) for evidence and limits.
+Commit/merge authorization is separate from acceptance; this does not start
+Phase 3 or validate performance.
+
 - Share execution/ledger, valuation, cash-flow and metric primitives; keep strategy
   definitions/configuration separate. Start with Monthly/Daily-Core duplication.
 - Give each run an immutable configuration/version, data provenance and mode:
@@ -359,8 +372,8 @@ strategy switch or deletion is authorized by this audit alone.
 ## Phase 1 implementation status — 2026-10-21 (code complete, not yet accepted)
 
 **Status date: 2026-10-21.** Branch: `feature/phase-1-financial-correctness`
-(base commit `ba37afa`; commit `888c919` plus three uncommitted follow-up
-batches). Phase 1 of the plan in section 5 is **code-complete** and
+(base commit `ba37afa`; commits `888c919`, `4a9ac8d`, `93ef048` and
+`fffda7e`). Phase 1 of the plan in section 5 is **code-complete** and
 **independently verified** (see the checkpoint below). The acceptance criteria
 of section 5 are met in code apart from the honest residual list further down;
 formal acceptance is a separate decision, so this note does not declare Phase 1
@@ -419,7 +432,8 @@ run, and the follow-up batches above carry their own regression modules under
 
 ### Phase 1 status
 
-The code scope of Phase 1 is **complete and independently verified**: the
+At the October 21 checkpoint, the code scope of Phase 1 was reported as
+**complete and independently verified**: the
 acceptance criteria in section 5 are met in code, with this honest residual
 list. The residuals are documented exclusions, not silent gaps, and none of
 them reopens the corrected decision/fill path for the four strategies that
@@ -462,6 +476,358 @@ Phase 4 compares.
 - The chart "%" view remains **gain on contributed capital**
   (equity / contributed − 1), **not** a time-weighted return. The labels now
   say so; the metric itself is unchanged.
+
+## Phase 2 implementation progress — 2026-10-30
+
+Work continues on `feature/phase-1-financial-correctness` after the four
+Phase 1 commits above. The whole roadmap is to be completed before merging;
+new Phase 2 changes remain uncommitted unless separately authorized.
+
+The first bounded implementation batch corrects the synthetic universe market
+gate: chain equal-weight daily simple returns rather than average nominal
+share prices, using one causal helper in live, persisted replay and research.
+Per-listing price-unit rescaling must not change the index or its gate signal.
+This does not turn the gate into a survivorship-free investable benchmark or
+resolve stale-price and delisting policy. Independent verification passed
+19 focused tests, scoped lint and a separate loop-reference check over a
+random missing-price tape, including rescaling and prefix-causality probes.
+
+A separate currency batch fixes the factor open lookup reading a nonexistent
+close field from FX open rows and makes known foreign listings fail closed
+when a valid prior FX rate is unavailable. It also adds Vienna's EUR mapping
+and fixes a naive-as-of query bound. Independent verification passed 82
+Monthly/FX tests and scoped lint. Full instrument metadata, pence scaling,
+corporate-action accounting and explicit price-age limits remain open.
+
+A fundamentals-ingestion batch extends the same fail-closed currency contract
+to statement facts: the fabricated 1.0 "no FX data, assume USD" factor is
+gone, and a converted fact (income, OCF, capex, equity) is only booked when a
+usable rate exists at or before its period end — a missing pair, a
+pre-history period, or an invalid (NaN/inf/negative) rate skips that fact
+instead of storing a local-currency value as USD. Unknown dot-suffixes are
+now explicitly unresolved (their converted facts skip rather than being
+guessed USD); share counts are currency-free and always ingest. Independent
+verification passed 33 offline tests plus an orchestrator probe of every
+fail-closed path, with the ingestion driver left untouched. One honest
+consequence: dot-form share-class tickers such as `BRK.B` in the small
+us-large-cap universe (the S&P 500 file uses the dash form `BRK-B` and is
+unaffected) now skip converted facts with an INFO log, and the genuinely
+unmapped `NOVO-B.CO` stops being stored at a roughly sevenfold-wrong USD
+value. Resolving share-class suffixes belongs to explicit instrument
+metadata, not to per-path guessing — the batch after this one provides it.
+
+A follow-up batch consolidates instrument quote metadata under one owner,
+`app/instruments.py`: the suffix→FX map (moved verbatim, re-exported from
+`fundamentals` so every existing importer keeps working), explicit
+pence-scaled London quotes (`.L` closes are quoted in pence — a raw close
+must be scaled by 0.01 before GBPUSD is applied, a latent hundredfold error
+no shipped universe exercises but any custom one could), and an explicit
+USD-native share-class set (`.A`/`.B`/`.C`, e.g. `BRK.B` — a notation, not a
+currency code) so dot-form US share classes ingest fundamentals as
+explicitly known-USD rather than accidentally. The factor price path
+applies the unit factor before FX; unknown foreign suffixes remain raw and
+explicitly unresolved; reporting-versus-trading currency remains explicitly
+unmodelled and documented as open. Independent verification passed 210
+scoped tests plus an orchestrator probe (pence conversion exact at
+1250p → $15.625, `.DE`/`.SW` bit-identical to the previous arithmetic, `.L`
+without its pair fails closed to NaN, re-export identity holds), and the
+`BRK.B` consequence above is resolved: its converted facts ingest again,
+now as explicitly known-USD. The Savings tracker's own EUR pricing still
+multiplies a `.L` close by GBPUSD without the unit — the same latent error,
+scheduled into the next Savings batch.
+
+The price-age policy batch gives staleness one definition
+(`app/price_freshness.py`): a print older than
+`factor_price_max_age_days` (default 10 calendar days, rationale documented)
+is not a current mark. Marks — live valuations and both persisted replays —
+treat a stale cell exactly like a missing close, so the existing cost-basis
+fallback takes over and the position is flagged `stale` (per-position and
+`stale_marks`, additive keys, no shape change); ranking excludes a stale
+listing explicitly (`eligible_frame` gains a `stale` column; the flag is
+visible, the exclusion is the only consequence); an FX rate print older
+than the limit no longer converts anything. The research replay gained the
+cost-basis bookkeeping its marks needed to mirror the persisted replay, and
+its final valuation now uses the same gated EOD mark. `_exec_buy` gained
+the same hard-slot backstop the replay and research paths already have
+(inert in normal flow — the live planner caps first; structural
+equivalence). Independent verification passed 417 scoped tests, an
+orchestrator probe of every policy boundary (10-day edge fresh, 11 days
+stale, future print stale, ffill-backed cells expiring exactly, and a
+strong-fundamentals listing with a month-old print explicitly stale and
+ineligible while a fresh name ranks), and all five sizing reproducers
+remain invariant under the F-close mutation. Two pre-existing Monthly
+fixtures that seeded a hard-coded September bar against the real wall clock
+had their valuation clocks pinned to the seeded session — a documented
+expectation update (the assertions themselves are unchanged); they were
+time bombs under any age policy. The audit's "indefinitely stale listing
+stays silently eligible" gap is closed.
+
+The read-only Savings review confirmed that position removal deletes booked
+mirror entries and rewrites earlier comparison points. Its first implementation
+batch retains those entries, appends a dated reversal and makes removal plus
+mirror updates atomic. Cash semantics remain unchanged; this is not yet a
+settled-sale ledger. A disjoint label-only batch makes clear that the mirror
+is an equal-allocation picks comparison, not the full Daily-Core strategy.
+The backend repair passed independent source review, 64 Savings tests and
+scoped lint, including an injected post-write failure that proves the removal
+and mirror book roll back together. Fixed-candle curve points strictly before
+the removal day remain unchanged; the removal day's daily aggregate can change.
+Reset/reinitialization are still destructive and are not covered by this repair.
+The label-only change has been independently reviewed: the diff changes only
+display strings/comments, and both inline JavaScript blocks pass `node
+--check`. The backend history repair is verified as described above; no responsive or
+rendered-page acceptance is claimed by this label check.
+
+A follow-up batch gives the ledger its disposal record: `SavingsEvent`
+gains nullable `occurred_on`/`shares`/`price`/`cost_basis`/`flow_class`
+columns through an additive, non-backfilling migration (legacy removals were
+never observed, so nothing is fabricated for them), and `remove_position`
+appends a dated SELL row in the same transaction as the position delete, the
+WARN audit row and the mirror reversal. The row is a record of facts, not
+settlement: `amount` stays 0.0 — cash and contributed are untouched, the
+proceeds still arrive via the next true-up — and the execution price is
+stored only when the operator supplied one (an invalid price rejects the
+whole removal before anything is touched). Independent verification passed
+77 Savings tests plus an orchestrator probe of rejection-leaves-no-trace,
+row exactness and cash/contributed inertia, and the injected-failure
+rollback now covers the SELL row too. Flow classification of the wider
+ledger, dated withdrawals, sale settlement and a non-destructive initialize
+remain the open Savings batches; the disposal columns are not yet surfaced
+through the events API.
+
+Batch 3 adds the flow taxonomy, dated withdrawals and Savings metrics. One
+classifier (`flow_class_of`) maps every event kind to its flow class —
+contribution, withdrawal, investment, reward, interest, reconciliation,
+sale, audit — auto-stamped on every new row and applied on read to legacy
+rows (one definition, no backfill migration). `withdraw` books a dated,
+signed-negative WITHDRAWAL event under an explicit cash guard, and every
+contributed computation becomes NET (contributions − withdrawals): a
+deposit-then-withdraw tape that the old metric reported as a −40% loss now
+reports exactly 0% — the orchestrator verified that contrast directly.
+Savings gains the same TWR/XIRR endpoints as the other tabs (key-identical
+to `/api/metrics/*`, reusing the generic performance functions untouched,
+plus one additive drawdown field), a flat flows-only tape pins at 0% TWR
+with zero drawdown, and the tab shows the same chips with net-contributed
+wording plus a Withdraw control. The tracker's own `.L` pricing now applies
+the pence unit before GBPUSD (1250 GBp at 1.25/1.10 prices at
+14.2045 € exactly; unit-1.0 venues bit-identical). Independent verification
+passed 139 Savings tests plus the orchestrator probes; two integration
+corrections were made at acceptance: the withdraw endpoint's
+insufficient-cash rejection is 422 (matching `/api/savings/buy`'s class;
+404 remains for the uninitialized tracker) and the `SavingsEvent` docstring
+now records the WITHDRAWAL kind and the one-definition flow classification.
+
+The LLM decision ledger (Phase 1's deferred rule-7 item) is implemented:
+`SimLlmDecision` append-only rows for every LLM decision — hybrid review,
+pure-LLM cycle, and both chat paths (including the streamed variant) — with
+`decided_at` frozen at parse time, the decision's relation to the
+deterministic proposal (one shared classifier, equivalence-checked on 500
+randomised cases against the old bucket logic), and the frozen fill
+(`filled_at` plus shares/price/cash_after) written once when the trade
+executed; a decided-but-unfilled decision keeps NULL fill columns, which is
+the honest record under rule 7's no-pending-order semantics. Ledger failures
+are logged and can never fail a cycle. Independent verification passed 172
+scoped tests, confirmed zero edits to any execution path, and the full suite
+passes with network sockets disabled — no LLM or provider call anywhere.
+session.py rule 7 now records the ledger instead of deferring it.
+
+A further bounded provenance batch adds nullable candle source, requested
+adjustment basis and ingestion time, retaining unknown provenance on legacy
+rows and recording the actual provider after fallbacks. It is not an immutable
+experiment data snapshot, and migration verification uses temporary databases
+only; the running database is not being migrated in this work. Independent
+verification passed 51 market/provenance tests and scoped lint. Review caught
+and covered a compatibility regression: omitted volume must still default to
+zero, while an explicitly invalid volume must not be silently coerced. A
+second review finding is fixed and independently verified: the three extra
+bound parameters per row lower SQLite's single-statement batch ceiling from
+4,680 to 3,276 rows (independently reproduced: 3,276 bars stored, 3,277
+failed), so ten-year and max-range refreshes could fail outright with zero
+bars stored. The chunked single-commit upsert — 2,000 rows per chunk, the
+bound documented against the 32,766-parameter cap and guarded against future
+schema growth by a test — restores 3,650- and 5,000-bar stores with every
+row tagged, mid-chunk failures roll back the whole batch, and 55
+market/provenance tests pass.
+
+Shared execution arithmetic now has pure zero-fee fill primitives and Monthly
+live/backfill adoption. Independent verification passed 121 primitive/Monthly
+tests and scoped lint, preserving floor-four sizing, the exact-cash guard and
+valid-input operation order while rejecting invalid fills before mutation.
+Daily-Core's adoption is complete and independently verified in the same way:
+all four fill sites (live `_exec_buy`/`_exec_sell` and the backfill
+`do_buy`/`do_sell`) call the shared primitives, a 200,000-case arithmetic
+differential found zero mismatches on valid inputs, and the scoped suites
+(153 tests including the golden cadence parity) pass unchanged. The adoption
+also hardens the live executors: the old code raised on NaN budgets, and a
+NaN or infinite SELL price could commit NaN cash or delete a position while
+persisting an infinite-proceeds trade — those inputs now book no fill and
+mutate nothing, pinned by 33 new tests. The invalid-input delta is a
+disclosed behavior change from "raises/corrupts" to "no fill", not a
+silent one. Research adoption is complete as well, verified the same way:
+`_fill_buy` and the replay's SELL arm are thin fee-aware wrappers over the
+primitive `buy_fill`/`sell_fill` (the fee comes out of cash only, sizes are
+never re-floored), a grid comparison found the wrappers bit-identical to the
+old formulas at every fee level, and the wrapper's fee-inclusive guard was
+proven NON-redundant — real inputs exist where the zero-fee primitive
+accepts a leg whose fee-inclusive total exceeds the cash by one ULP, which
+only the retained guard rejects. The research sizing reproducer remains
+invariant under the F-close mutation and all five parity suites pass
+(184 scoped tests). With all three engines on the shared arithmetic and the
+per-ticker risk checks structurally identical, the shared-execution item's
+code scope is complete. A separate
+read-only review confirmed, and the
+orchestrator independently reproduced, pre-fill use of F-close position values
+in factor order sizing. Changing only a held name's F close from 100 to 140
+changed live Monthly and Daily-Core F-open buys from 5/10 shares to 4/11,
+with identical F opens and history through S. Research and both persisted
+replays share the defect, so cross-engine parity passes despite it. This
+reopens Phase 1's causal acceptance criterion rather than being treated as an
+optional enhancement. Repairs are bounded by engine: sizing uses S marks and
+actual cash, execution uses F open, and end-of-session reporting remains F
+close. The Monthly engine's repair is complete and independently verified:
+both reproducers show identical F-day trades under the F-close mutation (live
+and persisted replay) with F-close reporting intact, and 128 scoped tests pass
+with clean lint. The research replay's repair is verified the same way: its
+reproducer is invariant under the mutation, all four confirmed sizing sites
+plus the target-vol cap read S, 152 scoped tests pass including both golden
+parity suites, and the three existing research test files are unchanged. The
+Daily-Core clock repair is verified the same way: both of its reproducers are
+invariant under the mutation with F-close reporting intact, its sizing
+valuation and post-buy refresh read S, its target-vol history is bounded to
+sessions before the cycle, and the contract docstring (rules 1/3) now states
+the sizing/reporting split explicitly. With all three engines repaired, the
+reopened causal gap is closed in code: every reproducer is invariant, both
+golden parity suites are green, and the full integrated suite passes (933
+tests, clean ruff, clean diff check). Formal acceptance remains a separate
+decision.
+
+At the subsequent offline checkpoint, the Savings Batch 4 implementation adds
+dated dividends, fees, sale settlements, splits and corrections; snapshots
+carry an optional `as_of` date, reinitialization refuses to overwrite a live
+tracker, and reset preserves events/snapshots behind an appended boundary.
+Independent verification passes 239 Savings tests and the full 1,314-test
+suite with outbound connections blocked and **zero connection attempts**;
+all five sizing reproducers remain invariant. Review identified same-day reset
+clipping, split-source attribution, missing partial-sale/tax entry points and
+stale reset UI wording; the follow-up repairs are now independently verified
+with **263 Savings tests, zero connection attempts**, plus an orchestrator
+end-to-end probe. Partial sales preserve the remaining quantity and average
+cost, append exact disposal facts and proportionally release the mirror;
+settlement credits cash exactly once through a unique disposal link. Unlinked
+legacy settlements require explicit acknowledgement and an explanatory note.
+Splits append one adjustment per funding source, measured at the split date;
+later buys are not multiplied. Unsupported retroactive actions that would
+require replaying later position changes refuse instead of inventing holdings;
+future-dated mutations also refuse. Tax is a dated internal expense, not an
+external withdrawal. Snapshot epoch identity follows creation order, while
+`as_of` controls valuation-day grouping, so same-day post-reset metrics work.
+The correction tests preserve the original cash/share/return invariants and
+document each intentional expectation change.
+
+The per-execution provenance summarizer independently passes **29 tests with
+zero connection attempts**. It records bounded cached candle/fundamental
+source, adjustment-basis and ingestion-time summaries for the actual universe
+and required FX pairs. Unknown provenance stays explicitly unknown; unresolved
+membership never widens to the entire cache. This is an observation of cached
+inputs, **not an immutable dataset snapshot or a content-replay guarantee**.
+Immutable run configurations, mode/epoch stamping and protection of forward
+paper records are in final integration: the independent schema/adoption gate
+passes **53 tests with zero connection attempts**. A separate synthetic probe
+confirms all three paper engines refuse unknown legacy history before mutation,
+preserve it bit-for-bit on reset, and credit a new epoch's same-month allowance
+exactly once. Migration default parity, same-month rebalance provenance and
+opening-capital stability under configuration changes remain under final review.
+The account-schema follow-up independently passes **39 tests with zero network
+attempts**: nullable `opening_seed` records actual newly opened capital without
+inventing a value for legacy accounts. The first full integrated run passes
+1,415 tests and exposes four obsolete destructive-history expectations plus one
+decision-clock regression (the unchanged nine-test ledger suite subsequently
+passes after the application fix). A separate review also reproduces a stale
+writer/reset epoch race; fencing those writes and freezing the actual opening
+capital are still required before closure. This is not yet the full integrated
+acceptance gate. No production migration,
+provider refresh, strategy switch, commit or new performance claim is part of
+this checkpoint.
+
+## Phase 2 final acceptance — 2026-10-30
+
+**Phase 2 is complete.** This acceptance supersedes the intermediate checkpoints
+above; their failures and open-item descriptions remain as the review history.
+The final integrated gate is independently run on the released working tree:
+
+```text
+1435 passed in 247.68s (0:04:07)
+NETWORK_CONNECTION_ATTEMPTS: []
+SOURCE_FILES_CHANGED_DURING_GATE: []
+```
+
+Outbound IPv4/IPv6 `connect` and `connect_ex` were blocked and counted. Tests
+used synthetic fixtures and temporary/in-memory SQLite, not the production
+database. The final source-hash manifest still matches the accepted tree.
+`ruff check app tests`, `git diff --check` and `node --check` for both inline
+JavaScript blocks pass. All five sizing reproducers also pass in **separate
+fresh interpreters**, with parsed base/mutated trade tuples asserted equal and
+zero network attempts; reporting still reflects the changed F-close marks.
+
+### Accepted integration
+
+- Shared fill/accounting, currency/FX, market-index and price-age primitives
+  are integrated without merging technical and factor strategies into one score.
+  Exact-cash, eligibility and slot backstops remain in the execution paths.
+- Immutable `RunConfig` registrations capture effective settings, actual universe
+  membership/hash, currency/fill conventions and a version contract. Cache
+  identity follows that configuration; unknown ranking provenance invalidates
+  the derived cache. A conflicting same-month paper rebalance refuses rather
+  than silently re-stamping its earlier decision.
+- `RunExecution` separately records admitted runs and bounded cached-input
+  provenance. A registered configuration is not evidence an experiment ran;
+  read-only ranking polls, terminal data skips and refused replays do not count
+  as executions. Replay rows and their execution record commit atomically.
+- All three paper engines protect unknown legacy and forward-paper records
+  before replay mutation. Resets atomically append an epoch boundary, preserve
+  historical ledgers and reseed current state. Decision/metric readers scope the
+  current epoch; raw history exports intentionally retain closed epochs.
+- Reset and final replay-persistence transactions share short state-write locks
+  with standalone writers. Inside-transaction epoch fencing rejects stale
+  allowance, trade, ranking and snapshot writes. Snapshot valuation cannot cross
+  a reset. Independent event-barrier verification proves a queued writer cannot
+  enter its body before replay commits, then credits cash exactly once afterwards.
+- Actual `opening_seed` is persisted when an account opens, resets or replays.
+  Changing settings does not invent funding; a zero-seed factor replay remains
+  zero-seed when paper trading starts. New epochs have independent imaginary
+  capital baselines, not transfers from the closed paper book.
+- Savings acceptance includes exact partial/full disposal facts, linked
+  exactly-once settlement, dated tax/expense/income events, source-correct split
+  adjustments, append-only mirror releases and same-day post-reset metrics.
+  The independent end-to-end probe reconciles quantities, cost, cash, mirror
+  allocations and preserved history.
+
+Independent focused evidence includes 39 schema/migration tests, 29 cache
+provenance tests, 263 Savings tests and 46 adoption/sizing-clock/unchanged-ledger
+tests. Existing tests were corrected only for the intentional history-preserving
+reset/replay policy, explicit legacy settlement, operator-local dates and
+known-matching ranking-cache fixtures. Original financial/golden parity assertions
+remain; preservation and refusal assertions were added, not skipped or weakened.
+The decision-clock regression found during integration was fixed in application
+code, with the original ledger tests unchanged.
+
+### Explicit limits and next phases
+
+Legacy seed/source metadata remains unknown where it was never observed: seed
+NULL uses a conservative zero fallback and is marked unknown in run provenance,
+not inferred from current settings. Cached-input summaries are **not immutable
+dataset snapshots or content-replay guarantees**. The singleton ranking and DCA
+benchmark remain documented derived-artifact reset exceptions, not immutable
+decision ledgers. Savings mirror restatement remains day-granularity; ambiguous
+retroactive actions requiring later-position replay refuse. Reporting-versus-
+trading currency and additional signal-staleness gating are not introduced here.
+
+Verification performed no provider refresh, LLM call, production migration or
+strategy switch. Commits and merges require separate explicit authorization.
+Published performance claims remain stale until Phase 4
+revalidation. Phase 3 UI simplification and Phase 4 research validation/pruning
+remain the next roadmap work; Phase 2 acceptance is not a claim of investment
+edge or live-provider correctness.
 
 ## References
 

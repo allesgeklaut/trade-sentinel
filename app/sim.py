@@ -21,11 +21,13 @@ a research/education tool.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
 import os
 import threading
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, UTC
 from pathlib import Path
@@ -33,7 +35,7 @@ from zoneinfo import ZoneInfo
 from collections.abc import Callable
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 
 import pandas as pd
 
@@ -41,6 +43,7 @@ from .analysis import MIN_CANDLES, compute, signal_series
 from .config import settings
 from . import llm as llm_mod
 from . import monthly as monthly_mod
+from . import run_config
 from . import session as session_mod
 from .db import (
     SimAccount,
@@ -48,6 +51,7 @@ from .db import (
     SimBenchmarkAccount,
     SimBenchmarkSnapshot,
     SimChatMessage,
+    SimLlmDecision,
     SimPosition,
     SimSnapshot,
     SimTrade,
@@ -65,6 +69,25 @@ from .strategy import (
 )
 
 logger = logging.getLogger("trade_sentinel.sim")
+
+# The RunConfig registry's engine key for this portfolio (app/run_config.py).
+_ENGINE = "sim"
+
+# The run-configuration CONTRACT version. BUMP RULE: bump when the snapshot's
+# field set/meaning changes, or when a DECISION CONSTANT/formula changes (the
+# snapshot's ``code`` block records the constants; a behavioural change not
+# expressible as a value is only visible through this version). A config
+# recorded by an older contract must never be read as equivalent to a newer
+# one.
+_CONFIG_CONTRACT_VERSION = "phase2-v1"
+
+# The LOGICAL RUN's frozen paper stamp ({"mode","config_id","epoch"}).
+# run_cycle / sim_chat / sim_chat_stream set it for their duration; the deep
+# executors (_exec_buy/_exec_sell and the snapshot writer) read it instead of
+# resolving per leg. A ContextVar (not a module global) keeps concurrent runs
+# isolated and propagates through awaited calls in the same task; an explicit
+# writer kwarg always wins, so the public mutators stay callable standalone.
+_RUN_STAMP: ContextVar[dict | None] = ContextVar("sim_run_stamp", default=None)
 
 # Stores the raw LLM reasoning text from the most recent _llm_decide() call.
 _last_llm_reasoning: str = ""
@@ -91,6 +114,14 @@ _run_progress: dict[str, Any] = {"running": False, "stage": "", "started_at": ""
 # click can't execute simultaneously. If a cycle is already running, a
 # second call returns immediately instead of racing on trades/snapshots.
 _run_cycle_lock: asyncio.Lock = asyncio.Lock()
+
+# Serialises every STATE/CASH/HISTORY mutation against a reset's boundary (the
+# stamp/reset TOCTOU): a stamp captured before a reset is validated against the
+# CURRENT epoch INSIDE this lock and its transaction, and refuses without
+# writing into the new epoch's book. Lock order is ALWAYS cycle-lock ->
+# state-lock (never the reverse); the chat path takes only this lock per leg,
+# so a long LLM turn never blocks a reset.
+_state_write_lock: asyncio.Lock = asyncio.Lock()
 # Holds the asyncio.Task for the currently in-flight run_cycle() (whether
 # triggered manually or by the scheduler). Used by the decoupled
 # /api/sim/run endpoint so the cycle survives browser disconnects.
@@ -241,7 +272,9 @@ async def _account() -> SimAccount:
     async with Session() as s:
         acc = await s.get(SimAccount, 1)
         if acc is None:
-            acc = SimAccount(id=1, cash=settings.sim_start_cash, last_allowance_month=None)
+            acc = SimAccount(id=1, cash=settings.sim_start_cash,
+                             last_allowance_month=None,
+                             opening_seed=settings.sim_start_cash)
             s.add(acc)
             await s.commit()
         return acc
@@ -251,25 +284,70 @@ async def _account() -> SimAccount:
 # Allowance
 # ---------------------------------------------------------------------------
 
-async def deposit_allowance() -> dict[str, Any]:
+async def deposit_allowance(*, mode: str | None = None, config_id: int | None = None,
+                            epoch: int | None = None) -> dict[str, Any]:
     """Deposit the monthly allowance if a new month has begun.
 
     Returns a dict describing whether a deposit was made and the resulting
     cash balance.
+
+    Forward PAPER record: stamped with the logical run's frozen stamp when one
+    is threaded (``run_cycle``), else with a freshly resolved paper stamp —
+    the status endpoint calls this standalone, and a standalone deposit is
+    still a forward record.
+
+    EPOCH-AWARE GUARD: the month marker is current STATE (a reset clears it),
+    so it alone cannot prove the month was funded in THIS epoch — a closed
+    epoch's same-month row is preserved on purpose. Before inserting, the
+    guard verifies no allowance row exists for the month under the current
+    epoch: a marker that lagged its row heals instead of duplicating (the
+    rebuilt UNIQUE(month, epoch) is the last-resort backstop), while a
+    post-reset same-month deposit writes its own new-epoch row — a NEW
+    imaginary allocation in the new epoch's ledger, not a transfer of the old
+    epoch's money and not real capital.
     """
     month = _current_month()
+    async with _state_write_lock:
+        return await _deposit_allowance_locked(month, mode=mode,
+                                               config_id=config_id, epoch=epoch)
+
+
+async def _deposit_allowance_locked(month: str, *, mode: str | None,
+                                    config_id: int | None,
+                                    epoch: int | None) -> dict[str, Any]:
+    stamp = await _resolve_paper_stamp(mode=mode, config_id=config_id, epoch=epoch)
     async with Session() as s:
+        if not await _stamp_is_current(s, stamp):
+            acc = await s.get(SimAccount, 1)
+            logger.warning("Sim deposit refused: stale epoch stamp %s", stamp["epoch"])
+            return {"deposited": False, "month": month,
+                    "cash": acc.cash if acc is not None else None,
+                    "refused": "stale epoch stamp"}
         acc = await s.get(SimAccount, 1)
         if acc is None:
-            acc = SimAccount(id=1, cash=settings.sim_start_cash, last_allowance_month=None)
+            acc = SimAccount(id=1, cash=settings.sim_start_cash,
+                             last_allowance_month=None,
+                             opening_seed=settings.sim_start_cash)
             s.add(acc)
 
         if acc.last_allowance_month == month:
             return {"deposited": False, "month": month, "cash": acc.cash}
+        exists = await s.scalar(
+            select(func.count()).select_from(SimAllowance).where(
+                SimAllowance.month == month,
+                run_config.epoch_clause(SimAllowance, stamp["epoch"])))
+        if exists:
+            acc.last_allowance_month = month
+            await s.commit()
+            logger.info("Sim allowance for %s already deposited (epoch %s)",
+                        month, stamp["epoch"])
+            return {"deposited": False, "month": month, "cash": acc.cash}
 
         acc.cash += settings.sim_monthly_allowance
         acc.last_allowance_month = month
-        s.add(SimAllowance(amount=settings.sim_monthly_allowance, month=month))
+        s.add(SimAllowance(amount=settings.sim_monthly_allowance, month=month,
+                           mode=stamp["mode"], config_id=stamp["config_id"],
+                           epoch=stamp["epoch"]))
         await s.commit()
 
         logger.info("Sim allowance deposited: %.2f for %s → cash %.2f",
@@ -293,16 +371,32 @@ async def valuate() -> dict[str, Any]:
             "total_equity": float,
             "allowance_total": float,
         }
+
+    EPOCH-SCOPED contributed total ("seed capital + monthly allowances"):
+    ``allowance_total`` = the epoch's opening SEED (the epoch's FROZEN
+    ``sim_start_cash`` — see ``_epoch_seed``) + the CURRENT epoch's monthly
+    deposits. A nonzero seed must be counted or the contributed baseline is 0
+    on the seed-only stretch (undefined XIRR, phantom gain on the seed); it is
+    constant per epoch so contribution-adjusted differences cancel, and it is
+    FROZEN: changing the setting without a reset does not rewrite an account
+    that already holds the old capital. A reset re-seeds with the then-current
+    setting, so the fresh book's baseline restarts with its own seed.
     """
     async with Session() as s:
         acc = await s.get(SimAccount, 1)
         if acc is None:
-            acc = SimAccount(id=1, cash=settings.sim_start_cash, last_allowance_month=None)
+            acc = SimAccount(id=1, cash=settings.sim_start_cash,
+                             last_allowance_month=None,
+                             opening_seed=settings.sim_start_cash)
             s.add(acc)
             await s.commit()
 
         positions = (await s.scalars(select(SimPosition).order_by(SimPosition.ticker))).all()
-        allowance_total = (await s.scalar(select(func.sum(SimAllowance.amount)))) or 0.0
+        cur = await run_config.current_epoch(_ENGINE, session=s)
+        deposits = (await s.scalar(
+            select(func.sum(SimAllowance.amount)).where(
+                run_config.epoch_clause(SimAllowance, cur)))) or 0.0
+        seed = await _epoch_seed(s)
 
     positions_value = 0.0
     pos_list: list[dict[str, Any]] = []
@@ -330,7 +424,10 @@ async def valuate() -> dict[str, Any]:
         "positions": pos_list,
         "positions_value": round(positions_value, 2),
         "total_equity": round(acc.cash + positions_value, 2),
-        "allowance_total": round(float(allowance_total), 2),
+        # "seed capital + monthly allowances": the epoch's external capital
+        # basis (see the docstring). The pre-existing key set stays frozen —
+        # the composition is documented, not expanded with new keys.
+        "allowance_total": round(seed + float(deposits), 2),
     }
 
 
@@ -366,8 +463,253 @@ def _universe() -> str:
         return settings.sim_universe
 
 
+# ---------------------------------------------------------------------------
+# Run configuration + provenance stamping (the immutable Phase 2 half)
+# ---------------------------------------------------------------------------
+#
+# RULE (provenance contract): the snapshot must capture EVERY input that
+# changes a decision. A configuration that changed a decision but not the
+# config hash is a provenance bug. The field list is grep-verified against this
+# module's ``settings.*`` reads and the hard-coded strategy constants
+# (``code``). ``strategy.py`` reads NO settings itself — every decision
+# parameter is passed in from here, so this module's reads are the complete
+# sim list.
+# Deliberately excluded, with rationale:
+#   * ``sim_benchmark_enabled``/``sim_benchmark_ticker`` — the DCA benchmark is
+#     a comparison artifact, not a sim decision input.
+#   * ``sim_run_hour``/``sim_run_minute`` — scheduler timing.
+#   * ``sim_monthly_enabled`` — feature gate.
+#   * ``market_fresh_seconds`` — refresh plumbing (the Candle provenance
+#     columns cover the data, not the run policy).
+#   * ``sim_monthly_rank_boost`` — read only by the research replay
+#     (app/optimize.py), never by this live engine.
+
+
+async def current_config() -> dict:
+    """The immutable configuration snapshot for ONE sim run.
+
+    ASYNC ON PURPOSE: the effective universe can be the ``watchlist`` DB table
+    (its members ARE the decision universe), so resolving the actual
+    membership needs the DB. The builder never raises — an unresolvable
+    universe records None members rather than breaking a cycle.
+    """
+    name = _universe()
+    source = "watchlist" if name.lower() == "watchlist" else "file"
+    try:
+        members = sorted(await _candidate_tickers())
+    except Exception:  # noqa: BLE001 — provenance must never break a cycle
+        members = None
+    universe = {
+        "name": name,
+        "source": source,
+        "members_hash": (hashlib.sha256(",".join(members).encode()).hexdigest()
+                         if members is not None else None),
+    }
+    return {
+        "contract_version": _CONFIG_CONTRACT_VERSION,
+        "engine": _ENGINE,
+        "currency": "USD",
+        "fill_basis": "session strict exact-date open (app/session.py rule 2), zero fees",
+        "fill_basis_note": (
+            "the technical sim's historical replay (app/optimize.py) still "
+            "fills each decision at that bar's same close — a documented "
+            "legacy approximation, not this engine's live contract"),
+        "timezone": settings.allowance_tz,
+        # --- effective runtime selection (shared state file) --------------
+        # EFFECTIVE only: the raw ``sim_universe`` fallback is not repeated —
+        # a persisted selection shadows it, and duplicating it would mint a
+        # new "configuration tried" for a setting that changed no decision.
+        "universe": universe,
+        # The single top-level members key ``run_provenance.summarize`` reads
+        # to scope its candle/fundamental provenance query.
+        "universe_members": members,
+        # --- strategy / risk parameters ----------------------------------
+        "sim_strategy": settings.sim_strategy,
+        "sim_start_cash": settings.sim_start_cash,
+        "sim_monthly_allowance": settings.sim_monthly_allowance,
+        "sim_max_position_pct": settings.sim_max_position_pct,
+        "sim_min_cash_pct": settings.sim_min_cash_pct,
+        "sim_max_positions": settings.sim_max_positions,
+        "sim_stop_pct": settings.sim_stop_pct,
+        "sim_max_run_5d": settings.sim_max_run_5d,
+        "sim_min_run_5d": settings.sim_min_run_5d,
+        "sim_max_dist_above": settings.sim_max_dist_above,
+        # --- LLM decision controls ---------------------------------------
+        "sim_llm_review_interval": settings.sim_llm_review_interval,
+        "sim_llm_minimal_prompt": settings.sim_llm_minimal_prompt,
+        "sim_llm_mode_aware_prompt": settings.sim_llm_mode_aware_prompt,
+        "sim_llm_failure_marker": settings.sim_llm_failure_marker,
+        "sim_llm_fundamentals_context": settings.sim_llm_fundamentals_context,
+        "sim_block_negative_roe": settings.sim_block_negative_roe,
+        # --- hard-coded decision constants (see the contract bump rule) ---
+        "code": {
+            "buy_threshold": 40,
+            "sell_threshold": -40,
+            "stop_type": "percent",
+            "use_atr_stop": True,
+            "min_candles": MIN_CANDLES,
+        },
+    }
+
+
+async def _paper_stamp(config: dict | None = None, *, record: bool = True) -> dict:
+    """Resolve the stamp for ONE forward PAPER run: ``(mode, config_id, epoch)``.
+
+    Resolve ONCE per logical run and thread it (ContextVar or explicit kwargs);
+    the fallback path goes through THIS module's ``Session`` factory so a
+    monkeypatched in-memory DB is never bypassed.
+
+    ``record=False`` defers the RunExecution to the caller's STABLE INPUT
+    POINT: a live cycle refreshes candles after its stamp, so recording at
+    stamp time would describe the pre-refresh cache instead of the data the
+    decision actually read. The caller must then call ``_record_run`` exactly
+    once (standalone writers and the chat turn keep the default: no data
+    refresh follows them).
+    """
+    cfg = await current_config() if config is None else config
+    stamp = {
+        "mode": "paper",
+        "config_id": await run_config.get_or_create(
+            _ENGINE, "paper", cfg, session_factory=Session),
+        "epoch": await run_config.current_epoch(_ENGINE, session_factory=Session),
+    }
+    # A stamp scope IS a logical run: record its data provenance exactly once.
+    if record:
+        await _record_run(stamp, cfg)
+    return stamp
+
+
+async def _record_run(stamp: dict, cfg: dict, *,
+                      asof: datetime | None = None,
+                      session=None) -> dict:
+    """Summarize the run's DATA provenance and append one RunExecution.
+
+    The clock is an explicit ``asof`` or the WALL clock at recording time —
+    deliberately NOT the injectable decision clock (``_utcnow``), so recording
+    provenance can never consume or perturb a frozen decision/fill timestamp
+    (session fill contract rule 7: ``decided_at`` is the FIRST clock capture
+    of a decision turn); in production the two coincide. The summary is an
+    upper-bounded aggregate of the candle/fundamental cache the run could
+    read, unknown provenance preserved — NOT an immutable data snapshot.
+    """
+    from . import run_provenance
+    clock = datetime.now(UTC) if asof is None else asof
+    # A caller-owned session keeps the execution row in the caller's
+    # transaction (the helpers never commit it): a backfill's rows and its
+    # execution record then commit — or roll back on a late forward-record
+    # refusal — atomically.
+    scope = {"session": session} if session is not None else {"session_factory": Session}
+    summary = await run_provenance.summarize(cfg, asof=clock, **scope)
+    # The run's capital basis: the account's frozen opening seed, or an
+    # explicit UNKNOWN for a legacy account (never an inferred value).
+    if session is not None:
+        acc = await session.get(SimAccount, 1)
+    else:
+        async with Session() as meta_s:
+            acc = await meta_s.get(SimAccount, 1)
+    opening = None if acc is None else acc.opening_seed
+    summary["opening_seed"] = {
+        "value": opening,
+        "known": opening is not None,
+        "basis": ("account_opening_seed" if opening is not None
+                  else "conservative_zero_legacy_unknown"),
+    }
+    await run_config.record_execution(
+        _ENGINE, stamp["mode"], stamp["config_id"], stamp["epoch"], summary,
+        data_asof=clock, **scope)
+    return summary
+
+
+async def _stamp_is_current(s, stamp: dict) -> bool:
+    """True when the stamp's epoch is the CURRENT epoch (read in the caller's
+    session, i.e. under the state lock + its transaction)."""
+    return await run_config.current_epoch(_ENGINE, session=s) == stamp["epoch"]
+
+
+async def _resolve_paper_stamp(*, mode: str | None = None,
+                               config_id: int | None = None,
+                               epoch: int | None = None) -> dict:
+    """The stamp a writer uses: explicit kwargs win, then the running logical
+    run's frozen ContextVar stamp, else a freshly resolved PAPER stamp.
+
+    Standalone public writers (status-endpoint calls, a hand-run executor) are
+    forward paper writes and are stamped ``paper`` by default; the all-None
+    NULL default exists only for direct model construction. A non-paper mode
+    always passes its full stamp (the backfill writes its own rows).
+    """
+    if mode is not None and config_id is not None and epoch is not None:
+        return {"mode": mode, "config_id": config_id, "epoch": epoch}
+    ctx = _RUN_STAMP.get() or {}
+    out = {
+        "mode": mode if mode is not None else ctx.get("mode") or "paper",
+        "config_id": config_id if config_id is not None else ctx.get("config_id"),
+        "epoch": epoch if epoch is not None else ctx.get("epoch"),
+    }
+    if out["config_id"] is None or out["epoch"] is None:
+        fresh = await _paper_stamp()
+        out["config_id"] = fresh["config_id"] if out["config_id"] is None else out["config_id"]
+        out["epoch"] = fresh["epoch"] if out["epoch"] is None else out["epoch"]
+    return out
+
+
+async def _config_changed(frozen: dict) -> bool:
+    """True when the runtime configuration no longer matches the one this run
+    froze at its start (best-effort mid-run guard; see
+    ``daily_core._config_changed``). Async because this engine's universe can
+    be the watchlist table."""
+    return (run_config.config_hash(await current_config())
+            != run_config.config_hash(frozen))
+
+
+async def _epoch_seed(s) -> float:
+    """The opening SEED capital of the CURRENT epoch — the account's own
+    ``opening_seed``, FROZEN when the account was opened/re-seeded.
+
+    A live-setting read would retroactively rewrite the contributed basis when
+    ``sim_start_cash`` changes without a reset (the account still holds the old
+    capital). The field is written in the SAME transaction that
+    creates/re-seeds the account and by the historical replay (the sim
+    backfill sets ``params.start_cash`` — this engine's synthetic baseline
+    really is that seed). A LEGACY account (NULL) has an UNKNOWN seed: the
+    conservative fallback is 0.0 and ``_record_run`` flags
+    ``opening_seed.known = False`` — never fabricate historical funding.
+    """
+    acc = await s.get(SimAccount, 1)
+    seed = None if acc is None else acc.opening_seed
+    if seed is not None:
+        return float(seed)
+    return 0.0
+
+
+async def _write_snapshot(post: dict, *, mode: str | None = None,
+                          config_id: int | None = None,
+                          epoch: int | None = None) -> None:
+    """Write one equity-curve point stamped with the logical run's stamp.
+
+    The three forward writers (run_cycle, sim_chat, sim_chat_stream) all go
+    through here: chat-driven marks are forward records too.
+    """
+    async with _state_write_lock:
+        stamp = await _resolve_paper_stamp(mode=mode, config_id=config_id, epoch=epoch)
+        async with Session() as s:
+            if not await _stamp_is_current(s, stamp):
+                logger.warning("Sim snapshot refused: stale epoch stamp")
+                return
+            s.add(SimSnapshot(
+                cash=post["cash"],
+                positions_value=post["positions_value"],
+                total_equity=post["total_equity"],
+                allowance_total=post["allowance_total"],
+                mode=stamp["mode"], config_id=stamp["config_id"],
+                epoch=stamp["epoch"],
+            ))
+            await s.commit()
+
+
 async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str,
-                    stop_price: float | None = None) -> dict | None:
+                    stop_price: float | None = None, *, mode: str | None = None,
+                    config_id: int | None = None,
+                    epoch: int | None = None) -> dict | None:
     """Execute a paper BUY.  Returns the trade dict or None if skipped.
 
     Uses fractional shares (rounded to 4 decimals) so the bot can always
@@ -390,8 +732,19 @@ async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str,
     if shares < 0.0001:
         return None
     cost = shares * price
+    async with _state_write_lock:
+        stamp = await _resolve_paper_stamp(mode=mode, config_id=config_id, epoch=epoch)
+        return await _exec_buy_locked(ticker, price, shares, cost, reason,
+                                      stop_price, stamp)
 
+
+async def _exec_buy_locked(ticker: str, price: float, shares: float, cost: float,
+                           reason: str, stop_price: float | None,
+                           stamp: dict) -> dict | None:
     async with Session() as s:
+        if not await _stamp_is_current(s, stamp):
+            logger.warning("Sim BUY %s refused: stale epoch stamp", ticker)
+            return None
         acc = await s.get(SimAccount, 1)
         if acc is None or acc.cash < cost:
             return None
@@ -414,7 +767,8 @@ async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str,
 
         trade = SimTrade(
             ticker=ticker, side="BUY", shares=shares, price=price,
-            cash_after=acc.cash, reason=reason,
+            cash_after=acc.cash, reason=reason, mode=stamp["mode"],
+            config_id=stamp["config_id"], epoch=stamp["epoch"],
         )
         s.add(trade)
         await s.commit()
@@ -426,12 +780,24 @@ async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str,
         }
 
 
-async def _exec_sell(ticker: str, price: float, shares: float | None, reason: str) -> dict | None:
+async def _exec_sell(ticker: str, price: float, shares: float | None, reason: str,
+                     *, mode: str | None = None, config_id: int | None = None,
+                     epoch: int | None = None) -> dict | None:
     """Execute a paper SELL.  *shares*=None means sell entire position.
 
     Returns the trade dict or None if nothing to sell.
     """
+    async with _state_write_lock:
+        stamp = await _resolve_paper_stamp(mode=mode, config_id=config_id, epoch=epoch)
+        return await _exec_sell_locked(ticker, price, shares, reason, stamp)
+
+
+async def _exec_sell_locked(ticker: str, price: float, shares: float | None,
+                            reason: str, stamp: dict) -> dict | None:
     async with Session() as s:
+        if not await _stamp_is_current(s, stamp):
+            logger.warning("Sim SELL %s refused: stale epoch stamp", ticker)
+            return None
         pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
         if pos is None or pos.shares <= 0:
             return None
@@ -451,7 +817,8 @@ async def _exec_sell(ticker: str, price: float, shares: float | None, reason: st
 
         trade = SimTrade(
             ticker=ticker, side="SELL", shares=sell_shares, price=price,
-            cash_after=acc.cash, reason=reason,
+            cash_after=acc.cash, reason=reason, mode=stamp["mode"],
+            config_id=stamp["config_id"], epoch=stamp["epoch"],
         )
         s.add(trade)
         await s.commit()
@@ -1631,6 +1998,237 @@ async def _llm_prose_summary(decisions: list[dict]) -> str:
         return ""
 
 
+# ---------------------------------------------------------------------------
+# LLM frozen-decision ledger (session fill contract, rule 7)
+# ---------------------------------------------------------------------------
+# Every LLM decision is appended to SimLlmDecision with the ``decided_at``
+# captured when its response was PARSED, its relation to the deterministic
+# proposal, and — when the decision's trade executed — the frozen fill. The
+# ledger is ADDITIVE bookkeeping: it never changes an order, a guard, an
+# execution order or a returned payload, and its failure never fails a cycle
+# or a chat turn (the executed trades are already committed real state).
+
+
+def _llm_decision_relation(action: str, det_side: str | None, *,
+                           vetoed: bool = False) -> str:
+    """Classify one LLM decision against the deterministic proposal.
+
+    Single source of truth for the relation vocabulary, shared with
+    ``get_last_llm_summary`` (which renders the same classification for the
+    frontend) so the two renderings can never drift:
+
+      * HOLD on a proposed ticker   -> ``veto`` (the proposal is blocked)
+      * HOLD on any other ticker    -> ``hold`` (passive)
+      * BUY/SELL with no proposal   -> ``addition`` (LLM-initiated)
+      * side == the proposal's side -> ``confirmation``
+      * side != the proposal's side -> ``change`` (a flip: the proposal is
+        vetoed and the flipped order itself is engine-excluded)
+    """
+    act = str(action or "").upper()
+    side = str(det_side or "").upper() or None
+    if act == "HOLD":
+        return "veto" if vetoed else "hold"
+    if side is None:
+        return "addition"
+    return "confirmation" if act == side else "change"
+
+
+def _cycle_session_date() -> str:
+    """The cycle's session F date ("YYYY-MM-DD") for ledger rows.
+
+    Session F is the cycle's own session — the run date (contract rule 2) —
+    which is exactly what the per-session guard keys on. Ledger ``cycle``
+    rows are stamped with it so a decision can be attributed to the session
+    whose OPEN filled it.
+    """
+    return _session_guard_key()
+
+
+def _chat_session_date() -> str:
+    """The chat turn's operator-local calendar date ("YYYY-MM-DD")."""
+    return datetime.now(_TZ).strftime("%Y-%m-%d")
+
+
+def _executed_index(executed: list[dict]) -> dict[tuple[str, str], dict]:
+    """(TICKER, SIDE) -> executed trade dict, for the ledger's fill columns.
+
+    ``_exec_buy`` / ``_exec_sell`` (and therefore ``_execute_proposed``)
+    return dicts carrying ticker/side/shares/price/cash_after; matching on
+    (ticker, side) attributes a fill to the decision that caused it.
+    """
+    index: dict[tuple[str, str], dict] = {}
+    for t in executed:
+        index[(str(t.get("ticker") or "").upper(),
+               str(t.get("side") or "").upper())] = t
+    return index
+
+
+def _ledger_row(*, decided_at: datetime, mode: str, session_date: str,
+                ticker: str, action: str, reason: str, relation: str,
+                det_side: str | None = None, det_reason: str | None = None,
+                fill: dict | None = None,
+                filled_at: datetime | None = None) -> SimLlmDecision:
+    """Build one frozen ledger row (rule 7).
+
+    ``decided_at`` is always the value captured at PARSE time — this helper
+    never re-stamps it. ``fill`` is the executed trade dict when the
+    decision's order ran; without both ``fill`` and ``filled_at`` the four
+    fill columns stay NULL: decided, never filled.
+    """
+    filled = fill is not None and filled_at is not None
+    return SimLlmDecision(
+        decided_at=decided_at,
+        mode=mode,
+        session_date=session_date,
+        ticker=str(ticker or ""),
+        action=str(action or ""),
+        reason=reason or "",
+        det_side=det_side,
+        det_reason=det_reason,
+        relation=relation,
+        filled_at=filled_at if filled else None,
+        shares=fill.get("shares") if filled else None,
+        price=fill.get("price") if filled else None,
+        cash_after=fill.get("cash_after") if filled else None,
+    )
+
+
+def _ledger_cycle_rows(decisions: list[dict], proposals: list[dict],
+                       vetoed: list[dict], executed: list[dict],
+                       decided_at: datetime) -> list[SimLlmDecision]:
+    """Rule-7 rows for one hybrid cycle: one per LLM decision.
+
+    ``det_side``/``det_reason`` come from the deterministic proposal map (the
+    PRE-veto proposals — what the engine wanted before the LLM spoke), the
+    relation from ``_llm_decision_relation``, and the fill columns from the
+    executed trade dicts matched by (ticker, side). A vetoed, held,
+    unpriced or exec-guard-skipped decision keeps NULL fill columns.
+    """
+    det_by = {str(p.get("ticker") or "").upper(): p for p in proposals}
+    vetoed_tickers = {str(v.get("ticker") or "").upper() for v in vetoed}
+    fills = _executed_index(executed)
+    filled_at = _utcnow()  # fill freeze time — always >= decided_at
+    session_date = _cycle_session_date()
+    rows: list[SimLlmDecision] = []
+    for d in decisions:
+        ticker = str(d.get("ticker") or "")
+        action = str(d.get("action") or "")
+        det = det_by.get(ticker.upper())
+        det_side = (str(det.get("side") or "") or None) if det else None
+        rows.append(_ledger_row(
+            decided_at=decided_at,
+            mode="cycle",
+            session_date=session_date,
+            ticker=ticker,
+            action=action,
+            reason=str(d.get("reason") or ""),
+            relation=_llm_decision_relation(
+                action, det_side, vetoed=ticker.upper() in vetoed_tickers),
+            det_side=det_side,
+            det_reason=(str(det.get("reason") or "") if det else None),
+            fill=fills.get((ticker.upper(), action.upper())),
+            filled_at=filled_at,
+        ))
+    return rows
+
+
+def _ledger_llm_rows(decisions: list[dict], executed: list[dict],
+                     decided_at: datetime) -> list[SimLlmDecision]:
+    """Rule-7 rows for one pure-LLM cycle.
+
+    That path is handed no deterministic proposals, so every decision is
+    LLM-initiated: ``det_side``/``det_reason`` are NULL and the relation is
+    ``addition``. A HOLD there is still an initiated decision — recorded as
+    decided-but-unfilled, like any decision whose order did not run.
+    """
+    fills = _executed_index(executed)
+    filled_at = _utcnow()
+    session_date = _cycle_session_date()
+    rows: list[SimLlmDecision] = []
+    for d in decisions:
+        ticker = str(d.get("ticker") or "")
+        action = str(d.get("action") or "")
+        rows.append(_ledger_row(
+            decided_at=decided_at,
+            mode="cycle",
+            session_date=session_date,
+            ticker=ticker,
+            action=action,
+            reason=str(d.get("reason") or ""),
+            relation="addition",
+            fill=fills.get((ticker.upper(), action.upper())),
+            filled_at=filled_at,
+        ))
+    return rows
+
+
+def _ledger_chat_rows(actions: list[dict], executed: list[dict],
+                      decided_at: datetime) -> list[SimLlmDecision]:
+    """Rule-7 rows for one chat turn's ``[[ACTION]]`` block: one per action.
+
+    Chat actions are operator-driven LLM decisions with no deterministic
+    proposal behind them, so ``det_side``/``det_reason`` are NULL and the
+    relation is ``chat_action``. An action that was skipped (no price, cash
+    or position guard) keeps NULL fill columns.
+    """
+    fills = _executed_index(executed)
+    filled_at = _utcnow()
+    session_date = _chat_session_date()
+    rows: list[SimLlmDecision] = []
+    for a in actions:
+        ticker = str(a.get("ticker") or "")
+        action = str(a.get("action") or "")
+        rows.append(_ledger_row(
+            decided_at=decided_at,
+            mode="chat",
+            session_date=session_date,
+            ticker=ticker,
+            action=action,
+            reason=str(a.get("reason") or ""),
+            relation="chat_action",
+            fill=fills.get((ticker.upper(), action.upper())),
+            filled_at=filled_at,
+        ))
+    return rows
+
+
+async def _ledger_llm_decisions(rows: list[SimLlmDecision]) -> None:
+    """Append LLM decisions to the rule-7 ledger — best-effort, never fatal.
+
+    One session/commit for the whole batch. A failure is logged LOUDLY and
+    swallowed: the trades these rows describe are ALREADY committed real
+    state (``_exec_buy``/``_exec_sell``), and trading must never roll back or
+    fail because the ledger write failed — a failed write is a loud audit
+    gap, not a trading failure.
+    """
+    if not rows:
+        return
+    try:
+        async with Session() as s:
+            s.add_all(rows)
+            await s.commit()
+    except Exception:
+        logger.error(
+            "LLM decision ledger write FAILED — %d decision(s) lost from the "
+            "audit trail; the executed trades are unaffected", len(rows),
+            exc_info=True)
+
+
+async def _freeze_llm_decisions(rows: list[SimLlmDecision]) -> None:
+    """Freeze a batch of LLM decisions (rule 7) — the hooks' entry point.
+
+    ``_ledger_llm_decisions`` already swallows DB/commit failures; this outer
+    guard also covers a bug in the writer itself, so ledger bookkeeping can
+    never fail a cycle or a chat turn whose trades are already committed.
+    """
+    try:
+        await _ledger_llm_decisions(rows)
+    except Exception:
+        logger.error(
+            "LLM decision ledger bookkeeping FAILED — the executed trades "
+            "and the cycle/chat result are unaffected", exc_info=True)
+
+
 async def _llm_review_proposals(
     valuation: dict[str, Any],
     proposals: list[dict],
@@ -1665,11 +2263,16 @@ async def _llm_review_proposals(
     proposals and LLM additions alike — reads F's OPEN, and a ticker
     without an F bar fills nothing. The decision INPUTS (signals and the
     proposal set) were frozen to data <= the previous session's close by
-    the caller. Honest limitation: the LLM's reasoning TEXT is timestamped
-    to the cycle that produced it and there is no frozen-decision ledger
-    yet (Phase 2) — a re-run on identical frozen inputs consults the LLM
-    again and may reason differently; the per-session guard limits that to
-    one consult per session. With ``session_bars=None`` (legacy
+    the caller.
+
+    Rule 7 ledger: every parsed decision is appended to
+    ``SimLlmDecision`` with the ``decided_at`` frozen at parse time, its
+    relation to the deterministic proposal (confirmation / change / veto /
+    hold / addition) and, when it executed, the frozen fill; a decision that
+    never filled keeps NULL fill columns. The honest limitation that remains
+    is the LLM itself: a re-run on identical frozen inputs consults it again
+    and it may reason differently — the per-session guard limits that to one
+    consult per session. With ``session_bars=None`` (legacy
     callers/tests), fills read the latest cached close as before.
     """
     global _last_llm_reasoning, _last_llm_summary
@@ -1711,6 +2314,9 @@ async def _llm_review_proposals(
         return executed, []
 
     _last_llm_reasoning = content
+    # Rule 7: the decision is frozen when the response is PARSED — captured
+    # once, before any of these decisions can execute, and never re-stamped.
+    decided_at = _utcnow()
     decisions = _parse_llm_decisions(content)
     if decisions is None:
         logger.warning("Could not parse LLM decisions; executing all proposals. Raw: %s", content[:500])
@@ -1742,7 +2348,18 @@ async def _llm_review_proposals(
     # These execute on top of the approved proposals, through the same exec
     # helpers, honouring partial-size fields and risk guards.
     total_equity = valuation["total_equity"]
+
+    async def _record_ledger() -> None:
+        """Freeze this cycle's LLM decisions in the rule-7 ledger.
+
+        Called only after execution so the fill columns are known; the trades
+        are already committed, so a ledger failure is logged and swallowed
+        (never a trading failure)."""
+        await _freeze_llm_decisions(_ledger_cycle_rows(
+            decisions, proposals, vetoed, executed, decided_at))
+
     if total_equity <= 0:
+        await _record_ledger()
         return executed, vetoed
 
     # Fill prices: contract mode reads F's OPEN from the cycle's strict
@@ -1809,6 +2426,7 @@ async def _llm_review_proposals(
             # (handled in the reconcile step above) execute.
             logger.info("LLM-initiated SELL %s skipped (engine owns exits)", d["ticker"])
 
+    await _record_ledger()
     return executed, vetoed
 
 
@@ -1839,13 +2457,17 @@ async def _llm_decide(
     Fill timing follows the session fill contract (``app.session``): the
     ``signals`` handed in were frozen to data <= the previous session's
     close, and with ``session_bars`` (the cycle's strict F bars) every fill
-    reads F's OPEN — a ticker without an F bar fills nothing. Honest
-    limitation: the LLM's reasoning TEXT is timestamped to the cycle that
-    produced it and there is no frozen-decision ledger yet (Phase 2) — a
-    re-run on identical frozen inputs consults the LLM again and may reason
-    differently; the per-session guard limits that to one consult per
-    session. With ``session_bars=None`` (legacy callers/tests), fills read
-    the latest cached close as before.
+    reads F's OPEN — a ticker without an F bar fills nothing.
+
+    Rule 7 ledger: every parsed decision is appended to ``SimLlmDecision``
+    with the ``decided_at`` frozen at parse time and, when it executed, the
+    frozen fill. This path receives no deterministic proposals, so its rows
+    carry NULL ``det_side``/``det_reason`` and relation ``addition``. The
+    honest limitation that remains is the LLM itself: a re-run on identical
+    frozen inputs consults it again and it may reason differently — the
+    per-session guard limits that to one consult per session. With
+    ``session_bars=None`` (legacy callers/tests), fills read the latest
+    cached close as before.
     """
     # Default fallback
     if signals is None:
@@ -1916,6 +2538,8 @@ async def _llm_decide(
 
     # Store raw LLM reasoning for display in the frontend
     _last_llm_reasoning = content
+    # Rule 7: frozen at PARSE time, before any of these decisions executes.
+    decided_at = _utcnow()
     decisions = _parse_llm_decisions(content)
     if decisions is None:
         logger.warning("Could not parse LLM decisions; falling back. Raw: %s", content[:500])
@@ -1932,6 +2556,7 @@ async def _llm_decide(
     # Recompute equity / budget guards (same logic as deterministic)
     total_equity = valuation["total_equity"]
     if total_equity <= 0:
+        await _freeze_llm_decisions(_ledger_llm_rows(decisions, [], decided_at))
         return []
 
     executed: list[dict] = []
@@ -2020,6 +2645,7 @@ async def _llm_decide(
             logger.info("LLM HOLD %s — %s", ticker, reason)
             continue
 
+    await _freeze_llm_decisions(_ledger_llm_rows(decisions, executed, decided_at))
     return executed
 
 
@@ -2165,6 +2791,16 @@ async def run_cycle() -> dict[str, Any]:
             return {"skipped": True,
                     "reason": f"session {session_key} already processed"}
 
+        # ONE paper stamp for the whole cycle (deposit, trades, snapshot):
+        # one logical run, one configuration. The ContextVar carries it to the
+        # deep executors without changing their call signatures.
+        cfg = await current_config()
+        # The stamp is created first (the deposit needs it); its RunExecution
+        # is recorded only AFTER the refresh/decision-inputs stage below, so
+        # the provenance summary describes the cache the decision read.
+        stamp = await _paper_stamp(cfg, record=False)
+        stamp_token = _RUN_STAMP.set(stamp)
+
         # Reset all per-cycle LLM state; the LLM paths set them if they run.
         # The deterministic path leaves them empty so the frontend can show a
         # "deterministic mode — no LLM was called" explanation instead of
@@ -2182,7 +2818,7 @@ async def run_cycle() -> dict[str, Any]:
         try:
             # 1. Deposit allowance (if new month)
             _set_progress("allowance", "Depositing monthly allowance", started_at=started_at)
-            allowance_result = await deposit_allowance()
+            allowance_result = await deposit_allowance(**stamp)
 
             # 2. Refresh candles for the universe (reuse the nightly prefetch:
             # tickers already fetched within the freshness window are skipped).
@@ -2224,6 +2860,20 @@ async def run_cycle() -> dict[str, Any]:
             # same session (contract rule 2). The stages before this point
             # (allowance, refresh, valuation) are safe to retry.
             _stamp_session_guard(session_key)
+
+            # Mid-run configuration guard: the refresh/valuation awaits above
+            # give an operator time to change the universe/risk config. The
+            # cycle decided under `cfg`; executing/stamping under a changed
+            # configuration would misattribute the run. Refuse BEFORE the
+            # first decision write; the next cycle runs under the new config.
+            if await _config_changed(cfg):
+                return {"skipped": True,
+                        "reason": "run configuration changed mid-run — retry under the new config"}
+
+            # Stable input point: the refresh/frozen-input stages above wrote
+            # the data the decision reads, so the run's provenance belongs
+            # here (exactly once) and before any decision/trade write.
+            await _record_run(stamp, cfg)
 
             # 4. Decide & trade
             strategy = settings.sim_strategy.lower()
@@ -2278,18 +2928,25 @@ async def run_cycle() -> dict[str, Any]:
                     acc = await s.get(SimAccount, 1)
                     if acc is None:
                         acc = SimAccount(id=1, cash=settings.sim_start_cash,
-                                         last_allowance_month=None)
+                                         last_allowance_month=None,
+                                         opening_seed=settings.sim_start_cash)
                         s.add(acc)
                         await s.commit()
                     last_review_week = acc.last_review_week
                 if settings.sim_llm_failure_marker:
                     # --- failure marker: stop-out cascade / drawdown ---
+                    # EPOCH-SCOPED decision inputs: the failure marker must
+                    # not read a CLOSED epoch's stop-outs or peak (the fresh
+                    # book's drawdown restarts with its epoch).
                     async with Session() as s:
                         recent_trades = (await s.scalars(
-                            select(SimTrade).order_by(SimTrade.created_at.desc()).limit(10)
+                            select(SimTrade)
+                            .where(run_config.epoch_clause(SimTrade, stamp["epoch"]))
+                            .order_by(SimTrade.created_at.desc()).limit(10)
                         )).all()
                         peak_equity = (await s.scalar(
-                            select(func.max(SimSnapshot.total_equity))
+                            select(func.max(SimSnapshot.total_equity)).where(
+                                run_config.epoch_clause(SimSnapshot, stamp["epoch"]))
                         )) or 0.0
                     # Mirror the replay's 5-trading-day window (optimize.py).
                     cutoff = _utcnow() - timedelta(days=7)
@@ -2347,16 +3004,7 @@ async def run_cycle() -> dict[str, Any]:
             # completed bar after the refresh above).
             _set_progress("snapshot", "Snapshotting equity curve", started_at=started_at)
             post_valuation = await valuate()
-            allowance_total = post_valuation["allowance_total"]
-            async with Session() as s:
-                snap = SimSnapshot(
-                    cash=post_valuation["cash"],
-                    positions_value=post_valuation["positions_value"],
-                    total_equity=post_valuation["total_equity"],
-                    allowance_total=allowance_total,
-                )
-                s.add(snap)
-                await s.commit()
+            await _write_snapshot(post_valuation, **stamp)
 
             # 5b. Benchmark snapshot
             await _benchmark_snapshot()
@@ -2375,6 +3023,10 @@ async def run_cycle() -> dict[str, Any]:
             # of an indeterminate "Running..." state.
             _set_progress("error", f"{type(e).__name__}: {e}", started_at=started_at, running=False, error=str(e))
             raise
+        finally:
+            # The logical run is over — the frozen stamp must not leak into a
+            # later standalone write in the same task.
+            _RUN_STAMP.reset(stamp_token)
 
 
 def start_run_cycle_background() -> dict[str, Any]:
@@ -2457,36 +3109,34 @@ def get_last_llm_summary() -> dict[str, Any]:
         action = d["action"]
         reason = d["reason"]
         det = det_by_ticker.get(ticker)
+        det_side = det["side"] if det else None
+        # Shared with the rule-7 ledger writer (sim._llm_decision_relation):
+        # veto / hold / confirmation / change / addition cannot drift apart.
+        relation = _llm_decision_relation(
+            action, det_side, vetoed=ticker in vetoed_tickers)
 
-        if action == "HOLD":
-            if ticker in vetoed_tickers:
-                # HOLD on a proposed trade = veto (blocked execution)
-                det_side = det["side"] if det else None
-                vetoes.append({
-                    "ticker": ticker, "action": "HOLD", "reason": reason,
-                    "det_action": det_side, "det_reason": det.get("reason", "") if det else None,
-                    "change_type": "veto",
-                })
-            else:
-                # HOLD on a non-proposal ticker = passive hold
-                holds.append({"ticker": ticker, "reason": reason})
-            continue
-
-        if det:
-            det_side = det["side"]
-            if action == det_side:
-                confirmations.append({
-                    "ticker": ticker, "action": action, "reason": reason,
-                    "det_reason": det.get("reason", ""),
-                })
-            else:
-                changes.append({
-                    "ticker": ticker, "action": action, "reason": reason,
-                    "det_action": det_side, "det_reason": det.get("reason", ""),
-                    "change_type": "override",
-                })
-        else:
-            # LLM proposed something the deterministic engine didn't
+        if relation == "veto":
+            # HOLD on a proposed trade = veto (blocked execution)
+            vetoes.append({
+                "ticker": ticker, "action": "HOLD", "reason": reason,
+                "det_action": det_side, "det_reason": det.get("reason", "") if det else None,
+                "change_type": "veto",
+            })
+        elif relation == "hold":
+            # HOLD on a non-proposal ticker = passive hold
+            holds.append({"ticker": ticker, "reason": reason})
+        elif relation == "confirmation":
+            confirmations.append({
+                "ticker": ticker, "action": action, "reason": reason,
+                "det_reason": det.get("reason", ""),
+            })
+        elif relation == "change":
+            changes.append({
+                "ticker": ticker, "action": action, "reason": reason,
+                "det_action": det_side, "det_reason": det.get("reason", ""),
+                "change_type": "override",
+            })
+        else:  # addition — LLM proposed something the engine didn't
             changes.append({
                 "ticker": ticker, "action": action, "reason": reason,
                 "det_action": None, "det_reason": None,
@@ -2527,6 +3177,12 @@ def get_last_llm_summary() -> dict[str, Any]:
 
 
 async def get_trades(limit: int = 100) -> list[dict]:
+    """Raw trade-log export (all epochs, newest first).
+
+    Deliberately NOT epoch-clipped: the audit/history listing. The
+    DECISION-feeding trade read (the failure-marker scan) DOES carry the epoch
+    clause.
+    """
     async with Session() as s:
         rows = (
             await s.scalars(
@@ -2549,23 +3205,42 @@ async def get_trades(limit: int = 100) -> list[dict]:
 
 
 async def get_allowances() -> list[dict]:
+    """The CURRENT epoch's deposit ledger, newest month first (epoch-scoped:
+    no read may count the lifetime after a reset; closed epochs' rows stay in
+    the table for audit). ``mode``/``config_id``/``epoch`` are additive keys.
+    """
     async with Session() as s:
+        cur = await run_config.current_epoch(_ENGINE, session=s)
         rows = (
             await s.scalars(
-                select(SimAllowance).order_by(SimAllowance.month.desc())
+                select(SimAllowance)
+                .where(run_config.epoch_clause(SimAllowance, cur))
+                .order_by(SimAllowance.month.desc())
             )
         ).all()
         return [
-            {"id": r.id, "amount": r.amount, "month": r.month, "at": r.created_at.isoformat()}
+            {"id": r.id, "amount": r.amount, "month": r.month, "at": r.created_at.isoformat(),
+             "mode": r.mode, "config_id": r.config_id, "epoch": r.epoch}
             for r in rows
         ]
 
 
 async def get_equity_curve(limit: int = 365) -> list[dict]:
+    """The CURRENT epoch's equity curve, oldest first.
+
+    Epoch-scoped at the SQL level and the limit applies AFTER the clip: a
+    reset restarts the curve, so closed-epoch rows stay in the table
+    (audit/history) but never leak into the chart. Each row carries its
+    provenance additively (``mode``/``config_id``/``epoch``; JSON-safe None on
+    legacy rows).
+    """
     async with Session() as s:
+        cur = await run_config.current_epoch(_ENGINE, session=s)
         rows = (
             await s.scalars(
-                select(SimSnapshot).order_by(SimSnapshot.created_at.desc()).limit(limit)
+                select(SimSnapshot)
+                .where(run_config.epoch_clause(SimSnapshot, cur))
+                .order_by(SimSnapshot.created_at.desc()).limit(limit)
             )
         ).all()
         # Return oldest-first for charting
@@ -2577,6 +3252,9 @@ async def get_equity_curve(limit: int = 365) -> list[dict]:
                 "positions_value": r.positions_value,
                 "total_equity": r.total_equity,
                 "allowance_total": r.allowance_total,
+                "mode": r.mode,
+                "config_id": r.config_id,
+                "epoch": r.epoch,
             }
             for r in rows
         ]
@@ -2615,6 +3293,28 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
     now(), which would silently anchor the position ratchet to the wrong
     bars) and the percent stop frozen at that entry fill (contract rule 5).
 
+    FORWARD-RECORD PROTECTION (the audit's "do not overwrite a forward
+    record"): if the CURRENT epoch already holds a forward paper row, the
+    replay is REFUSED before any mutation. A replay regenerates the book's
+    ORIGIN; a "bounded re-backfill" (regenerate only the pre-paper synthetic
+    segment) was considered and REJECTED because the seam books a spurious
+    external flow (``allowance_total`` jumps between the two segments'
+    baselines) and the paper book's origin would no longer match the synthetic
+    run preceding it. Reset first — a reset preserves the old history as a
+    closed epoch. The refusal FAILS CLOSED: a legacy NULL-mode row cannot be
+    proven synthetic, so it is protected too.
+
+    The replay's rows are stamped ``mode="backfill"`` in the current epoch; a
+    RE-backfill replaces only its own rows (mode ``backfill``/NULL in the same
+    epoch) — never a paper row and never a closed epoch's history. The
+    benchmark tables are NOT part of the replay (its own backfill_benchmark
+    writes them) and are left untouched.
+
+    CAPITAL BASIS: this replay's baseline IS ``params.start_cash`` (the
+    configured ``sim_start_cash`` seed) plus its monthly deposits, and its
+    snapshot rows carry exactly that explicit contributed total — consistent
+    with the live ``valuate`` seed-inclusive basis.
+
     ``start`` semantics (mirrors monthly.backfill / daily_core.backfill):
       - explicit "YYYY-MM-DD": replay from that day
       - "all": the full stored history (candles to 1980; the replay walks
@@ -2642,6 +3342,22 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
     if _run_cycle_lock.locked():
         return {"skipped": True, "reason": "a sim cycle is already running"}
     async with _run_cycle_lock:
+        # --- forward-record guard: BEFORE any mutation ---------------------
+        cur = await run_config.current_epoch(_ENGINE, session_factory=Session)
+        if await run_config.has_paper_rows(_ENGINE, cur, session_factory=Session):
+            return {"ok": False,
+                    "error": "a forward paper record exists for this epoch — "
+                             "backfill would overwrite the live book's origin; "
+                             "reset first (reset preserves history as a closed epoch)"}
+        # The replay's OWN configuration snapshot — never a paper stamp (a
+        # backfill must not create a paper config row while it prepares).
+        cfg = await current_config()
+        stamp = {
+            "mode": "backfill",
+            "config_id": await run_config.get_or_create(
+                _ENGINE, "backfill", cfg, session_factory=Session),
+            "epoch": cur,
+        }
         if start is None:
             start = await _sync_start_date()
         elif start == "all":
@@ -2663,23 +3379,6 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
         days = [e["time"] for e in res.equity_curve]
         replay_months = sorted({d[:7] for d in days})
 
-        # --- wipe + persist (keep the live allowance marker like the other
-        # backfills) ---
-        async with Session() as s:
-            acc0 = await s.get(Acc, 1)
-            live_allowance_month = acc0.last_allowance_month if acc0 else None
-            await s.execute(sa_delete(Tr))
-            await s.execute(sa_delete(Pos))
-            await s.execute(sa_delete(Al))
-            await s.execute(sa_delete(Sn))
-            acc = await s.get(Acc, 1)
-            if acc is None:
-                acc = Acc(id=1, cash=0.0)
-                s.add(acc)
-            acc.cash = 0.0
-            acc.last_allowance_month = None
-            acc.last_review_week = None
-            await s.commit()
         # The replay replaces the whole portfolio state, so the per-session
         # fill guard must reset too — the next cycle must be free to run.
         _reset_session_guard()
@@ -2727,64 +3426,114 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
         # marker lagged behind the row the next live deposit would hit the
         # unique allowance constraint. (Mirrors daily_core.backfill.)
         current_month = _current_month()
-        if live_allowance_month == current_month and current_month not in replay_months:
-            cash += params.monthly_allowance
-            replay_months = sorted(set(replay_months) | {current_month})
 
-        async with Session() as s:
-            acc = await s.get(Acc, 1)
-            assert acc is not None  # created in the wipe step above
-            acc.cash = round(cash, 2)
-            for t, sh in shares.items():
-                # avg_cost not tracked per-fill here — book at the last close
-                # like the other backfills (the equity curve is what matters).
-                last_px = None
-                df = series.get(t)
-                if df is not None and len(df):
-                    last_px = float(df["close"].iloc[-1])
-                anchor = entry_anchor.get(t)
-                # opened_at: the replay's ACTUAL first-buy date (16:00 UTC
-                # on that session), NOT wall-clock now() — this is the
-                # monotone ATR ratchet's entry anchor (contract rule 6);
-                # anchoring it to now() would let the ratchet see bars from
-                # before the position existed.
-                opened_at = (pd.Timestamp(f"{anchor['date']} 16:00:00+00:00").to_pydatetime()
-                             if anchor else None)
-                # stop_price: the percent stop frozen at the ENTRY fill
-                # (contract rule 5) — the same value the replay froze from
-                # its proposals' entry_stop for the percent config the live
-                # sim runs (optimize._live_sim_params).
-                frozen_stop = (anchor["price"] * (1 - params.stop_pct / 100)
-                               if anchor and params.stop_type == "percent" else None)
-                s.add(Pos(ticker=t, shares=round(sh, 6),
-                          avg_cost=round(last_px or 0.0, 6),
-                          opened_at=opened_at, stop_price=frozen_stop))
-            for tr in res.trades:
-                s.add(Tr(ticker=tr["ticker"], side=tr["side"],
-                         shares=round(tr["shares"], 6), price=round(tr["price"], 6),
-                         cash_after=0.0, reason=f"backfill: {tr['reason']}",
-                         created_at=pd.Timestamp(f"{tr['date']} 16:00:00+00:00").to_pydatetime()))
-            for m in replay_months:
-                s.add(Al(amount=settings.sim_monthly_allowance, month=m))
-            # Keep the marker consistent: never let it lag the newest inserted
-            # row, or the next live deposit would duplicate that month.
-            last_month = max(live_allowance_month or "",
-                             replay_months[-1] if replay_months else "")
-            acc.last_allowance_month = last_month or None
-            allowance_running = 0.0
-            months_seen: set[str] = set()
-            for e in res.equity_curve:
-                d = e["time"]
-                # equity_curve is ascending, so counting distinct months as we
-                # go is O(days) rather than re-scanning the curve per point.
-                months_seen.add(d[:7])
-                allowance_running = round(
-                    params.start_cash + params.monthly_allowance * len(months_seen), 2)
-                s.add(Sn(cash=0.0, positions_value=e["equity"],
-                         total_equity=e["equity"],
-                         allowance_total=round(allowance_running, 2),
-                         created_at=pd.Timestamp(f"{d} 16:00:00+00:00").to_pydatetime()))
-            await s.commit()
+        # --- persist the end state: ONE transaction under the state lock ---
+        # The forward-record guard, the deletions, the inserts, the account
+        # re-seed/markers, the RunExecution and the commit are ONE transaction
+        # serialized with standalone writers by ``_state_write_lock``: a
+        # writer either committed BEFORE it (the guard refuses) or runs AFTER
+        # the lock releases (its paper row lands on the new book and is never
+        # erased) — it can never slip into the gap. The long replay/loader work
+        # above stays OUTSIDE the lock; only the final commit block is held.
+        async with _state_write_lock:
+            async with Session() as s:
+                if await run_config.has_paper_rows(_ENGINE, cur, session=s):
+                    await s.rollback()
+                    return {"ok": False,
+                            "error": "a forward paper record exists for this epoch — "
+                                     "backfill would overwrite the live book's origin; "
+                                     "reset first (reset preserves history as a closed epoch)"}
+                acc = await s.get(Acc, 1)
+                live_allowance_month = None if acc is None else acc.last_allowance_month
+                # The live engine deposits at the START of the month, so it may
+                # already have deposited the CURRENT month while the replay
+                # window has no candle for it yet (e.g. backfill on the 1st
+                # before the market opens). The replay never re-deposits it, so
+                # restore the contribution and the row — otherwise the account
+                # ends permanently short. (Mirrors daily_core.backfill.)
+                if (live_allowance_month == current_month
+                        and current_month not in replay_months):
+                    cash += params.monthly_allowance
+                    replay_months = sorted(set(replay_months) | {current_month})
+                # Only this epoch's replaceable rows go: mode backfill, or
+                # legacy NULL-mode rows (cannot be proven forward). A paper row
+                # would have been refused above; a CLOSED epoch's history is
+                # never touched. Positions are current STATE, cleared outright.
+                for tbl in (Tr, Al, Sn):
+                    await s.execute(sa_delete(tbl).where(
+                        run_config.epoch_clause(tbl, cur),
+                        or_(tbl.mode.is_(None), tbl.mode == "backfill")))
+                await s.execute(sa_delete(Pos))
+                if acc is None:
+                    acc = Acc(id=1, cash=0.0, opening_seed=params.start_cash)
+                    s.add(acc)
+                acc.cash = round(cash, 2)
+                acc.last_review_week = None
+                # This engine's replay baseline IS params.start_cash (the
+                # configured sim_start_cash seed the synthetic book was opened
+                # with) — freeze it as the epoch's capital basis.
+                acc.opening_seed = params.start_cash
+                # Appended in THIS transaction, after the in-tx forward guard
+                # and the account seed: a refusal/failure records no execution.
+                await _record_run(stamp, cfg, session=s)
+                for t, sh in shares.items():
+                    # avg_cost not tracked per-fill here — book at the last
+                    # close like the other backfills (the equity curve is what
+                    # matters).
+                    last_px = None
+                    df = series.get(t)
+                    if df is not None and len(df):
+                        last_px = float(df["close"].iloc[-1])
+                    anchor = entry_anchor.get(t)
+                    # opened_at: the replay's ACTUAL first-buy date (16:00 UTC
+                    # on that session), NOT wall-clock now() — the monotone ATR
+                    # ratchet's entry anchor (contract rule 6).
+                    opened_at = (pd.Timestamp(
+                        f"{anchor['date']} 16:00:00+00:00").to_pydatetime()
+                        if anchor else None)
+                    # stop_price: the percent stop frozen at the ENTRY fill
+                    # (contract rule 5).
+                    frozen_stop = (anchor["price"] * (1 - params.stop_pct / 100)
+                                   if anchor and params.stop_type == "percent" else None)
+                    s.add(Pos(ticker=t, shares=round(sh, 6),
+                              avg_cost=round(last_px or 0.0, 6),
+                              opened_at=opened_at, stop_price=frozen_stop))
+                for tr in res.trades:
+                    s.add(Tr(ticker=tr["ticker"], side=tr["side"],
+                             shares=round(tr["shares"], 6),
+                             price=round(tr["price"], 6), cash_after=0.0,
+                             reason=f"backfill: {tr['reason']}",
+                             mode=stamp["mode"], config_id=stamp["config_id"],
+                             epoch=stamp["epoch"],
+                             created_at=pd.Timestamp(
+                                 f"{tr['date']} 16:00:00+00:00").to_pydatetime()))
+                for m in replay_months:
+                    s.add(Al(amount=settings.sim_monthly_allowance, month=m,
+                             mode=stamp["mode"], config_id=stamp["config_id"],
+                             epoch=stamp["epoch"]))
+                # Keep the marker consistent: never let it lag the newest
+                # inserted row, or the next live deposit would duplicate it.
+                last_month = max(live_allowance_month or "",
+                                 replay_months[-1] if replay_months else "")
+                acc.last_allowance_month = last_month or None
+                allowance_running = 0.0
+                months_seen: set[str] = set()
+                for e in res.equity_curve:
+                    d = e["time"]
+                    # equity_curve is ascending, so counting distinct months
+                    # as we go is O(days), not a per-point rescan.
+                    months_seen.add(d[:7])
+                    allowance_running = round(
+                        params.start_cash
+                        + params.monthly_allowance * len(months_seen), 2)
+                    s.add(Sn(cash=0.0, positions_value=e["equity"],
+                             total_equity=e["equity"],
+                             allowance_total=round(allowance_running, 2),
+                             mode=stamp["mode"], config_id=stamp["config_id"],
+                             epoch=stamp["epoch"],
+                             created_at=pd.Timestamp(
+                                 f"{d} 16:00:00+00:00").to_pydatetime()))
+                await s.commit()
 
         return {"ok": True, "days": len(res.equity_curve),
                 "start": res.equity_curve[0]["time"], "end": res.equity_curve[-1]["time"],
@@ -2796,7 +3545,12 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
 
 async def _sync_start_date() -> str | None:
     """Earliest MonthlySnapshot date — the sim backfill's default start so
-    the sim / monthly / daily-core curves cover the same window."""
+    the sim / monthly / daily-core curves cover the same window.
+
+    Deliberately NOT epoch-clipped: a fresh backfill may start inside a CLOSED
+    epoch's window to model a shared historical experiment. It only READS that
+    history; the replay's own rows are stamped into the current epoch, so
+    nothing in a closed epoch is rewritten."""
     from .db import MonthlySnapshot
     async with Session() as s:
         d = await s.scalar(select(func.min(MonthlySnapshot.created_at)))
@@ -2808,24 +3562,79 @@ async def _sync_start_date() -> str | None:
 # ---------------------------------------------------------------------------
 
 async def reset_sim() -> dict[str, Any]:
-    """Wipe all sim tables and re-initialize with start cash."""
-    async with Session() as s:
-        await s.execute(delete(SimTrade))
-        await s.execute(delete(SimPosition))
-        await s.execute(delete(SimAllowance))
-        await s.execute(delete(SimSnapshot))
-        await s.execute(delete(SimAccount))
+    """Close the current epoch and re-seed the book — HISTORY IS PRESERVED.
 
-        acc = SimAccount(id=1, cash=settings.sim_start_cash, last_allowance_month=None)
-        s.add(acc)
-        await s.commit()
+    The money ledger survives: trades, allowances and snapshots are NOT
+    deleted. One ``RunEpoch`` boundary records the reset (with a note counting
+    what was preserved), the current positions are cleared and the account is
+    re-seeded (cash = start, month/week markers None), all in ONE transaction
+    under the ENGINE LOCK (a concurrent cycle can never interleave a trade or
+    a boundary with the re-seed). The equity curve restarts at the new epoch
+    (``get_equity_curve`` clips to it); preserved rows keep their epoch and
+    remain auditable. The LLM decision ledger (SimLlmDecision) is untouched —
+    it is append-only by contract.
 
-    # A fresh portfolio leaves the next cycle free (per-session fill guard).
-    _reset_session_guard()
+    CAPITAL BASIS: the new epoch is an INDEPENDENT paper capital baseline. Its
+    contribution basis is the configured ``start_cash`` seed (EXTERNAL capital
+    the paper book is opened with — not a real transfer) plus the epoch's own
+    monthly deposits; a deposit for a month the closed epoch already funded is
+    a NEW allocation in the new ledger (UNIQUE(month, epoch) lets both rows
+    coexist). Epoch metrics never count the lifetime.
 
-    await reset_benchmark()
-    logger.info("Sim reset: cash=%.2f", settings.sim_start_cash)
-    return {"ok": True, "cash": settings.sim_start_cash}
+    DERIVED-ARTIFACT EXCEPTION: the DCA benchmark tables are a comparison
+    artifact (not a decision book and not evidence of what the portfolio did),
+    so ``reset_benchmark()`` still REPLACES them destructively — documented
+    here because it is the one deliberate exception to "resets preserve
+    history". The per-session fill guard is re-armed for the fresh book.
+
+    Returns the new epoch and the preserved row counts additively; existing
+    keys are unchanged.
+    """
+    async with _run_cycle_lock, _state_write_lock:
+        async with Session() as s:
+            # ONE transaction: boundary + counts + positions + re-seed. The
+            # helpers take the caller's session and never commit behind us.
+            cur = await run_config.current_epoch(_ENGINE, session=s)
+            preserved = {
+                "trades": (await s.scalar(
+                    select(func.count()).select_from(SimTrade)
+                    .where(run_config.epoch_clause(SimTrade, cur)))) or 0,
+                "snapshots": (await s.scalar(
+                    select(func.count()).select_from(SimSnapshot)
+                    .where(run_config.epoch_clause(SimSnapshot, cur)))) or 0,
+                "allowances": (await s.scalar(
+                    select(func.count()).select_from(SimAllowance)
+                    .where(run_config.epoch_clause(SimAllowance, cur)))) or 0,
+            }
+            note = (f"reset — {preserved['trades']} trades, "
+                    f"{preserved['snapshots']} snapshots, "
+                    f"{preserved['allowances']} allowances preserved "
+                    f"as epoch {cur}")
+            new_epoch = await run_config.record_boundary(_ENGINE, note, session=s)
+            await s.execute(delete(SimPosition))
+            acc = await s.get(SimAccount, 1)
+            if acc is None:
+                acc = SimAccount(id=1, cash=settings.sim_start_cash,
+                                 last_allowance_month=None,
+                                 opening_seed=settings.sim_start_cash)
+                s.add(acc)
+            else:
+                acc.cash = settings.sim_start_cash
+                acc.last_allowance_month = None
+                acc.last_review_week = None
+                # The new epoch's ACTUAL opening capital (external seed).
+                acc.opening_seed = settings.sim_start_cash
+            await s.commit()
+
+        # A fresh portfolio leaves the next cycle free (per-session fill guard).
+        _reset_session_guard()
+
+        # Derived comparison artifact — destructive BY DESIGN (see docstring).
+        await reset_benchmark()
+    logger.info("Sim reset: cash=%.2f epoch=%s (preserved %s)",
+                settings.sim_start_cash, new_epoch, preserved)
+    return {"ok": True, "cash": settings.sim_start_cash,
+            "epoch": new_epoch, "preserved": preserved}
 
 
 # ---------------------------------------------------------------------------
@@ -3596,6 +4405,9 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
         return {"text": "No messages to send.", "trades": [], "actions_executed": False, "history": []}
 
     context = await _build_sim_chat_context()
+    # The turn's configuration is captured BEFORE the (potentially slow) LLM
+    # call; the action block executes only if it did not change meanwhile.
+    cfg_at_start = await current_config()
 
     try:
         out = await llm_mod.chat([
@@ -3607,6 +4419,9 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
         return {"text": f"LLM unavailable: {e}", "trades": [], "actions_executed": False, "history": history}
 
     content = out["text"]
+    # Rule 7: frozen when the response is PARSED — the ledger write below
+    # must never re-stamp it.
+    decided_at = _utcnow()
 
     # Check for action block
     actions = _parse_action_block(content)
@@ -3628,6 +4443,16 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
         history.append({"role": "assistant", "content": display_text})
 
     if actions:
+        # Chat trades and marks are forward records: one paper stamp for the
+        # turn, threaded explicitly (a refusal never stamps a changed config).
+        # Resolve without recording: a turn REFUSED by the config gate must
+        # not appear in the execution ledger. Recorded once after the gate.
+        stamp = await _paper_stamp(cfg_at_start, record=False)
+        if await _config_changed(cfg_at_start):
+            return {"text": display_text, "trades": [], "actions_executed": False,
+                    "history": history,
+                    "skipped": "run configuration changed mid-run — retry"}
+        await _record_run(stamp, cfg_at_start)
         # Execute the proposed actions
         valuation = await valuate()
         total_equity = valuation["total_equity"]
@@ -3651,7 +4476,8 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
                     target_shares = action["shares"]
                 elif "amount" in action:
                     target_shares = action["amount"] / price
-                t = await _exec_sell(ticker, price, target_shares, f"User chat: {reason}")
+                t = await _exec_sell(ticker, price, target_shares,
+                                     f"User chat: {reason}", **stamp)
                 if t:
                     executed_trades.append(t)
                     valuation = await valuate()
@@ -3692,7 +4518,8 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
                     continue
 
                 override_tag = " [reserve spent]" if action.get("use_reserve") else ""
-                t = await _exec_buy(ticker, price, budget, f"User chat:{override_tag} {reason}")
+                t = await _exec_buy(ticker, price, budget,
+                                    f"User chat:{override_tag} {reason}", **stamp)
                 if t:
                     executed_trades.append(t)
                     valuation = await valuate()
@@ -3703,15 +4530,12 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
         # Take a snapshot after chat-driven trades
         if executed_trades:
             post_val = await valuate()
-            async with Session() as s:
-                snap = SimSnapshot(
-                    cash=post_val["cash"],
-                    positions_value=post_val["positions_value"],
-                    total_equity=post_val["total_equity"],
-                    allowance_total=post_val["allowance_total"],
-                )
-                s.add(snap)
-                await s.commit()
+            await _write_snapshot(post_val, **stamp)
+
+        # Rule 7: freeze this turn's actions (best-effort — a skipped action
+        # keeps NULL fill columns, a ledger failure never fails the turn).
+        await _freeze_llm_decisions(
+            _ledger_chat_rows(actions, executed_trades, decided_at))
 
         return {
             "text": display_text,
@@ -3765,6 +4589,9 @@ async def sim_chat_stream(messages: list[dict]):
         return
 
     context = await _build_sim_chat_context()
+    # The turn's configuration is captured BEFORE the (potentially slow) LLM
+    # stream; the action block executes only if it did not change meanwhile.
+    cfg_at_start = await current_config()
     full_parts: list[str] = []
     error_msg: str | None = None
 
@@ -3823,6 +4650,9 @@ async def sim_chat_stream(messages: list[dict]):
 
     # Parse any action block from the complete raw text.
     actions = _parse_action_block(raw_content)
+    # Rule 7: the turn's decision is frozen at PARSE time (the empty-error
+    # path above returned before this point — no decision was made).
+    decided_at = _utcnow()
     display_text = raw_content
     if actions:
         start = raw_content.find("[[ACTION]]")
@@ -3843,6 +4673,23 @@ async def sim_chat_stream(messages: list[dict]):
     executed_trades: list[dict] = []
     actions_executed = False
     if actions:
+        # Chat trades and marks are forward records: one paper stamp for the
+        # turn, threaded explicitly (a refusal never stamps a changed config).
+        # Resolve without recording: a turn REFUSED by the config gate must
+        # not appear in the execution ledger. Recorded once after the gate.
+        stamp = await _paper_stamp(cfg_at_start, record=False)
+        if await _config_changed(cfg_at_start):
+            yield {
+                "type": "done",
+                "text": display_text,
+                "trades": [],
+                "actions_executed": False,
+                "raw": raw_content,
+                "history": history,
+                "skipped": "run configuration changed mid-run — retry",
+            }
+            return
+        await _record_run(stamp, cfg_at_start)
         # Execute proposed actions (same risk logic as sim_chat).
         valuation = await valuate()
         total_equity = valuation["total_equity"]
@@ -3865,7 +4712,8 @@ async def sim_chat_stream(messages: list[dict]):
                     target_shares = action["shares"]
                 elif "amount" in action:
                     target_shares = action["amount"] / price
-                t = await _exec_sell(ticker, price, target_shares, f"User chat: {reason}")
+                t = await _exec_sell(ticker, price, target_shares,
+                                     f"User chat: {reason}", **stamp)
                 if t:
                     executed_trades.append(t)
                     valuation = await valuate()
@@ -3899,7 +4747,8 @@ async def sim_chat_stream(messages: list[dict]):
                     continue
 
                 override_tag = " [reserve spent]" if action.get("use_reserve") else ""
-                t = await _exec_buy(ticker, price, budget, f"User chat:{override_tag} {reason}")
+                t = await _exec_buy(ticker, price, budget,
+                                    f"User chat:{override_tag} {reason}", **stamp)
                 if t:
                     executed_trades.append(t)
                     valuation = await valuate()
@@ -3909,15 +4758,10 @@ async def sim_chat_stream(messages: list[dict]):
 
         if executed_trades:
             post_val = await valuate()
-            async with Session() as s:
-                snap = SimSnapshot(
-                    cash=post_val["cash"],
-                    positions_value=post_val["positions_value"],
-                    total_equity=post_val["total_equity"],
-                    allowance_total=post_val["allowance_total"],
-                )
-                s.add(snap)
-                await s.commit()
+            await _write_snapshot(post_val, **stamp)
+        # Rule 7: freeze this turn's actions, exactly like sim_chat.
+        await _freeze_llm_decisions(
+            _ledger_chat_rows(actions, executed_trades, decided_at))
         actions_executed = True
 
     yield {

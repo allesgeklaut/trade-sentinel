@@ -225,6 +225,18 @@ class Settings(BaseSettings):
     sim_monthly_min_history_days: int = 253  # trading days of valid closes required
     sim_monthly_cost_oneway: float = 0.0010  # paper friction, one-way bps on notional swapped
     sim_monthly_fundamentals_source: str = "edgar"  # edgar (US filers) + yfinance fallback | yfinance-only
+    # Price-age policy for the FACTOR ENGINES only (app/price_freshness.py is
+    # the one definition): a stored print older than this many CALENDAR days
+    # is not a current mark — a missing/stale quote is not a valid executable
+    # price. Rationale: factor prices are daily bars, so 10 calendar days is
+    # ~7 sessions — enough to bridge the US/EU holiday gaps including
+    # Thanksgiving week (Thu+Fri closed) and a weekend, while anything older
+    # than a full trading week+ is no longer "today's" price. Overshoot on
+    # this boundary only delays the visible stale flag by days, so the
+    # tighter default is the safer one. NOT used by the savings tracker (a
+    # real-money EUR ledger with its own owner) or the technical sim (its own
+    # raw-price contract, app/session.py) — factor marks/ranking/FX only.
+    factor_price_max_age_days: int = 10
 
     # --- SEC EDGAR fair-access contact ------------------------------------
     # SEC's edge blocks User-Agents without a contact email on www.sec.gov (the

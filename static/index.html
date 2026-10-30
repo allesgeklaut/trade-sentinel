@@ -1737,7 +1737,10 @@
                 (paid monthly like TR), Sparplan buys and one-off manual buys executed virtually from that
                 cash. No connection to TR: seed the balance, then true it up when it drifts. Your held
                 positions and every future € invested into positions (Sparplan buys, manual buys,
-                Saveback) are mirrored into the current daily-core suggestion for comparison.
+                Saveback) also feed an equal-allocation picks mirror: each amount is split equally
+                across the Daily-Core picks available at that pass, at the latest cached prices. That
+                mirror is a picks comparison — not Daily-Core strategy performance (no rebalance,
+                sells, protection overlays or cash timing).
             </p>
             <div class="row">
                 <label>Cash balance (€)
@@ -1758,12 +1761,14 @@
             </div>
         </div>
         <div class="sim-section" id="savings-main" style="display:none">
-            <div class="sim-section-title">Equity Curve (cash + positions vs contributed, EUR)</div>
+            <div class="sim-section-title">Equity Curve (cash + positions vs net contributed capital, EUR)</div>
             <div style="display:flex;gap:16px;margin-bottom:8px;flex-wrap:wrap">
                 <span style="color:#42ff72;font-size:12px">● Total (cash + positions + accrued interest)</span>
                 <span style="color:#4d9fff;font-size:12px">● Positions value</span>
-                <span style="color:#b48cff;font-size:12px">● Daily-core mirror (same €, their picks)</span>
-                <span style="color:#7aaa81;font-size:12px">● Contributed (seed + transfers)</span>
+                <span style="color:#b48cff;font-size:12px"
+                    title="Each invested amount split equally across the Daily-Core picks available at that date, at the latest cached prices — a picks comparison, not Daily-Core strategy performance (no rebalance, sells, protection overlays or cash timing).">● Equal-allocation picks mirror (same €, equal split)</span>
+                <span style="color:#7aaa81;font-size:12px"
+                    title="NET contributed capital: seed + deposits MINUS withdrawals. Taking money out lowers this line, so it never looks like investment P&L.">● Net contributed (deposits − withdrawals)</span>
                 <span style="flex:1"></span>
                 <span id="sv-range-bar" style="display:inline-flex;gap:4px;margin-left:10px">
                     <button class="range-btn" data-range="6M" onclick="setSavingsRange('6M')">6M</button>
@@ -1780,7 +1785,7 @@
                 <div id="savings-positions-table"></div>
             </div>
             <div class="sim-section">
-                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">DAILY-CORE MIRROR</h3>
+                <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">EQUAL-ALLOCATION PICKS MIRROR</h3>
                 <div id="savings-mirror-summary" style="margin-bottom:8px"></div>
                 <div id="savings-mirror-positions"></div>
             </div>
@@ -1810,8 +1815,9 @@
                 <button id="savings-refresh-btn" onclick="svRefreshData(this)">Refresh prices</button>
                 <button onclick="svRunNow(this)">Run pass now</button>
                 <button onclick="svTrueupPrompt(this)" title="Reconciliation only: fixes drift between the tracker and your real TR cash (small deltas, interest display differences). Fresh money you moved in goes through 'Add deposit'.">True-up balance</button>
-                <button onclick="svDepositPrompt(this)" title="Fresh money moved into your TR cash — raises the tracked cash and counts as a contribution (Contributed), unlike a true-up delta">Add deposit</button>
-                <button onclick="svBuyPrompt(this)" title="One-off asset purchase paid from your TR cash — deducts from the tracked balance, mirrors into daily-core">Add buy</button>
+                <button onclick="svDepositPrompt(this)" title="Fresh money moved into your TR cash — raises the tracked cash and counts as a contribution (net contributed capital), unlike a true-up delta">Add deposit</button>
+                <button onclick="svWithdrawPrompt(this)" title="Fresh money moved OUT of your TR cash back to your bank — lowers the tracked cash and the net contributed capital (an external flow, not an investment loss, and not a true-up). A larger real-world gap is the true-up's job.">Withdraw</button>
+                <button onclick="svBuyPrompt(this)" title="One-off asset purchase paid from your TR cash — deducts from the tracked balance and adds an equal-allocation picks mirror entry (the € split equally across the Daily-Core picks available then, at the latest cached prices)">Add buy</button>
                 <button onclick="svSavebackPrompt(this)" title="TR's 1% card Saveback that TR invests for you on the 2nd — bonus money from nowhere, NOT from your tracked cash">Add Saveback</button>
                 <label style="font-size:12px;color:#7aaa81;display:flex;align-items:center;gap:4px">
                     Transfer €<input type="number" id="sv-cfg-transfer" min="0" step="1"
@@ -1822,14 +1828,19 @@
                         style="max-width:80px;background:#0a1a10;color:#b7ffc0;border:1px solid #1d4d29;border-radius:4px;padding:4px">
                 </label>
                 <button onclick="svSaveConfig(this)">Save config</button>
-                <button onclick="svReinitConfirm()" title="Back to the setup form (wipes the TRACKER, not the sims)">Re-initialize</button>
+                <button onclick="svReinitConfirm()" title="Back to the setup form — clears the tracker's current cash, positions and plans and restarts the picks mirror; the money ledger and equity curve are preserved (a reset boundary starts a new epoch), the sims are untouched">Re-initialize</button>
             </div>
             <div id="savings-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
             <div style="margin-top:6px;font-size:11px;color:#7aaa81">
                 Real money — never touched by "Reset All Sims" or any backfill. Interest accrues daily at
                 rate/365 on the cash balance and pays out monthly, like Trade Republic. "Add deposit"
-                moves fresh money in (a contribution); Sparplan buys and one-off buys ("Add buy")
-                deduct from the tracked cash and mirror into daily-core; "Add Saveback" books TR's 1%
+                moves fresh money in (a contribution); "Withdraw" moves fresh money out (an external
+                flow that lowers net contributed capital — never a loss; only a true-up reconciles
+                drift); Sparplan buys and one-off buys ("Add buy")
+                deduct from the tracked cash and add an equal-allocation picks mirror entry (each
+                amount split equally across the Daily-Core picks available at the time, at latest
+                cached prices — a picks comparison, not Daily-Core strategy performance);
+                "Add Saveback" books TR's 1%
                 bonus (new money, cash untouched); "True-up" only reconciles drift. A missing price
                 defers a Sparplan buy to the next pass.
             </div>
@@ -3663,10 +3674,16 @@
 
         async function loadSavingsAll() {
             const limit = SAVINGS_RANGE_LIMIT[savingsRange] || 380;
-            const [status, snaps, mirror] = await Promise.all([
+            const [status, snaps, mirror, metricsXirr, metricsTwr] = await Promise.all([
                 api('savings/status').catch(() => null),
                 api(`savings/equity?limit=${limit}`).catch(() => null),
                 api(`savings/mirror?limit=${limit}`).catch(() => null),
+                // Same read-only metrics pair as the other tabs: XIRR
+                // (money-weighted, dated external flows from the ledger) +
+                // TWR (unitized NAV over the snapshot curve). The full
+                // window (no range limit) is what the metric annualizes.
+                api('savings/metrics/xirr').catch(() => null),
+                api('savings/metrics/twr').catch(() => null),
             ]);
             if (!status) {
                 document.getElementById('savings-summary').innerHTML =
@@ -3674,7 +3691,7 @@
                 return;
             }
             renderSavingsSetupVsMain(status);
-            renderSavingsSummary(status);
+            renderSavingsSummary(status, metricsXirr, metricsTwr);
             renderSavingsPositions(status);
             renderSavingsPlans(status);
             renderSavingsEvents(status);
@@ -3699,21 +3716,34 @@
             }
         }
 
-        function renderSavingsSummary(status) {
+        function renderSavingsSummary(status, metricsXirr, metricsTwr) {
             if (!status.initialized) {
                 document.getElementById('savings-summary').innerHTML =
                     '<span class="metric">Tracker<b>not set up</b></span>';
                 return;
             }
+            // NET contributed capital (deposits − withdrawals): a withdrawal
+            // is an external flow, so gain-on-contributed never shows one as
+            // an investment loss.
             const gain = status.contributed > 0
                 ? status.total_equity / status.contributed * 100 - 100 : null;
+            // XIRR/TWR chips: money-weighted (dated external flows) and
+            // time-weighted (unitized NAV) returns — the same pair the other
+            // tabs show. XIRR is a fraction and is suppressed for windows
+            // shorter than a month — annualizing a few days is noise.
+            const xirrVal = (metricsXirr && metricsXirr.xirr != null
+                && metricsXirr.window_days != null && metricsXirr.window_days >= 30)
+                ? metricsXirr.xirr : null;
+            const twrVal = (metricsTwr && metricsTwr.twr_pct != null) ? metricsTwr.twr_pct : null;
             const m = [
                 ['Total Equity', fmtEur(status.total_equity)],
                 ['Cash', fmtEur(status.cash)],
                 ['Accrued Interest', fmtEur(status.accrued_interest)],
                 ['Positions', fmtEur(status.positions_value)],
-                ['Contributed', fmtEur(status.contributed)],
-                ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(2) + '%' : '—', '', 'Gain on contributed capital (equity / contributed - 1) - NOT a time-weighted return'],
+                ['Net Contributed', fmtEur(status.contributed), '', 'NET contributed capital: seed + deposits MINUS withdrawals — external flows, never investment P&L'],
+                ['Gain', gain != null ? (gain >= 0 ? '+' : '') + gain.toFixed(2) + '%' : '—', '', 'Gain on NET contributed capital (equity / contributed - 1) - NOT a time-weighted return'],
+                ['XIRR', xirrVal != null ? (xirrVal >= 0 ? '+' : '') + (xirrVal * 100).toFixed(1) + '%/yr' : '—', '', 'money-weighted annualized return from dated external flows — deposits and withdrawals from the event ledger (occurred_on when recorded), terminal value = latest equity, actual/365 day counts; shown once the window is at least 30 days'],
+                ['TWR', twrVal != null ? (twrVal >= 0 ? '+' : '') + twrVal.toFixed(1) + '%' : '—', '', 'Time-weighted return of the unitized (cash-flow-adjusted) NAV over the snapshot window - deposits and withdrawals do not count as returns'],
                 ['Rate', status.interest_rate.toFixed(2) + '% p.a.'],
                 ['Transfer', fmtEur(status.monthly_transfer, 0) + '/mo'],
             ];
@@ -3727,7 +3757,7 @@
             el.innerHTML = pos.length ? `<table><tr><th>Ticker</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>P&L%</th><th></th></tr>${pos.map(p => {
                 const cls = p.pnl_pct > 0 ? 'buy' : p.pnl_pct < 0 ? 'sell' : '';
                 return `<tr><td>${escapeHtml(p.ticker)}</td><td>${p.shares.toFixed(4)}</td><td>${fmtEur(p.avg_cost)}</td><td>${fmtEur(p.current_price)}</td><td>${fmtEur(p.value)}</td><td class="${cls}">${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(2)}%</td>` +
-                    `<td><button style="padding:2px 8px;font-size:11px" onclick="svRemovePosition('${escapeHtml(p.ticker)}')" title="Sold in TR — remove from tracker; the money arrives via true-up">✕</button></td></tr>`;
+                    `<td><button style="padding:2px 8px;font-size:11px" onclick="svRemovePosition('${escapeHtml(p.ticker)}')" title="Remove from tracker (e.g. sold in TR): cash is left unchanged, so book the proceeds via the next true-up; its picks-mirror allocation is removed too">✕</button></td></tr>`;
             }).join('')}</table>` : '<div class="sim-empty">No positions yet — add a Sparplan, an "Add buy" purchase, or book a Saveback.</div>';
         }
 
@@ -3785,9 +3815,12 @@
                 color: '#7aaa81', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted,
                 priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
             }).setData(pts.map(p => ({ time: p.time, value: p.contributed })));
-            // Daily-core mirror overlay: the same position-€ spread over the
-            // daily-core picks at each date (violet, matching the Daily-Core
-            // tab's color). Only spans dates where mirror data exists.
+            // Equal-allocation picks mirror overlay: the same position-€ split
+            // equally across the Daily-Core picks available at each date, at
+            // the latest cached prices (violet, matching the Daily-Core tab's
+            // color). A picks comparison, not Daily-Core strategy
+            // performance — no rebalance, sells or protection overlays are
+            // replayed. Only spans dates where mirror data exists.
             const mirrorPts = ((mirror && mirror.curve) || [])
                 .filter(c => c.value > 0 || c.allocated > 0)
                 .map(c => ({ time: c.date, value: c.value }));
@@ -3845,13 +3878,13 @@
                 });
                 status.textContent = `Initialized: ${fmtEur(r.cash)} cash` +
                     (r.invested ? `, ${fmtEur(r.invested)} positions` : '') +
-                    (r.mirror ? `, mirror seeded into ${r.mirror.picks} daily-core picks` : '') + '.';
+                    (r.mirror ? `, equal-allocation picks mirror seeded across ${r.mirror.picks} Daily-Core picks` : '') + '.';
                 await loadSavingsAll();
             } catch (e) { status.textContent = 'Error: ' + e.message; }
         }
 
         async function svReinitConfirm() {
-            if (!confirm('Re-initialize the SAVINGS TRACKER?\n\nThis wipes the tracked cash, positions, plans, events, snapshots and the mirror — not the paper sims. Your real TR account is unaffected.'))
+            if (!confirm('Re-initialize the SAVINGS TRACKER?\n\nThis clears the tracked cash, positions and plans and restarts the equal-allocation picks mirror (the comparison starts over). Your money ledger and equity curve are PRESERVED — the reset only starts a new epoch. The paper sims and your real TR account are unaffected.'))
                 return;
             await api('savings/reset', { method: 'POST' }).catch(() => { });
             savingsLoaded = true;
@@ -3859,7 +3892,7 @@
         }
 
         async function svRemovePosition(ticker) {
-            if (!confirm(`Remove ${ticker} from the tracker?\n(The position was sold in TR — the proceeds arrive via the next true-up.)`))
+            if (!confirm(`Remove ${ticker} from the tracker?\n(Cash is left unchanged — if you sold it in TR, book the proceeds with the next true-up. The position's picks-mirror allocation is removed as well.)`))
                 return;
             try {
                 await api('savings/positions/' + encodeURIComponent(ticker), { method: 'DELETE' });
@@ -3950,7 +3983,7 @@
         }
 
         async function svDepositPrompt(btn) {
-            const amountStr = prompt('Deposit: how much € did you move INTO your TR cash?\n(Fresh money from outside — raises the tracked cash and counts in Contributed.)');
+            const amountStr = prompt('Deposit: how much € did you move INTO your TR cash?\n(Fresh money from outside — raises the tracked cash and counts in net contributed capital.)');
             if (amountStr === null) return;
             const amount = parseFloat(amountStr.replace(',', '.'));
             if (isNaN(amount) || amount <= 0) { alert('Enter an amount > 0.'); return; }
@@ -3965,8 +3998,27 @@
             } catch (e) { status.textContent = 'Error: ' + e.message; }
         }
 
+        async function svWithdrawPrompt(btn) {
+            const amountStr = prompt('Withdrawal: how much € did you move OUT of your TR cash?\n(Fresh money back to your bank — lowers the tracked cash and the net contributed capital. It is an external flow, not an investment loss.)');
+            if (amountStr === null) return;
+            const amount = parseFloat(amountStr.replace(',', '.'));
+            if (isNaN(amount) || amount <= 0) { alert('Enter an amount > 0.'); return; }
+            const dateStr = prompt('Date of the withdrawal? (YYYY-MM-DD — leave empty for today)');
+            if (dateStr === null) return;
+            const occurredOn = dateStr.trim();
+            const status = document.getElementById('savings-run-status');
+            try {
+                const r = await api('savings/withdraw', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(occurredOn ? { amount, occurred_on: occurredOn } : { amount }),
+                });
+                status.textContent = `Withdrawal booked: ${fmtEur(r.amount)} on ${r.occurred_on} — ${fmtEur(r.cash)} tracked cash.`;
+                await loadSavingsAll();
+            } catch (e) { status.textContent = 'Error: ' + e.message; }
+        }
+
         async function svBuyPrompt(btn) {
-            const amountStr = prompt('Manual buy: how much € did you invest?\n(Paid from your TR cash — the tracker deducts it from the tracked balance and mirrors the € into daily-core.)');
+            const amountStr = prompt('Manual buy: how much € did you invest?\n(Paid from your TR cash — the tracker deducts it from the tracked balance and splits it equally across the Daily-Core picks available now, at the latest cached prices. That picks mirror is a comparison only: no Daily-Core rebalance, sells or protection overlays.)');
             if (amountStr === null) return;
             const amount = parseFloat(amountStr.replace(',', '.'));
             if (isNaN(amount) || amount <= 0) { alert('Enter an amount > 0.'); return; }
@@ -4021,17 +4073,17 @@
             try {
                 const m = mirror || await api('savings/mirror?limit=12000');
                 const pending = m.pending > 0
-                    ? ` <b style="color:#ff9f43">${fmtEur(m.pending)}</b> waiting for a fresh daily-core ranking — it enters the mirror on the next pass that has one.`
+                    ? ` <b style="color:#ff9f43">${fmtEur(m.pending)}</b> waiting for a fresh Daily-Core ranking — it enters the picks mirror on the next pass that has one.`
                     : '';
                 sum.innerHTML = m.allocated > 0
-                    ? `Same € that went into your positions, spread equally over the daily-core picks at each date — <b>${fmtEur(m.allocated)}</b> mirrored, now worth <b>${fmtEur(m.total_equity)}</b> (${(m.total_equity / m.allocated * 100 - 100 >= 0 ? '+' : '') + (m.total_equity / m.allocated * 100 - 100).toFixed(2)}%).${pending}`
+                    ? `Same € that went into your positions, split equally across the Daily-Core picks available at each date (latest cached prices) — <b>${fmtEur(m.allocated)}</b> allocated, now worth <b>${fmtEur(m.total_equity)}</b> (${(m.total_equity / m.allocated * 100 - 100 >= 0 ? '+' : '') + (m.total_equity / m.allocated * 100 - 100).toFixed(2)}%). Equal-allocation picks comparison, not Daily-Core strategy performance — no rebalance, sells, protection overlays or cash timing.${pending}`
                     : (m.pending > 0
-                        ? `No allocation yet — <b style="color:#ff9f43">${fmtEur(m.pending)}</b> is parked until the daily-core ranking refreshes.${pending}`
-                        : 'No mirror entries yet — initialize with positions or add a Sparplan.');
+                        ? `No allocation yet — <b style="color:#ff9f43">${fmtEur(m.pending)}</b> is parked until the Daily-Core ranking refreshes.${pending}`
+                        : 'No picks-mirror entries yet — initialize with positions or add a Sparplan.');
                 el.innerHTML = (m.positions || []).length ? `<table><tr><th>Ticker</th><th>Shares</th><th>Avg Cost</th><th>Price</th><th>Value</th><th>P&L%</th></tr>${m.positions.map(p => {
                     const cls = p.pnl_pct > 0 ? 'buy' : p.pnl_pct < 0 ? 'sell' : '';
                     return `<tr><td>${escapeHtml(p.ticker)}</td><td>${p.shares.toFixed(4)}</td><td>${fmtEur(p.avg_cost)}</td><td>${fmtEur(p.current_price)}</td><td>${fmtEur(p.value)}</td><td class="${cls}">${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(2)}%</td></tr>`;
-                }).join('')}</table>` : '<div class="sim-empty">Mirror is empty.</div>';
+                }).join('')}</table>` : '<div class="sim-empty">Picks mirror is empty.</div>';
             } catch (e) { sum.innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
 

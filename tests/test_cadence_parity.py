@@ -9,14 +9,21 @@ month-ends on the true US session calendar) into a temp SQLite DB, then:
    + ``monthly.run_monthly_cycle`` + ``daily_core.run_daily_cycle`` — with
    ``monthly._now()``/``daily_core._now()`` pinned to each session's
    post-close instant (21:00 UTC; the Vienna allowance anchor keeps the
-   session's own calendar date, so deposit months align with the replay's);
-2. captures every live trade row in stream order;
-3. wipes + replays the SAME candles through ``monthly.backfill`` /
-   ``daily_core.backfill`` (which stamp the historical fill days) and
-   captures the replay's trade rows;
-4. asserts the trade sets are identical, the end-of-stream positions match
-   (ticker, shares, avg_cost), and the replay's ``opened_at`` equals each
-   position's actual first-buy date.
+   session's own calendar date, so deposit months align with the replay's),
+   and captures every live trade row in stream order;
+2. proves the FORWARD-RECORD GUARD: a replay inside the live (epoch 1) book
+   is REFUSED before any mutation, and the live trade/position rows are
+   unchanged, bit-for-bit, by the refusal;
+3. explicitly resets BOTH engines (the documented "reset first" path): each
+   epoch closes at 2, the live paper rows survive in epoch 1 untouched and
+   only the current positions/state are cleared;
+4. replays the SAME candles through ``monthly.backfill`` /
+   ``daily_core.backfill`` IN EPOCH 2 — which stamp the historical fill days
+   — captures ONLY the epoch-2 replay trade rows, and verifies the closed
+   epoch-1 rows are still bit-for-bit intact after the replay;
+5. asserts the live and replay trade sets are identical, the end-of-stream
+   positions match (ticker, shares, avg_cost), and the replay's ``opened_at``
+   equals each position's actual first-buy date.
 
 The tape's intra-month wiggle makes the DAILY-ranked portfolio differ from
 the month-end frame's picks — the parity itself proves the month-end band
@@ -37,7 +44,7 @@ import pytest
 from sqlalchemy import StaticPool, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app import daily_core, monthly
+from app import daily_core, monthly, run_config
 from app import fundamentals as fundamentals_mod
 from app import sim as sim_mod
 from app.config import settings
@@ -201,12 +208,33 @@ async def mem_db(monkeypatch):
 # Capture helpers
 # ---------------------------------------------------------------------------
 
-async def _trade_rows(model) -> list[dict]:
+async def _trade_rows(model, epoch: int | None = None) -> list[dict]:
+    """Trade rows in stream order; ``epoch`` optionally scopes the dump (the
+    default is the full history: closed epochs + the current one)."""
     async with daily_core.Session() as s:
-        rows = (await s.scalars(select(model).order_by(model.id))).all()
+        stmt = select(model).order_by(model.id)
+        if epoch is not None:
+            stmt = stmt.where(model.epoch == epoch)
+        rows = (await s.scalars(stmt)).all()
     return [{"side": r.side, "ticker": r.ticker,
              "shares": round(r.shares, 6), "price": round(r.price, 6),
              "date": r.created_at.strftime("%Y-%m-%d")} for r in rows]
+
+
+async def _table_rows(model, epoch: int | None = None) -> list[dict]:
+    """Every mapped column of every *model* row, in id order.
+
+    ``epoch`` scopes the dump to one epoch of a history table; the default is
+    the full history. Used for bit-for-bit preservation checks: a reset or a
+    replay may not rewrite (or drop) a single field of a CLOSED epoch's rows.
+    """
+    async with daily_core.Session() as s:
+        stmt = select(model).order_by(model.id)
+        if epoch is not None:
+            stmt = stmt.where(model.epoch == epoch)
+        rows = (await s.scalars(stmt)).all()
+    cols = [c.name for c in model.__table__.columns]
+    return [{c: getattr(r, c) for c in cols} for r in rows]
 
 
 async def _position_rows(model) -> list[dict]:
@@ -251,18 +279,101 @@ async def test_live_deployment_matches_persisted_backfill(parity_env):
     assert any(t["side"] == "SELL" for t in live_monthly)
     assert any(t["side"] == "SELL" for t in live_daily)
 
-    # --- 2) replay the SAME candles through the persisted backfills ---
+    # The live book is the current (epoch 1) FORWARD record. These full-column
+    # dumps are its baseline: neither the refused replay, nor the reset, nor
+    # the epoch-2 replay may rewrite one field of it. Ranking is excluded on
+    # purpose — it is a current cache (singleton), not history, and the reset
+    # drops it by contract.
+    history = {
+        "monthly_trades": monthly.MonthlyTrade,
+        "monthly_allowances": monthly.MonthlyAllowance,
+        "monthly_snapshots": monthly.MonthlySnapshot,
+        "monthly_rebalances": monthly.MonthlyRebalance,
+        "daily_trades": daily_core.DailyCoreTrade,
+        "daily_allowances": daily_core.DailyCoreAllowance,
+        "daily_snapshots": daily_core.DailyCoreSnapshot,
+    }
+    live_hist = {name: await _table_rows(model, epoch=1)
+                 for name, model in history.items()}
+    positions = (monthly.MonthlyPosition, daily_core.DailyCorePosition)
+    live_pos_dump = {model.__name__: await _table_rows(model)
+                     for model in positions}
+
+    # --- 2) the forward-record guard REFUSES the destructive replay ---
+    # A replay regenerates the book's ORIGIN, so it must not run inside the
+    # live paper epoch — and it must refuse BEFORE mutating anything.
+    refused_m = await monthly.backfill(start=start)
+    refused_d = await daily_core.backfill(start=start)
+    for refused, engine in ((refused_m, "monthly"), (refused_d, "daily-core")):
+        assert refused["ok"] is False, (engine, refused)
+        assert "forward paper record" in refused["error"], (engine, refused)
+    # the refusal is inert: not one live row changed (no wipe, no re-stamp)...
+    for name, model in history.items():
+        assert await _table_rows(model, epoch=1) == live_hist[name], \
+            f"{name}: a refused replay mutated the live book"
+    for model in positions:
+        assert await _table_rows(model) == live_pos_dump[model.__name__], \
+            f"{model.__name__}: a refused replay mutated the live book"
+    # ...and no epoch boundary was appended by a refused replay
+    assert await run_config.current_epoch("monthly") == 1
+    assert await run_config.current_epoch("daily_core") == 1
+
+    # --- 3) explicit reset closes both epochs; the paper book survives ---
+    reset_m = await monthly.reset_monthly()
+    reset_d = await daily_core.reset_daily_core()
+    assert reset_m["ok"] is True and reset_m["epoch"] == 2, reset_m
+    assert reset_d["ok"] is True and reset_d["epoch"] == 2, reset_d
+    # every live row was COUNTED as preserved, not discarded
+    assert reset_m["preserved"]["trades"] == len(live_monthly)
+    assert reset_m["preserved"]["snapshots"] == len(live_hist["monthly_snapshots"])
+    assert reset_m["preserved"]["allowances"] == len(live_hist["monthly_allowances"])
+    assert reset_m["preserved"]["rebalances"] == len(live_hist["monthly_rebalances"])
+    assert reset_d["preserved"] == {
+        "trades": len(live_daily),
+        "snapshots": len(live_hist["daily_snapshots"]),
+        "allowances": len(live_hist["daily_allowances"]),
+    }
+    assert await run_config.current_epoch("monthly") == 2
+    assert await run_config.current_epoch("daily_core") == 2
+    # the closed epoch is bit-for-bit intact; only CURRENT state was cleared
+    for name, model in history.items():
+        assert await _table_rows(model, epoch=1) == live_hist[name], \
+            f"{name}: the reset rewrote the closed epoch"
+    for model in positions:
+        assert await _table_rows(model) == [], model.__name__
+    # both equity curves restart EMPTY in epoch 2 (no closed-epoch leak)
+    assert await monthly.get_equity_curve() == []
+    assert await daily_core.get_equity_curve() == []
+
+    # --- 4) replay the SAME candles in the fresh epoch (SAME explicit start;
+    #        the pinned clock sits at the last session and is never consulted
+    #        for the replay's window) ---
     rm = await monthly.backfill(start=start)
     rd_ = await daily_core.backfill(start=start)
     assert rm["ok"] is True, rm
     assert rd_["ok"] is True, rd_
 
-    replay_monthly = await _trade_rows(monthly.MonthlyTrade)
-    replay_daily = await _trade_rows(daily_core.DailyCoreTrade)
+    replay_monthly = await _trade_rows(monthly.MonthlyTrade, epoch=2)
+    replay_daily = await _trade_rows(daily_core.DailyCoreTrade, epoch=2)
     replay_monthly_pos = await _position_rows(monthly.MonthlyPosition)
     replay_daily_pos = await _position_rows(daily_core.DailyCorePosition)
+    assert replay_monthly and replay_daily
 
-    # --- 3) GOLDEN: identical trade sets on the identical stream ---
+    # the replay wrote epoch-2 rows ONLY: after it, the closed epoch is still
+    # bit-for-bit identical to what the live engines produced ...
+    for name, model in history.items():
+        assert await _table_rows(model, epoch=1) == live_hist[name], \
+            f"{name}: the replay rewrote the closed epoch"
+    # ... and the old paper trades are exactly the live stream, not a concat
+    assert await _trade_rows(monthly.MonthlyTrade, epoch=1) == live_monthly
+    assert await _trade_rows(daily_core.DailyCoreTrade, epoch=1) == live_daily
+    # the full history is live epoch 1 + replay epoch 2, nothing lost/duplicated
+    assert len(await _table_rows(monthly.MonthlyTrade)) == \
+        len(live_monthly) + len(replay_monthly)
+    assert len(await _table_rows(daily_core.DailyCoreTrade)) == \
+        len(live_daily) + len(replay_daily)
+
+    # --- 5) GOLDEN: identical trade sets on the identical stream ---
     assert [_key(t) for t in live_monthly] == [_key(t) for t in replay_monthly], \
         "monthly: live vs replay trade streams diverge"
     assert [_key(t) for t in live_daily] == [_key(t) for t in replay_daily], \
@@ -275,7 +386,7 @@ async def test_live_deployment_matches_persisted_backfill(parity_env):
             [{k: p[k] for k in ("ticker", "shares", "avg_cost")} for p in b], \
             f"{name}: end-of-stream positions diverge"
 
-    # --- 4) replay bookkeeping: opened_at = the first-buy date of the
+    # --- 6) replay bookkeeping: opened_at = the first-buy date of the
     #        CURRENT (still-open) stint — a full release + re-buy opens a
     #        NEW stint, so the stream's very first buy does not anchor it ---
     for replay_pos, replay_tr in ((replay_monthly_pos, replay_monthly),
@@ -290,7 +401,7 @@ async def test_live_deployment_matches_persisted_backfill(parity_env):
             assert p["opened_at"] == stints[p["ticker"]], \
                 f"opened_at {p['ticker']}: {p['opened_at']} != stint start {stints.get(p['ticker'])}"
 
-    # --- 5) month-end band policy: releases only at the first session
+    # --- 7) month-end band policy: releases only at the first session
     #        after the month-end that changed the band ---
     mes = monthly.completed_month_ends(close.index, sessions[0], sessions[-1])
     first_after_me = set()
@@ -305,7 +416,7 @@ async def test_live_deployment_matches_persisted_backfill(parity_env):
         if tr["side"] == "SELL":
             assert pd.Timestamp(tr["date"]) in first_after_me, tr
 
-    # --- 6) the fixture proves the policy is doing real work: a MID-MONTH
+    # --- 8) the fixture proves the policy is doing real work: a MID-MONTH
     #        frame ranks differently than the month-end frame, yet both
     #        engines matched each other (they both ranked the month-end) ---
     me_frame = monthly.eligible_frame(pd.Timestamp("2026-02-27"), close, vol, fund)
@@ -317,13 +428,25 @@ async def test_live_deployment_matches_persisted_backfill(parity_env):
         "fixture regression: daily facts no longer differ from the month-end "
         "ranking — the parity no longer proves the month-end band policy")
 
-    # --- 7) contributions aligned: the same months funded on both sides ---
-    async def allowance_months(model):
+    # --- 9) contributions aligned: the SAME months funded on both sides ---
+    async def allowance_months(model, epoch: int | None = None):
         async with daily_core.Session() as s:
-            rows = (await s.scalars(select(model))).all()
+            stmt = select(model)
+            if epoch is not None:
+                stmt = stmt.where(model.epoch == epoch)
+            rows = (await s.scalars(stmt)).all()
         return sorted(r.month for r in rows)
 
     from app.db import DailyCoreAllowance, MonthlyAllowance
+    expected_months = sorted({d.strftime("%Y-%m") for d in sessions})
+    # the epoch-2 replay deposits the tape's month sequence on BOTH engines...
+    replay_months = await allowance_months(MonthlyAllowance, epoch=2)
+    assert replay_months == expected_months
+    assert replay_months == await allowance_months(DailyCoreAllowance, epoch=2)
+    # ...and exactly the same months the live book (epoch 1) funded
+    assert await allowance_months(MonthlyAllowance, epoch=1) == expected_months
+    assert await allowance_months(DailyCoreAllowance, epoch=1) == expected_months
+    # the full-history listings agree too (epoch 1 + epoch 2, per engine)
     assert await allowance_months(MonthlyAllowance) == \
         await allowance_months(DailyCoreAllowance)
 

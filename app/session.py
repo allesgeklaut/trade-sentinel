@@ -7,9 +7,12 @@ after session F's bar is complete and cached. Session F is the cycle's own
 session (the run date); S is the previous *completed* session.
 
   1. Decision inputs are strictly data <= S's close: every candle handed to
-     the indicator engine is truncated to sessions <= S. F's bar never
-     informs the decision, so mutating or appending F's candle cannot change
-     what is proposed.
+     the indicator engine is truncated to sessions <= S, and so is the
+     PRE-TRADE valuation that sizes the orders — the target weight, the
+     per-name gap and ``current_value`` all read known closes <= S (allocation
+     and size are part of the decision, not of the day's reporting). F's bar
+     never informs the decision, so mutating or appending F's candle cannot
+     change what is proposed, sized or filled.
   2. Fills execute at F's OPEN — strict same-session bar per ticker: the
      fill price is read from the stored bar with an exact date match
      (``open_at`` — never forward-filled, never a stale close; a missing
@@ -17,7 +20,12 @@ session (the run date); S is the previous *completed* session.
      is NO fill — the decision is simply re-taken at the next cycle. A
      per-session guard makes a second cycle within the same session a
      no-op, so a re-taken decision cannot double-fill.
-  3. Marks/valuation use F's close (the completed session bar).
+  3. Marks/valuation use F's close (the completed session bar) — for
+     END-OF-SESSION REPORTING only: the cycle's returned/persisted valuation,
+     the stored equity snapshot and any post-cycle display read F's close,
+     and that value is never fed back into the same session's decision or
+     order sizing (rule 1). A LATER cycle may of course consume it: by then
+     that close is part of data <= S.
   4. A stop level known at S's close is a standing order for F: fill at
      F's open when open <= level, else at the level when F's low <= level,
      else no stop fill this session.
@@ -32,10 +40,18 @@ session (the run date); S is the previous *completed* session.
   7. No pending-order persistence: the deterministic decision is recomputed
      at F's cycle from frozen inputs and is bit-identical on a re-run; an
      unfilled proposal is simply dropped and re-taken next session. The
-     LLM's frozen-decision ledger is a Phase 2 item — for now the LLM path
-     uses the same data <= S inputs and fills at F's open, but its
-     *reasoning* is timestamped to the cycle that produced it (an honest,
-     documented limitation, not a replayable artifact).
+     LLM's frozen-decision ledger EXISTS (``SimLlmDecision`` →
+     ``sim_llm_decisions``): every LLM decision — hybrid review, pure-LLM
+     cycle, chat action — is appended with the ``decided_at`` frozen at the
+     moment its response was parsed, the decision itself, its relation to
+     the deterministic proposal, and, when the decision's trade actually
+     executed, the frozen fill (``filled_at`` plus shares/price/cash_after;
+     ``decided_at <= filled_at`` always). A decision that never filled keeps
+     NULL fill columns — recorded as DECIDED-BUT-UNFILLED, never as a
+     pending order: with no pending-order persistence it is simply re-taken
+     at the next cycle, and the per-session guard stops that from
+     double-filling. The ledger is append-only bookkeeping — it never changes
+     what is decided, sized or filled.
 
 Manual cycles outside the scheduled window: F's open is stable intraday, so
 open fills stay correct, but F's *low* is only final after the session

@@ -478,18 +478,47 @@ class TestStoredRanking:
     def test_compute_targets_reads_stored_ranking_on_me_match(
             self, mem_db, monkeypatch, tmp_path):
         """compute_targets() (force=False) returns the stored decision when
-        the stored ranking_date matches the resolved month-end — the whole
-        month runs on ONE decision, so the expensive frame never recomputes
-        and no age gate applies."""
+        the stored ranking_date AND provenance stamp match the resolved
+        month-end — the whole month runs on ONE decision, so the expensive
+        frame never recomputes and no age gate applies.
+
+        The cache is a DERIVED artifact: an UNKNOWN provenance (legacy NULL
+        ``config_id``) invalidates the row and forces a recompute, because it
+        cannot be proven to describe this run's configuration. This fixture is
+        deliberately KNOWN-MATCHING: it seeds the row with the exact paper
+        ``config_id``/epoch the run resolves.
+        """
+        from app import run_config
         from app.db import DailyCoreRanking
 
         me = pd.Timestamp("2026-09-30")
+
+        # Patch the state file BEFORE capturing the configuration: the run
+        # config reads the persisted runtime selections from it, so a real
+        # /data file would change the config hash this fixture stamps with
+        # (and reset/compute could attempt a write outside the temp dir).
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+
+        async def resolve_stamp() -> dict:
+            """The stamp compute_targets() resolves for this run (no execution:
+            a read-cache pass registers a config, never a RunExecution)."""
+            cfg = daily_core.current_config()
+            return {
+                "config_id": await run_config.get_or_create(
+                    "daily_core", "paper", cfg, session_factory=mem_db),
+                "epoch": await run_config.current_epoch(
+                    "daily_core", session_factory=mem_db),
+            }
+
+        stamp = asyncio.run(resolve_stamp())
 
         async def seed():
             async with mem_db() as s:
                 s.add(DailyCoreRanking(
                     id=1, ranking_date=me.to_pydatetime(),
-                    band="AAA,BBB,CCC", picks="AAA,BBB"))
+                    band="AAA,BBB,CCC", picks="AAA,BBB",
+                    mode="paper", config_id=stamp["config_id"],
+                    epoch=stamp["epoch"]))
                 await s.commit()
         asyncio.run(seed())
 
@@ -501,10 +530,7 @@ class TestStoredRanking:
             raise AssertionError("frame recomputed though the stored ranking matched")
         monkeypatch.setattr(daily_core, "_core_frame", boom)
 
-        async def scenario():
-            monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
-            return await daily_core.compute_targets()
-        band, picks, frame = asyncio.run(scenario())
+        band, picks, frame = asyncio.run(daily_core.compute_targets())
         assert (band, picks, frame) == (["AAA", "BBB", "CCC"], ["AAA", "BBB"], None)
 
     def test_newer_month_end_recomputes_and_restores(
@@ -862,12 +888,29 @@ class TestBackfill:
 
 
 class TestReset:
-    def test_reset_clears_state_and_restores_start_cash(self, mem_db):
+    def test_reset_clears_current_state_and_preserves_history(
+            self, mem_db, monkeypatch, tmp_path):
+        """A reset CLOSES the epoch; it does not rewrite it.
+
+        Portfolio *state* is cleared and re-seeded for the fresh epoch
+        (positions gone, cash = start, allowance marker None), while the closed
+        epoch's money ledger — trades, allowances and snapshots — survives
+        bit-for-bit in every mapped column. The old test asserted the opposite
+        (all four tables empty), which described the destructive reset that
+        rewrote the paper book's own record; the epoch boundary in
+        app/run_config.py replaces it (a later backfill must be refusable
+        because the live origin still exists).
+        """
+        from app import run_config
         from app.db import DailyCoreAccount as Acc
         from app.db import DailyCoreAllowance as Al
         from app.db import DailyCorePosition as Pos
         from app.db import DailyCoreSnapshot as Sn
         from app.db import DailyCoreTrade as Tr
+        from app.db import RunEpoch
+
+        # reset re-writes the basket state file: keep it out of /data
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
 
         async def seed():
             async with mem_db() as s:
@@ -881,20 +924,56 @@ class TestReset:
                 s.add(Sn(cash=0.0, positions_value=1.0, total_equity=1.0,
                          allowance_total=1000.0))
                 await s.commit()
+
+        async def dump(model) -> list[dict]:
+            """Every mapped column of every row of *model*, in id order."""
+            async with mem_db() as s:
+                rows = (await s.scalars(select(model).order_by(model.id))).all()
+            cols = [c.name for c in model.__table__.columns]
+            return [{c: getattr(r, c) for c in cols} for r in rows]
+
+        async def history_dump() -> dict[str, list[dict]]:
+            return {m.__name__: await dump(m) for m in (Tr, Al, Sn)}
+
         asyncio.run(seed())
+        before = asyncio.run(history_dump())
 
         r = asyncio.run(daily_core.reset_daily_core())
         assert r["ok"] is True
         assert r["cash"] == settings.sim_monthly_start_cash
+        assert r["epoch"] == 2
+        assert r["preserved"] == {"trades": 1, "snapshots": 1, "allowances": 1}
 
         async def check():
             async with mem_db() as s:
-                for model in (Pos, Tr, Al, Sn):
-                    assert (await s.scalars(select(model))).all() == []
+                assert (await s.scalars(select(Pos))).all() == []
                 acc = await s.get(Acc, 1)
                 assert acc.cash == settings.sim_monthly_start_cash
                 assert acc.last_allowance_month is None
+                epochs = (await s.scalars(select(RunEpoch))).all()
+                assert [(e.engine, e.epoch) for e in epochs] == [("daily_core", 2)]
+                assert await run_config.current_epoch("daily_core", session=s) == 2
         asyncio.run(check())
+
+        # The closed epoch's ledger is preserved bit-for-bit ...
+        after = asyncio.run(history_dump())
+        for name, rows in before.items():
+            assert after[name] == rows, \
+                f"{name}: the reset rewrote the closed epoch's rows"
+
+        async def curve_check():
+            # ... and the equity curve restarts EMPTY in the new epoch: the
+            # preserved snapshots must not leak into the fresh book's chart.
+            assert await daily_core.get_equity_curve() == []
+            async with mem_db() as s:
+                s.add(Sn(cash=250.0, positions_value=0.0, total_equity=250.0,
+                         allowance_total=250.0, epoch=2))
+                await s.commit()
+            curve = await daily_core.get_equity_curve()
+            assert [(c["cash"], c["positions_value"], c["total_equity"],
+                     c["allowance_total"], c["epoch"]) for c in curve] == \
+                [(250.0, 0.0, 250.0, 250.0, 2)]
+        asyncio.run(curve_check())
 
 
 # ---------------------------------------------------------------------------

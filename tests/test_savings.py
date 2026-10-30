@@ -15,6 +15,10 @@ data volume. They cover:
 - True-up / Saveback / manual buys (paid from cash) / deposits (fresh
   money in, counted as contributions) / config / plan CRUD
 - Position removal unwinds the mirror € that position's buys allocated
+- Mirror removal is append-only: past curve dates stay bit-for-bit, the
+  outstanding allocation is reversed by a dated negative entry, seed/other
+  sources survive, and the position removal + WARN + pending release +
+  reversal + projection rebuild commit atomically
 - The daily-core forward mirror (allocation, deferred without a ranking,
   parked € per source, per-source flush + release on removal)
 - Reset isolation: savings reset never touches the sim tables and
@@ -25,6 +29,7 @@ data volume. They cover:
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -148,6 +153,28 @@ async def _events(mem_db, kind: str | None = None) -> list[SavingsEvent]:
         return list((await s.scalars(stmt)).all())
 
 
+async def _mirror_entries(mem_db) -> list[SavingsMirrorEntry]:
+    """All mirror-book rows, oldest first (the append-only order)."""
+    async with mem_db() as s:
+        return list(
+            (await s.scalars(select(SavingsMirrorEntry).order_by(SavingsMirrorEntry.id))).all()
+        )
+
+
+async def _mirror_entry_snapshot(mem_db) -> list[tuple]:
+    """(id, amount, source_ticker, breakdown, created_at) for every entry —
+    the immutable part of the mirror history, comparable before/after."""
+    return [
+        (e.id, e.amount, e.source_ticker, e.breakdown, e.created_at)
+        for e in await _mirror_entries(mem_db)
+    ]
+
+
+async def _pending_rows(mem_db) -> list[SavingsMirrorPending]:
+    async with mem_db() as s:
+        return list((await s.scalars(select(SavingsMirrorPending))).all())
+
+
 # ---------------------------------------------------------------------------
 # Initialization
 # ---------------------------------------------------------------------------
@@ -189,17 +216,21 @@ async def test_initialize_seeds_cash_positions_and_markers(mem_db, monkeypatch):
     assert payout["paid"] is False
 
 
-async def test_initialize_replaces_previous_state(mem_db):
+async def test_initialize_refuses_when_already_initialized(mem_db):
+    """Batch 4 changed this contract: re-initializing a LIVE tracker used to
+    wipe its cash, positions, plans, events and snapshots. It is now refused
+    before any mutation — the explicit restart path is ``reset`` (which keeps
+    the ledger). This replaces the old ``test_initialize_replaces_previous_state``
+    expectation, which pinned the destructive semantics."""
     await savings.initialize(100.0)
     await savings.add_plan("URTH", 50.0, 1)
+    before = await savings.valuate()
     r = await savings.initialize(9000.0)
-    assert r["ok"] is True
-    plans = await savings.get_plans()
-    assert plans == []
-    val = await savings.valuate()
-    assert val["cash"] == 9000.0
-    # Old INIT events were wiped — contributed counts only the new seed.
-    assert val["contributed"] == 9000.0
+    assert r == {"ok": False, "reason": "already initialized"}
+    # Nothing was touched: the plan, the cash and the ledger are as they were.
+    assert len(await savings.get_plans()) == 1
+    assert await savings.valuate() == before
+    assert [e.kind for e in await _events(mem_db)] == ["INIT"]
 
 
 async def test_all_actions_noop_when_uninitialized(mem_db):
@@ -811,6 +842,329 @@ async def test_unwind_mirror_rebuilds_multi_entry_positions(mem_db):
     await savings.remove_position("URTH")
     mirror = await savings._mirror_valuate()
     assert mirror["allocated"] == 0.0 and mirror["positions"] == []
+
+
+async def test_removal_keeps_historical_curve_and_appends_dated_reversal(mem_db):
+    """Removal is append-only in the mirror book.
+
+    Every snapshot date strictly before the removal must replay bit-for-bit
+    identically (the old delete-based unwind rewrote those dates), the
+    original entries keep their ids/amounts/breakdowns, and the source's
+    still-outstanding € is cancelled by exactly one new reversal entry
+    dated at the removal.
+    """
+    base = datetime.now(UTC) - timedelta(days=6)
+    await _seed_ranking(mem_db, ["AAPL"])
+    await _seed_candle(mem_db, "AAPL", 100.0, when=base)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0, when=base)
+    await _seed_candle(mem_db, "SPY", 50.0, when=base)
+    await _seed_candle(mem_db, "URTH", 100.0, when=base)
+    await savings.initialize(1000.0)
+    await savings.manual_buy(40.0, "SPY")    # mirror 0.4 sh AAPL @ 100
+    await savings.manual_buy(20.0, "URTH")   # mirror 0.2 sh AAPL @ 100
+    # Later closes: the mirror must be valued with each date's own price.
+    for i, px in ((2, 150.0), (4, 200.0)):
+        await _seed_candle(mem_db, "AAPL", px, when=base + timedelta(days=i))
+        await _seed_candle(mem_db, "EURUSD=X", 1.0, when=base + timedelta(days=i))
+    # Backdate the entries (SPY day 0, URTH day 2) and snapshot every 2 days.
+    async with mem_db() as s:
+        spy_entry = await s.scalar(
+            select(SavingsMirrorEntry).where(SavingsMirrorEntry.source_ticker == "SPY"))
+        urth_entry = await s.scalar(
+            select(SavingsMirrorEntry).where(SavingsMirrorEntry.source_ticker == "URTH"))
+        spy_entry.created_at = base
+        urth_entry.created_at = base + timedelta(days=2)
+        for i in range(3):
+            s.add(savings.SavingsSnapshot(
+                cash=0.0, positions_value=0.0, total_equity=0.0, contributed=0.0,
+                created_at=base + timedelta(days=i * 2)))
+        await s.commit()
+
+    curve_before = await savings.get_mirror_curve(100)
+    assert [c["allocated"] for c in curve_before] == [40.0, 60.0, 60.0]
+    assert [c["value"] for c in curve_before] == [40.0, 90.0, 120.0]
+    entries_before = await _mirror_entry_snapshot(mem_db)
+
+    removal_started = datetime.now(UTC)
+    await savings.remove_position("SPY")
+
+    # Every date strictly before the removal is bit-for-bit unchanged.
+    assert await savings.get_mirror_curve(100) == curve_before
+
+    after = await _mirror_entries(mem_db)
+    by_id = {e.id: e for e in after}
+    for eid, amount, source, breakdown, created in entries_before:
+        kept = by_id[eid]  # never deleted…
+        assert (kept.amount, kept.source_ticker, kept.breakdown, kept.created_at) == (
+            amount, source, breakdown, created)  # …and never edited
+    # Exactly one new row: SPY's outstanding € reversed at removal time.
+    assert len(after) == len(entries_before) + 1
+    reversal = after[-1]
+    assert reversal.id > max(eid for eid, *_ in entries_before)
+    assert reversal.source_ticker == "SPY"
+    assert reversal.amount == pytest.approx(-40.0)
+    bd = json.loads(reversal.breakdown)
+    assert len(bd) == 1 and bd[0][0] == "AAPL"
+    assert bd[0][1] == pytest.approx(-0.4)
+    assert bd[0][2] == pytest.approx(100.0)
+    assert reversal.created_at >= removal_started
+
+    # Net current state: only URTH's 20 € remain mirrored, at its own cost.
+    mirror = await savings._mirror_valuate()
+    assert mirror["allocated"] == pytest.approx(20.0)
+    pos = next(p for p in mirror["positions"] if p["ticker"] == "AAPL")
+    assert pos["shares"] == pytest.approx(0.2)
+    assert pos["avg_cost"] == pytest.approx(100.0)
+
+    # A snapshot on/after the removal date replays the cancellation exactly:
+    # the released source leaves no phantom share/€ dust behind.
+    async with mem_db() as s:
+        s.add(savings.SavingsSnapshot(
+            cash=0.0, positions_value=0.0, total_equity=0.0, contributed=0.0,
+            created_at=datetime.now(UTC)))
+        await s.commit()
+    curve_after = await savings.get_mirror_curve(100)
+    assert curve_after[:-1] == curve_before  # past dates still untouched
+    assert curve_after[-1]["allocated"] == pytest.approx(20.0)
+    assert curve_after[-1]["value"] == pytest.approx(40.0)  # 0.2 sh @ carried 200
+
+
+async def test_removal_rebuild_keeps_remaining_avg_cost_after_price_move(mem_db):
+    """The rebuilt projection must keep the REMAINING source's cost basis,
+    not a blend with the released allocation."""
+    await _seed_ranking(mem_db, ["AAPL"])
+    await _seed_candle(mem_db, "AAPL", 100.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await _seed_candle(mem_db, "SPY", 50.0)
+    await _seed_candle(mem_db, "URTH", 100.0)
+    await savings.initialize(1000.0)
+    await savings.manual_buy(30.0, "SPY")    # 0.3 sh AAPL @ 100 (cost 30)
+    await _seed_candle(mem_db, "AAPL", 200.0, when=datetime.now(UTC) + timedelta(days=1))
+    await savings.manual_buy(20.0, "URTH")   # 0.1 sh AAPL @ 200 (cost 20)
+    assert (await savings._mirror_valuate())["positions"][0]["avg_cost"] == pytest.approx(125.0)
+
+    await savings.remove_position("SPY")
+
+    mirror = await savings._mirror_valuate()
+    pos = next(p for p in mirror["positions"] if p["ticker"] == "AAPL")
+    assert pos["shares"] == pytest.approx(0.1)
+    assert pos["avg_cost"] == pytest.approx(200.0)  # not the blended 125
+    assert mirror["allocated"] == pytest.approx(20.0)
+
+
+async def test_removal_reverses_every_pick_the_source_touched(mem_db):
+    """A source can have bought DIFFERENT daily-core picks over time (the
+    ranking rotates): its removal must reverse the net shares in every one
+    of those picks, not just today's list."""
+    await _seed_ranking(mem_db, ["AAPL", "MSFT"])
+    await _seed_candle(mem_db, "AAPL", 100.0)
+    await _seed_candle(mem_db, "MSFT", 50.0)
+    await _seed_candle(mem_db, "NVDA", 200.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await _seed_candle(mem_db, "SPY", 50.0)
+    await _seed_candle(mem_db, "URTH", 100.0)
+    await savings.initialize(1000.0)
+    await savings.manual_buy(100.0, "SPY")  # 50 € AAPL (0.5 sh) + 50 € MSFT (1 sh)
+    # A later ranking rotates the picks: the second buy touches NVDA only.
+    async with mem_db() as s:
+        ranking = await s.get(DailyCoreRanking, 1)
+        ranking.picks = "NVDA"
+        await s.commit()
+    await savings.manual_buy(40.0, "SPY")   # 0.2 sh NVDA @ 200
+    await savings.manual_buy(20.0, "URTH")  # 0.1 sh NVDA @ 200 (other source)
+    assert {p["ticker"] for p in (await savings._mirror_valuate())["positions"]} == {
+        "AAPL", "MSFT", "NVDA"}
+
+    await savings.remove_position("SPY")
+
+    rows = await _mirror_entries(mem_db)
+    reversal = rows[-1]
+    assert reversal.amount == pytest.approx(-140.0)
+    bd = {row[0]: row[1] for row in json.loads(reversal.breakdown)}
+    assert set(bd) == {"AAPL", "MSFT", "NVDA"}
+    assert bd["AAPL"] == pytest.approx(-0.5)
+    assert bd["MSFT"] == pytest.approx(-1.0)
+    assert bd["NVDA"] == pytest.approx(-0.2)
+    mirror = await savings._mirror_valuate()
+    assert mirror["allocated"] == pytest.approx(20.0)
+    by_ticker = {p["ticker"]: p for p in mirror["positions"]}
+    assert set(by_ticker) == {"NVDA"}  # AAPL/MSFT fully released
+    assert by_ticker["NVDA"]["shares"] == pytest.approx(0.1)
+    assert by_ticker["NVDA"]["avg_cost"] == pytest.approx(200.0)
+
+
+async def test_remove_rebuy_remove_reverses_only_outstanding_allocation(mem_db):
+    """A repeated removal reverses only what is currently outstanding: the
+    second removal cancels the REBOUGHT allocation, never the historical
+    originals again."""
+    await _seed_ranking(mem_db, ["AAPL"])
+    await _seed_candle(mem_db, "AAPL", 100.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await _seed_candle(mem_db, "SPY", 50.0)
+    await _seed_candle(mem_db, "URTH", 100.0)
+    await savings.initialize(1000.0)
+    await savings.manual_buy(30.0, "SPY")
+    original = (await _mirror_entries(mem_db))[0]
+    await savings.manual_buy(20.0, "URTH")
+    await savings.remove_position("SPY")      # reversal 1: −30
+    await savings.manual_buy(30.0, "SPY")     # rebuy: +30
+    await savings.remove_position("SPY")      # reversal 2: −30, not −60
+
+    rows = await _mirror_entries(mem_db)
+    assert [round(e.amount, 2) for e in rows if e.source_ticker == "SPY"] == [
+        30.0, -30.0, 30.0, -30.0]
+    kept = next(e for e in rows if e.id == original.id)
+    assert (kept.amount, kept.breakdown) == (original.amount, original.breakdown)
+    mirror = await savings._mirror_valuate()
+    assert mirror["allocated"] == pytest.approx(20.0)
+    pos = next(p for p in mirror["positions"] if p["ticker"] == "AAPL")
+    assert pos["shares"] == pytest.approx(0.2)
+
+    # Nothing is outstanding any more: no third reversal, no mirror write at
+    # all — and removing the already-gone position is refused cleanly.
+    assert await savings._unwind_mirror("SPY") == 0.0
+    assert len(await _mirror_entries(mem_db)) == len(rows)
+    length = len(rows)
+    assert (await savings.remove_position("SPY"))["ok"] is False
+    assert len(await _mirror_entries(mem_db)) == length
+
+
+async def test_removal_cancels_legacy_breakdownless_entry_without_inventing_shares(mem_db):
+    """A pre-breakdown mirror entry still cancels its € amount (so the net
+    allocated figure stays honest) but contributes no shares — the removal
+    must not invent picks the replay never recorded."""
+    await _seed_ranking(mem_db, ["AAPL"])
+    await _seed_candle(mem_db, "AAPL", 100.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await _seed_candle(mem_db, "SPY", 50.0)
+    await savings.initialize(1000.0)
+    await savings.manual_buy(30.0, "SPY")  # breakdown: 0.3 sh AAPL @ 100
+    async with mem_db() as s:
+        legacy = SavingsMirrorEntry(amount=70.0, source_ticker="SPY", breakdown="")
+        s.add(legacy)
+        await s.commit()
+        legacy_id = legacy.id
+    assert (await savings._mirror_valuate())["allocated"] == pytest.approx(100.0)
+
+    await savings.remove_position("SPY")
+
+    rows = await _mirror_entries(mem_db)
+    kept = next(e for e in rows if e.id == legacy_id)
+    assert (kept.amount, kept.breakdown) == (70.0, "")  # untouched
+    reversal = rows[-1]
+    assert reversal.source_ticker == "SPY"
+    assert reversal.amount == pytest.approx(-100.0)  # legacy € cancels too
+    bd = json.loads(reversal.breakdown)
+    assert len(bd) == 1  # only the real pick — no shares for the legacy €
+    assert bd[0][0] == "AAPL" and bd[0][1] == pytest.approx(-0.3)
+    mirror = await savings._mirror_valuate()
+    assert mirror["allocated"] == pytest.approx(0.0)
+    assert mirror["positions"] == []
+
+
+async def test_pending_only_removal_cancels_parked_eur_without_fabricating_entry(mem_db):
+    """When a source only ever parked € (no booked mirror entry yet), the
+    removal cancels the pending rows and writes NO mirror entry at all."""
+    await savings.initialize(1000.0)
+    await _seed_candle(mem_db, "SPY", 50.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await savings.add_plan("SPY", 100.0, 1)
+    await _backdate_plan(mem_db, "SPY", date(2026, 9, 1))
+    r = await savings.run_sparplans(day=date(2026, 9, 1))  # no ranking → parked
+    assert r["executed"] == 1 and r["trades"][0]["mirror_allocated"] is False
+    assert await _mirror_entries(mem_db) == []
+    assert await savings._pending_total() == pytest.approx(100.0)
+
+    await savings.remove_position("SPY")
+
+    assert await _mirror_entries(mem_db) == []  # nothing fabricated
+    assert await savings._pending_total() == 0.0
+    assert (await savings._mirror_valuate())["allocated"] == 0.0
+
+
+async def test_removal_preserves_seed_and_other_source_entries_and_pending(mem_db):
+    """Only the removed source's outstanding € moves: the seed entry
+    (source "") and other sources' entries/pending rows are untouched."""
+    await _seed_ranking(mem_db, ["AAPL"])
+    await _seed_candle(mem_db, "AAPL", 100.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await _seed_candle(mem_db, "SPY", 50.0)
+    await savings.initialize(
+        100.0, positions=[{"ticker": "URTH", "shares": 1.0, "avg_cost": 40.0}])
+    await savings.manual_buy(30.0, "SPY")
+    async with mem_db() as s:
+        s.add(SavingsMirrorPending(amount=25.0, source_ticker="URTH"))
+        s.add(SavingsMirrorPending(amount=5.0, source_ticker=""))
+        await s.commit()
+    seed_entry = next(e for e in await _mirror_entries(mem_db) if e.source_ticker == "")
+
+    await savings.remove_position("SPY")
+
+    rows = await _mirror_entries(mem_db)
+    seed_after = [e for e in rows if e.source_ticker == ""]
+    assert [e.id for e in seed_after] == [seed_entry.id]  # no seed reversal
+    assert (seed_after[0].amount, seed_after[0].breakdown) == (
+        seed_entry.amount, seed_entry.breakdown)
+    assert [round(e.amount, 2) for e in rows if e.source_ticker == "SPY"] == [30.0, -30.0]
+    assert sorted(p.source_ticker for p in await _pending_rows(mem_db)) == ["", "URTH"]
+    mirror = await savings._mirror_valuate()
+    assert mirror["allocated"] == pytest.approx(40.0)
+    pos = next(p for p in mirror["positions"] if p["ticker"] == "AAPL")
+    assert pos["shares"] == pytest.approx(0.4)
+
+
+async def test_remove_position_rolls_back_everything_on_mirror_failure(mem_db, monkeypatch):
+    """The real position delete, WARN audit row, pending cancellation,
+    mirror reversal and projection rebuild are ONE transaction: a mirror
+    write failure leaves no split state behind."""
+    await _seed_ranking(mem_db, ["AAPL"])
+    await _seed_candle(mem_db, "AAPL", 100.0)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0)
+    await _seed_candle(mem_db, "SPY", 50.0)
+    await savings.initialize(1000.0)
+    await savings.manual_buy(30.0, "SPY")  # placed entry +30
+    async with mem_db() as s:
+        ranking = await s.get(DailyCoreRanking, 1)
+        ranking.ranking_date = datetime.now(UTC) - timedelta(days=10)  # stale
+        await s.commit()
+    await savings.manual_buy(20.0, "SPY")  # deferred: parked 20
+    entries_before = await _mirror_entry_snapshot(mem_db)
+    warns_before = len(await _events(mem_db, "WARN"))
+    assert await savings._pending_total() == pytest.approx(20.0)
+    assert len(entries_before) == 1
+
+    async def boom(session):
+        # Fail AFTER the mirror reversal and projection rewrite have been
+        # flushed, so the rollback has to undo real writes, not just undo
+        # an early abort.
+        await original_rebuild(session)
+        raise RuntimeError("mirror write failed")
+
+    original_rebuild = savings._rebuild_mirror_positions
+    with monkeypatch.context() as m:
+        m.setattr(savings, "_rebuild_mirror_positions", boom)
+        with pytest.raises(RuntimeError, match="mirror write failed"):
+            await savings.remove_position("SPY")
+
+    # ALL of it rolled back: position, audit row, pending €, mirror entries
+    # and projection are exactly as before the failed removal.
+    async with mem_db() as s:
+        still = await s.scalar(select(SavingsPosition).where(SavingsPosition.ticker == "SPY"))
+    assert still is not None
+    assert len(await _events(mem_db, "WARN")) == warns_before
+    assert await savings._pending_total() == pytest.approx(20.0)
+    assert await _mirror_entry_snapshot(mem_db) == entries_before
+    mirror_after_failure = await savings._mirror_valuate()
+    assert mirror_after_failure["allocated"] == pytest.approx(30.0)
+    pos = next(p for p in mirror_after_failure["positions"] if p["ticker"] == "AAPL")
+    assert pos["shares"] == pytest.approx(0.3)
+
+    # The failed attempt left no half-written state: a retry works fully.
+    assert (await savings.remove_position("SPY"))["ok"] is True
+    assert await savings._pending_total() == 0.0
+    assert [round(e.amount, 2) for e in await _mirror_entries(mem_db)] == [30.0, -30.0]
+    assert (await savings._mirror_valuate())["allocated"] == pytest.approx(0.0)
+    assert len(await _events(mem_db, "WARN")) == warns_before + 1
 
 
 # ---------------------------------------------------------------------------

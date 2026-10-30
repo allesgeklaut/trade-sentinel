@@ -614,10 +614,18 @@ async def test_deposit_month_key_matches_sim_anchor(mem_db):
     assert monthly._TZ == sim_mod._TZ
 
 
-async def test_take_snapshot_records_daily_equity(mem_db):
+async def test_take_snapshot_records_daily_equity(mem_db, monkeypatch):
     """take_snapshot() writes a MonthlySnapshot from the live valuation —
     the mechanism that makes the Monthly curve move every day."""
     from app.db import Candle
+
+    # The mark must be FRESH relative to the valuation clock (price-age
+    # policy, app/price_freshness.py): a print older than
+    # settings.factor_price_max_age_days is not a usable mark and falls back
+    # to avg_cost. Pin the clock to the seeded session instead of letting the
+    # fixed 2026-09-01 bar age out of the window as wall time advances.
+    monkeypatch.setattr(monthly, "_now",
+                        lambda: datetime(2026, 9, 1, 22, 0, tzinfo=UTC))
 
     # seed a price so valuation uses the fresh close, not the avg_cost fallback
     async with mem_db() as s:
@@ -665,6 +673,12 @@ async def test_refresh_holdings_no_rebalance(mem_db, monkeypatch):
     """refresh_holdings refreshes candles for held tickers (+ FX pairs) only —
     no deposits, no trades, no rebalance side effects."""
     from app.db import Candle
+
+    # Same fixture-clock pin as test_take_snapshot_records_daily_equity: the
+    # fresh-close assertion only holds while the seeded bar is inside the
+    # price-age window (app/price_freshness.py).
+    monkeypatch.setattr(monthly, "_now",
+                        lambda: datetime(2026, 9, 1, 22, 0, tzinfo=UTC))
 
     async def fake_refresh(ticker, period):
         return []
@@ -1652,12 +1666,24 @@ class TestBackfill:
 
 
 class TestReset:
-    def test_reset_clears_state_and_restores_start_cash(self, mem_db):
+    def test_reset_clears_current_state_and_preserves_history(self, mem_db):
+        """A reset CLOSES the epoch; it does not rewrite it.
+
+        Positions are cleared and the account re-seeded (cash = start, both
+        month markers None) for the fresh epoch, while the closed epoch's
+        money ledger — trades, allowances, snapshots and rebalances — survives
+        bit-for-bit in every mapped column. The old test expected all five
+        tables to be emptied, which described the destructive reset that
+        rewrote the paper book's own record; the epoch boundary in
+        app/run_config.py replaces it.
+        """
+        from app import run_config
         from app.db import MonthlyAllowance as Al
         from app.db import MonthlyPosition as Pos
         from app.db import MonthlyRebalance as Rb
         from app.db import MonthlySnapshot as Sn
         from app.db import MonthlyTrade as Tr
+        from app.db import RunEpoch
 
         async def seed():
             async with mem_db() as s:
@@ -1677,21 +1703,59 @@ class TestReset:
                 s.add(Rb(rebal_month="2026-09", rebal_date=datetime(2026, 9, 30),
                          held_before="", picked="AAA", n_new=1, snapshot=""))
                 await s.commit()
+
+        async def dump(model) -> list[dict]:
+            """Every mapped column of every row of *model*, in id order."""
+            async with mem_db() as s:
+                rows = (await s.scalars(select(model).order_by(model.id))).all()
+            cols = [c.name for c in model.__table__.columns]
+            return [{c: getattr(r, c) for c in cols} for r in rows]
+
+        async def history_dump() -> dict[str, list[dict]]:
+            return {m.__name__: await dump(m) for m in (Tr, Al, Sn, Rb)}
+
         asyncio.run(seed())
+        before = asyncio.run(history_dump())
 
         r = asyncio.run(monthly.reset_monthly())
         assert r["ok"] is True
         assert r["cash"] == settings.sim_monthly_start_cash
+        assert r["epoch"] == 2
+        assert r["preserved"] == {"trades": 1, "snapshots": 1,
+                                  "allowances": 1, "rebalances": 1}
 
         async def check():
             async with mem_db() as s:
-                for model in (Pos, Tr, Al, Sn, Rb):
-                    assert (await s.scalars(select(model))).all() == []
+                assert (await s.scalars(select(Pos))).all() == []
                 acc = await s.get(MonthlyAccount, 1)
                 assert acc.cash == settings.sim_monthly_start_cash
                 assert acc.last_allowance_month is None
                 assert acc.last_rebalance_month is None
+                epochs = (await s.scalars(select(RunEpoch))).all()
+                assert [(e.engine, e.epoch) for e in epochs] == [("monthly", 2)]
+                assert await run_config.current_epoch("monthly", session=s) == 2
         asyncio.run(check())
+
+        # The closed epoch's ledger (rebalances included) is preserved
+        # bit-for-bit ...
+        after = asyncio.run(history_dump())
+        for name, rows in before.items():
+            assert after[name] == rows, \
+                f"{name}: the reset rewrote the closed epoch's rows"
+
+        async def curve_check():
+            # ... and the equity curve restarts EMPTY: preserved snapshots
+            # must not leak into the fresh book's chart.
+            assert await monthly.get_equity_curve() == []
+            async with mem_db() as s:
+                s.add(Sn(cash=250.0, positions_value=0.0, total_equity=250.0,
+                         allowance_total=250.0, epoch=2))
+                await s.commit()
+            curve = await monthly.get_equity_curve()
+            assert [(c["cash"], c["positions_value"], c["total_equity"],
+                     c["allowance_total"], c["epoch"]) for c in curve] == \
+                [(250.0, 0.0, 250.0, 250.0, 2)]
+        asyncio.run(curve_check())
 
 
 async def test_load_frames_filters_tickers_and_bounds_history(mem_db):
@@ -1762,3 +1826,162 @@ async def test_first_snapshot_is_parked_contribution(mem_db, monkeypatch):
     assert rows, "backfill produced snapshots"
     assert rows[0].total_equity == pytest.approx(1000.0)      # parked, 100%
     assert rows[0].allowance_total == pytest.approx(1000.0)
+
+
+# ---------------------------------------------------------------------------
+# Shared zero-fee fill primitives (app/factor_fills.py) — Phase 2 adoption.
+# The Monthly live adapters and the persisted backfill must book EXACTLY what
+# the primitive returns; invalid legs must never mutate the book.
+# ---------------------------------------------------------------------------
+
+async def _set_cash(db_factory, cash: float) -> None:
+    async with db_factory() as s:
+        acc = await s.get(MonthlyAccount, 1)
+        assert acc is not None
+        acc.cash = cash
+        await s.commit()
+
+
+async def _book_state(db_factory):
+    """(cash, trades, positions) read straight from the temp DB."""
+    from app.db import MonthlyPosition as Pos
+    from app.db import MonthlyTrade as Tr
+    async with db_factory() as s:
+        acc = await s.get(MonthlyAccount, 1)
+        trades = (await s.scalars(select(Tr).order_by(Tr.id))).all()
+        pos = (await s.scalars(select(Pos).order_by(Pos.ticker))).all()
+    return acc.cash, trades, pos
+
+
+async def test_exec_buy_books_the_shared_primitive_fill(mem_db):
+    """The live BUY adapter sizes and guards through factor_fills.buy_fill:
+    the booked trade row, position and cash are the primitive's values
+    bit-for-bit (zero fees, historical float order)."""
+    from app import factor_fills
+
+    cash0 = 1000.0
+    await _set_cash(mem_db, cash0)
+    budget, price = 250.0, 10.0
+    fill = factor_fills.buy_fill(cash0, budget, price)
+    assert fill is not None
+
+    t = await monthly._exec_buy("AAA", price, budget, "test")
+    assert t is not None
+    assert t["shares"] == fill.shares
+    assert t["cost"] == round(fill.notional, 2)
+
+    cash, trades, pos = await _book_state(mem_db)
+    assert cash == fill.cash_after                      # no fee, exact
+    assert [(r.side, r.shares, r.price, r.cash_after) for r in trades] == \
+        [("BUY", fill.shares, price, fill.cash_after)]
+    assert [(p.ticker, p.shares, p.avg_cost) for p in pos] == \
+        [("AAA", fill.shares, price)]
+
+
+async def test_exec_buy_razor_edge_drops_the_leg_without_mutation(mem_db):
+    """A 4dp-floored cost a hair above the EXACT cash is dropped — the budget
+    is never clamped down to the cash (the live executor's own guard, now
+    owned by the shared primitive)."""
+    await _set_cash(mem_db, 999.995)          # budget 1000 @ 3.00 -> 999.9999
+    assert await monthly._exec_buy("AAA", 3.0, 1000.0, "test") is None
+    cash, trades, pos = await _book_state(mem_db)
+    assert cash == 999.995 and trades == [] and pos == []
+
+
+async def test_exec_buy_invalid_inputs_leave_the_book_untouched(mem_db):
+    """Non-finite / negative / overflowing legs are non-executable: no cash
+    movement, no trade row, no position."""
+    bad = [(float("nan"), 100.0), (float("inf"), 100.0), (0.0, 100.0),
+           (-10.0, 100.0), (10.0, float("nan")), (10.0, float("inf")),
+           (10.0, -100.0), (5e-324, 1e308)]
+    cash0 = settings.sim_monthly_start_cash
+    for price, budget in bad:
+        assert await monthly._exec_buy("AAA", price, budget, "test") is None, price
+    cash, trades, pos = await _book_state(mem_db)
+    assert cash == cash0 and trades == [] and pos == []
+
+
+async def test_exec_buy_without_the_primitive_books_nothing(mem_db, monkeypatch):
+    """Wiring guard: the live BUY adapter has no private arithmetic left — a
+    primitive that refuses the leg refuses the trade."""
+    monkeypatch.setattr(monthly.factor_fills, "buy_fill", lambda *_a, **_k: None)
+    assert await monthly._exec_buy("AAA", 50.0, 500.0, "test") is None
+    cash, trades, pos = await _book_state(mem_db)
+    assert cash == settings.sim_monthly_start_cash and trades == [] and pos == []
+
+
+async def test_exec_sell_invalid_price_keeps_the_position(mem_db):
+    """Regression (Monthly's unguarded SELL path): a zero/negative/NaN/inf
+    quote used to delete the position for $0 proceeds and book a bogus SELL.
+    Now the primitive refuses the fill and NOTHING is mutated."""
+    await _set_cash(mem_db, 1000.0)
+    buy = await monthly._exec_buy("AAA", 50.0, 500.0, "test")
+    assert buy is not None                       # 10 shares @ 50, cash 500
+    cash_before, trades_before, pos_before = await _book_state(mem_db)
+    for bad in (0.0, -5.0, float("nan"), float("inf"), None):
+        assert await monthly._exec_sell("AAA", bad, "test") is None, bad
+    cash, trades, pos = await _book_state(mem_db)
+    assert cash == cash_before
+    assert [(r.side, r.ticker) for r in trades] == [("BUY", "AAA")]
+    assert [(p.ticker, p.shares) for p in pos] == \
+        [(p.ticker, p.shares) for p in pos_before]
+
+
+async def test_exec_sell_liquidates_every_supplied_share(mem_db):
+    """The SELL primitive uses the position's own share count as-is: no
+    re-flooring, no rounding of a legacy/backfilled 9dp book."""
+    from app.db import MonthlyPosition as Pos
+    await _set_cash(mem_db, 100.0)
+    async with mem_db() as s:
+        s.add(Pos(ticker="AAA", shares=0.123456789, avg_cost=9.0,
+                  opened_at=datetime(2026, 1, 2)))
+        await s.commit()
+
+    t = await monthly._exec_sell("AAA", 10.0, "test")
+    assert t is not None
+    assert t["shares"] == 0.123456789            # untouched by the floor
+    assert t["proceeds"] == round(0.123456789 * 10.0, 2)
+    cash, trades, pos = await _book_state(mem_db)
+    assert cash == 100.0 + 0.123456789 * 10.0    # exact zero-fee proceeds
+    assert [(r.side, r.shares, r.price, r.cash_after) for r in trades] == \
+        [("SELL", 0.123456789, 10.0, cash)]
+    assert pos == []                             # liquidated + deleted
+
+
+async def test_buy_sell_round_trip_conserves_cash(mem_db):
+    """At an unchanged price a full round trip returns the account to its
+    starting cash: there is no fee term anywhere in the live adapters."""
+    cash0 = 1000.0
+    await _set_cash(mem_db, cash0)
+    buy = await monthly._exec_buy("AAA", 2.5, 500.0, "test")
+    assert buy is not None
+    sell = await monthly._exec_sell("AAA", 2.5, "test")
+    assert sell is not None
+    assert sell["shares"] == buy["shares"]
+    cash, trades, pos = await _book_state(mem_db)
+    assert cash == cash0
+    assert pos == []
+    assert [r.side for r in trades] == ["BUY", "SELL"]
+    assert trades[0].shares == trades[1].shares
+    assert trades[0].price == trades[1].price
+
+
+def test_backfill_books_only_through_the_shared_primitives(
+        mem_db, fake_market, monkeypatch):
+    """Wiring guard for the persisted replay: with the primitives refusing
+    every leg the backfill books no trades and holds no positions — i.e. its
+    BUY/SELL arithmetic has no private path around them."""
+    monkeypatch.setattr(monthly.factor_fills, "buy_fill", lambda *_a, **_k: None)
+    monkeypatch.setattr(monthly.factor_fills, "sell_fill", lambda *_a, **_k: None)
+    monkeypatch.setattr(monthly, "_current_month", lambda: "2026-08")
+
+    r = asyncio.run(monthly.backfill(start="2026-07-01"))
+    assert r["ok"] is True and r["trades"] == 0
+
+    async def check():
+        from app.db import MonthlyPosition as Pos
+        from app.db import MonthlyTrade as Tr
+        async with mem_db() as s:
+            assert (await s.scalars(select(Tr))).all() == []
+            assert (await s.scalars(select(Pos))).all() == []
+    asyncio.run(check())

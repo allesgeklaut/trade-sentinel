@@ -375,27 +375,81 @@ class TestExecSell:
 # ---------------------------------------------------------------------------
 
 class TestReset:
-    async def test_reset_wipes_everything(self, with_cash):
-        """Reset should clear all tables and reinitialize cash."""
-        # Create some state
+    async def test_reset_preserves_history_clears_current_book(
+            self, with_cash, monkeypatch, tmp_path):
+        """``reset_sim()`` CLOSES the epoch; it does not rewrite it.
+
+        The CURRENT book is cleared and re-seeded (positions gone, cash =
+        start, month/week markers None) and a ``RunEpoch`` boundary moves the
+        engine to epoch 2, while the closed epoch's ledger — trades, snapshots
+        and allowances — survives bit-for-bit in every mapped column. The old
+        test expected every table to be wiped, i.e. the destructive reset that
+        rewrote the paper book's own record; the epoch boundary in
+        app/run_config.py replaces it.
+
+        The DCA benchmark is the documented DERIVED-ARTIFACT exception (a
+        comparison curve, not a decision book) and is already covered by
+        ``TestBenchmark.test_benchmark_reset`` — not re-asserted here.
+        """
+        from sqlalchemy import select as sa_select
+
+        from app import run_config
+        from app.db import RunEpoch, SimAllowance
+
+        # reset re-arms the per-session guard in the sim state file
+        monkeypatch.setattr(sim, "_STATE_FILE", tmp_path / "state.json")
+
+        # Create some state: a filled trade, a snapshot, an allowance and the
+        # account markers the reset must clear.
         await sim._exec_buy("AAPL", 100.0, 2000.0, "buy")
         async with sim.Session() as s:
-            s.add(SimSnapshot(cash=8000, positions_value=2000, total_equity=10000, allowance_total=0))
+            s.add(SimSnapshot(cash=8000, positions_value=2000,
+                              total_equity=10000, allowance_total=0))
+            s.add(SimAllowance(amount=1000.0, month="2026-09"))
+            acc = await s.get(SimAccount, 1)
+            acc.last_allowance_month = "2026-09"
+            acc.last_review_week = "2026-W36"
             await s.commit()
+
+        async def dump(model) -> list[dict]:
+            """Every mapped column of every row of *model*, in id order."""
+            async with sim.Session() as s:
+                rows = (await s.scalars(
+                    sa_select(model).order_by(model.id))).all()
+            cols = [c.name for c in model.__table__.columns]
+            return [{c: getattr(r, c) for c in cols} for r in rows]
+
+        tables = (SimTrade, SimSnapshot, SimAllowance)
+        before = {m.__name__: await dump(m) for m in tables}
 
         result = await sim.reset_sim()
         assert result["ok"] is True
+        assert result["cash"] == settings.sim_start_cash
+        assert result["epoch"] == 2
+        assert result["preserved"] == {"trades": 1, "snapshots": 1,
+                                       "allowances": 1}
 
         async with sim.Session() as s:
-            from sqlalchemy import select as sa_select
-            pos = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "AAPL"))
+            pos = await s.scalar(sa_select(SimPosition).where(
+                SimPosition.ticker == "AAPL"))
             assert pos is None
-            trades = (await s.scalars(sa_select(SimTrade))).all()
-            assert len(trades) == 0
-            snaps = (await s.scalars(sa_select(SimSnapshot))).all()
-            assert len(snaps) == 0
+            assert (await s.scalars(sa_select(SimPosition))).all() == []
             acc = await s.get(SimAccount, 1)
             assert acc.cash == settings.sim_start_cash
+            assert acc.last_allowance_month is None
+            assert acc.last_review_week is None
+            epochs = (await s.scalars(sa_select(RunEpoch))).all()
+            assert [(e.engine, e.epoch) for e in epochs] == [("sim", 2)]
+            assert await run_config.current_epoch("sim", session=s) == 2
+
+        # The closed epoch's ledger is preserved bit-for-bit ...
+        after = {m.__name__: await dump(m) for m in tables}
+        for name, rows in before.items():
+            assert after[name] == rows, \
+                f"{name}: the reset rewrote the closed epoch's rows"
+
+        # ... and the fresh epoch's curve starts EMPTY (no closed-epoch leak).
+        assert await sim.get_equity_curve() == []
 
 
 # ---------------------------------------------------------------------------

@@ -1232,6 +1232,58 @@ class SavingsTrueupRequest(BaseModel):
 class SavingsDepositRequest(BaseModel):
     amount: float
 
+class SavingsWithdrawRequest(BaseModel):
+    amount: float
+    occurred_on: str | None = None  # "YYYY-MM-DD"; omitted = today (operator-local)
+    note: str = ""
+
+class SavingsDividendRequest(BaseModel):
+    amount: float                   # EUR received (money IN to the tracked cash)
+    ticker: str                     # the paying holding
+    occurred_on: str | None = None  # "YYYY-MM-DD"; omitted = today (operator-local)
+    note: str = ""
+
+class SavingsFeeRequest(BaseModel):
+    amount: float                   # EUR paid from the tracked cash
+    occurred_on: str | None = None  # "YYYY-MM-DD"; omitted = today (operator-local)
+    note: str = ""
+
+class SavingsSettleRequest(BaseModel):
+    ticker: str                     # the disposed holding the proceeds belong to
+    proceeds: float                 # EUR now in the tracked cash
+    occurred_on: str | None = None  # "YYYY-MM-DD"; omitted = today (operator-local)
+    note: str = ""
+    # The SELL row this settlement closes (optional: inferred when exactly one
+    # unsettled disposal exists for the ticker). UNIQUE per disposal.
+    settlement_of: int | None = None
+    # Explicit opt-in for a disposal that predates the SELL record; requires a
+    # non-empty explanatory note.
+    legacy: bool = False
+
+class SavingsTaxRequest(BaseModel):
+    amount: float                   # EUR paid from the tracked cash
+    occurred_on: str | None = None  # "YYYY-MM-DD"; omitted = today (operator-local)
+    note: str = ""
+
+class SavingsSellRequest(BaseModel):
+    ticker: str
+    shares: float                    # quantity disposed (> 0, <= held); omitted = full via DELETE
+    price: float | None = None       # execution price per share in EUR (never invented)
+    occurred_on: str | None = None   # "YYYY-MM-DD"; omitted = today (operator-local)
+
+class SavingsSplitRequest(BaseModel):
+    ticker: str
+    ratio: float                    # new shares per old share (> 0, not exactly 1.0)
+    occurred_on: str | None = None  # "YYYY-MM-DD"; omitted = today (operator-local)
+    note: str = ""
+
+class SavingsCorrectRequest(BaseModel):
+    ticker: str
+    shares: float | None = None      # NEW share count (omitted = not corrected)
+    avg_cost: float | None = None    # NEW per-share average cost in EUR
+    occurred_on: str | None = None   # "YYYY-MM-DD"; omitted = today (operator-local)
+    note: str = ""
+
 class SavingsSavebackRequest(BaseModel):
     amount: float
     ticker: str
@@ -1268,14 +1320,145 @@ async def savings_mirror(limit: int = Query(default=365, ge=1, le=12000)):
     return {**await savings._mirror_valuate(),
             "curve": await savings.get_mirror_curve(limit)}
 
+@app.get('/api/savings/metrics/xirr')
+async def savings_metrics_xirr(limit: int = Query(default=12000, ge=1, le=12000)):
+    """Dated money-weighted annualized return (XIRR) of the savings account.
+
+    Same response shape/conventions as ``/api/metrics/xirr`` — ``scope`` is
+    ``savings``, and the flows are the event ledger's DATED external capital
+    (contributions in, withdrawals out, dated ``occurred_on`` when recorded
+    else the operator-local ``created_at`` day) instead of the day-over-day
+    deltas of a snapshot column. The equity window is the
+    ``SavingsSnapshot`` curve; the terminal value is its latest point.
+
+    ``xirr`` is a FRACTION (``0.10`` = +10%/yr) and null (with a ``reason``)
+    when the money-weighted return is undefined. ``window_days`` reports the
+    span of the equity window. Because the flow schedule comes from the
+    ledger (not from the window's first contribution), a truncated ``limit``
+    does not invent an opening inflow — but it does drop equity points
+    before the window, so the full history remains the meaningful run.
+    """
+    from . import savings
+    from .performance import xirr
+
+    data = await savings.metric_series(limit)
+    points = data["points"]
+    flows = [(date.fromisoformat(f["date"]), f["amount"]) for f in data["flows"]]
+
+    final_date = points[-1]["date"] if points else None
+    final_value = _finite_or_none(points[-1]["total_equity"]) if points else None
+    window_days = None
+    if len(points) > 1:
+        window_days = (date.fromisoformat(points[-1]["date"])
+                       - date.fromisoformat(points[0]["date"])).days
+    rate: float | None = None
+    reason: str | None = None
+    if not points:
+        reason = "no equity snapshots for this savings account yet"
+    elif final_value is None:
+        reason = "latest snapshot has no usable total_equity"
+    elif not flows:
+        reason = ("no dated external flows in this window (no contribution or "
+                  "withdrawal at or before the last snapshot)")
+    else:
+        rate = xirr([d for d, _ in flows], [a for _, a in flows], final_value, final_date)
+        if rate is None:
+            reason = ("no NPV=0 solution — e.g. no positive terminal value "
+                      "(a total loss cannot be annualized)")
+
+    return {
+        "ok": True,
+        "scope": "savings",
+        "xirr": rate,
+        "xirr_pct": None if rate is None else rate * 100.0,
+        "final_value": final_value,
+        "final_date": final_date,
+        "window_days": window_days,
+        "contributed": _finite_or_none(points[-1]["contributed"]) if points else None,
+        "points": len(points),
+        "flows": [{"date": d.isoformat(), "amount": a} for d, a in flows],
+        "reason": reason,
+    }
+
+@app.get('/api/savings/metrics/twr')
+async def savings_metrics_twr(limit: int = Query(default=12000, ge=1, le=12000)):
+    """Time-weighted return (unitized NAV) series of the savings account.
+
+    Same response shape/conventions as ``/api/metrics/twr`` (``scope`` is
+    ``savings``): ``nav`` is the chained, cash-flow-adjusted NAV from
+    ``app.performance.unitized_nav`` over the ``SavingsSnapshot`` curve with
+    the ledger's cumulative NET contributed series; a deposit or withdrawal
+    that leaves the value unchanged leaves the NAV unchanged. ``return_pct``
+    is the cumulative return since the chain start.
+
+    Additive vs the paper-portfolio endpoint: ``max_drawdown_pct`` is the
+    cash-flow-neutral (peak-to-trough of the same unitized NAV) maximum
+    drawdown from ``app.performance.max_drawdown`` — withdrawals and deposits
+    are flows, so they never appear as drawdown.
+    """
+    from . import savings
+    from .performance import max_drawdown, unitized_nav
+
+    data = await savings.metric_series(limit)
+    points = data["points"]
+    nav = unitized_nav([p["total_equity"] for p in points],
+                       [p["contributed"] for p in points]) if points else []
+
+    start_index = next((i for i, v in enumerate(nav) if v > 0.0), None)
+    base = nav[start_index] if start_index is not None else None
+
+    zeros = [i for i in range((start_index or 0) + 1, len(nav))
+             if nav[i] == 0.0 and nav[i - 1] > 0.0]
+    restarted = bool(zeros) and any(v > 0.0 for v in nav[zeros[-1] + 1:])
+
+    twr_pct: float | None = None
+    reason: str | None = None
+    if not points:
+        reason = "no equity snapshots for this savings account yet"
+    elif base is None:
+        reason = "the account was never funded (no positive equity point)"
+    elif restarted:
+        reason = ("the unitized NAV hit zero (total loss) inside this window and "
+                  "restarted — no single cumulative TWR is meaningful")
+    else:
+        twr_pct = (nav[-1] / base - 1.0) * 100.0
+
+    series = []
+    for i, (point, value) in enumerate(zip(points, nav, strict=True)):
+        return_pct: float | None = None
+        if (base is not None and start_index is not None
+                and i >= start_index and math.isfinite(value)):
+            return_pct = (value / base - 1.0) * 100.0
+        series.append({
+            "date": point["date"],
+            "nav": _finite_or_none(value),
+            "return_pct": return_pct,
+            "total_equity": _finite_or_none(point["total_equity"]),
+            "contributed": _finite_or_none(point["contributed"]),
+        })
+
+    return {
+        "ok": True,
+        "scope": "savings",
+        "points": series,
+        "twr_pct": twr_pct,
+        "nav_start": base,
+        "start": points[start_index]["date"] if start_index is not None else None,
+        "end": points[-1]["date"] if points else None,
+        "max_drawdown_pct": max_drawdown(nav) if nav else None,
+        "reason": reason,
+    }
+
 @app.post('/api/savings/initialize')
 async def savings_initialize(req: SavingsInitRequest):
-    """(Re)initialize the tracker: savings cash + current holdings.
+    """Seed a FRESH tracker: savings cash + current holdings.
 
-    Destructive for TRACKER data only: wipes previous tracker state (the
-    paper sims are untouched). Pass positions as
-    [{ticker, shares, avg_cost}] (EUR); repeated tickers are aggregated
-    into one weighted-average lot.
+    Non-destructive by contract. An already initialized tracker is refused
+    with 422 ``already initialized`` BEFORE anything is touched — the operator's
+    restart path is ``/api/savings/reset``, which preserves the event ledger
+    and the equity curve, clears the current state, and lets this endpoint seed
+    a fresh epoch. Pass positions as [{ticker, shares, avg_cost}] (EUR);
+    repeated tickers are aggregated into one weighted-average lot.
     """
     from . import savings
     if req.cash < 0:
@@ -1291,12 +1474,23 @@ async def savings_initialize(req: SavingsInitRequest):
         if sh <= 0 or ac <= 0:
             raise HTTPException(422, "position shares/avg_cost must be > 0")
     async with savings.account_lock:
-        return await savings.initialize(
+        r = await savings.initialize(
             req.cash, req.positions, req.monthly_transfer, req.interest_rate)
+    if not r.get("ok"):
+        raise HTTPException(422, r.get("reason", "initialize failed"))
+    return r
 
 @app.post('/api/savings/reset')
 async def savings_reset():
-    """Wipe the tracker back to uninitialized (setup form). Sims untouched."""
+    """Start a new epoch: clear current state, KEEP the ledger and the curve.
+
+    History-safe: the events and snapshots are preserved bit-for-bit and a
+    ``RESET`` boundary row is appended; contributed capital and the metrics
+    series read only the new epoch's rows. Positions/plans and the picks
+    mirror (the comparison artifact) are cleared and the tracker is
+    uninitialized again, so the setup form returns. The paper sims are never
+    touched.
+    """
     from . import savings
     async with savings.account_lock:
         return await savings.reset()
@@ -1324,7 +1518,7 @@ async def savings_config(req: SavingsConfigRequest):
 @app.post('/api/savings/deposit')
 async def savings_deposit(req: SavingsDepositRequest):
     """Book a one-off cash deposit: fresh money moved into the TR cash —
-    a contribution (counted in Contributed). True-up stays the
+    a contribution (raises NET contributed capital). True-up stays the
     reconciliation tool for drift."""
     from . import savings
     async with savings.account_lock:
@@ -1332,6 +1526,162 @@ async def savings_deposit(req: SavingsDepositRequest):
     if not r.get("ok"):
         raise HTTPException(422, r.get("reason", "deposit failed"))
     return r
+
+@app.post('/api/savings/withdraw')
+async def savings_withdraw(req: SavingsWithdrawRequest):
+    """Book a dated cash withdrawal: fresh money moved OUT of the TR cash.
+
+    The mirror of ``/api/savings/deposit``: the tracked cash drops and a
+    ``WITHDRAWAL`` event (signed negative, dated ``occurred_on``) lowers NET
+    contributed capital — it is an external flow, never an investment loss.
+    Refusals: 422 for a malformed amount/date or for insufficient tracked
+    cash (matching ``/api/savings/buy``'s state-rejection class); 404 for an
+    uninitialized tracker (the resource does not exist) — a larger
+    real-world gap is true-up's reconciliation.
+    """
+    from . import savings
+    async with savings.account_lock:
+        r = await savings.withdraw(req.amount, req.occurred_on, req.note)
+    return _savings_event_result(r, "withdrawal failed")
+
+
+def _savings_event_result(result: dict, action: str) -> dict:
+    """Shared status convention for the dated savings ledger events.
+
+    422 for a malformed payload or a state rejection (matching
+    ``/api/savings/buy``'s class); 404 only for an uninitialized tracker —
+    the resource does not exist, so nothing could have been booked.
+    """
+    if not result.get("ok"):
+        reason = result.get("reason", action)
+        raise HTTPException(404 if reason == "not initialized" else 422, reason)
+    return result
+
+
+@app.post('/api/savings/dividend')
+async def savings_dividend(req: SavingsDividendRequest):
+    """Book a cash dividend received into the tracked TR cash.
+
+    A dividend is INVESTMENT INCOME, not fresh capital: the cash rises and a
+    ``DIVIDEND`` event (signed positive, dated ``occurred_on``, flow_class
+    ``dividend``) is appended, so NET contributed capital is untouched and the
+    income shows up in the return. Refusals: 422 malformed amount/date or an
+    invalid ticker symbol; 404 for an uninitialized tracker.
+    """
+    from . import savings
+    ticker = req.ticker.strip().upper()
+    if not _TICKER_RE.match(ticker):
+        raise HTTPException(422, f"invalid ticker symbol: {ticker!r}")
+    async with savings.account_lock:
+        r = await savings.add_dividend(req.amount, ticker, req.occurred_on, req.note)
+    return _savings_event_result(r, "dividend failed")
+
+
+@app.post('/api/savings/fee')
+async def savings_fee(req: SavingsFeeRequest):
+    """Book a fee PAID from the tracked cash (e.g. TR's FX fee).
+
+    The cash drops and a ``FEE`` event (signed negative, flow_class ``fee``)
+    is appended. A fee is a cost INSIDE the tracker, not an external flow: it
+    is never netted against contributed capital and hits the return honestly.
+    Refusals: 422 malformed amount/date or ``insufficient cash``; 404 for an
+    uninitialized tracker.
+    """
+    from . import savings
+    async with savings.account_lock:
+        r = await savings.add_fee(req.amount, req.occurred_on, req.note)
+    return _savings_event_result(r, "fee failed")
+
+
+@app.post('/api/savings/tax')
+async def savings_tax(req: SavingsTaxRequest):
+    """Book a tax PAID from the tracked cash.
+
+    The cash drops and a ``TAX`` event (signed negative, flow_class ``tax``)
+    is appended. A tax is a cost INSIDE the tracker, not an external flow: it
+    is never netted against contributed capital and hits the return honestly.
+    Refusals: 422 malformed/future date or ``insufficient cash``; 404 for an
+    uninitialized tracker.
+    """
+    from . import savings
+    async with savings.account_lock:
+        r = await savings.add_tax(req.amount, req.occurred_on, req.note)
+    return _savings_event_result(r, "tax failed")
+
+
+@app.post('/api/savings/settle')
+async def savings_settle(req: SavingsSettleRequest):
+    """Book the settlement half of a manual disposal: proceeds are now cash.
+
+    The counterpart of the SELL disposal record: the tracked cash rises and a
+    ``SETTLEMENT`` event (signed positive, flow_class ``sale_settlement``) is
+    appended, dated ``occurred_on`` and LINKED to the SELL row it closes
+    (``settlement_of`` — inferred when exactly one unsettled disposal exists
+    for the ticker). It is NOT an external flow — the pair reads honestly
+    (temporary mark-down while the money was in flight, then the proceeds
+    booked inside the account; the net over the pair is the realized outcome).
+    One disposal can never be settled twice (the link is UNIQUE). A disposal
+    that predates the SELL record needs the explicit ``legacy`` opt-in and an
+    explanatory note. Refusals: 422 malformed proceeds/date, invalid ticker,
+    already-settled/ambiguous linkage or an over-priced settlement; 404
+    uninitialized tracker.
+    """
+    from . import savings
+    ticker = req.ticker.strip().upper()
+    if not _TICKER_RE.match(ticker):
+        raise HTTPException(422, f"invalid ticker symbol: {ticker!r}")
+    async with savings.account_lock:
+        r = await savings.settle_sale(
+            ticker, req.proceeds, req.occurred_on, req.note,
+            settlement_of=req.settlement_of, legacy=req.legacy)
+    return _savings_event_result(r, "settlement failed")
+
+
+@app.post('/api/savings/split')
+async def savings_split(req: SavingsSplitRequest):
+    """Record a share split (a corporate action) on a real holding.
+
+    Adjusts the position in place — shares × ratio, average cost ÷ ratio, the
+    total cost basis unchanged — appends a ``SPLIT`` record (amount 0, the NEW
+    share count and average cost, flow_class ``corporate_action``) and, for
+    every funding source with mirror shares of that ticker outstanding as of
+    the split day, appends ONE 0-€ per-source adjustment dated at the split
+    (so past curve dates replay unchanged and each source releases exactly its
+    scaled shares later).
+    Refusals: 422 invalid ratio / no-op split (ratio 1.0) / no such position /
+    malformed or future date / ``later position changes prevent backdated
+    split`` (no lot replay); 404 uninitialized tracker.
+    """
+    from . import savings
+    ticker = req.ticker.strip().upper()
+    if not _TICKER_RE.match(ticker):
+        raise HTTPException(422, f"invalid ticker symbol: {ticker!r}")
+    async with savings.account_lock:
+        r = await savings.record_split(ticker, req.ratio, req.occurred_on, req.note)
+    return _savings_event_result(r, "split failed")
+
+
+@app.post('/api/savings/correct')
+async def savings_correct(req: SavingsCorrectRequest):
+    """Record a dated bookkeeping correction of a real holding.
+
+    Sets the supplied fields (shares and/or average cost) and appends a
+    ``CORRECTION`` record carrying the NEW values (the untouched field stays
+    NULL) plus the old ones in the note — so the change is auditable even
+    though the position row is overwritten. No cash moves, contributed capital
+    is untouched and the picks mirror is NOT rescaled (a corporate action is
+    ``/api/savings/split``). A correction mutates the current position, so a
+    future date is refused. Refusals: 422 nothing to correct / invalid value /
+    invalid or future date / no such position; 404 uninitialized tracker.
+    """
+    from . import savings
+    ticker = req.ticker.strip().upper()
+    if not _TICKER_RE.match(ticker):
+        raise HTTPException(422, f"invalid ticker symbol: {ticker!r}")
+    async with savings.account_lock:
+        r = await savings.correct_position(
+            ticker, req.shares, req.avg_cost, req.occurred_on, req.note)
+    return _savings_event_result(r, "correction failed")
 
 @app.post('/api/savings/saveback')
 async def savings_saveback(req: SavingsSavebackRequest):
@@ -1395,6 +1745,35 @@ async def savings_remove_position(ticker: str):
         r = await savings.remove_position(ticker.strip().upper())
     if not r.get("ok"):
         raise HTTPException(404, r.get("reason", "no such position"))
+    return r
+
+@app.post('/api/savings/sell')
+async def savings_sell(req: SavingsSellRequest):
+    """Dispose of a specific quantity of one holding (partial sale record).
+
+    Records the EXACT disposed shares as a dated ``SELL`` row (prior average
+    cost, execution price only when supplied, amount=0 — no cash moves), keeps
+    the remaining shares at their average cost, and releases the funding
+    source's picks-mirror allocation proportionally. The response carries
+    ``disposal_event_id`` for linking the later settlement. A full quantity
+    works too; the DELETE route remains the undated full-disposal path. A
+    future date is refused (a disposal mutates the current position), and a
+    BACK-DATED quantity refuses when later position changes or later mirror
+    allocations would make the reversal fabricate history. Refusals: 422
+    invalid quantity/price/date or more shares than held, 422 backdated
+    chronology conflicts; 404 uninitialized tracker or no such position.
+    """
+    from . import savings
+    ticker = req.ticker.strip().upper()
+    if not _TICKER_RE.match(ticker):
+        raise HTTPException(422, f"invalid ticker symbol: {ticker!r}")
+    async with savings.account_lock:
+        r = await savings.remove_position(
+            ticker, req.price, shares=req.shares, occurred_on=req.occurred_on)
+    if not r.get("ok"):
+        reason = r.get("reason", "sell failed")
+        raise HTTPException(
+            404 if reason in ("not initialized", "no such position") else 422, reason)
     return r
 
 @app.post('/api/savings/refresh')
