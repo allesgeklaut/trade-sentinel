@@ -392,12 +392,15 @@ deterministic rule that captures the gain wins by construction.
 
 Proposed sequencing (each step gated, owner approval between phases):
 
-- **5A-1** (built, gated, pending commit): the sell-shadow research harness —
-  contexts, frozen prompt + fail-safe parser, defer ledger, the sim's five
-  deterministic exit variants. Full-window verdict recorded: V1 signal
-  exits +18.5%/yr vs BASE −2.2%/yr (same buys — the entire gap is the exit
-  rule); V2 the drawdown-averse pick (27.4% maxDD); the crude portfolio
-  breaker a dead end.
+- **5A-1** (committed — `app/sellshadow.py`, the context extractor with the
+  2,906/2,906 bit-identical ratchet self-check, the frozen prompt +
+  fail-safe parser, the defer ledger, the five deterministic exit
+  variants): full-window verdict recorded — V1 signal exits +18.5%/yr vs
+  BASE −2.2%/yr (same buys — the entire gap is the exit rule); V2 the
+  drawdown-averse pick (27.4% maxDD); the crude portfolio breaker a dead
+  end; blanket deferral +2.93pp/event (positive 9 of 12 years, 61% of
+  defers never re-stopping within a quarter) — the LLM's bar is beating
+  the blanket rule with selectivity AND beating V1/V2 at portfolio level.
 - **5B**: the monthly-book M-set (M1–M4 run in parallel on existing knobs;
   M5's engine hook after 4B lands). Feeds the 4C study with the controls.
 - **5C**: the per-engine event adapters (B and C above) for the unified

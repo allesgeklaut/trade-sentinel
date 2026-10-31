@@ -1316,6 +1316,88 @@ the technical sim's 30× annualized turnover made visible for the first
 time — and the snapshot's row counts were re-verified unchanged after
 the run.
 
+## Phase 5A-1 sell-shadow research harness — 2026-10-31
+
+**Slice 5A-1 code-complete, independently verified, and committed.** The
+first Phase 5 slice (the sell-side program predeclared in
+`docs/sell-exit-research-2026-10-31.md`, itself committed 2026-10-31): the
+deterministic machinery for the LLM sell-decider — built OFFLINE, with zero
+LLM/network calls (the authorized model `deepseek-v4.1-flash-mistral` is a
+recorded constant; the Mistral serving behind the LAN LiteLLM proxy at
+192.168.0.46:4000 was separately verified reachable and smoke-tested
+1-token from the sandbox, key at `/opt/secrets/litellm.key`).
+
+`app/sellshadow.py` (new, 1,049 lines): (1) `contexts` — the stop-fire
+context extractor (`stopfire-context/1`): every ATR standing-order SELL of
+a CONTRACT-mode `_replay` run with per-event point-in-time context
+(decision-day only: entry reason/strength, blended basis, sessions held,
+P&L and giveback, ATR14, distance-to-trail in ATR units, benchmark
+drawdown + 20d realized vol, position weight, sessions to month-end),
+sorted-keys deterministic JSON. The extractor's mandatory self-check —
+recompute the standing level from raw bars with the engine's exact
+formula and compare to the level recorded in the trade's reason string —
+passed **2,906/2,906 on the full window (max abs diff 0.0, bit-identical
+to the series' own atr14/atr_stop columns)**. A subtlety it surfaced and
+declares: the REPLAY path's standing level is the per-bar prior-known
+Chandelier candidate (20-day-high − 2×ATR14, maxed with the frozen initial
+percent stop); only the LIVE sim additionally maintains the monotone
+per-position ratchet. (2) the frozen `sellshadow/1` prompt renderer +
+fail-safe parser: byte-identical prompts, `parse_response` maps anything
+malformed/refused/unparsable to CONFIRM (the engine's rule always stands);
+DEFER carries `rearm_mult` clamped [1, 3]. (3) `defer` — the
+counterfactual `defer-ledger/1`: per stop-fire event the DEFER branch's
+forward path under the predeclared rule (stop re-armed at
+level×(1−0.10), CONTRACT-honest fills via the engine's own
+`_standing_stop_fill`, 63-session time cap, window end), both branches
+net of round-trip costs, delta aggregated overall and by year. (4)
+`variants` — the five predeclared deterministic exit variants (existing
+`ReplayParams` knobs only, zero engine changes) through the honest metric
+pipeline (reval's pure functions on the yield-adjusted unitized NAV).
+`tests/test_sellshadow.py` (new, 12 tests on a self-contained
+closed-form-ATR tape).
+
+**Full-window findings (2015-01-02..2026-10-30, sp500, CONTRACT, declared
+costs 10bps/15fx + 3% cash yield, $1,000/month, configs frozen in the
+research doc before any run):** the five-variant study — BASE (the live
+configuration) −2.2%/yr TWR, 41.2% maxDD, Sharpe −0.24, 22.0× turnover,
+median hold 5 sessions; **V1 signal-exits-only +18.5%/yr, Sharpe +0.76,
+0.7× turnover, median hold 190 sessions** — with the same buys, signals,
+costs and universe, the entire ~21pp/yr gap is the exit rule (Clare et
+al.'s "a change of trend is the best stop loss", validated on our data;
+V1's +18.5%/yr ≈ the monthly factor arm's +18.3%/yr — the sim's buys are
+as good as the factor ranking once the stops stop destroying them). V2
+(15% percent trail) +11.6%/yr with the lowest maxDD of the five (27.4%).
+V3 (frozen initial 2×ATR stop, no ratchet) +12.1%/yr — flattered by the
+2022-24 window (+41% there), worst maxDD of the alternatives over the
+decade (42.6%), highest loss-realization (PLR 0.417). V4 (20% portfolio
+breaker) −3.8%/yr, 48.1% maxDD, 19 breaker fires — a crude threshold
+breaker is portfolio-level whipsaw, a dead end (the literature's vol
+*scaling* is not a breaker). BASE reproduces the Phase 4A full-window run
+exactly (−2.2%/41.2%/22×/6,686 trades) — two independent harnesses, same
+numbers. The defer ledger: blanket deferral (the naive shadow policy)
++2.93pp/event mean, +1.11pp median, 52.9% positive over 2,906 events —
+positive in 9 of 12 years (best 2016/2017/2023 at +5.3..5.6pp), negative
+in 2015 (−2.3pp, n=62) and 2022 (−0.13pp, median −7.7pp); 61% of defers
+hit the 63-session time cap with the re-armed stop never breached. The
+LLM's bar is therefore twofold: beat the blanket rule with selectivity
+(skip the 2015/2022-type events), and beat V1/V2 at portfolio level.
+
+Independent verification: the 12 new tests + the golden parity suites
+(optimize + replay fills, 123) green on the orchestrator's own runs; the
+full offline suite in an isolated worktree at the branch head
+**1608 passed** (1596 + 12); ruff clean; real-data CLI runs for all three
+subcommands against the snapshot (contexts 2,906 events / self-check
+1.0; defer full window; variants 3m26s); the snapshot's row counts
+re-verified unchanged after every run. Honesty limits declared in the
+module docstring and carried by any evaluation built on it: the DEFER
+branch is a single-name what-if (no redeployment of freed cash, no
+re-entry — it OVERSTATES deferral vs the real engine, whose freed cash
+would have been redeployed into the next BUY signal; V1 is the
+portfolio-level truth), the sell-mix/holding/disposition statistics
+share the current-membership survivorship caveat, and no LLM was
+consulted anywhere (contexts are for prompt design and prospective
+windows only — no LLM calls on history).
+
 ## References
 
 - [SEC Apple companyfacts](https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json)
