@@ -188,6 +188,211 @@ class TestChat:
             self._chat(monkeypatch, llm_state_tmp, {}, status_code=500)
 
 
+class TestChatTemplateKwargs:
+    """The vLLM-native ``chat_template_kwargs`` are OPT-IN per backend.
+
+    Regression pin for the 2026-10-31 live smoke: the LAN LiteLLM proxy
+    (routing deepseek-v4.1-flash-mistral) answered HTTP 422
+    ``extra_forbidden ... body.chat_template_kwargs`` for the
+    unconditional field, so every sell-layer consult fail-safed; the clean
+    body (no field) answered 200. Only a backend that DECLARES the kwargs
+    sends them.
+    """
+
+    def _capture_body(self, monkeypatch, backends_json, effort=""):
+        captured: dict = {}
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"choices": [{"message": {"content": "ok"}}],
+                        "model": "m1"}
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, url, json=None, headers=None):
+                captured["body"] = json
+                return FakeResponse()
+
+            async def get(self, url, headers=None):
+                return FakeResponse()
+
+        monkeypatch.setattr(llm.httpx, "AsyncClient", FakeClient)
+        monkeypatch.setattr(llm.settings, "llm_backends", backends_json)
+        monkeypatch.setattr(llm.settings, "llm_reasoning_effort", effort)
+
+        async def run():
+            return await llm.chat([{"role": "user", "content": "hi"}])
+
+        asyncio_run(run())
+        return captured["body"]
+
+    def test_undeclared_backend_sends_the_clean_body(self, monkeypatch, llm_state_tmp):
+        body = self._capture_body(monkeypatch, json.dumps([
+            {"name": "proxy", "type": "openai", "url": "http://a:1",
+             "model": "m"},
+        ]))
+        assert "chat_template_kwargs" not in body  # the LiteLLM 422 regression
+
+    def test_declared_backend_carries_the_kwargs(self, monkeypatch, llm_state_tmp):
+        body = self._capture_body(monkeypatch, json.dumps([
+            {"name": "vllm", "type": "openai", "url": "http://b:1",
+             "model": "m", "chat_template_kwargs": {"enable_thinking": True}},
+        ]))
+        assert body["chat_template_kwargs"]["enable_thinking"] is True
+
+    def test_effort_budget_rides_only_on_a_declared_backend(self, monkeypatch, llm_state_tmp):
+        body = self._capture_body(monkeypatch, json.dumps([
+            {"name": "vllm", "type": "openai", "url": "http://b:1",
+             "model": "m", "chat_template_kwargs": {"enable_thinking": True}},
+        ]), effort="high")
+        assert body["chat_template_kwargs"]["thinking_budget"] == 8192
+
+    def test_effort_on_a_strict_backend_sends_reasoning_effort(self, monkeypatch, llm_state_tmp):
+        """The strict-schema path (probe-verified 2026-10-31): the LiteLLM
+        proxy answers ``reasoning_effort`` with HTTP 200 + reasoning_content,
+        while the vLLM-only field 422s — so the effort travels as the
+        OpenAI-style field, never chat_template_kwargs."""
+        body = self._capture_body(monkeypatch, json.dumps([
+            {"name": "proxy", "type": "openai", "url": "http://a:1",
+             "model": "m"},
+        ]), effort="high")
+        assert body["reasoning_effort"] == "high"
+        assert "chat_template_kwargs" not in body
+
+    def test_xhigh_rides_verbatim_on_the_strict_path(self, monkeypatch, llm_state_tmp):
+        """Probe-verified 2026-10-31: the proxy's Mistral route SUPPORTS
+        xhigh (supported values ['none', 'low', 'high', 'xhigh', 'max']) —
+        so it rides verbatim; the app does not curate the server's
+        vocabulary (an earlier pin kept it vLLM-only, contradicting the
+        probe)."""
+        body = self._capture_body(monkeypatch, json.dumps([
+            {"name": "proxy", "type": "openai", "url": "http://a:1",
+             "model": "m"},
+        ]), effort="xhigh")
+        assert body["reasoning_effort"] == "xhigh"
+        assert "chat_template_kwargs" not in body
+
+    def test_max_rides_verbatim_outside_the_vllm_table(self, monkeypatch, llm_state_tmp):
+        """``max`` is outside the vLLM thinking-budget table yet supported
+        by the Mistral route — it rides verbatim, proving no curation;
+        the SERVER validates the value (the route rejects "medium" with a
+        400 listing its supported values, by design the app's fail-safe
+        then records it)."""
+        body = self._capture_body(monkeypatch, json.dumps([
+            {"name": "proxy", "type": "openai", "url": "http://a:1",
+             "model": "m"},
+        ]), effort="max")
+        assert body["reasoning_effort"] == "max"
+        assert "chat_template_kwargs" not in body
+
+    def test_no_effort_sends_no_reasoning_fields(self, monkeypatch, llm_state_tmp):
+        body = self._capture_body(monkeypatch, json.dumps([
+            {"name": "proxy", "type": "openai", "url": "http://a:1",
+             "model": "m"},
+        ]), effort="")
+        assert "reasoning_effort" not in body
+        assert "chat_template_kwargs" not in body
+
+    # --- the streaming variant (chat_stream — the live chat UI's wire) ---
+
+    def _capture_stream_body(self, monkeypatch, backends_json, effort=""):
+        """Drive llm.chat_stream against a fake SSE stream; return the
+        request body it sent (and prove the stream parsed to a done)."""
+        captured: dict = {}
+
+        class FakeStreamResp:
+            status_code = 200
+
+            async def aiter_lines(self):
+                yield ('data: {"model": "m", "choices": '
+                       '[{"delta": {"content": "ok"}}]}')
+                yield "data: [DONE]"
+
+            async def aread(self):
+                return b""
+
+        class FakeStreamCtx:
+            async def __aenter__(self):
+                return FakeStreamResp()
+
+            async def __aexit__(self, *a):
+                return False
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            def stream(self, method, url, json=None, headers=None):
+                captured["body"] = json
+                return FakeStreamCtx()
+
+        monkeypatch.setattr(llm.httpx, "AsyncClient", FakeClient)
+        monkeypatch.setattr(llm.settings, "llm_backends", backends_json)
+        monkeypatch.setattr(llm.settings, "llm_reasoning_effort", effort)
+
+        async def run():
+            events = []
+            async for evt in llm.chat_stream(
+                    [{"role": "user", "content": "hi"}]):
+                events.append(evt)
+            return events
+
+        events = asyncio_run(run())
+        assert events[-1]["type"] == "done"
+        assert events[-1]["text"] == "ok"
+        return captured["body"]
+
+    def test_stream_undeclared_backend_sends_the_clean_body(self, monkeypatch, llm_state_tmp):
+        """The streaming 422 regression: chat_stream (the live chat UI's
+        wire — the chat endpoint + the sim chat) must send the same clean
+        body as the non-streaming path on an undeclared backend."""
+        body = self._capture_stream_body(monkeypatch, json.dumps([
+            {"name": "proxy", "type": "openai", "url": "http://a:1",
+             "model": "m"},
+        ]))
+        assert "chat_template_kwargs" not in body
+        assert "reasoning_effort" not in body
+
+    def test_stream_declared_backend_carries_the_kwargs(self, monkeypatch, llm_state_tmp):
+        body = self._capture_stream_body(monkeypatch, json.dumps([
+            {"name": "vllm", "type": "openai", "url": "http://b:1",
+             "model": "m", "chat_template_kwargs": {"enable_thinking": True}},
+        ]))
+        assert body["chat_template_kwargs"]["enable_thinking"] is True
+
+    def test_stream_effort_rides_verbatim_on_the_strict_path(self, monkeypatch, llm_state_tmp):
+        body = self._capture_stream_body(monkeypatch, json.dumps([
+            {"name": "proxy", "type": "openai", "url": "http://a:1",
+             "model": "m"},
+        ]), effort="max")
+        assert body["reasoning_effort"] == "max"
+        assert "chat_template_kwargs" not in body
+
+    def test_stream_effort_budget_rides_only_on_a_declared_backend(self, monkeypatch, llm_state_tmp):
+        body = self._capture_stream_body(monkeypatch, json.dumps([
+            {"name": "vllm", "type": "openai", "url": "http://b:1",
+             "model": "m", "chat_template_kwargs": {"enable_thinking": True}},
+        ]), effort="high")
+        assert body["chat_template_kwargs"]["thinking_budget"] == 8192
+        assert "reasoning_effort" not in body
+
+
 # ---------------------------------------------------------------------------
 # chat_stream — streaming SSE/NDJSON parser
 # ---------------------------------------------------------------------------

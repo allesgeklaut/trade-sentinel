@@ -14,6 +14,14 @@ Backends are configured through the ``LLM_BACKENDS`` JSON env var, e.g.::
       {"name":"ollama","type":"ollama","url":"http://host.docker.internal:11434","model":"deepseek-v4-flash:0731-cloud"}
     ]
 
+A backend may declare ``chat_template_kwargs`` (a dict) for vLLM-native
+chat-template overrides (e.g. ``{"enable_thinking": true}`` plus the
+``LLM_REASONING_EFFORT`` thinking budget). The field is OPT-IN: strict
+OpenAI-schema servers reject it (HTTP 422 ``extra_forbidden`` on
+``body.chat_template_kwargs``, probe-verified 2026-10-31 through the LAN
+LiteLLM proxy routing to Mistral), so it is only sent when the backend
+declares it.
+
 The actively selected backend is persisted to a small JSON file so the choice
 survives restarts.  For backwards compatibility the legacy ``OLLAMA_URL`` /
 ``OLLAMA_MODEL`` settings are honoured when ``LLM_BACKENDS`` is not set.
@@ -106,11 +114,17 @@ def _configured_backends() -> list[dict[str, Any]]:
         url = str(b.get("url") or "").strip().rstrip("/")
         model = str(b.get("model") or "").strip()
         api_key = str(b.get("api_key") or "").strip()
+        # vLLM-native chat-template overrides, OPT-IN per backend: strict
+        # OpenAI-schema servers reject the field with HTTP 422
+        # "extra_forbidden" (probe-verified 2026-10-31 through the LAN
+        # LiteLLM proxy -> Mistral), so it is only sent when declared.
+        ctk = b.get("chat_template_kwargs")
+        chat_kwargs = dict(ctk) if isinstance(ctk, dict) else {}
         if btype not in ("ollama", "openai") or not url or not name:
             logger.warning("Skipping invalid LLM backend entry: %r", b)
             continue
         out.append({"name": name, "type": btype, "url": url, "model": model,
-                     "api_key": api_key})
+                    "api_key": api_key, "chat_template_kwargs": chat_kwargs})
     return out
 
 
@@ -329,16 +343,30 @@ async def chat_stream(messages: list[dict[str, str]]):
                     "model": backend["model"] or "default",
                     "messages": messages,
                     "stream": True,
-                    "chat_template_kwargs": {"enable_thinking": True},
                 }
+                # Same opt-in contract as _post_chat (the non-streaming
+                # path): the vLLM-native chat_template_kwargs ride ONLY on
+                # a declared backend — strict OpenAI-schema servers reject
+                # the field with 422 "extra_forbidden" (probe-verified
+                # 2026-10-31 through the LAN LiteLLM proxy -> Mistral) —
+                # and on the strict path the effort rides VERBATIM as the
+                # OpenAI-style reasoning_effort (the supported vocabulary
+                # is server-specific; the server validates it). This is
+                # the live chat UI's wire (the chat endpoint + the sim
+                # chat), so the streaming variant must not regress it.
+                chat_kwargs = dict(backend.get("chat_template_kwargs") or {})
                 effort = str(settings.llm_reasoning_effort or "").strip().lower()
-                if effort in ("low", "medium", "high", "xhigh"):
-                    payload["chat_template_kwargs"]["thinking_budget"] = {
-                        "low": 512,
-                        "medium": 2048,
-                        "high": 8192,
-                        "xhigh": 32768,
-                    }[effort]
+                if chat_kwargs:
+                    if effort in ("low", "medium", "high", "xhigh"):
+                        chat_kwargs["thinking_budget"] = {
+                            "low": 512,
+                            "medium": 2048,
+                            "high": 8192,
+                            "xhigh": 32768,
+                        }[effort]
+                    payload["chat_template_kwargs"] = chat_kwargs
+                elif effort:
+                    payload["reasoning_effort"] = effort
                 async with client.stream(
                     "POST", backend["url"] + "/v1/chat/completions",
                     json=payload, headers=_auth_headers(backend),
@@ -427,16 +455,36 @@ async def _post_chat(
                 "model": backend["model"] or "default",
                 "messages": messages,
                 "stream": False,
-                "chat_template_kwargs": {"enable_thinking": True},
             }
+            # The vLLM-native kwargs ride ONLY when the backend declared
+            # them: strict OpenAI-schema servers (LiteLLM routing to
+            # Mistral/OpenAI/...) reject the field with 422
+            # "extra_forbidden" (probe-verified 2026-10-31), so the clean
+            # body is the default. On the strict path the reasoning effort
+            # travels VERBATIM as the OpenAI-style ``reasoning_effort``:
+            # the supported vocabulary is SERVER-SPECIFIC — the LAN proxy's
+            # Mistral route answers none/low/high/xhigh/max and rejects
+            # "medium" (HTTP 400 "reasoning_effort 'medium' is not supported
+            # for this model; supported values: ['none', 'low', 'high',
+            # 'xhigh', 'max']"; low/high answer 200 with
+            # ``reasoning_content`` + ``usage.reasoning_tokens``), while
+            # OpenAI itself takes "medium" but not xhigh/max — so the app
+            # does NOT curate the list; the operator sets a value their
+            # server supports and the server validates it (all probe-
+            # verified 2026-10-31).
+            chat_kwargs = dict(backend.get("chat_template_kwargs") or {})
             effort = str(settings.llm_reasoning_effort or "").strip().lower()
-            if effort in ("low", "medium", "high", "xhigh"):
-                payload["chat_template_kwargs"]["thinking_budget"] = {
-                    "low": 512,
-                    "medium": 2048,
-                    "high": 8192,
-                    "xhigh": 32768,
-                }[effort]
+            if chat_kwargs:
+                if effort in ("low", "medium", "high", "xhigh"):
+                    chat_kwargs["thinking_budget"] = {
+                        "low": 512,
+                        "medium": 2048,
+                        "high": 8192,
+                        "xhigh": 32768,
+                    }[effort]
+                payload["chat_template_kwargs"] = chat_kwargs
+            elif effort:
+                payload["reasoning_effort"] = effort
             resp = await client.post(
                 backend["url"] + "/v1/chat/completions",
                 json=payload, headers=_auth_headers(backend),

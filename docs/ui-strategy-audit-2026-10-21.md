@@ -2262,6 +2262,118 @@ governs the sell layer; with no backend configured the accounts behave
 exactly as today (the no-backend short-circuit), and the first meaningful
 scorecard needs ~3 months of live type-A events.
 
+## The quota-day live smoke + the LLM transport fix — 2026-10-31
+
+**The owner's invitation: "today is the last day of the llm quota, so if
+you want to test a little knock yourself out."** The live sell layer's
+first real-backend exercise (all its tests use synthetic transports),
+on a throwaway COPY of the read-only reval snapshot (the pristine DBs
+untouched; the API key read by app/llm.py, never printed or logged).
+
+- **The fail-safe proven under a REAL transport error first**: the
+  initial consults all returned HTTP 422 from the LAN LiteLLM proxy —
+  and all three fail-safed exactly per the design (CONFIRM / CONFIRM /
+  HOLD, the error recorded as fail_reason, ~300ms, the engine's rule
+  standing). The property the whole design rests on, verified against
+  the real proxy rather than mocks.
+- **The diagnosis (two probes)**: the app's exact request body — with
+  the vLLM-only ``chat_template_kwargs`` — gets 422 ``extra_forbidden
+  ... body.chat_template_kwargs`` (the Mistral upstream's strict
+  OpenAI schema); the clean body answers 200 with a real completion. A
+  genuine live bug: deployed as-is, every sell-layer consult would have
+  fail-safed and the LLM would never have decided anything (the book
+  safe — but the quota spent for zero decisions).
+- **The fix (this commit)**: ``chat_template_kwargs`` is OPT-IN per
+  backend — a backend entry declares it (e.g. local vLLM serving with
+  ``{"enable_thinking": true}``); the ``LLM_REASONING_EFFORT`` thinking
+  budget rides only on a declared backend; undeclared backends (the
+  LiteLLM proxy, OpenAI itself, any strict-schema server) get the clean
+  OpenAI body. Four regression tests pin it.
+- **The re-run, with the fix — the full loop, live**: the consult trio
+  got REAL decisions from ``deepseek-v4.1-flash-mistral`` at
+  temperature 0, no fail-safes, ~600-730ms each: type A CONFIRM
+  ("position is +10.8% with no giveback, so letting the stop rule
+  stand"), type B DEFER ("the drop-out is noise, not thesis decay"),
+  type C HOLD ("fundamentals have not actually broken the thesis") —
+  the frozen prompts produce parseable, reasoned decisions through the
+  app's own transport.
+- **The forced-A full loop through ``sim.run_cycle``** (the cycle's own
+  injectable clock pinned to the 2026-10-30 session — a Saturday
+  "today" has no F bar to fill against): FOUR standing-stop fires —
+  the forced AMGN percent stop (level 493.5, filled at the open 470.0)
+  plus THREE GENUINE ATR stop-fires the real book had that session
+  (GRMN, SW, WAB) — each consulted (four real calls, all CONFIRM,
+  552-709ms), each executed at the strict F-open, each logged in the
+  ``LlmSellDecision`` ledger with the engine-branch counterfactual (the
+  fired level/label/fill price). The sold positions' rows deleted on
+  the full sell, per the documented convention.
+- **The type-C nightly step** ran clean (Saturday: no trading night, no
+  events — the honest no-event path), and **the scorecard** read the
+  resulting ledger: 4 rows, all PENDING (the completed-window rule
+  honest — no mid-window peeking on decisions made minutes earlier).
+
+What the smoke proves about the deploy: the Settings backend selection
++ the fixed transport = real LLM decisions in the live accounts; the
+no-backend and transport-error paths both fail-safe to the engine's own
+rule (proven against the real proxy, not just mocks). The honest
+limits: the trio's B/C contexts were representative (the transport's
+proof), the forced stop was synthetic (the loop's proof), and one
+session's four CONFIRMs say nothing about decision QUALITY — that is
+the scorecard's job over the coming months.
+
+### The follow-up pass — reasoning wired + the C-EXIT proof
+
+**The owner's correction ("oh but reasoning works! if you send it
+right") reframed the fix's second half.** Probes against the proxy's
+Mistral route: the OpenAI-style ``reasoning_effort`` field answers 200
+with ``reasoning_content`` in the message and
+``usage.reasoning_tokens`` tracked — but the supported VOCABULARY IS
+SERVER-SPECIFIC: this route takes ``none/low/high/xhigh/max`` and
+rejects ``medium`` with a 400 that lists its supported values, while
+OpenAI itself takes ``medium`` but not xhigh/max. So the strict path
+sends the operator's ``LLM_REASONING_EFFORT`` VERBATIM — the app does
+not curate the list; the server validates it (empty = the plain path,
+no field). The vLLM thinking-budget table stays on the declared-
+``chat_template_kwargs`` path only. Both wire paths carry the same
+contract now — the non-streaming ``chat`` (the sell layer's consults)
+and ``chat_stream`` (the live chat UI's wire: the ticker chat
+endpoint + the sim chat), which still hardcoded the vLLM field and
+would have 422'd identically. Eleven llm tests pin the whole behavior
+across both paths (27 total in the file).
+
+**The C-EXIT chain — the last unproven wiring — proven live
+end-to-end** (`c-exit-smoke.py`, reasoning at ``max``, the owner's
+"test what you can" blessing):
+
+- A smoke-authoring discovery first: the synthetic break must carry
+  ``source='edgar'`` — ``fundamentals._load_fundamentals_rows`` keeps
+  ONLY the edgar rows for a ticker that has any (the deliberate
+  edgar-over-yfinance point-in-time preference), so the first pass's
+  ``source='smoke'`` row was dropped at read time and the scan saw a
+  healthy AES. Working as designed; the smoke's insert now matches it.
+- The SCAN step consulted on the break (event ``C:AES:2026-10-30``,
+  the filing-date PIT event id): **EXIT**, fail_safe=false, 8.3s at
+  max reasoning — "The newly filed fundamentals breach the predeclared
+  thesis condition… Exiting at the next session's open locks the
+  near-flat PnL and avoids carrying a broken thesis until the
+  month-end rebuild." The pending row appended unfilled, per the
+  declared contract.
+- The rerun proved the dedupe + the fill: **zero new consults** (the
+  (ticker, filing) event-id gate), and the FILL step sold AES at the
+  session's strict open 14.87 — a ``MonthlyTrade`` SELL ("thesis-break
+  LLM exit", 6.7476 shares) with the frozen fill columns stamped on the
+  ledger row (``filled_at``/``shares``/``price``/``cash_after`` =
+  1100.46). The full C chain: scan → consult → pending row → next
+  cycle's fill at the declared open.
+- A max-reasoning type-A consult for the comparison: APA **CONFIRM**
+  ("Price closed 6.3% below the 54.76 trailing stop, a gap larger than
+  the 1.54 ATR14… Preserve the ratcheted stop rather than widen into a
+  breakdown"), 5.1s — against the plain mode's ~0.6-0.7s for the same
+  prompt family. Reasoning at max costs ~8x latency; both modes
+  produce parseable decisions through the frozen prompts, and the
+  deploy's mode choice stays with the owner (the recorded constants:
+  plain, temperature 0).
+
 ## References
 
 - [SEC Apple companyfacts](https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json)

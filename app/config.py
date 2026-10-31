@@ -37,8 +37,14 @@ class Settings(BaseSettings):
     # legacy OLLAMA_URL / OLLAMA_MODEL settings are used as a single backend.
     llm_backends: str = ""
     llm_state_file: str = "/data/llm_state.json"
-    # Qwen3 thinking budget applied to OpenAI-compatible backends (llama-server).
-    # One of: low | medium | high | xhigh. Empty = leave server default untouched.
+    # Reasoning effort for the LLM wire. On a backend that declares
+    # chat_template_kwargs (local vLLM / llama-server) it maps to the
+    # Qwen3 thinking budget (low | medium | high | xhigh); on strict
+    # OpenAI-schema backends it rides VERBATIM as reasoning_effort — the
+    # supported vocabulary is SERVER-SPECIFIC (the LAN proxy's Mistral
+    # route takes none | low | high | xhigh | max and rejects medium;
+    # OpenAI takes medium but not xhigh/max), so set a value your server
+    # supports. Empty = the plain path, no reasoning field.
     llm_reasoning_effort: str = ""
 
     # --- SearXNG news search (optional) -------------------------------
