@@ -5196,7 +5196,7 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(and positive to re-enter) — default 3")
     dc.add_argument("--basket-threshold", type=float, default=None,
                     help="Minimum |slope| to count as a negative (e.g. 0.05 = only a "
-                         "real 5% N-day drop triggers; 0 = any negative slope)")
+                         "real 5%% N-day drop triggers; 0 = any negative slope)")
     dc.add_argument("--basket-drawdown", type=float, default=None,
                     help="Cash out when the target basket is this far below its peak "
                          "(e.g. 0.08); re-enter when the drawdown halves (0 = off)")
