@@ -199,7 +199,8 @@ class TestChatTemplateKwargs:
     sends them.
     """
 
-    def _capture_body(self, monkeypatch, backends_json, effort=""):
+    def _capture_body(self, monkeypatch, backends_json, effort="",
+                      temperature=None):
         captured: dict = {}
 
         class FakeResponse:
@@ -231,10 +232,26 @@ class TestChatTemplateKwargs:
         monkeypatch.setattr(llm.settings, "llm_reasoning_effort", effort)
 
         async def run():
-            return await llm.chat([{"role": "user", "content": "hi"}])
+            return await llm.chat([{"role": "user", "content": "hi"}],
+                                  temperature=temperature)
 
         asyncio_run(run())
         return captured["body"]
+
+    def test_temperature_sent_only_when_declared(self, monkeypatch, llm_state_tmp):
+        """The frozen-constant fix: the wire must carry the temperature every
+        consult record declares — None (the default) leaves the server's
+        default untouched."""
+        b1 = self._capture_body(monkeypatch, json.dumps([
+            {"name": "proxy", "type": "openai", "url": "http://a:1",
+             "model": "m"},
+        ]))
+        assert "temperature" not in b1
+        b2 = self._capture_body(monkeypatch, json.dumps([
+            {"name": "proxy", "type": "openai", "url": "http://a:1",
+             "model": "m"},
+        ]), temperature=0.0)
+        assert b2["temperature"] == 0.0
 
     def test_undeclared_backend_sends_the_clean_body(self, monkeypatch, llm_state_tmp):
         body = self._capture_body(monkeypatch, json.dumps([
@@ -391,6 +408,23 @@ class TestChatTemplateKwargs:
         ]), effort="high")
         assert body["chat_template_kwargs"]["thinking_budget"] == 8192
         assert "reasoning_effort" not in body
+
+
+class TestBackendEntryRedaction:
+    """The invalid-entry log must never carry an inline api_key — the app's
+    own never-log-the-key invariant (a malformed entry is exactly the case
+    where an operator pastes a config with the key inline)."""
+
+    def test_invalid_entry_log_omits_the_key(self, monkeypatch, llm_state_tmp, caplog):
+        import logging
+        monkeypatch.setattr(llm.settings, "llm_backends", json.dumps([
+            {"name": "bad", "type": "nope", "url": "http://a:1", "model": "m",
+             "api_key": "sk-NEVER-LOG-THIS-xyz"},
+        ]))
+        with caplog.at_level(logging.WARNING):
+            assert llm._configured_backends() == []
+        assert "Skipping invalid LLM backend entry" in caplog.text
+        assert "NEVER-LOG-THIS-xyz" not in caplog.text
 
 
 # ---------------------------------------------------------------------------

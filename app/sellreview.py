@@ -6,10 +6,10 @@ analysis-only).
 NO LLM calls on history, ever — contexts are for prompt design and prospective
 evaluation windows only; the first and only origin of real LLM calls is the
 ``consult`` runner below, invoked PROSPECTIVELY on live/forward events; the
-authorized model is recorded as a constant and was verified reachable (LAN
-LiteLLM proxy http://192.168.0.46:4000, OpenAI-compatible; key at
-/opt/secrets/litellm.key or the LITELLM_API_KEY env — the key is NEVER stored,
-logged, or printed).
+authorized model is recorded as a constant. The wire is the app's ONE
+transport (``app.llm.chat`` — the multi-backend client; the endpoint and key
+come from ``LLM_BACKENDS`` / ``LITELLM_API_KEY_FILE``, the same contract as
+the live layer) — the key is NEVER stored, logged, or printed.
 
 Purpose
 -------
@@ -168,11 +168,9 @@ PROMPT_VERSION_B = "sellshadow-b/1"
 PROMPT_VERSION_C = "sellshadow-c/1"
 
 # The authorized model/temperature travel with every consult record (imported
-# from sellshadow). The proxy endpoint and key location are environment facts,
-# recorded here; the key itself is read AT CALL TIME and never stored/logged.
-DEFAULT_LLM_BASE_URL = "http://192.168.0.46:4000"
-DEFAULT_KEY_FILE = "/opt/secrets/litellm.key"
-MAX_TOKENS = 512
+# from sellshadow). The proxy endpoint + key are configured on the app's one
+# transport (LLM_BACKENDS / LITELLM_API_KEY_FILE — see app/llm.py); the key is
+# read AT CALL TIME inside that wire and never stored/logged.
 ERROR_TEXT_MAX = 200          # error text is truncated to this many chars
 DEFAULT_TIMEOUT_S = 30.0
 
@@ -245,48 +243,35 @@ def _fail_safe_c(why: str) -> dict:
 # 1. The prospective consult runner (the ONLY origin of real LLM calls)
 # ---------------------------------------------------------------------------
 
-def _resolve_api_key() -> str | None:
-    """Read the LLM key AT CALL TIME from LITELLM_API_KEY, else the file named
-    by LITELLM_API_KEY_FILE, else /opt/secrets/litellm.key. The key is never
-    stored on the module, logged, or printed — only its PRESENCE is reported."""
-    key = os.environ.get("LITELLM_API_KEY")
-    if key:
-        return key
-    key_file = os.environ.get("LITELLM_API_KEY_FILE") or DEFAULT_KEY_FILE
-    try:
-        text = Path(key_file).read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return text or None
+async def _auth_present() -> bool:
+    """Auth presence for the unified wire, mirroring ``app.llm._auth_headers``:
+    the active backend's own ``api_key``, the key file, or the env — presence
+    ONLY, never the key itself."""
+    from . import llm as llm_mod
+    backend = await llm_mod.current_backend()
+    if backend.get("api_key"):
+        return True
+    if llm_mod._api_key_from_file():
+        return True
+    return bool(os.environ.get("LITELLM_API_KEY"))
 
 
 async def _default_transport(messages: list[dict], model_id: str, temperature: float,
                              timeout_s: float) -> str:
-    """The real proxy call: ONE attempt, pinned timeout, via httpx POST to
-    ``{LLM_BASE_URL or default}/v1/chat/completions``. The Authorization header
-    carries the key read at call time; headers are never logged, and an httpx
-    failure's text never contains the key (assert-safe)."""
-    import httpx
-
-    key = _resolve_api_key()
-    if not key:
-        raise RuntimeError(
-            "no LLM API key available (LITELLM_API_KEY / LITELLM_API_KEY_FILE / "
-            f"{DEFAULT_KEY_FILE})")
-    base = os.environ.get("LLM_BASE_URL") or DEFAULT_LLM_BASE_URL
-    payload = {"model": model_id, "messages": messages,
-               "temperature": temperature, "max_tokens": MAX_TOKENS}
-    async with httpx.AsyncClient(timeout=timeout_s) as client:
-        resp = await client.post(f"{base}/v1/chat/completions", json=payload,
-                                 headers={"Authorization": f"Bearer {key}"})
-    if resp.status_code != 200:
-        raise RuntimeError(f"LLM proxy returned HTTP {resp.status_code}")
-    try:
-        body = resp.json()
-        text = body["choices"][0]["message"]["content"]
-    except (ValueError, KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(f"malformed LLM proxy response body: {type(e).__name__}") from e
-    if not isinstance(text, str) or not text.strip():
+    """The real proxy call — UNIFIED on the app's ONE wire (``app.llm.chat``):
+    the same backend selection, key precedence, payload discipline, and
+    reasoning-effort handling as the live layer. One transport, no drift.
+    ``temperature``/``timeout_s`` ride through, so the wire matches the frozen
+    constant every consult record declares. Raises on a no-backend or empty
+    result so the consult's fail-safe table classifies it exactly like a
+    transport error."""
+    from . import llm as llm_mod
+    result = await llm_mod.chat(messages, temperature=temperature,
+                                timeout_s=timeout_s)
+    if not result.get("backend"):
+        raise RuntimeError("no LLM backend configured (LLM_BACKENDS)")
+    text = str(result.get("text") or "")
+    if not text.strip():
         raise RuntimeError("empty LLM response content")
     return text
 
@@ -341,7 +326,7 @@ async def consult(event_id: str, event_type: str, prompt_version: str,
     error: str | None = None
     error_class: str | None = None
     if transport is None:
-        key_present = _resolve_api_key() is not None
+        key_present = await _auth_present()
         transport = _default_transport
     try:
         text = await transport(messages, MODEL_ID, TEMPERATURE, timeout_s)

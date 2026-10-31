@@ -435,6 +435,30 @@ class TestTypeBOverlay:
         assert json.loads(r.engine_branch)["action"] == "release at rebuild"
         assert json.loads(r.context)["fill_price"] == 99.0
 
+    async def test_capacity_cap_records_the_truncation(self, mem_db, llm_backend):
+        """When a target_n cut makes the capacity cap release a DEFER-retained
+        name anyway, the detail records it — the scorecard must be able to
+        see the release was capacity, not the LLM's call (the DEFER row
+        stands)."""
+        await self._setup_book(mem_db)
+        dates, close, vol, fund = _monthly_tape()
+        f_date = dates[-1]
+        frame = await asyncio.to_thread(
+            monthly.eligible_frame, pd.Timestamp(f_date), close, vol, fund)
+        executed, detail = await selllayer.overlay_type_b(
+            held_before=["AAA", "BBB"], picks=["AAA"],
+            fill_map={"AAA": 100.0, "BBB": 99.0}, frame=frame,
+            close=close, fund=fund, members=list(close.columns),
+            me_ts=pd.Timestamp(f_date), f_date=f_date,
+            target_n=1, hold_band=4,
+            transport=mock_transport('{"decision": "DEFER", "rationale": "keep"}'))
+        assert executed == ["AAA"]                        # the cap: target_n
+        assert detail["retained"] == ["BBB"]
+        assert detail["capacity_truncated"] == ["BBB"]    # the honest record
+        rows = await _ledger_rows()
+        assert len(rows) == 1
+        assert rows[0].decision == "DEFER" and rows[0].ticker == "BBB"
+
     async def test_confirm_is_bit_identical(self, mem_db, llm_backend):
         await self._setup_book(mem_db)
         (executed, detail), (_, picks, _) = await self._run_overlay(
@@ -705,6 +729,43 @@ class TestTypeC:
         from app.db import Session
         async with Session() as s:
             assert await s.scalar(select(func.count()).select_from(MonthlyPosition)) == 1
+
+    async def test_fail_safe_row_does_not_silence_the_filing(
+            self, mem_db, llm_backend):
+        """A transient fail-safe night (transport down / timeout / parse
+        failure) must NOT permanently suppress the (ticker, filing)
+        re-consult — only a CONSULTED row dedupes."""
+        await self._seed(mem_db)
+        dates, close, vol = _c_tape()
+        fund = _broken_fund()
+        night1 = datetime(2026, 2, 2, 23, 30, tzinfo=UTC)   # Monday
+
+        async def broken(messages, model_id, temperature, timeout_s):
+            raise RuntimeError("proxy down")
+        res = await selllayer.run_type_c_step(now=night1, transport=broken,
+                                              fund=fund, close=close, vol=vol)
+        assert len(res["scans"]) == 1
+        assert res["scans"][0]["decision"] == "HOLD"        # the C fail-safe
+        rows = await _ledger_rows()
+        assert len(rows) == 1 and rows[0].fail_safe is True
+
+        # second night, transport healthy: the filing is re-consulted
+        calls: list = []
+        res2 = await selllayer.run_type_c_step(
+            now=datetime(2026, 2, 3, 23, 30, tzinfo=UTC),
+            transport=mock_transport('{"decision": "HOLD"}', calls),
+            fund=fund, close=close, vol=vol)
+        assert len(res2["scans"]) == 1 and len(calls) == 1
+        rows = await _ledger_rows()
+        assert len(rows) == 2                              # append-only
+        assert rows[1].fail_safe is False and rows[1].decision == "HOLD"
+
+        # third night: the CONSULTED row now dedupes — no new consult
+        res3 = await selllayer.run_type_c_step(
+            now=datetime(2026, 2, 4, 23, 30, tzinfo=UTC),
+            transport=mock_transport('{"decision": "HOLD"}', calls),
+            fund=fund, close=close, vol=vol)
+        assert res3["scans"] == [] and len(calls) == 1
 
     async def test_healthy_fundamentals_no_consult(self, mem_db, llm_backend):
         await self._seed(mem_db)

@@ -358,19 +358,24 @@ class LlmSellDecision(Base):
         ``engine`` is ``sim`` or ``monthly``. ``event_id`` is the stable
         per-event key (``"A:TICKER:DATE"`` / ``"B:TICKER:DATE"`` /
         ``"C:TICKER:FILING"``) — type C dedupes on it: a break is NEW only
-        when no row exists for that (ticker, latest filing date).
+        when no CONSULTED (non-fail-safe) row exists for that (ticker, latest
+        filing date) — a transient fail-safe row never silences a filing.
       * ``decision`` is CONFIRM|DEFER (A/B) or EXIT|HOLD (C).
       * ``context`` is the full point-in-time context JSON the prompt was
         rendered from; ``engine_branch`` is the JSON of what the ENGINE's own
         rule would do (A: the fired level; B: the release; C: hold-to-rebuild)
         — the counterfactual the scorecard compares against.
       * The FILL columns (``filled_at``, ``shares``, ``price``, ``cash_after``)
-        are written ONCE, when the decision's trade actually executes (the
-        type-C EXIT fills at the NEXT session's strict open); ``filled_at`` is
-        stamped after the trade committed, so it is always >= ``decided_at``.
-        An unfilled decision keeps all four NULL — the decided-but-unfilled
-        pending record; there is NO pending-order persistence beyond this
-        ledger, so the next cycle re-scans it.
+        are written ONCE, when the decision's trade actually executes — in
+        practice ONLY the type-C EXIT rows fill (at the NEXT session's strict
+        open). Type A/B rows keep all four NULL BY DESIGN: they act
+        in-cycle (the stop executes / the retention releases at the
+        rebuild) and their executions are traced via SimTrade /
+        MonthlyRebalance, not as pending orders. ``filled_at`` is stamped
+        after the trade committed, so it is always >= ``decided_at``; an
+        unfilled C-EXIT keeps all four NULL — the decided-but-unfilled
+        pending record the next cycle re-scans (there is NO pending-order
+        persistence beyond this ledger).
 
     Rows are NEVER updated (except the frozen fill stamping on execution) or
     deleted. ``fail_safe`` marks decisions where the LLM could not answer
@@ -382,7 +387,8 @@ class LlmSellDecision(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     decided_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    # Operator-local "YYYY-MM-DD": the decision session F.
+    # Operator-local "YYYY-MM-DD" — the event's decision session: the
+    # stop-fire session S for type A; the decision session F for B and C.
     session_date: Mapped[str] = mapped_column(String(10))
     event_type: Mapped[str] = mapped_column(String(1))  # A | B | C
     engine: Mapped[str] = mapped_column(String(8))      # sim | monthly

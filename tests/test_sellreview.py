@@ -311,6 +311,40 @@ async def test_consult_mock_transports_and_fail_safe():
     assert r["prompt_version"] == "sellshadow-b/1"
 
 
+async def test_default_transport_is_the_unified_wire(monkeypatch):
+    """The default transport delegates to app.llm.chat — ONE wire for the
+    shadow CLI and the live layer (backend selection, key precedence,
+    payload discipline), temperature/timeout riding through so the wire
+    matches the frozen constant every consult record declares."""
+    from app import llm as llm_mod
+    seen: dict = {}
+
+    async def fake_chat(messages, *, temperature=None, timeout_s=None):
+        seen["temperature"] = temperature
+        seen["timeout_s"] = timeout_s
+        return {"text": '{"decision": "HOLD"}', "backend": "lan",
+                "model": "m", "reasoning": ""}
+
+    monkeypatch.setattr(llm_mod, "chat", fake_chat)
+    text = await sellreview._default_transport([], "model-id", 0.0, 12.5)
+    assert text == '{"decision": "HOLD"}'
+    assert seen == {"temperature": 0.0, "timeout_s": 12.5}
+
+
+async def test_default_transport_raises_on_no_backend(monkeypatch):
+    """A no-backend result raises, so the consult's fail-safe table
+    classifies it exactly like the old local transport's errors."""
+    from app import llm as llm_mod
+
+    async def fake_chat(messages, *, temperature=None, timeout_s=None):
+        return {"text": "No LLM backend configured", "backend": "",
+                "model": "", "reasoning": ""}
+
+    monkeypatch.setattr(llm_mod, "chat", fake_chat)
+    with pytest.raises(RuntimeError):
+        await sellreview._default_transport([], "model-id", 0.0, 5.0)
+
+
 async def test_consult_record_deterministic_and_key_never_present(monkeypatch, tmp_path):
     monkeypatch.setenv("LITELLM_API_KEY", "super-secret-test-key-XYZ")
     msgs = [{"role": "user", "content": "ctx"}]

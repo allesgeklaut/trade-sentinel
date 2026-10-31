@@ -96,13 +96,16 @@ async def _llm_transport(messages: list[dict], model_id: str, temperature: float
                          timeout_s: float) -> str:
     """The default transport: wrap ``app.llm.chat`` (the multi-backend client).
 
-    ``model_id``/``temperature`` travel with the frozen prompt discipline; the
-    backend's own configured model is what actually serves the request, so
-    they are recorded, not forwarded. The per-consult wall-clock bound is the
-    caller's ``asyncio.wait_for`` (``sell_layer_timeout_s``), not this wrapper.
+    ``model_id`` is recorded, not forwarded — the backend's own configured
+    model serves the request. ``temperature`` IS forwarded (one wire,
+    matching the frozen constant every consult record declares) and
+    ``timeout_s`` rides through as the per-call read bound; the caller's
+    ``asyncio.wait_for`` (``sell_layer_timeout_s``) remains the wall-clock
+    bound.
     """
     from . import llm as llm_mod
-    result = await llm_mod.chat(messages)
+    result = await llm_mod.chat(messages, temperature=temperature,
+                                timeout_s=timeout_s)
     return str(result.get("text") or "")
 
 
@@ -430,7 +433,12 @@ async def overlay_type_b(*, held_before: list[str], picks: list[str],
     as today; DEFER -> the name is retained one more month: ``executed_picks``
     = picks minus the LAST-ADDED new names (from the tail of the adds) plus
     the retained names, so ``len(executed_picks) <= target_n`` and at most one
-    retained name per displaced add. The SELL/BUY loops then run on
+    retained name per displaced add. When the defensive capacity cap releases
+    a DEFER-retained name anyway (reachable when a ``target_n`` cut shrinks
+    the book below the retained names), the detail records it as
+    ``capacity_truncated`` — the DEFER ledger rows stand, and the scorecard
+    can attribute the release to capacity, not the LLM's call. The SELL/BUY
+    loops then run on
     ``executed_picks`` unchanged.
 
     Returns ``(executed_picks, sell_detail)`` — ``sell_detail`` is the
@@ -518,10 +526,19 @@ async def _overlay_type_b_impl(*, held_before, picks, fill_map, frame, close, fu
     adds = [t for t in picks if t not in held_set]
     drop = set(adds[-len(retained):]) if adds else set()
     executed = [t for t in picks if t not in drop] + sorted(retained)
+    truncated: list[str] = []
     if len(executed) > target_n:  # defensive cap — never exceed target_n
+        truncated = sorted(executed[target_n:])
         executed = executed[:target_n]
     detail = {"engine_picks": picks, "executed_picks": executed,
               "retained": sorted(retained), "consulted": consulted}
+    if truncated:
+        # Attribution honesty: the capacity cap can release DEFER-retained
+        # names anyway — their DEFER ledger rows stand, and the scorecard
+        # must be able to see the release was capacity, not the LLM's call.
+        detail["capacity_truncated"] = truncated
+        logger.info("sell layer B: capacity cap released %s "
+                    "(their DEFER rows stand)", ", ".join(truncated))
     return executed, detail
 
 
@@ -544,9 +561,11 @@ async def run_type_c_step(now: datetime | None = None, *, transport=None,
        next cycle — no pending-order persistence beyond the ledger).
     2. SCAN step: for each held monthly position, load the latest PIT
        fundamentals (filing-date PIT, the ``_asof_entries`` family), apply
-       the predeclared thesis condition; a break is NEW when no ledger row
-       exists for that (ticker, latest filing date). Consult; EXIT appends the
-       unfilled pending row (filled at the NEXT cycle), HOLD the row only.
+       the predeclared thesis condition; a break is NEW when no CONSULTED
+       (non-fail-safe) ledger row exists for that (ticker, latest filing
+       date) — a transient fail-safe row never silences a filing. Consult;
+       EXIT appends the unfilled pending row (filled at the NEXT cycle),
+       HOLD the row only.
 
     The scan's frame/fund/series loads run over the LIVE UNIVERSE (the same
     loads the rebuild and the daily-core cycle make — declared nightly cost,
@@ -677,9 +696,13 @@ async def _run_type_c_step_impl(now, *, transport=None, fund, close, vol, frame)
         async with db_mod.Session() as s:
             exists = await s.scalar(
                 select(func.count()).select_from(LlmSellDecision)
-                .where(LlmSellDecision.event_id == event_id))
+                .where(LlmSellDecision.event_id == event_id,
+                       LlmSellDecision.fail_safe.is_(False)))
         if exists:
-            continue  # dedupe: no second consult for the same (ticker, filing)
+            # dedupe: only a CONSULTED row silences the filing — a transient
+            # fail-safe row (no backend / timeout / parse failure) must never
+            # permanently suppress the re-consult
+            continue
         ctxs = sellreview._monthly_book_context(
             fund, members, as_of, [h], plumb["band"], hold_band, plumb["next_rebuild"],
             frame, plumb["elig"], plumb["order"], plumb["close_map"], plumb["day_idx"],

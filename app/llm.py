@@ -121,7 +121,11 @@ def _configured_backends() -> list[dict[str, Any]]:
         ctk = b.get("chat_template_kwargs")
         chat_kwargs = dict(ctk) if isinstance(ctk, dict) else {}
         if btype not in ("ollama", "openai") or not url or not name:
-            logger.warning("Skipping invalid LLM backend entry: %r", b)
+            # Redacted on purpose: a malformed entry may carry an inline
+            # api_key — the key must NEVER reach the logs (the app's own
+            # invariant, pinned by test).
+            logger.warning("Skipping invalid LLM backend entry: %r",
+                           {k: v for k, v in b.items() if k != "api_key"})
             continue
         out.append({"name": name, "type": btype, "url": url, "model": model,
                     "api_key": api_key, "chat_template_kwargs": chat_kwargs})
@@ -247,12 +251,17 @@ async def select_backend(name: str, model: str | None = None) -> dict[str, Any]:
 # Ollama seed/temperature, so pinning would be ignored anyway and only adds
 # false reproducibility expectations to backtests.
 
-async def chat(messages: list[dict[str, str]]) -> dict[str, Any]:
+async def chat(messages: list[dict[str, str]], *,
+               temperature: float | None = None,
+               timeout_s: float | None = None) -> dict[str, Any]:
     """Send a chat request to the active backend.
 
     ``messages`` is a list of ``{"role": ..., "content": ...}`` dicts (system
-    messages included). Returns ``{"text": ..., "backend": ..., "model": ...,
-    "reasoning": ...}``.
+    messages included). ``temperature`` is sent ONLY when set (None leaves
+    the server's default) — the sell layer passes its frozen recorded
+    temperature so the wire matches what every consult record declares.
+    ``timeout_s`` overrides the read bound per call. Returns ``{"text": ...,
+    "backend": ..., "model": ..., "reasoning": ...}``.
     """
     backend = await current_backend()
     if not backend:
@@ -262,7 +271,9 @@ async def chat(messages: list[dict[str, str]]) -> dict[str, Any]:
             "model": "",
             "reasoning": "",
         }
-    text, reasoning, model = await _post_chat(backend, messages)
+    text, reasoning, model = await _post_chat(backend, messages,
+                                              temperature=temperature,
+                                              timeout_s=timeout_s)
     return {
         "text": text,
         "backend": backend["name"],
@@ -349,9 +360,10 @@ async def chat_stream(messages: list[dict[str, str]]):
                 # a declared backend — strict OpenAI-schema servers reject
                 # the field with 422 "extra_forbidden" (probe-verified
                 # 2026-10-31 through the LAN LiteLLM proxy -> Mistral) —
-                # and on the strict path the effort rides VERBATIM as the
-                # OpenAI-style reasoning_effort (the supported vocabulary
-                # is server-specific; the server validates it). This is
+                # and on the strict path the effort rides as the
+                # OpenAI-style reasoning_effort (the operator's value,
+                # case-normalized — never a curated list; the server
+                # validates it). This is
                 # the live chat UI's wire (the chat endpoint + the sim
                 # chat), so the streaming variant must not regress it.
                 chat_kwargs = dict(backend.get("chat_template_kwargs") or {})
@@ -435,12 +447,14 @@ async def chat_stream(messages: list[dict[str, str]]):
 
 
 async def _post_chat(
-    backend: dict[str, Any], messages: list[dict[str, str]]
+    backend: dict[str, Any], messages: list[dict[str, str]],
+    *, temperature: float | None = None, timeout_s: float | None = None
 ) -> tuple[str, str, str]:
     """Raw POST for one backend; returns (text, reasoning, model_id)."""
     timeout = httpx.Timeout(
         connect=10.0,
-        read=settings.ollama_timeout_seconds,
+        read=(timeout_s if timeout_s is not None
+              else settings.ollama_timeout_seconds),
         write=30.0,
         pool=10.0,
     )
@@ -449,6 +463,8 @@ async def _post_chat(
             req_body: dict[str, Any] = {
                 "model": backend["model"], "messages": messages, "stream": False,
             }
+            if temperature is not None:
+                req_body["options"] = {"temperature": temperature}
             resp = await client.post(backend["url"] + "/api/chat", json=req_body)
         else:
             payload: dict[str, Any] = {
@@ -456,12 +472,15 @@ async def _post_chat(
                 "messages": messages,
                 "stream": False,
             }
+            if temperature is not None:
+                payload["temperature"] = temperature
             # The vLLM-native kwargs ride ONLY when the backend declared
             # them: strict OpenAI-schema servers (LiteLLM routing to
             # Mistral/OpenAI/...) reject the field with 422
             # "extra_forbidden" (probe-verified 2026-10-31), so the clean
             # body is the default. On the strict path the reasoning effort
-            # travels VERBATIM as the OpenAI-style ``reasoning_effort``:
+            # travels as the OpenAI-style ``reasoning_effort`` (the
+            # operator's value, case-normalized — never a curated list):
             # the supported vocabulary is SERVER-SPECIFIC — the LAN proxy's
             # Mistral route answers none/low/high/xhigh/max and rejects
             # "medium" (HTTP 400 "reasoning_effort 'medium' is not supported
