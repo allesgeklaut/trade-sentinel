@@ -425,7 +425,19 @@ the engine's own rule stands), and one counterfactual-ledger pattern:
   DEFERs retention to the next rebalance. The measured bar is HIGH:
   blanket retention of dropped names is negative-edge (−1.0%/quarter
   excess, §1.2), so deferral must find the specific subset where it wins —
-  the mirror image of the sim case.
+  the mirror image of the sim case. **Measured (2026-10-31, full window,
+  `banddrop-ledger/1`, 165 events, self-check 165/165): blanket retention
+  mean −1.60pp/event (median −1.03pp, 44.2% positive) — and the by-year
+  selectivity map is the reviewer's assignment: retention WINS in
+  bear/choppy years (2022 +3.18pp mean, 62% positive; 2020 +1.32pp) and
+  LOSES catastrophically when fresh additions rip (2023 −13.30pp mean,
+  only 9% positive; 2016 −2.85pp; 2018 −2.60pp; 2026-partial −9.20pp).
+  The dropped names' raw ~1-month drift is ~flat (+0.04pp/event) — the
+  negative edge is the REPLACEMENTS outperforming the retained names:
+  the ranking works; the reviewer must find the events where the specific
+  retained name beats its replacement. The B prompt is frozen
+  (`sellshadow-b/1`, parameter-free DEFER) and the machinery is committed
+  (`app/sellreview.py`).**
 - **Event type C — intra-month thesis-break candidates for the factor
   book**: filing-day re-checks (shared with M5's hook) plus
   drawdown/momentum alarms; the reviewer proposes an early exit the

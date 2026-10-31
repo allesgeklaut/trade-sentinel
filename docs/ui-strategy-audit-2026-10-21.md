@@ -1653,6 +1653,88 @@ avoided, not a P&L attribution; the hook re-derives TTM per holding per
 session only when ON; survivorship caveat unchanged.
 
 
+## Phase 5C-A/B — the unified reviewer's consult runner + the type-B adapter — 2026-10-31
+
+**Slice 5C-A/B code-complete, independently verified, and committed** (the
+owner signed off the 5C start and the `sellshadow/1` prompt design as-is on
+2026-10-31). The unified reviewer (research doc §4b): ONE LLM sell-decider
+over candidate exit events from every engine — this slice builds the
+prospective consult runner (the only place an LLM call can ever originate)
+and the type-B (monthly band-drop) event adapter. ZERO LLM/network calls in
+the slice: the default transport exists but no test or CLI path invokes it
+(proven by an httpx-monkeypatched test).
+
+`app/sellreview.py` (new, 1,023 lines): **the consult runner** —
+transport-injectable (`async (messages, model_id, temperature, timeout_s)
+-> str`; the default is the real LiteLLM proxy call via httpx, ONE attempt,
+pinned timeout, the key read at call time from `LITELLM_API_KEY` /
+`LITELLM_API_KEY_FILE` / `/opt/secrets/litellm.key` — presence recorded as
+`key_present: bool` only, NEVER the key, never logged, never printed); ANY
+failure (network, non-200, timeout, empty, malformed/refused/unparsable
+response) → the fail-safe CONFIRM with the error class recorded; the
+`sell-consult/1` record carries the event id/type, prompt version,
+`MODEL_ID` (`deepseek-v4.1-flash-mistral`), `TEMPERATURE` (0.0), the
+decision + parameters, rationale, parsed/fail_safe flags, latency;
+`log_consult` appends `shadow-consult-log/1` JSONL. The parser routes by
+event type: A events → `sellshadow.parse_response` (DEFER requires
+`rearm_mult`); B events → the new `parse_response_b` (B's DEFER is
+PARAMETER-FREE — retention to the next rebalance has no level — which is
+why it splits). **The type-B adapter**: `banddrop_contexts`
+(`banddrop-contexts/1` — an M0-default run over the shared read-only frame
+cache; every band-drop release with per-event PIT context: the 5A-1 field
+family plus the factor fields §4b pins — ROE, P/FCF, the 12-1 momentum and
+its percentile rank in the frame, band distance, days since the last
+filing, benchmark drawdown + 20d vol, sessions to the next rebalance; with
+a self-check asserting per event: held at the prior session, the frame's
+band really excludes the name, the fill price matches the ledger);
+`banddrop_ledger` (`banddrop-ledger/1` — the DEFER-retention
+counterfactual, predeclared primary delta = the retained name's
+per-unit return over [release fill → next rebuild fill] minus the
+equal-weight mean return of the names newly added at the same rebuild —
+the engine's actual use of the freed capital — cash yield when none, both
+legs net of the one-way cost, the §1.2 baseline drift as context); the
+frozen `sellshadow-b/1` prompt (same pattern as `sellshadow/1`, B
+semantics); an offline-only CLI (`contexts|ledger` — no CLI path can ever
+construct a real LLM call). Imports from `sellshadow` exactly the 9
+stable symbols (verified against the M5-modified module in the main
+tree). `tests/test_sellreview.py` (new, 11 tests: the mock-transport
+consult matrix, the zero-network proof, contexts determinism/self-check/
+factor fields, the ledger hand-computed delta math, the A/B parser
+split, no-write proof, CLI smoke).
+
+**Full-window evidence (2015-2026, sp500, read-only snapshot):** 165
+band-drop events (self-check 165/165, match rate 1.0 — consistent with
+the M0 run's 165 band releases). The type-B bar for the LLM — blanket
+retention: **mean −1.60pp/event, median −1.03pp, p5 −21.5pp / p95
++13.7pp, 44.2% positive** — negative-edge overall, confirming §1.2's
+prior, BUT with the by-year selectivity map that is the reviewer's job:
+retention WINS in bear/choppy years (2022 **+3.18pp** mean, 62% positive;
+2020 +1.32pp, 57%; 2025 +0.82pp) and LOSES catastrophically when fresh
+additions rip (2023 **−13.30pp** mean, only 9% positive; 2016 −2.85pp,
+26%; 2018 −2.60pp; 2026-partial −9.20pp). The dropped names' raw drift is
+~flat (+0.04pp/event, 53.9% positive over the ~1-month retention window)
+— the negative edge comes from the REPLACEMENTS outperforming the
+retained names: the ranking works, and the reviewer must find the
+regimes/events where the specific retained name beats its replacement.
+Declared honesty limits (verbatim in the payloads): the ledger's DEFER
+branch is a single-name what-if (no redeployment modeling, no re-entry
+modeling — the next rebalance's band may re-admit the name); the
+additions' own buy costs are not charged; contexts are PIT at the
+governing month-end; `band_distance_ranks`/`mom_rank_pct_in_frame` are
+None for unranked (ineligible) drops — common on real data.
+
+Independent verification: the orchestrator's own runs — 37 tests green in
+the main tree against the M5-modified sellshadow (11 new + 19 sellshadow +
+7 thesis-break), ruff clean; the full-window contexts + ledger runs
+(3m19s + 3m20s) with the snapshot's row counts/mtime re-verified
+unchanged; the worker's deviation claims each checked (the log-schema
+override, latency excluded from determinism, `key_present=False` for
+injected transports, the tape's full-year negative filing, the CLI at
+default book settings). The remaining 5C step (after the owner picks the
+deployment topology): the prospective wiring — live events →
+`consult` → the JSONL log, fail-safe to the engine's rule, evaluated
+against these ledgers.
+
 ## References
 
 - [SEC Apple companyfacts](https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json)
