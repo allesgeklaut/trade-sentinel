@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     sim_monthly_allowance: float = 1000.0
     sim_start_cash: float = 0.0
     sim_universe: str = "diversified-plus"
-    sim_strategy: str = "deterministic"  # deterministic | llm | hybrid
+    sim_strategy: str = "deterministic"  # deterministic only — the llm/hybrid whole-cycle modes are retired; a stale llm/hybrid value falls back to deterministic (logged) in sim.run_cycle
     sim_max_position_pct: float = 10.0
     sim_min_cash_pct: float = 5.0
     sim_max_positions: int = 10
@@ -83,10 +83,6 @@ class Settings(BaseSettings):
     # keep OFF until the scoring-side fix is evaluated on its own branch.
     sim_min_run_5d: float = 0.0
     sim_max_dist_above: float = 0.0
-    sim_llm_review_interval: int = 1  # consult the LLM every N cycles (1=daily, 5=weekly)
-    sim_llm_minimal_prompt: bool = False  # use the minimal system prompt (no methodology/regime rules)
-    sim_llm_mode_aware_prompt: bool = False  # use the mode-aware minimal prompt (engine owns exits; LLM adds BUYs only)
-    sim_llm_failure_marker: bool = False  # hybrid: consult the LLM only on engine failure (stop-out cascade / drawdown)
     # Fundamentals context (daily sim): show point-in-time ROE % and P/FCF per
     # candidate in the LLM's signals table. Missing fundamentals render as "-"
     # (neutral); the table is omitted entirely when off (zero prompt change).

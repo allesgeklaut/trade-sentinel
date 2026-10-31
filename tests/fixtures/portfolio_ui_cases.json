@@ -2192,12 +2192,6 @@
         "sha256": "237c6ebde46f9af4c6078aec5511afa57805396a78dbcf462d2ba94c9e0641dd"
       },
       {
-        "name": "withLiveToday",
-        "start_marker": "        function withLiveToday(points, live) {",
-        "end_marker": "        async function loadDailyCoreStatus",
-        "sha256": "3930ee2ae607fed4a14bd75eae97a4f6dd2f0ec73e23c7da486f0a6aae6975e3"
-      },
-      {
         "name": "savings_block_all_functions_and_math",
         "start_marker": "        // ===================== Savings tracker (real money, EUR) =====================",
         "end_marker": "        // ===================== Monthly qv-mom portfolio =====================",

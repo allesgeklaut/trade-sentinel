@@ -49,6 +49,14 @@ FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 #     behavior), and `node --check` passes on both extracted inline scripts.
 #     Only the Savings block digest moved, exactly where slice 3E retired the
 #     prompt() buttons / ✕ remove-position anti-pattern.
+#   - 2026-10-31 (dead-code pass, part 2): index.html's dead withLiveToday
+#     copy was retired (portfolio.js's own withLiveToday is the live one and
+#     is untouched), so its source_guards entry was REMOVED from
+#     portfolio_ui_cases.json — a guard whose start marker no longer exists
+#     cannot be pinned. Intactness evidence: the mddOf and Savings block
+#     digests are UNCHANGED (they do not span the deleted function), the
+#     golden overlay pins still pass, node --check passes on both inline
+#     scripts.
 #   - Amended later the same day (orchestrator, after the populated gate
 #     caught two real 3E defects): the type select's onchange now updates
 #     svTxnType before re-rendering (stale type kept the old field set), and
@@ -60,6 +68,9 @@ FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 #     stay visible); savings block re-pinned. Intactness evidence: mddOf and
 #     withLiveToday digests unchanged, golden overlay pins pass, node --check
 #     passes on both inline scripts.
+#   - 2026-10-31 (dead-code pass, part 2): the withLiveToday guard entry was
+#     removed together with the function (see the entry above); mddOf and
+#     Savings digests unchanged.
 # ---------------------------------------------------------------------------
 
 RESULT_PREFIX = "__PORTFOLIO_UI_RESULT__"
@@ -632,8 +643,9 @@ def test_phase3a_helpers_and_savings_block_byte_identical() -> None:
             f"{guard['name']} changed from the accepted Phase-3A baseline:\n"
             f"expected sha256 {guard['sha256']}\n"
             f"got      sha256 {digest}\n"
-            "The contract requires mddOf/withLiveToday and all Savings functions/math "
-            "to remain byte-identical."
+            "The contract requires mddOf and all Savings functions/math "
+            "to remain byte-identical (the retired index.html withLiveToday copy "
+            "no longer has a guard entry; portfolio.js's copy is the live one)."
         )
 
 

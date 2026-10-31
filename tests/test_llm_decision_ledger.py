@@ -4,17 +4,11 @@ The LLM is ALWAYS stubbed — a fake ``httpx.AsyncClient`` exactly like
 ``tests/test_llm.py`` / ``tests/test_sim.py``, never a network call — and the
 database is in-memory SQLite, never the production DB.
 
-Covered here:
+The whole-cycle llm/hybrid strategy modes are retired, so their ledger paths
+are gone with them; what remains is the chat flow, which is the only live
+writer of SimLlmDecision rows. Covered here:
 
-* the hybrid review writes one row per LLM decision with the right relation
-  (confirmation / change / veto / hold / addition) and the frozen fill of the
-  ones that executed;
-* a decision whose trade never executed (exec guard / veto / hold) is stored
-  as decided-but-unfilled with ``decided_at`` still frozen at parse time;
-* the pure-LLM path (relation ``addition``, no deterministic proposal);
 * chat ``[[ACTION]]`` rows (mode ``chat``) with and without fills;
-* append-only across sessions (earlier rows bit-for-bit unchanged, the
-  per-session guard writes nothing on a same-session repeat);
 * a ledger write failure is non-fatal for trading;
 * a deterministic-only cycle writes NO ledger rows.
 """
@@ -26,7 +20,6 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 import httpx
-import pandas as pd
 import pytest
 from sqlalchemy import StaticPool, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -43,19 +36,6 @@ from app.db import (
 
 # A mid-day, DST-safe parse time for the frozen-clock tests.
 _T0 = datetime(2026, 3, 2, 14, 0, tzinfo=UTC)
-
-# The hybrid response: one decision per relation this test class needs.
-_HYBRID_RESPONSE = (
-    "Confirming one, flipping one, vetoing one, holding one and adding one.\n"
-    "[\n"
-    '  {"ticker": "AAA", "action": "BUY", "reason": "confirm the setup"},\n'
-    '  {"ticker": "BBB", "action": "SELL", "reason": "flip it"},\n'
-    '  {"ticker": "CCC", "action": "HOLD", "reason": "veto the exit"},\n'
-    '  {"ticker": "DDD", "action": "HOLD", "reason": "nothing to do"},\n'
-    '  {"ticker": "EEE", "action": "BUY", "reason": "new idea"}\n'
-    "]\n"
-)
-
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -167,177 +147,7 @@ def _valuation(cash: float = 10000.0, equity: float = 10000.0) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 1. Hybrid cycle: five decisions, five relations, frozen fills
-# ---------------------------------------------------------------------------
-
-class TestHybridCycleLedger:
-    async def test_five_relations_and_frozen_fills(self, mem_db, monkeypatch,
-                                                   llm_backend):
-        _freeze_first_call_clock(monkeypatch, _T0)
-        _stub_llm(monkeypatch, _HYBRID_RESPONSE)
-
-        async def fake_close(ticker):
-            return {"EEE": 25.0}.get(ticker)
-        monkeypatch.setattr(sim, "_latest_close", fake_close)
-
-        proposals = [
-            {"ticker": "AAA", "side": "BUY", "price": 100.0, "budget": 2000.0,
-             "reason": "det BUY AAA", "entry_stop": 95.0},
-            {"ticker": "BBB", "side": "BUY", "price": 50.0, "budget": 1000.0,
-             "reason": "det BUY BBB", "entry_stop": 47.5},
-            {"ticker": "CCC", "side": "SELL", "price": 20.0, "shares": None,
-             "reason": "det SELL CCC"},
-        ]
-        session_bars = {"EEE": {"open": 25.0, "low": 24.0, "close": 26.0}}
-
-        executed, vetoed = await sim._llm_review_proposals(
-            _valuation(), proposals, {}, session_bars=session_bars)
-
-        # Execution behaviour is untouched: AAA (confirmed) + EEE (addition).
-        assert [(t["ticker"], t["side"]) for t in executed] == [
-            ("AAA", "BUY"), ("EEE", "BUY")]
-        assert sorted(v["ticker"] for v in vetoed) == ["BBB", "CCC"]
-
-        rows = await _rows(mem_db)
-        assert len(rows) == 5
-        by_ticker = {r["ticker"]: r for r in rows}
-
-        # Relations + the deterministic proposal they relate to.
-        assert by_ticker["AAA"]["relation"] == "confirmation"
-        assert by_ticker["AAA"]["det_side"] == "BUY"
-        assert by_ticker["AAA"]["det_reason"] == "det BUY AAA"
-        assert by_ticker["BBB"]["relation"] == "change"
-        assert by_ticker["BBB"]["det_side"] == "BUY"
-        assert by_ticker["BBB"]["det_reason"] == "det BUY BBB"
-        assert by_ticker["CCC"]["relation"] == "veto"
-        assert by_ticker["CCC"]["det_side"] == "SELL"
-        assert by_ticker["CCC"]["det_reason"] == "det SELL CCC"
-        assert by_ticker["DDD"]["relation"] == "hold"
-        assert by_ticker["DDD"]["det_side"] is None
-        assert by_ticker["DDD"]["det_reason"] is None
-        assert by_ticker["EEE"]["relation"] == "addition"
-        assert by_ticker["EEE"]["det_side"] is None
-        assert by_ticker["EEE"]["det_reason"] is None
-
-        # Every row: cycle mode, the cycle's session F date, decided_at frozen
-        # at PARSE time (never the later ledger-write time).
-        for row in rows:
-            assert row["mode"] == "cycle"
-            assert row["session_date"] == _T0.date().isoformat()
-            assert row["decided_at"] == _T0
-
-        # Filled rows carry the frozen fill; decided_at <= filled_at always.
-        for ticker, shares, price, cash_after in (
-                ("AAA", 20.0, 100.0, 8000.0), ("EEE", 40.0, 25.0, 7000.0)):
-            row = by_ticker[ticker]
-            assert row["filled_at"] is not None
-            assert row["decided_at"] <= row["filled_at"]
-            assert row["filled_at"] > row["decided_at"]  # write did not re-stamp
-            assert row["shares"] == pytest.approx(shares)
-            assert row["price"] == pytest.approx(price)
-            assert row["cash_after"] == pytest.approx(cash_after)
-
-        # Veto / hold / change (flip) executed nothing: NULL fill columns.
-        for ticker in ("BBB", "CCC", "DDD"):
-            row = by_ticker[ticker]
-            assert row["filled_at"] is None
-            assert row["shares"] is None
-            assert row["price"] is None
-            assert row["cash_after"] is None
-
-
-# ---------------------------------------------------------------------------
-# 2. A decision whose fill is blocked stays recorded, unfilled
-# ---------------------------------------------------------------------------
-
-class TestDecidedButUnfilled:
-    async def test_exec_guard_skip_keeps_decided_at_and_null_fill(
-            self, mem_db, monkeypatch, llm_backend):
-        _freeze_first_call_clock(monkeypatch, _T0)
-        _stub_llm(monkeypatch, (
-            "The cash is short this session.\n"
-            '[{"ticker": "AAA", "action": "BUY", "reason": "confirm"}]\n'))
-
-        # The account can no longer fund the order (exec guard: cash shortfall).
-        async with mem_db() as s:
-            acc = await s.get(SimAccount, 1)
-            acc.cash = 50.0
-            await s.commit()
-
-        proposals = [{"ticker": "AAA", "side": "BUY", "price": 100.0,
-                      "budget": 5000.0, "reason": "det BUY AAA"}]
-        executed, _vetoed = await sim._llm_review_proposals(
-            _valuation(), proposals, {}, session_bars={})
-
-        assert executed == []  # the guard skipped the trade
-        async with mem_db() as s:
-            trades = (await s.scalars(select(SimTrade))).all()
-        assert trades == []
-
-        rows = await _rows(mem_db)
-        assert len(rows) == 1
-        row = rows[0]
-        assert row["ticker"] == "AAA"
-        assert row["action"] == "BUY"
-        assert row["relation"] == "confirmation"
-        # Decided — at the parse-time instant, not at the (later) write.
-        assert row["decided_at"] == _T0
-        # ... never filled: no pending-order persistence, re-taken next cycle.
-        assert row["filled_at"] is None
-        assert row["shares"] is None
-        assert row["price"] is None
-        assert row["cash_after"] is None
-
-
-# ---------------------------------------------------------------------------
-# 3. Pure-LLM cycle: LLM-initiated decisions only
-# ---------------------------------------------------------------------------
-
-class TestPureLlmCycleLedger:
-    async def test_addition_rows_without_deterministic_proposal(
-            self, mem_db, monkeypatch, llm_backend):
-        _freeze_first_call_clock(monkeypatch, _T0)
-        _stub_llm(monkeypatch, (
-            "One new position, one name to leave alone.\n"
-            "[\n"
-            '  {"ticker": "AAA", "action": "BUY", "reason": "fresh idea"},\n'
-            '  {"ticker": "BBB", "action": "HOLD", "reason": "no edge"}\n'
-            "]\n"))
-
-        async def fake_close(ticker):
-            return {"AAA": 100.0, "BBB": 50.0}.get(ticker)
-        monkeypatch.setattr(sim, "_latest_close", fake_close)
-
-        executed = await sim._llm_decide(_valuation(), [], {}, pure_llm=True)
-
-        assert [(t["ticker"], t["side"]) for t in executed] == [("AAA", "BUY")]
-
-        rows = await _rows(mem_db)
-        assert [r["ticker"] for r in rows] == ["AAA", "BBB"]
-        for row in rows:
-            # No deterministic proposal exists in this path.
-            assert row["relation"] == "addition"
-            assert row["det_side"] is None
-            assert row["det_reason"] is None
-            assert row["mode"] == "cycle"
-            assert row["session_date"] == _T0.date().isoformat()
-            assert row["decided_at"] == _T0
-
-        filled = rows[0]
-        assert filled["action"] == "BUY"
-        assert filled["filled_at"] is not None
-        assert filled["decided_at"] <= filled["filled_at"]
-        assert filled["shares"] == pytest.approx(10.0)  # 1000 budget @ 100
-        assert filled["price"] == pytest.approx(100.0)
-        assert filled["cash_after"] == pytest.approx(9000.0)
-
-        held = rows[1]
-        assert held["filled_at"] is None
-        assert held["shares"] is None
-
-
-# ---------------------------------------------------------------------------
-# 4. Chat [[ACTION]] rows
+# 1. Chat [[ACTION]] rows
 # ---------------------------------------------------------------------------
 
 class TestChatActionLedger:
@@ -471,79 +281,7 @@ class TestChatActionLedger:
 
 
 # ---------------------------------------------------------------------------
-# 5. Append-only across sessions; the per-session guard writes nothing new
-# ---------------------------------------------------------------------------
-
-class TestAppendOnlyAcrossCycles:
-    async def test_second_session_appends_and_guard_skips_repeat(
-            self, mem_db, monkeypatch, llm_backend, guard_state):
-        day1 = datetime(2026, 3, 2, 23, 30, tzinfo=UTC)
-        day2 = datetime(2026, 3, 3, 23, 30, tzinfo=UTC)
-
-        monkeypatch.setattr(settings, "sim_strategy", "llm")
-        monkeypatch.setattr(settings, "sim_benchmark_enabled", False)
-        monkeypatch.setattr(settings, "sim_llm_fundamentals_context", False)
-        monkeypatch.setattr(settings, "sim_block_negative_roe", False)
-
-        async def fake_candidates():
-            return ["AAA", "BBB"]
-        monkeypatch.setattr(sim, "_candidate_tickers", fake_candidates)
-
-        async def fake_refresh_many(tickers, period, max_age_seconds=None):
-            return [], {}
-        monkeypatch.setattr(sim, "refresh_many", fake_refresh_many)
-
-        async def fake_news(signals):
-            return {}
-        monkeypatch.setattr(sim, "_gather_news", fake_news)
-
-        async def fake_decision_inputs(tickers, held_entries=None, now=None):
-            return sim._DecisionInputs(
-                f_ts=pd.Timestamp(datetime.now(UTC).date()), s_ts=None,
-                signals={}, prices={}, session_bars=None, ratchets={})
-        monkeypatch.setattr(sim, "_decision_inputs", fake_decision_inputs)
-
-        async def fake_close(ticker):
-            return {"AAA": 100.0, "BBB": 50.0}.get(ticker)
-        monkeypatch.setattr(sim, "_latest_close", fake_close)
-
-        _stub_llm(
-            monkeypatch,
-            'First session.\n[{"ticker": "AAA", "action": "BUY", "reason": "first"}]\n',
-            'Second session.\n[{"ticker": "BBB", "action": "BUY", "reason": "second"}]\n',
-        )
-
-        # --- cycle 1 (session F = day1) ---
-        monkeypatch.setattr(sim, "_utcnow", lambda: day1)
-        first = await sim.run_cycle()
-        assert "skipped" not in first
-        rows_after_1 = await _rows(mem_db)
-        assert len(rows_after_1) == 1
-        assert rows_after_1[0]["ticker"] == "AAA"
-        assert rows_after_1[0]["session_date"] == "2026-03-02"
-
-        # --- cycle 2 (next session) appends, never rewrites ---
-        monkeypatch.setattr(sim, "_utcnow", lambda: day2)
-        second = await sim.run_cycle()
-        assert "skipped" not in second
-        rows_after_2 = await _rows(mem_db)
-        assert len(rows_after_2) == 2
-        # The earlier row is bit-for-bit unchanged (every column compared).
-        assert rows_after_2[0] == rows_after_1[0]
-        assert rows_after_2[1]["ticker"] == "BBB"
-        assert rows_after_2[1]["session_date"] == "2026-03-03"
-        assert rows_after_2[1]["relation"] == "addition"
-        assert rows_after_2[1]["filled_at"] is not None
-
-        # --- same-session repeat: the guard bails out before any decision ---
-        third = await sim.run_cycle()
-        assert third.get("skipped") is True
-        assert third["reason"] == "session 2026-03-03 already processed"
-        assert await _rows(mem_db) == rows_after_2
-
-
-# ---------------------------------------------------------------------------
-# 6. A ledger failure is never a trading failure
+# 2. A ledger failure is never a trading failure
 # ---------------------------------------------------------------------------
 
 class _AddAllBoomSession:
@@ -651,7 +389,7 @@ class TestLedgerFailureIsNonFatal:
 
 
 # ---------------------------------------------------------------------------
-# 7. A deterministic-only cycle writes NO ledger rows
+# 3. A deterministic-only cycle writes NO ledger rows
 # ---------------------------------------------------------------------------
 
 class TestDeterministicCycleWritesNothing:

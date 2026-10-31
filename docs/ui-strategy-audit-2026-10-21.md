@@ -2185,6 +2185,83 @@ the pinned-marker comment kept verbatim; the chat-envelope test renamed
 mocks kept in the two tests where `valuate()` genuinely uses them (live
 infrastructure, not legacy plumbing).
 
+## The dead-code retirement — part 2: the llm/hybrid modes + the pinned withLiveToday — 2026-10-31
+
+**The owner's verdicts, executed.** The inventory's DECISION-NEEDED items
+went to the owner with the measured blast radius; they chose: RETIRE the
+sim's llm/hybrid whole-cycle strategy modes (their own assessment — they
+"never worked well"; the sell layer covers the deterministic cycle, which
+is the live decision path) and RETIRE `withLiveToday` with a deliberate
+digest re-pin; KEEP `sim_chat` + the non-stream sim chat and KEEP the
+savings DELETE endpoint. ~1,466 deletions / 78 insertions across 7 files.
+
+- **The cycle machinery** (app/sim.py, ~820 lines):
+  `_llm_review_proposals`, `_llm_decide`, `_extract_summary`,
+  `_llm_prose_summary`, `_cycle_session_date`, `_ledger_cycle_rows`,
+  `_ledger_llm_rows`, `_top_news_candidates` + `_gather_news`, the
+  sim-side `_current_week`/`_is_stop_out` (optimize.py has its own
+  copies), the run_cycle llm/hybrid branches. The dispatch now has
+  exactly two paths: deterministic (the default — the sell layer's
+  type-A overlay wiring byte-equivalent, its parity tests pass
+  unchanged) and the unknown-strategy fallback. A stale
+  `SIM_STRATEGY=llm`/`hybrid` value degrades to deterministic via that
+  fallback, logged, never a crash (verified live for both values).
+  `get_last_llm_summary` is now the honest deterministic-only stub
+  (`llm_called` computed, not hardcoded — run_cycle resets the LLM
+  state globals every cycle; the classification keys the llm/hybrid
+  cycles produced are gone). The `_last_*` globals stay (the reset test
+  pins them; the chat context reads some).
+- **The knobs** (app/config.py): `sim_llm_review_interval`,
+  `sim_llm_minimal_prompt`, `sim_llm_mode_aware_prompt`,
+  `sim_llm_failure_marker` retired — from the Settings class AND the
+  run-config provenance payload. `sim_llm_fundamentals_context` STAYS
+  (it also arms the deterministic quality map); `sim_strategy` STAYS,
+  its comment now stating deterministic-only + the fallback.
+- **The UI** (static/index.html): the LLM REASONING panel is the honest
+  degraded state — no whole-cycle review anymore, the trades count, and
+  the pointer to where the LLM's sim role lives now: the sell layer's
+  decisions in the SELL SCORECARD, the backend selection in Settings.
+  `withLiveToday` deleted; its source_guards entry removed from
+  tests/fixtures/portfolio_ui_cases.json (the mddOf + Savings digests
+  byte-unchanged); portfolio.js's live copy is the one the app uses.
+- **The tests retiring with their subjects** (~513 lines): the llm/hybrid
+  ledger classes (`TestHybridCycleLedger`, `TestDecidedButUnfilled`,
+  `TestPureLlmCycleLedger`, `TestAppendOnlyAcrossCycles`) and
+  `TestExtractSummary` + `TestLLMDecide`. KEPT: the chat ledger classes,
+  the LLM-state reset test, `TestParseLLMDecisions` +
+  `TestBuildLLMContext` (they pin the optimize-replay-shared machinery),
+  the deterministic-cycle-writes-nothing test, the fundamentals-context
+  tests.
+
+**The protected set verified**: optimize.py is untouched (READ-ONLY), and
+every name it imports from sim still resolves — the prompts/context/parse
+machinery (`_LLM_SYSTEM_PROMPT`, `_LLM_MINIMAL_SYSTEM_PROMPT`,
+`_LLM_MODE_AWARE_MINIMAL_PROMPT`, `_PURE_LLM_SYSTEM_PROMPT`,
+`_build_llm_context`, `_parse_llm_decisions`, `_week_diff`) STAY in sim.py
+because the hybrid-replay / llm-walkforward CLI paths are the reproducible
+evidence record for docs/llm-strategy-experiments.md. The chat/proposals
+flow, `sim_chat`, `SimLlmDecision` (historical + chat ledger), the research
+paths, the OLLAMA fallback: all untouched, per the owner's verdicts and
+the policy.
+
+Independent verification (the orchestrator's gate): the diff review (the
+dispatch surgery, the stub, the payload, the re-pin all inspected); my
+own runs — 421 green on the worker's gate set plus test_ui_fixture_server,
+test_fundamentals_context and test_sellscore; ruff clean; the
+zero-reference grep per retired symbol (the only prose mention left is
+optimize.py's historical docstring "(mirrors sim._llm_decide)" — the
+replay's design ancestor, kept as history; test_news.py's gather_news is
+the news module's own function, unrelated). Full offline regression green
+in the main tree at the commit.
+
+**With this slice the owner's roadmap is complete**: the strategy-audit
+research (4C/5C) → the LLM sell layer executing in the live paper accounts
+(7b84d1f) → the scorecard (1a8665f) → the dead-code bookkeeping (491d7e5
++ this commit). The app is ready to deploy: the Settings backend selection
+governs the sell layer; with no backend configured the accounts behave
+exactly as today (the no-backend short-circuit), and the first meaningful
+scorecard needs ~3 months of live type-A events.
+
 ## References
 
 - [SEC Apple companyfacts](https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json)

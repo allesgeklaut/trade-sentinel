@@ -1,9 +1,11 @@
 """Autonomous paper-trading simulation engine for Trade Sentinel.
 
 The bot receives an imaginary monthly allowance, decides when to buy/sell
-assets from a configurable universe using deterministic signals, an LLM-based
-portfolio manager (hybrid mode), or a pure LLM mode, and tracks portfolio
-performance over time.
+assets from a configurable universe using deterministic signals (the LLM
+sell layer, app/selllayer.py, overlays the standing-stop exits), and tracks
+portfolio performance over time. The former llm/hybrid whole-cycle strategy
+modes are retired: a stale SIM_STRATEGY value degrades to deterministic via
+the unknown-strategy fallback in run_cycle.
 
 Execution follows the session fill contract — documented in full in
 ``app/session.py``, the single place it lives. Short version: the scheduled
@@ -64,10 +66,7 @@ from .screener import tickers as universe_tickers
 from .strategy import (
     _bar_price,
     StrategyParams,
-    llm_sell_shares,
-    plan_llm_buys,
     propose_trades,
-    reconcile_proposals,
 )
 
 logger = logging.getLogger("trade_sentinel.sim")
@@ -92,19 +91,21 @@ _CONFIG_CONTRACT_VERSION = "phase2-v1"
 # writer kwarg always wins, so the public mutators stay callable standalone.
 _RUN_STAMP: ContextVar[dict | None] = ContextVar("sim_run_stamp", default=None)
 
-# Stores the raw LLM reasoning text from the most recent _llm_decide() call.
+# Stores the raw LLM reasoning text from the most recent whole-cycle LLM call.
+# The llm/hybrid whole-cycle modes are retired, so run_cycle resets this to ""
+# every cycle and it stays empty; the chat flow never sets it.
 _last_llm_reasoning: str = ""
-# Stores the prose summary the LLM emitted before its JSON array (new prompt
-# format). Empty when the LLM only returned JSON or when it was unavailable.
+# Stores the prose summary the LLM emitted before its JSON array. Same
+# deterministic-only status as _last_llm_reasoning.
 _last_llm_summary: str = ""
-# Stores the deterministic trades from the most recent hybrid cycle (for comparison).
-# In the hybrid strategy these are the PROPOSALS (pre-veto); some may have been
-# vetoed by the LLM and never executed — see _last_llm_vetoes.
+# Stores the deterministic trades from the most recent cycle (the executed
+# trades in the deterministic strategy — the only live strategy).
 _last_deterministic_trades: list[dict] = []
-# Stores the parsed LLM decisions from the most recent cycle.
+# Stores the parsed LLM decisions from the most recent cycle. Empty in the
+# deterministic-only world (run_cycle resets it); the chat context reads it.
 _last_llm_decisions: list[dict] = []
-# Stores the deterministic proposals the LLM vetoed (HOLD) in the most recent
-# hybrid cycle. Empty for non-hybrid strategies and for the pure-LLM strategy.
+# Retired with the hybrid mode; kept (always empty) because run_cycle's
+# per-cycle state reset and its test pin it.
 _last_llm_vetoes: list[dict] = []
 
 # In-progress run-cycle state for the frontend status poller. Cleared at the
@@ -232,26 +233,6 @@ def _utcnow() -> datetime:
 
 def _current_month() -> str:
     return datetime.now(_TZ).strftime("%Y-%m")
-
-
-def _current_week() -> str:
-    """ISO calendar week key (YYYY-Www), anchored to the operator's local
-    timezone. Used for the weekly LLM portfolio review: the review fires on
-    the FIRST cycle of each new week, regardless of manual runs."""
-    return datetime.now(_TZ).strftime("%G-W%V")
-
-
-def _is_stop_out(reason: str) -> bool:
-    """True if a SELL was an automatic stop, not a signal-driven decision.
-
-    Mirrors optimize._is_stop_out: the engine stamps these reasons on
-    stop-loss exits ("Initial stop: ...", "ATR stop hit: ...",
-    "Trailing stop: ...", "Portfolio stop: ..."). Signal-driven SELLs say
-    "SELL signal (strength ...)".
-    """
-    r = reason.lower()
-    return any(r.startswith(p) for p in
-               ("initial stop", "atr stop", "trailing stop", "portfolio stop"))
 
 
 def _week_diff(current: str, last: str) -> int:
@@ -557,10 +538,6 @@ async def current_config() -> dict:
         "sim_min_run_5d": settings.sim_min_run_5d,
         "sim_max_dist_above": settings.sim_max_dist_above,
         # --- LLM decision controls ---------------------------------------
-        "sim_llm_review_interval": settings.sim_llm_review_interval,
-        "sim_llm_minimal_prompt": settings.sim_llm_minimal_prompt,
-        "sim_llm_mode_aware_prompt": settings.sim_llm_mode_aware_prompt,
-        "sim_llm_failure_marker": settings.sim_llm_failure_marker,
         "sim_llm_fundamentals_context": settings.sim_llm_fundamentals_context,
         "sim_block_negative_roe": settings.sim_block_negative_roe,
         # --- LLM sell layer (app/selllayer.py) — provenance: these knobs are
@@ -1920,87 +1897,6 @@ def _parse_llm_decisions(content: str) -> list[dict] | None:
     return valid if valid else None
 
 
-def _extract_summary(content: str | None) -> str:
-    """Return the prose summary the LLM wrote before its JSON array.
-
-    The new prompt asks for a brief prose summary followed by the JSON array.
-    This helper returns everything before the array's opening ``[``. If the
-    LLM only returned JSON (no prose), returns an empty string. Fallback
-    ``[LLM UNAVAILABLE...]`` strings are detected and returned as-is (the
-    caller already treats them specially via ``is_fallback``).
-    """
-    if not content:
-        return ""
-    text = content.strip()
-    # The fallback message starts with "[" but is not JSON — leave it for
-    # is_fallback handling upstream; no prose to extract.
-    if text.startswith("[LLM UNAVAILABLE"):
-        return ""
-    # If the prose is followed by a ```json fence, the opening "[" we want is
-    # inside the fence. Strip the fence first so we can locate the array.
-    fence_idx = text.find("```")
-    if fence_idx > 0:
-        # There is prose before a fence. Drop the fence line; the JSON follows.
-        first_nl_after_fence = text.find("\n", fence_idx)
-        if first_nl_after_fence != -1:
-            prose = text[:fence_idx].strip()
-            return prose.rstrip(":").strip()
-    loc = _find_json_array(text)
-    if loc is None or loc[0] <= 0:
-        # No JSON array, or it's at the very start — no prose.
-        return ""
-    prose = text[:loc[0]].strip()
-    # Trim a trailing colon or "Then:" / "Decisions:" style lead-ins the LLM
-    # might add right before the array.
-    prose = prose.rstrip(":").strip()
-    return prose
-
-
-async def _llm_prose_summary(decisions: list[dict]) -> str:
-    """Ask the LLM for a brief prose explanation of its decisions.
-
-    Two-shot pattern: the main LLM call (with the big portfolio context)
-    tends to emit only a bare JSON array because Qwen3 puts its deliberation
-    in the reasoning channel. This second call has a tiny context (just the
-    parsed decisions), so the model reliably produces prose in ``content``.
-
-    Returns an empty string if the LLM is unavailable or the call fails.
-    """
-    if not decisions:
-        # No decisions — ask for a summary of why the LLM held everything.
-        prompt = (
-            "The portfolio was fully reviewed this cycle and no trades were "
-            "made (all positions held). Write 2-3 sentences in plain English "
-            "explaining why no trades were made."
-        )
-    else:
-        # Truncate to avoid re-sending a huge context — the LLM just needs
-        # the ticker/action/reason per decision, not the full portfolio state.
-        short = [
-            {"ticker": d["ticker"], "action": d["action"], "reason": d.get("reason", "")}
-            for d in decisions[:15]
-        ]
-        prompt = (
-            f"Here are my decisions for this cycle:\n"
-            f"{json.dumps(short, indent=2)}\n\n"
-            f"Write 2-3 sentences in plain English explaining why I made "
-            f"these decisions."
-        )
-    try:
-        out = await llm_mod.chat([
-            {"role": "system", "content": (
-                "You are a portfolio manager. Write a brief 2-3 sentence "
-                "summary in plain English. No JSON, no code fences, no "
-                "markdown - just prose."
-            )},
-            {"role": "user", "content": prompt},
-        ])
-        return (out.get("text") or "").strip()
-    except Exception as e:
-        logger.warning("LLM prose summary call failed: %s", e)
-        return ""
-
-
 # ---------------------------------------------------------------------------
 # LLM frozen-decision ledger (session fill contract, rule 7)
 # ---------------------------------------------------------------------------
@@ -2016,9 +1912,9 @@ def _llm_decision_relation(action: str, det_side: str | None, *,
                            vetoed: bool = False) -> str:
     """Classify one LLM decision against the deterministic proposal.
 
-    Single source of truth for the relation vocabulary, shared with
-    ``get_last_llm_summary`` (which renders the same classification for the
-    frontend) so the two renderings can never drift:
+    Single source of truth for the relation vocabulary (the chat flow's
+    ledger rows use ``chat_action`` directly; the cycle-mode vocabulary is
+    kept for the optimize replay paths, which import this helper):
 
       * HOLD on a proposed ticker   -> ``veto`` (the proposal is blocked)
       * HOLD on any other ticker    -> ``hold`` (passive)
@@ -2034,17 +1930,6 @@ def _llm_decision_relation(action: str, det_side: str | None, *,
     if side is None:
         return "addition"
     return "confirmation" if act == side else "change"
-
-
-def _cycle_session_date() -> str:
-    """The cycle's session F date ("YYYY-MM-DD") for ledger rows.
-
-    Session F is the cycle's own session — the run date (contract rule 2) —
-    which is exactly what the per-session guard keys on. Ledger ``cycle``
-    rows are stamped with it so a decision can be attributed to the session
-    whose OPEN filled it.
-    """
-    return _session_guard_key()
 
 
 def _chat_session_date() -> str:
@@ -2094,75 +1979,6 @@ def _ledger_row(*, decided_at: datetime, mode: str, session_date: str,
         price=fill.get("price") if filled else None,
         cash_after=fill.get("cash_after") if filled else None,
     )
-
-
-def _ledger_cycle_rows(decisions: list[dict], proposals: list[dict],
-                       vetoed: list[dict], executed: list[dict],
-                       decided_at: datetime) -> list[SimLlmDecision]:
-    """Rule-7 rows for one hybrid cycle: one per LLM decision.
-
-    ``det_side``/``det_reason`` come from the deterministic proposal map (the
-    PRE-veto proposals — what the engine wanted before the LLM spoke), the
-    relation from ``_llm_decision_relation``, and the fill columns from the
-    executed trade dicts matched by (ticker, side). A vetoed, held,
-    unpriced or exec-guard-skipped decision keeps NULL fill columns.
-    """
-    det_by = {str(p.get("ticker") or "").upper(): p for p in proposals}
-    vetoed_tickers = {str(v.get("ticker") or "").upper() for v in vetoed}
-    fills = _executed_index(executed)
-    filled_at = _utcnow()  # fill freeze time — always >= decided_at
-    session_date = _cycle_session_date()
-    rows: list[SimLlmDecision] = []
-    for d in decisions:
-        ticker = str(d.get("ticker") or "")
-        action = str(d.get("action") or "")
-        det = det_by.get(ticker.upper())
-        det_side = (str(det.get("side") or "") or None) if det else None
-        rows.append(_ledger_row(
-            decided_at=decided_at,
-            mode="cycle",
-            session_date=session_date,
-            ticker=ticker,
-            action=action,
-            reason=str(d.get("reason") or ""),
-            relation=_llm_decision_relation(
-                action, det_side, vetoed=ticker.upper() in vetoed_tickers),
-            det_side=det_side,
-            det_reason=(str(det.get("reason") or "") if det else None),
-            fill=fills.get((ticker.upper(), action.upper())),
-            filled_at=filled_at,
-        ))
-    return rows
-
-
-def _ledger_llm_rows(decisions: list[dict], executed: list[dict],
-                     decided_at: datetime) -> list[SimLlmDecision]:
-    """Rule-7 rows for one pure-LLM cycle.
-
-    That path is handed no deterministic proposals, so every decision is
-    LLM-initiated: ``det_side``/``det_reason`` are NULL and the relation is
-    ``addition``. A HOLD there is still an initiated decision — recorded as
-    decided-but-unfilled, like any decision whose order did not run.
-    """
-    fills = _executed_index(executed)
-    filled_at = _utcnow()
-    session_date = _cycle_session_date()
-    rows: list[SimLlmDecision] = []
-    for d in decisions:
-        ticker = str(d.get("ticker") or "")
-        action = str(d.get("action") or "")
-        rows.append(_ledger_row(
-            decided_at=decided_at,
-            mode="cycle",
-            session_date=session_date,
-            ticker=ticker,
-            action=action,
-            reason=str(d.get("reason") or ""),
-            relation="addition",
-            fill=fills.get((ticker.upper(), action.upper())),
-            filled_at=filled_at,
-        ))
-    return rows
 
 
 def _ledger_chat_rows(actions: list[dict], executed: list[dict],
@@ -2232,426 +2048,6 @@ async def _freeze_llm_decisions(rows: list[SimLlmDecision]) -> None:
             "and the cycle/chat result are unaffected", exc_info=True)
 
 
-async def _llm_review_proposals(
-    valuation: dict[str, Any],
-    proposals: list[dict],
-    signals: dict[str, dict],
-    news: dict[str, list[dict]] | None = None,
-    quality: dict[str, dict[str, float | None]] | None = None,
-    session_bars: dict[str, dict] | None = None,
-) -> tuple[list[dict], list[dict]]:
-    """Hybrid flow: let the LLM review deterministic proposals before they execute.
-
-    Mirrors the propose → review → execute flow that makes the LLM's HOLD
-    actually veto a deterministic trade instead of being a silent no-op:
-
-      1. Build the LLM context with the deterministic *proposals* (not yet
-         executed) and the current portfolio state.
-      2. Call the LLM; it returns a JSON array of BUY/SELL/HOLD decisions.
-      3. Reconcile: a deterministic proposal is vetoed when the LLM returns
-         HOLD for its ticker; otherwise it's approved and executes. LLM
-         decisions for tickers NOT in the proposals are treated as
-         LLM-initiated additions and execute on top.
-
-    Returns ``(executed, vetoed)`` where ``executed`` is the full list of
-    trades that ran (deterministic survivors + LLM additions) and ``vetoed``
-    is the list of deterministic proposals the LLM blocked (for logging /
-    frontend display).
-
-    On LLM call failure or unparseable response, falls back to executing all
-    proposals as-is (equivalent to the deterministic-only strategy).
-
-    Fill timing follows the session fill contract (``app.session``): with
-    ``session_bars`` (the cycle's strict F bars) every fill — approved
-    proposals and LLM additions alike — reads F's OPEN, and a ticker
-    without an F bar fills nothing. The decision INPUTS (signals and the
-    proposal set) were frozen to data <= the previous session's close by
-    the caller.
-
-    Rule 7 ledger: every parsed decision is appended to
-    ``SimLlmDecision`` with the ``decided_at`` frozen at parse time, its
-    relation to the deterministic proposal (confirmation / change / veto /
-    hold / addition) and, when it executed, the frozen fill; a decision that
-    never filled keeps NULL fill columns. The honest limitation that remains
-    is the LLM itself: a re-run on identical frozen inputs consults it again
-    and it may reason differently — the per-session guard limits that to one
-    consult per session. With ``session_bars=None`` (legacy
-    callers/tests), fills read the latest cached close as before.
-    """
-    global _last_llm_reasoning, _last_llm_summary
-
-    context = _build_llm_context(valuation, proposals, signals, news,
-                                minimal=settings.sim_llm_minimal_prompt
-                                or settings.sim_llm_mode_aware_prompt,
-                                quality=quality)
-    backend = await llm_mod.current_backend()
-
-    system_prompt = (_LLM_MODE_AWARE_MINIMAL_PROMPT if settings.sim_llm_mode_aware_prompt
-                     else _LLM_MINIMAL_SYSTEM_PROMPT if settings.sim_llm_minimal_prompt
-                     else _LLM_SYSTEM_PROMPT)
-
-    try:
-        out = await llm_mod.chat([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": context},
-        ])
-        content = out["text"]
-    except Exception as e:
-        err_detail = f"{type(e).__name__}: {e}"
-        resp = getattr(e, 'response', None)
-        if resp is not None:
-            try:
-                err_detail += f" | status={resp.status_code} body={resp.text[:300]}"
-            except Exception:
-                pass
-        logger.warning("LLM review failed [%s] (backend=%s, model=%s); executing all proposals",
-                       err_detail, backend.get("name", "?"), backend.get("model", "?"))
-        _last_llm_reasoning = (
-            f"[LLM UNAVAILABLE — executing all deterministic proposals]\n"
-            f"Error: {err_detail}\n"
-            f"Backend: {backend.get('name', '?')}\n"
-            f"Model: {backend.get('model', '?')}"
-        )
-        _last_llm_summary = ""
-        executed = await _execute_proposed(proposals)
-        return executed, []
-
-    _last_llm_reasoning = content
-    # Rule 7: the decision is frozen when the response is PARSED — captured
-    # once, before any of these decisions can execute, and never re-stamped.
-    decided_at = _utcnow()
-    decisions = _parse_llm_decisions(content)
-    if decisions is None:
-        logger.warning("Could not parse LLM decisions; executing all proposals. Raw: %s", content[:500])
-        _last_llm_summary = ""
-        executed = await _execute_proposed(proposals)
-        return executed, []
-
-    # Two-shot: the main call may have put prose in reasoning_content (Qwen3)
-    # and only emitted JSON in content. Try extracting prose from content
-    # first; if that's empty, make a lightweight second call with just the
-    # parsed decisions — the small context reliably produces prose in content.
-    _last_llm_summary = _extract_summary(content)
-    if not _last_llm_summary:
-        _last_llm_summary = await _llm_prose_summary(decisions)
-
-    logger.info("LLM returned %d decisions", len(decisions))
-
-    # --- Reconcile proposals with LLM decisions ---
-    approved, vetoed, proposal_tickers = reconcile_proposals(proposals, decisions)
-    for p in vetoed:
-        logger.info("LLM vetoed %s %s — %s", p["side"], p["ticker"], p.get("llm_reason", ""))
-
-    # Execute approved proposals (SELLs first so cash frees up for BUYs;
-    # _execute_proposed preserves order, and strategy.propose_trades already
-    # emits SELLs before BUYs).
-    executed = await _execute_proposed(approved)
-
-    # --- LLM-initiated additions: decisions for tickers NOT in proposals ---
-    # These execute on top of the approved proposals, through the same exec
-    # helpers, honouring partial-size fields and risk guards.
-    total_equity = valuation["total_equity"]
-
-    async def _record_ledger() -> None:
-        """Freeze this cycle's LLM decisions in the rule-7 ledger.
-
-        Called only after execution so the fill columns are known; the trades
-        are already committed, so a ledger failure is logged and swallowed
-        (never a trading failure)."""
-        await _freeze_llm_decisions(_ledger_cycle_rows(
-            decisions, proposals, vetoed, executed, decided_at))
-
-    if total_equity <= 0:
-        await _record_ledger()
-        return executed, vetoed
-
-    # Fill prices: contract mode reads F's OPEN from the cycle's strict
-    # session bars (a ticker without an F bar fills nothing); legacy mode
-    # reads the latest cached close.
-    if session_bars is not None:
-
-        async def _price_of(ticker: str) -> float | None:
-            return _session_fill_open(session_bars, ticker)
-
-    else:
-
-        async def _price_of(ticker: str) -> float | None:
-            return await _latest_close(ticker)
-
-    async def _value_of(ticker: str) -> float:
-        async with Session() as s:
-            pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
-        price = await _latest_close(ticker) or 0.0  # mark: latest cached close
-        return (pos.shares * price) if pos else 0.0
-
-    plan = await plan_llm_buys(
-        decisions, valuation["cash"], total_equity,
-        StrategyParams(
-            min_cash_pct=settings.sim_min_cash_pct,
-            max_position_pct=settings.sim_max_position_pct,
-        ),
-        guarded=True,
-        price_of=_price_of,
-        value_of=_value_of,
-        exclude=proposal_tickers,
-    )
-
-    for d in decisions:
-        ticker_u = d["ticker"].upper()
-        if ticker_u in proposal_tickers:
-            continue  # already handled above
-        action = d["action"]
-        reason = d.get("reason", f"LLM {action}")
-        if action == "HOLD":
-            continue  # HOLD on a non-proposal ticker = no-op
-
-        price = (_session_fill_open(session_bars, d["ticker"])
-                 if session_bars is not None else await _latest_close(d["ticker"]))
-        if price is None or price <= 0:
-            logger.warning("LLM addition for %s skipped: no price", d["ticker"])
-            continue
-
-        if action == "BUY":
-            budget = plan.get(ticker_u)
-            if budget is None:
-                continue
-            t = await _exec_buy(d["ticker"], price, budget, f"LLM: {reason}")
-            if t:
-                executed.append(t)
-                valuation = await valuate()
-                total_equity = valuation["total_equity"]
-        elif action == "SELL":
-            # Replay evidence (90-day bull window: -8.7% → +4.7%): the LLM's
-            # self-initiated SELLs (not proposed by the engine) are churn —
-            # it sells winners in bull markets. The engine owns exits via
-            # stop-losses and deterministic SELL signals. Skip LLM-initiated
-            # SELLs in hybrid mode; only SELLs tied to engine proposals
-            # (handled in the reconcile step above) execute.
-            logger.info("LLM-initiated SELL %s skipped (engine owns exits)", d["ticker"])
-
-    await _record_ledger()
-    return executed, vetoed
-
-
-async def _llm_decide(
-    valuation: dict[str, Any],
-    deterministic_trades: list[dict],
-    signals: dict[str, dict] | None = None,
-    news: dict[str, list[dict]] | None = None,
-    pure_llm: bool = False,
-    quality: dict[str, dict[str, float | None]] | None = None,
-    session_bars: dict[str, dict] | None = None,
-) -> list[dict]:
-    """LLM strategy: let an LLM decide what to buy/sell.
-
-    In hybrid mode (``pure_llm=False``) the LLM reviews deterministic
-    proposals and can veto/approve/flip them. In pure-LLM mode
-    (``pure_llm=True``) there are no proposals — the LLM picks the names and
-    the engine's hard sizing limits (min-cash floor, max-position-%,
-    max-positions cap) size every BUY. Both modes use the shared prompt.
-
-    Builds a structured context with the portfolio state, signal summaries,
-    and optional recent news, asks the LLM for a JSON array of decisions,
-    then executes each BUY/SELL through the same exec helpers.
-
-    If the LLM call fails or the response can't be parsed, falls back to the
-    deterministic trades (empty in pure-LLM mode, so effectively no trades).
-
-    Fill timing follows the session fill contract (``app.session``): the
-    ``signals`` handed in were frozen to data <= the previous session's
-    close, and with ``session_bars`` (the cycle's strict F bars) every fill
-    reads F's OPEN — a ticker without an F bar fills nothing.
-
-    Rule 7 ledger: every parsed decision is appended to ``SimLlmDecision``
-    with the ``decided_at`` frozen at parse time and, when it executed, the
-    frozen fill. This path receives no deterministic proposals, so its rows
-    carry NULL ``det_side``/``det_reason`` and relation ``addition``. The
-    honest limitation that remains is the LLM itself: a re-run on identical
-    frozen inputs consults it again and it may reason differently — the
-    per-session guard limits that to one consult per session. With
-    ``session_bars=None`` (legacy callers/tests), fills read the latest
-    cached close as before.
-    """
-    # Default fallback
-    if signals is None:
-        signals = {}
-
-    global _last_llm_reasoning, _last_llm_summary
-
-    system_prompt = (_LLM_MODE_AWARE_MINIMAL_PROMPT if settings.sim_llm_mode_aware_prompt
-                     else _LLM_MINIMAL_SYSTEM_PROMPT if settings.sim_llm_minimal_prompt
-                     else _LLM_SYSTEM_PROMPT)  # shared prompt: main-branch parity
-    # Recent trade history from the DB (newest first) so the LLM sees what it
-    # did recently and can avoid round-trips / repeated mistakes.
-    recent_trades: list[dict] = []
-    async with Session() as s:
-        recent_rows = (await s.scalars(
-            select(SimTrade).order_by(SimTrade.created_at.desc()).limit(12)
-        )).all()
-    recent_trades = [
-        {"date": tr.created_at.strftime("%Y-%m-%d") if tr.created_at else "",
-         "side": tr.side, "ticker": tr.ticker, "shares": tr.shares,
-         "price": tr.price, "reason": tr.reason}
-        for tr in recent_rows
-    ]
-    context = _build_llm_context(valuation, deterministic_trades, signals, news,
-                                pure_llm=pure_llm, trade_history=recent_trades,
-                                minimal=settings.sim_llm_minimal_prompt
-                                or settings.sim_llm_mode_aware_prompt,
-                                quality=quality)
-    backend = await llm_mod.current_backend()
-
-    try:
-        out = await llm_mod.chat([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": context},
-        ])
-        content = out["text"]
-    except Exception as e:
-        err_detail = f"{type(e).__name__}: {e}"
-        resp = getattr(e, 'response', None)
-        if resp is not None:
-            try:
-                err_detail += f" | status={resp.status_code} body={resp.text[:300]}"
-            except Exception:
-                pass
-        mode = "pure-LLM" if pure_llm else "hybrid"
-        logger.warning("LLM decide failed [%s] (backend=%s, model=%s); falling back (%s)",
-                       err_detail, backend.get("name", "?"), backend.get("model", "?"), mode)
-        if pure_llm:
-            _last_llm_reasoning = (
-                f"[LLM UNAVAILABLE — no trades executed]\n"
-                f"Error: {err_detail}\n"
-                f"Backend: {backend.get('name', '?')}\n"
-                f"Model: {backend.get('model', '?')}"
-            )
-        else:
-            _last_llm_reasoning = (
-                f"[LLM UNAVAILABLE — fell back to deterministic]\n"
-                f"Error: {err_detail}\n"
-                f"Backend: {backend.get('name', '?')}\n"
-                f"Model: {backend.get('model', '?')}\n\n"
-                f"Deterministic trades were executed instead:"
-            ) + ("\n" + "\n".join(
-                f"  - {t['ticker']} {t['side']} ×{t.get('shares', '?')} @ {t.get('price', '?'):.2f} — {t.get('reason', '')}"
-                for t in deterministic_trades
-            ) if deterministic_trades else "\n  (no deterministic trades either)")
-        _last_llm_summary = ""
-        return list(deterministic_trades)
-
-    # Store raw LLM reasoning for display in the frontend
-    _last_llm_reasoning = content
-    # Rule 7: frozen at PARSE time, before any of these decisions executes.
-    decided_at = _utcnow()
-    decisions = _parse_llm_decisions(content)
-    if decisions is None:
-        logger.warning("Could not parse LLM decisions; falling back. Raw: %s", content[:500])
-        _last_llm_summary = ""
-        return list(deterministic_trades)
-
-    logger.info("LLM returned %d decisions", len(decisions))
-
-    # Two-shot prose summary (see _llm_review_proposals for rationale).
-    _last_llm_summary = _extract_summary(content)
-    if not _last_llm_summary:
-        _last_llm_summary = await _llm_prose_summary(decisions)
-
-    # Recompute equity / budget guards (same logic as deterministic)
-    total_equity = valuation["total_equity"]
-    if total_equity <= 0:
-        await _freeze_llm_decisions(_ledger_llm_rows(decisions, [], decided_at))
-        return []
-
-    executed: list[dict] = []
-
-    # Plan all BUY budgets up front so unsized BUYs split the cash evenly
-    # instead of the first one taking everything.
-    if session_bars is not None:
-        # Contract mode: fill prices are F's open (strict session bars).
-        async def _price_of(ticker: str) -> float | None:
-            return _session_fill_open(session_bars, ticker)
-
-    else:
-        # Legacy mode: latest cached close.
-        async def _price_of(ticker: str) -> float | None:
-            return await _latest_close(ticker)
-
-    async def _value_of(ticker: str) -> float:
-        async with Session() as s:
-            pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
-        price = await _latest_close(ticker) or 0.0  # mark: latest cached close
-        return (pos.shares * price) if pos else 0.0
-
-    plan = await plan_llm_buys(
-        decisions, valuation["cash"], total_equity,
-        StrategyParams(
-            min_cash_pct=settings.sim_min_cash_pct,
-            max_position_pct=settings.sim_max_position_pct,
-            max_positions=settings.sim_max_positions,
-        ),
-        guarded=True,
-        price_of=_price_of,
-        value_of=_value_of,
-    )
-
-    # Track held tickers for the max-positions cap on LLM-initiated BUYs.
-    # Updated progressively as BUYs execute so the 2nd new BUY sees the 1st.
-    held_tickers: set[str] = set()
-    async with Session() as s:
-        existing = (await s.scalars(select(SimPosition))).all()
-    held_tickers = {p.ticker.upper() for p in existing}
-
-    for decision in decisions:
-        ticker = decision["ticker"]
-        action = decision["action"]
-        reason = decision["reason"] or f"LLM {action}"
-
-        price = (_session_fill_open(session_bars, ticker)
-                 if session_bars is not None else await _latest_close(ticker))
-        if price is None or price <= 0:
-            logger.warning("LLM decision for %s skipped: no price", ticker)
-            continue
-
-        if action == "BUY":
-            # Max-positions cap: block NEW positions when at the cap, but
-            # still allow topping up tickers already held (mirrors the
-            # deterministic engine's behaviour).
-            if (settings.sim_max_positions > 0
-                    and len(held_tickers) >= settings.sim_max_positions
-                    and ticker.upper() not in held_tickers):
-                logger.info("LLM BUY %s skipped (max-positions cap %d)",
-                            ticker, settings.sim_max_positions)
-                continue
-            budget = plan.get(ticker.upper())
-            if budget is None:
-                logger.info("LLM BUY %s skipped (budget guard)", ticker)
-                continue
-
-            t = await _exec_buy(ticker, price, budget, f"LLM: {reason}")
-            if t:
-                executed.append(t)
-                held_tickers.add(ticker.upper())
-                # Update guards after each buy
-                valuation = await valuate()
-                total_equity = valuation["total_equity"]
-
-        elif action == "SELL":
-            # Optional partial size: "shares" (exact) or "amount" (dollars).
-            target_shares = llm_sell_shares(decision, price)
-            t = await _exec_sell(ticker, price, target_shares, f"LLM: {reason}")
-            if t:
-                executed.append(t)
-                valuation = await valuate()
-                total_equity = valuation["total_equity"]
-
-        else:  # HOLD
-            logger.info("LLM HOLD %s — %s", ticker, reason)
-            continue
-
-    await _freeze_llm_decisions(_ledger_llm_rows(decisions, executed, decided_at))
-    return executed
-
-
 # ---------------------------------------------------------------------------
 # Main cycle
 # ---------------------------------------------------------------------------
@@ -2718,28 +2114,6 @@ async def get_chat_history(limit: int = 40) -> list[dict]:
 async def clear_chat_history() -> None:
     """Public: clear the persisted sim portfolio-manager chat history."""
     await _clear_chat_history()
-
-
-def _top_news_candidates(signals: dict[str, dict], limit: int = 10) -> list[str]:
-    """Return the tickers most relevant for news: those with BUY/SELL signals
-    or the highest strength HOLDs. Limits network calls per sim cycle."""
-    ranked = sorted(
-        signals.items(),
-        key=lambda x: (x[1]["action"] != "HOLD", x[1]["strength"]),
-        reverse=True,
-    )
-    return [t for t, _ in ranked[:limit]]
-
-
-async def _gather_news(signals: dict[str, dict]) -> dict[str, list[dict]]:
-    """Fetch news for the top candidate tickers + market-wide news.
-
-    Returns ``{}`` if SearXNG is disabled or no news is found.
-    """
-    from .news import gather_news_for_candidates
-
-    candidates = _top_news_candidates(signals)
-    return await gather_news_for_candidates(candidates, include_market=True)
 
 
 def _set_progress(stage: str, detail: str = "", *, running: bool = True,
@@ -2812,10 +2186,10 @@ async def run_cycle() -> dict[str, Any]:
         stamp = await _paper_stamp(cfg, record=False)
         stamp_token = _RUN_STAMP.set(stamp)
 
-        # Reset all per-cycle LLM state; the LLM paths set them if they run.
-        # The deterministic path leaves them empty so the frontend can show a
-        # "deterministic mode — no LLM was called" explanation instead of
-        # re-reporting a previous cycle's reasoning as if it belonged here.
+        # Reset all per-cycle LLM state (the whole-cycle llm/hybrid modes are
+        # retired, so nothing sets them anymore); the frontend's llm_called
+        # flag reads them, and this keeps a previous cycle's reasoning from
+        # being re-reported as if it belonged here.
         _last_llm_reasoning = ""
         _last_llm_summary = ""
         _last_llm_decisions = []
@@ -2901,119 +2275,18 @@ async def run_cycle() -> dict[str, Any]:
                 proposals = await _deterministic_propose(valuation,
                                                          quality_of=_quality_lookup(quality),
                                                          decision=decision)
-                # LLM sell layer, type A (deterministic mode ONLY — the
-                # hybrid/llm modes keep their existing whole-cycle review):
-                # wired BETWEEN propose and execute; stop-fire proposals carry
-                # the machine-readable "stop_fire" key. Fail-safe: knob off /
+                # LLM sell layer, type A (the live LLM path in the sim): wired
+                # BETWEEN propose and execute; stop-fire proposals carry the
+                # machine-readable "stop_fire" key. Fail-safe: knob off /
                 # no backend / any consult failure -> proposals unchanged.
                 from . import selllayer
                 proposals = await selllayer.overlay_type_a(proposals, decision)
                 trades = await _execute_proposed(proposals)
                 _last_deterministic_trades = trades
-            elif strategy == "llm":
-                # Decision inputs are the cycle's frozen ones (data <= S);
-                # fills read F's open via the strict session bars.
-                _set_progress("signals", "Preparing signals from frozen session inputs", started_at=started_at)
-                signals = decision.signals
-                news = await _gather_news(signals)
-                # Pure-LLM mode (main-branch parity): the engine makes NO
-                # proposals and NO risk-floor sells — the LLM picks the names,
-                # and the engine's hard sizing limits (min-cash floor,
-                # max-position-%, max-positions cap) size every BUY.
-                _set_progress("decide", "LLM deciding (pure-LLM strategy)", started_at=started_at)
-                trades = await _llm_decide(valuation, [], signals, news, pure_llm=True,
-                                           quality=quality if settings.sim_llm_fundamentals_context else None,
-                                           session_bars=decision.session_bars)
-                _last_deterministic_trades = []
-            elif strategy == "hybrid":
-                # Hybrid with a weekly review: the deterministic engine runs
-                # every cycle; the LLM reviews the proposals on the FIRST
-                # cycle of each calendar week (Europe/Vienna). Manual runs
-                # later in the same week do NOT trigger the LLM again — the
-                # review is anchored to the week, not to a run counter.
-                # On non-review cycles the deterministic proposals execute
-                # as-is — the engine manages daily risk, the LLM adds
-                # judgment once per week.
-                #
-                # Failure-marker mode (SIM_LLM_FAILURE_MARKER=true): the
-                # weekly cadence is replaced by a failure trigger — the LLM
-                # is consulted only when the engine shows signs of failure
-                # (2+ stop-out SELLs in the last 5 trading days, or equity
-                # >7% below its running peak). No cooldown: a fresh failure
-                # triggers a call the same day. This is the validated
-                # configuration (60d chop window: -0.8% vs -4.7% baseline).
-                review_interval = max(1, settings.sim_llm_review_interval)
-                week = _current_week()
-                async with Session() as s:
-                    acc = await s.get(SimAccount, 1)
-                    if acc is None:
-                        acc = SimAccount(id=1, cash=settings.sim_start_cash,
-                                         last_allowance_month=None,
-                                         opening_seed=settings.sim_start_cash)
-                        s.add(acc)
-                        await s.commit()
-                    last_review_week = acc.last_review_week
-                if settings.sim_llm_failure_marker:
-                    # --- failure marker: stop-out cascade / drawdown ---
-                    # EPOCH-SCOPED decision inputs: the failure marker must
-                    # not read a CLOSED epoch's stop-outs or peak (the fresh
-                    # book's drawdown restarts with its epoch).
-                    async with Session() as s:
-                        recent_trades = (await s.scalars(
-                            select(SimTrade)
-                            .where(run_config.epoch_clause(SimTrade, stamp["epoch"]))
-                            .order_by(SimTrade.created_at.desc()).limit(10)
-                        )).all()
-                        peak_equity = (await s.scalar(
-                            select(func.max(SimSnapshot.total_equity)).where(
-                                run_config.epoch_clause(SimSnapshot, stamp["epoch"]))
-                        )) or 0.0
-                    # Mirror the replay's 5-trading-day window (optimize.py).
-                    cutoff = _utcnow() - timedelta(days=7)
-                    stop_outs_5d = sum(
-                        1 for t in recent_trades
-                        if t.side == "SELL" and _is_stop_out(t.reason)
-                        and t.created_at >= cutoff
-                    )
-                    drawdown = (valuation["total_equity"] / peak_equity - 1) * 100 if peak_equity > 0 else 0.0
-                    failure = stop_outs_5d >= 2 or drawdown <= -7.0
-                    if failure:
-                        logger.info("failure marker: stop_outs_5d=%d drawdown=%.1f%%",
-                                    stop_outs_5d, drawdown)
-                    is_review_cycle = failure
-                else:
-                    # Fire the review when the last review is more than
-                    # (review_interval - 1) weeks ago (or never happened).
-                    is_review_cycle = (
-                        last_review_week is None
-                        or _week_diff(week, last_review_week) >= review_interval
-                    )
-                if not is_review_cycle:
-                    _set_progress("decide", "Deterministic engine deciding (LLM review off-cycle)", started_at=started_at)
-                    trades = await _deterministic_decide(valuation, quality_of=_quality_lookup(quality),
-                                                         decision=decision)
-                    _last_deterministic_trades = trades
-                    _last_llm_vetoes = []
-                else:
-                    _set_progress("signals", "Preparing signals from frozen session inputs", started_at=started_at)
-                    news = await _gather_news(decision.signals)
-                    _set_progress("propose", "Deterministic engine proposing", started_at=started_at)
-                    proposals = await _deterministic_propose(valuation, decision=decision,
-                                                             quality_of=_quality_lookup(quality))
-                    _set_progress("decide", "LLM reviewing proposals (hybrid)", started_at=started_at)
-                    trades, vetoed = await _llm_review_proposals(valuation, proposals, decision.signals, news,
-                                                                 quality=quality if settings.sim_llm_fundamentals_context else None,
-                                                                 session_bars=decision.session_bars)
-                    _last_deterministic_trades = proposals
-                    _last_llm_vetoes = vetoed
-                    # Mark the week as reviewed — no more LLM calls until the
-                    # calendar week changes.
-                    async with Session() as s:
-                        acc = await s.get(SimAccount, 1)
-                        if acc is not None:
-                            acc.last_review_week = week
-                            await s.commit()
             else:
+                # The llm/hybrid whole-cycle modes are retired: a stale
+                # SIM_STRATEGY=llm/hybrid value lands here and degrades to
+                # the deterministic engine (logged, never a crash).
                 logger.warning("Unknown strategy '%s', falling back to deterministic", strategy)
                 _set_progress("decide", "Deterministic engine deciding (unknown strategy fallback)", started_at=started_at)
                 trades = await _deterministic_decide(valuation, decision=decision)
@@ -3089,118 +2362,28 @@ def get_run_progress() -> dict[str, Any]:
 
 
 def get_last_llm_summary() -> dict[str, Any]:
-    """Return a structured reasoning summary for the frontend.
+    """Return the reasoning-panel payload for the frontend (/api/sim/reasoning).
 
-    Parses the raw LLM JSON and compares it against the deterministic
-    trades to highlight where the LLM changed the plan. Returns:
-    - raw: the full raw LLM text
-    - changes: decisions where the LLM diverged from deterministic
-    - confirmations: decisions where the LLM agreed with deterministic
-    - holds: HOLD decisions (abbreviated)
-    - deterministic_trades: what the deterministic engine proposed
-    - vetoes: deterministic proposals the LLM blocked (HOLD) — only populated
-      in the hybrid strategy under the propose→review→execute flow
+    The llm/hybrid whole-cycle strategy modes are retired: the cycle always
+    runs the deterministic engine, so no whole-cycle LLM is ever called and
+    this honestly reports ``llm_called=false`` (run_cycle resets the LLM
+    state globals at the start of every cycle, so the flag is always False).
+    The LLM's live role in the sim is the sell layer (app/selllayer.py) —
+    its decisions appear in the SELL SCORECARD, not in this panel.
     """
-    global _last_llm_decisions
-
-    raw = _last_llm_reasoning
-    is_fallback = raw.startswith("[LLM UNAVAILABLE")
-    decisions = _parse_llm_decisions(raw) or []
-    _last_llm_decisions = decisions
-
-    # Build a lookup of what the deterministic engine proposed per ticker
-    det_by_ticker: dict[str, dict] = {}
-    for t in _last_deterministic_trades:
-        det_by_ticker[t["ticker"]] = t
-
-    changes: list[dict] = []
-    confirmations: list[dict] = []
-    holds: list[dict] = []
-    vetoes: list[dict] = []
-
-    # Tickers the LLM explicitly vetoed (HOLD on a proposed trade). These are
-    # surfaced as vetoes, not passive holds, because the deterministic trade
-    # was blocked from executing.
-    vetoed_tickers: set[str] = {v["ticker"] for v in _last_llm_vetoes}
-
-    for d in decisions:
-        ticker = d["ticker"]
-        action = d["action"]
-        reason = d["reason"]
-        det = det_by_ticker.get(ticker)
-        det_side = det["side"] if det else None
-        # Shared with the rule-7 ledger writer (sim._llm_decision_relation):
-        # veto / hold / confirmation / change / addition cannot drift apart.
-        relation = _llm_decision_relation(
-            action, det_side, vetoed=ticker in vetoed_tickers)
-
-        if relation == "veto":
-            # HOLD on a proposed trade = veto (blocked execution)
-            vetoes.append({
-                "ticker": ticker, "action": "HOLD", "reason": reason,
-                "det_action": det_side, "det_reason": det.get("reason", "") if det else None,
-                "change_type": "veto",
-            })
-        elif relation == "hold":
-            # HOLD on a non-proposal ticker = passive hold
-            holds.append({"ticker": ticker, "reason": reason})
-        elif relation == "confirmation":
-            confirmations.append({
-                "ticker": ticker, "action": action, "reason": reason,
-                "det_reason": det.get("reason", ""),
-            })
-        elif relation == "change":
-            changes.append({
-                "ticker": ticker, "action": action, "reason": reason,
-                "det_action": det_side, "det_reason": det.get("reason", ""),
-                "change_type": "override",
-            })
-        else:  # addition — LLM proposed something the engine didn't
-            changes.append({
-                "ticker": ticker, "action": action, "reason": reason,
-                "det_action": None, "det_reason": None,
-                "change_type": "new",
-            })
-
-    # Also check tickers where deterministic proposed a trade but LLM didn't mention them
-    decision_tickers = {d["ticker"] for d in decisions}
-    for ticker, det in det_by_ticker.items():
-        if ticker not in decision_tickers:
-            changes.append({
-                "ticker": ticker, "action": "HOLD",
-                "reason": "LLM did not mention this ticker",
-                "det_action": det["side"], "det_reason": det.get("reason", ""),
-                "change_type": "dropped",
-            })
-
-    # Was the LLM called this cycle? In the deterministic strategy it never is,
-    # and both _last_llm_reasoning and _last_llm_summary stay empty (the latter
-    # because run_cycle resets it). The frontend uses this flag to show a
-    # "deterministic mode — no LLM was called" message instead of an empty panel.
-    llm_was_called = bool(_last_llm_reasoning or _last_llm_summary)
-
     return {
-        "raw": raw,
+        "raw": _last_llm_reasoning,
         "summary": _last_llm_summary,
         "deterministic_trades": _last_deterministic_trades,
-        "changes": changes,
-        "confirmations": confirmations,
-        "holds": holds,
-        "vetoes": vetoes,
-        "fallback": is_fallback,
         "strategy": settings.sim_strategy,
-        "failure_marker": settings.sim_llm_failure_marker,
-        "mode_aware_prompt": settings.sim_llm_mode_aware_prompt,
-        "llm_called": llm_was_called,
+        "llm_called": bool(_last_llm_reasoning or _last_llm_summary),
     }
 
 
 async def get_trades(limit: int = 100) -> list[dict]:
     """Raw trade-log export (all epochs, newest first).
 
-    Deliberately NOT epoch-clipped: the audit/history listing. The
-    DECISION-feeding trade read (the failure-marker scan) DOES carry the epoch
-    clause.
+    Deliberately NOT epoch-clipped: the audit/history listing.
     """
     async with Session() as s:
         rows = (
@@ -4744,7 +3927,7 @@ async def _build_sim_chat_context() -> str:
     except Exception as e:
         logger.warning("sim chat news gather failed: %s", e)
 
-    # Last sim cycle decision (from the most recent _llm_decide run).
+    # Last sim cycle decision (the most recent cycle's executed trades).
     # Included so the chat can answer questions about why the bot traded.
     # Marked as already-executed historical decisions — the LLM should not
     # re-propose them as new ACTIONs.

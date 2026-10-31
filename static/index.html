@@ -4919,22 +4919,6 @@
         let lastSavingsStatus = null;
         const DC_RANGE_LIMIT = PAPER_RANGE_LIMIT;
 
-        // Append/overwrite today's live point on an overlay curve so all
-        // tabs agree on "today" (snapshots end at the last nightly cycle;
-        // the live valuation is fresher — same rule as each tab's own line).
-        function withLiveToday(points, live) {
-            if (!live || live.total_equity == null) return points;
-            const today = new Date().toISOString().slice(0, 10);
-            const last = points[points.length - 1];
-            const lastDay = last ? last.time : null;
-            if (!lastDay || lastDay < today) {
-                return points.concat([{ time: today, value: live.total_equity, contributed: live.allowance_total }]);
-            }
-            const copy = points.slice();
-            copy[copy.length - 1] = { time: today, value: live.total_equity, contributed: live.allowance_total };
-            return copy;
-        }
-
         async function loadDailyCoreStatus(status, snaps, monthlyStatus, bench, preXirr, preTwr) {
             try {
                 // Metrics chips: XIRR (money-weighted, dated external flows)
@@ -6286,78 +6270,21 @@
                 const rawEl = document.getElementById('sim-raw-reasoning');
                 if (rawEl) rawEl.textContent = r.raw || '';
 
-                // Case 1: LLM was unavailable — show a red banner + the raw error.
-                if (r.fallback) {
-                    el.innerHTML = '<div style="color:#ff5c70;font-size:13px;margin-bottom:8px">⚠ LLM was unavailable — ran deterministic only</div>' + escapeHtml(r.raw || '');
-                    return;
-                }
-                // Case 2: deterministic strategy — no LLM was called this cycle.
-                // Show a clear explanation instead of the old "No LLM reasoning
-                // captured yet" placeholder.
-                if (!r.llm_called) {
-                    const n = (r.deterministic_trades || []).length;
-                    const tradesMsg = n
-                        ? `The bot ran <b>${n}</b> trade${n === 1 ? '' : 's'} purely from the rule engine.`
-                        : 'No trades were proposed by the rule engine this cycle.';
-                    const hint = (r.failure_marker && (r.strategy || '') === 'hybrid')
-                        ? (r.mode_aware_prompt
-                            ? ' Failure-marker + mode-aware mode is on: the LLM is consulted only when the engine shows signs of failure (stop-out cascade or drawdown), and its only job then is adding high-quality BUYs — it was not triggered this cycle.'
-                            : ' Failure-marker mode is on: the LLM is consulted only when the engine shows signs of failure (stop-out cascade or drawdown) — it was not triggered this cycle.')
-                        : ' Switch <code>SIM_STRATEGY</code> to <code>hybrid</code> or <code>llm</code> in <code>.env</code> to involve the LLM.';
-                    el.innerHTML =
-                        '<div class="sim-empty" style="text-align:left;padding:8px 0">' +
-                        '<b>Strategy: ' + escapeHtml(r.strategy || 'deterministic') + '</b> — no LLM was called this cycle. ' +
-                        tradesMsg + hint +
-                        '</div>';
-                    return;
-                }
-
-                let html = '';
-                // Case 3: LLM was called — show its prose summary at the top.
-                if (r.summary) {
-                    const summaryHtml = (typeof marked !== 'undefined')
-                        ? marked.parse(r.summary, { renderer: markedRenderer })
-                        : escapeHtml(r.summary);
-                    html += '<div style="margin-bottom:12px;padding:8px 10px;border:1px solid #1d6030;background:#0a2412;border-radius:4px;font-size:13px;line-height:1.5">' + summaryHtml + '</div>';
-                }
-                // Changes (LLM diverged from deterministic)
-                if (r.changes && r.changes.length) {
-                    html += '<div style="margin-bottom:12px"><span style="color:#ff5c70;font-size:12px;text-transform:uppercase">⚠ LLM changed the plan</span></div>';
-                    html += '<table style="width:100%;font-size:12px">';
-                    html += '<thead><tr><th style="text-align:left">Ticker</th><th>LLM</th><th>Det.</th><th style="text-align:left">Reason</th></tr></thead><tbody>';
-                    for (const c of r.changes) {
-                        const changeLabel = c.change_type === 'override' ? '🔄 Override'
-                            : c.change_type === 'new' ? '➕ New'
-                                : c.change_type === 'dropped' ? '⏭ Dropped' : '';
-                        const actClass = c.action === 'BUY' ? 'buy' : c.action === 'SELL' ? 'sell' : 'hold';
-                        const detLabel = c.det_action || '—';
-                        const detClass = detLabel === 'BUY' ? 'buy' : detLabel === 'SELL' ? 'sell' : '';
-                        html += `<tr><td><b>${escapeHtml(c.ticker)}</b><small style="display:block;color:#7aaa81">${changeLabel}</small></td><td class="${actClass}">${escapeHtml(c.action)}</td><td class="${detClass}">${escapeHtml(detLabel)}</td><td style="text-align:left;font-size:11px">${escapeHtml(c.reason)}</td></tr>`;
-                    }
-                    html += '</tbody></table>';
-                }
-                // Confirmations (LLM agreed with deterministic)
-                if (r.confirmations && r.confirmations.length) {
-                    html += '<div style="margin:12px 0 4px"><span style="color:#42ff72;font-size:12px;text-transform:uppercase">✓ Confirmed by LLM</span></div>';
-                    for (const c of r.confirmations) {
-                        const actClass = c.action === 'BUY' ? 'buy' : 'sell';
-                        html += `<div style="font-size:12px;padding:3px 0"><b class="${actClass}">${escapeHtml(c.action)}</b> <b>${escapeHtml(c.ticker)}</b> — <span style="color:#7aaa81">${escapeHtml(c.reason)}</span></div>`;
-                    }
-                }
-                // Holds (abbreviated — just count)
-                if (r.holds && r.holds.length) {
-                    html += `<div style="margin:12px 0 4px;color:#ffd65c;font-size:12px;text-transform:uppercase">⊙ ${r.holds.length} HOLD</div>`;
-                    html += '<div style="font-size:11px;color:#7aaa81;line-height:1.6">' + r.holds.map(h => escapeHtml(h.ticker)).join(' · ') + '</div>';
-                }
-                // If LLM was called but produced no summary and no decisions at
-                // all — surface a clear message rather than an empty panel.
-                if (!r.summary && !r.changes?.length && !r.confirmations?.length && !r.holds?.length) {
-                    html += '<div class="sim-empty">The LLM responded but did not produce a parseable summary or decisions. See the raw output below.</div>';
-                } else if (!r.summary && !r.changes?.length && !r.confirmations?.length) {
-                    // Only HOLDs, no summary — note that explicitly.
-                    html += '<div class="sim-empty" style="margin-top:8px">No changes from the deterministic plan.</div>';
-                }
-                el.innerHTML = html;
+                // The whole-cycle llm/hybrid strategy modes are retired: the
+                // cycle always runs the deterministic engine, so llm_called is
+                // always false. The LLM's live role in the sim is the sell
+                // layer (app/selllayer.py) — its decisions appear in the SELL
+                // SCORECARD, and the backend selection lives in Settings.
+                const n = (r.deterministic_trades || []).length;
+                const tradesMsg = n
+                    ? `The bot ran <b>${n}</b> trade${n === 1 ? '' : 's'} purely from the rule engine.`
+                    : 'No trades were proposed by the rule engine this cycle.';
+                el.innerHTML =
+                    '<div class="sim-empty" style="text-align:left;padding:8px 0">' +
+                    '<b>Strategy: ' + escapeHtml(r.strategy || 'deterministic') + '</b> — no whole-cycle LLM review anymore. ' +
+                    tradesMsg +
+                    ' The LLM path in the live sim is the sell layer (see the SELL SCORECARD); its backend is selected in Settings.' +
+                    '</div>';
             } catch (e) { document.getElementById('sim-reasoning').innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
 
