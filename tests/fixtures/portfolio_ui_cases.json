@@ -2201,7 +2201,7 @@
         "name": "savings_block_all_functions_and_math",
         "start_marker": "        // ===================== Savings tracker (real money, EUR) =====================",
         "end_marker": "        // ===================== Monthly qv-mom portfolio =====================",
-        "sha256": "5e38e9fc604d90d0be2020e90a42591df8f2ea785491271f94bf15708c656382"
+        "sha256": "77f1c31f0cfcaf6e6e13f386f27a56f2bfebecdb8f2ab3bbea76f9858b71b048"
       }
     ]
   },

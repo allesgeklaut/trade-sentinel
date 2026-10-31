@@ -55,6 +55,11 @@ FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 #     submitSavingsTxn re-renders BEFORE writing its success message (the
 #     re-render clears the status line, wiping the confirmation). Savings
 #     block digest re-pinned again; same intactness evidence.
+#   - 2026-10-31 (declutter slice): the Savings render template's mirror
+#     explanation was collapsed into a details disclosure (live mirror stats
+#     stay visible); savings block re-pinned. Intactness evidence: mddOf and
+#     withLiveToday digests unchanged, golden overlay pins pass, node --check
+#     passes on both inline scripts.
 # ---------------------------------------------------------------------------
 
 RESULT_PREFIX = "__PORTFOLIO_UI_RESULT__"

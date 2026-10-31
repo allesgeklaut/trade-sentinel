@@ -1440,9 +1440,12 @@
                         <button onclick="startChat()">Ask local LLM</button>
                         <button onclick="showExplainModal()">Explain This Screen</button>
                     </div>
-                    <div class="toolbar-scope">Scope: selected symbol <b id="refresh-scope">—</b> · selected chart
-                        range <b id="refresh-range">6M</b> candles and indicators (the symbol refresh follows the
-                        chart range buttons). Does not touch any paper account.</div>
+                    <details class="info-fold">
+                        <summary>Scope &amp; safety</summary>
+                        <div class="toolbar-scope">Scope: selected symbol <b id="refresh-scope">—</b> · selected chart
+                            range <b id="refresh-range">6M</b> candles and indicators (the symbol refresh follows the
+                            chart range buttons). Does not touch any paper account.</div>
+                    </details>
                     <b id="ticker"></b><span id="ticker-name" class="ticker-name-inline"></span>
                     <div id="signal"></div>
                     <div id="chart-range-bar" style="margin:8px 0;display:flex;gap:4px;flex-wrap:wrap"></div>
@@ -1460,12 +1463,18 @@
                             title="Download ~2y of candles for the selected research universe and re-rank it">Update
                             data</button>
                     </div>
-                    <div class="toolbar-scope">Scope: research universe <b id="research-scope">—</b>. Re-downloads ~2y
-                        and re-ranks the screener. This never changes a paper account's universe or policy, and it
-                        never runs, rebalances or replays a paper account.</div>
-                    <small>Ranks cached daily candles by trend, 20/60d momentum, RSI and relative volume. Changing the
-                        research universe only filters this screener. Deep history, membership sync and paper-history
-                        maintenance live in <b>Lab</b>.</small>
+                    <details class="info-fold">
+                        <summary>Scope &amp; safety</summary>
+                        <div class="toolbar-scope">Scope: research universe <b id="research-scope">—</b>. Re-downloads ~2y
+                            and re-ranks the screener. This never changes a paper account's universe or policy, and it
+                            never runs, rebalances or replays a paper account.</div>
+                    </details>
+                    <details class="info-fold">
+                        <summary>How the screener ranks</summary>
+                        <small>Ranks cached daily candles by trend, 20/60d momentum, RSI and relative volume. Changing the
+                            research universe only filters this screener. Deep history, membership sync and paper-history
+                            maintenance live in <b>Lab</b>.</small>
+                    </details>
                     <div id="screener-status" style="margin-top:6px;font-size:12px;color:#7aaa81;min-height:14px">
                     </div>
                     <div id="screen">No screen run yet.</div>
@@ -1507,10 +1516,13 @@
                     <summary>current effective configuration (next run)</summary>
                     <pre id="paper-live-json">not loaded</pre>
                 </details>
-                <span class="meta-note">“LATEST RECORDED” metadata from the newest stored equity snapshot — not the
-                    current effective configuration; the live configuration is shown separately as “CURRENT (next
-                    run)”. “not recorded” / “not loaded” means the stored point or the live fetch carries no value;
-                    nothing is inferred or fabricated.</span>
+                <details class="info-fold">
+                    <summary>What LATEST RECORDED / CURRENT mean</summary>
+                    <span class="meta-note">“LATEST RECORDED” metadata from the newest stored equity snapshot — not the
+                        current effective configuration; the live configuration is shown separately as “CURRENT (next
+                        run)”. “not recorded” / “not loaded” means the stored point or the live fetch carries no value;
+                        nothing is inferred or fabricated.</span>
+                </details>
             </div>
             <p class="paper-notice">Paper only — simulated fills in USD. No real broker orders are placed by this app
                 and no real broker trades are shown here.</p>
@@ -1522,9 +1534,12 @@
             <div class="paper-comparison-head">
                 <div class="paper-comparison-heading">
                     <div class="sim-section-title" id="paper-comparison-title">EQUITY COMPARISON // ALL PAPER ACCOUNTS (USD)</div>
-                    <p class="paper-comparison-scope">The selected account is the primary curve; the other two paper
-                        accounts and the derived DCA benchmark are comparison overlays. Each account keeps its own
-                        financially separate book.</p>
+                    <details class="info-fold">
+                        <summary>How to read this comparison</summary>
+                        <p class="paper-comparison-scope">The selected account is the primary curve; the other two paper
+                            accounts and the derived DCA benchmark are comparison overlays. Each account keeps its own
+                            financially separate book.</p>
+                    </details>
                 </div>
                 <div class="toolbar paper-comparison-controls">
                     <label class="field-label" for="paper-range"><span>Range (daily UTC marks)</span>
@@ -1544,12 +1559,15 @@
                     </label>
                 </div>
             </div>
-            <p class="paper-comparison-note"><b>% view:</b> equity / that account's own contributions ×100 (100
-                baseline). <b>NOT TWR</b> — funding dates and amounts differ by account, so this is a funding-aware
-                level comparison, not a like-for-like time-weighted return, and no line is called an “alpha winner”.
-                A % point is omitted (never shown as 0%) where the recorded contribution is zero, negative or missing.
-                <b>USD view:</b> actual equity for every line on one visible USD axis. The grey dotted line is the
-                selected account's own contributed baseline only.</p>
+            <details class="info-fold">
+                <summary>How to read % vs USD</summary>
+                <p class="paper-comparison-note"><b>% view:</b> equity / that account's own contributions ×100 (100
+                    baseline). <b>NOT TWR</b> — funding dates and amounts differ by account, so this is a funding-aware
+                    level comparison, not a like-for-like time-weighted return, and no line is called an “alpha winner”.
+                    A % point is omitted (never shown as 0%) where the recorded contribution is zero, negative or missing.
+                    <b>USD view:</b> actual equity for every line on one visible USD axis. The grey dotted line is the
+                    selected account's own contributed baseline only.</p>
+            </details>
             <div id="paper-comparison-legend" class="paper-comparison-legend" aria-label="Comparison legend"></div>
             <div id="paper-comparison-chart"></div>
             <div id="paper-comparison-asof" class="paper-comparison-asof" aria-live="polite"></div>
@@ -1585,9 +1603,12 @@
                 <button id="sim-run-btn" onclick="runSim()">Run bot now (paper only)</button>
             </div>
             <div id="sim-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
-            <div class="toolbar-scope">Scope: Daily Sim paper account only. “Update data” in the Paper header refreshes
-                market data without trading. Backfills, replays and resets moved to <b>Lab › Maintenance</b>; they
-                are not part of normal account use.</div>
+            <details class="info-fold">
+                <summary>Scope &amp; safety</summary>
+                <div class="toolbar-scope">Scope: Daily Sim paper account only. “Update data” in the Paper header refreshes
+                    market data without trading. Backfills, replays and resets moved to <b>Lab › Maintenance</b>; they
+                    are not part of normal account use.</div>
+            </details>
         </div>
         <div class="sim-section">
             <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">LLM REASONING</h3>
@@ -1603,9 +1624,12 @@
         </div>
         <div class="sim-section">
             <h3 style="margin:0 0 10px;font-size:14px;color:#42ff72">PORTFOLIO MANAGER ASSISTANT</h3>
-            <div class="ai-hint" style="margin-bottom:8px">Chat with the LLM portfolio manager in the Assistant
-                drawer (Paper-proposals mode). Proposed trades are NEVER executed by the chat itself — each proposal
-                is previewed and only runs after you explicitly confirm it.</div>
+            <details class="info-fold">
+                <summary>Chat proposals: never auto-executed</summary>
+                <div class="ai-hint" style="margin-bottom:8px">Chat with the LLM portfolio manager in the Assistant
+                    drawer (Paper-proposals mode). Proposed trades are NEVER executed by the chat itself — each proposal
+                    is previewed and only runs after you explicitly confirm it.</div>
+            </details>
             <div class="sim-actions">
                 <button id="sim-assistant-btn" onclick="openAssistant('proposals')">Open Assistant (paper
                     proposals)</button>
@@ -1650,8 +1674,11 @@
                 <button id="monthly-run-btn" onclick="runMonthly()">Rebalance now (paper only)</button>
             </div>
             <div id="monthly-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
-            <div class="toolbar-scope">Scope: Monthly paper account (USD) only. “Update data” in the Paper header
-                refreshes data without a rebalance. Backfill/replay controls moved to <b>Lab › Maintenance</b>.</div>
+            <details class="info-fold">
+                <summary>Scope &amp; safety</summary>
+                <div class="toolbar-scope">Scope: Monthly paper account (USD) only. “Update data” in the Paper header
+                    refreshes data without a rebalance. Backfill/replay controls moved to <b>Lab › Maintenance</b>.</div>
+            </details>
         </div>
     </section>
     <section id="dailycore-view" style="display:none">
@@ -1692,8 +1719,11 @@
                 <button id="dailycore-run-btn" onclick="runDailyCore()">Run cycle now (paper only)</button>
             </div>
             <div id="dailycore-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
-            <div class="toolbar-scope">Scope: Daily-Core paper account (USD) only. “Update data” in the Paper header
-                refreshes data without running a cycle. Backfill/replay controls moved to <b>Lab › Maintenance</b>.</div>
+            <details class="info-fold">
+                <summary>Scope &amp; safety</summary>
+                <div class="toolbar-scope">Scope: Daily-Core paper account (USD) only. “Update data” in the Paper header
+                    refreshes data without running a cycle. Backfill/replay controls moved to <b>Lab › Maintenance</b>.</div>
+            </details>
         </div>
         <div class="sim-section">
             <div class="bench-label">STRATEGY CONTROLS // NEXT CAPTURED RUN</div>
@@ -1840,24 +1870,30 @@
                 <button onclick="svReinitConfirm()" title="Back to the setup form — clears the tracker's current cash, positions and plans and restarts the picks mirror; the money ledger and equity curve are preserved (a reset boundary starts a new epoch), the sims are untouched">Re-initialize</button>
             </div>
             <div id="savings-run-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
-            <div class="toolbar-scope">Scope: Savings holdings and EURUSD only — “Update data” refreshes valuations
-                without posting a trade. The equal-allocation picks mirror label is unchanged: a picks comparison, not
-                Daily-Core strategy performance.</div>
-            <div style="margin-top:6px;font-size:11px;color:#7aaa81">
-                Real money — never touched by "Reset All Sims" or any backfill. Interest accrues daily at
-                rate/365 on the cash balance and pays out monthly, like Trade Republic. "Record transaction"
-                books each event with its own type: a Deposit
-                moves fresh money in (a contribution); a Withdrawal moves fresh money out (an external
-                flow that lowers net contributed capital — never a loss; only a true-up reconciles
-                drift); Sparplan buys and one-off Buys
-                deduct from the tracked cash and add an equal-allocation picks mirror entry (each
-                amount split equally across the Daily-Core picks available at the time, at latest
-                cached prices — a picks comparison, not Daily-Core strategy performance);
-                a Saveback books TR's 1%
-                bonus (new money, cash untouched); a Sell books the disposal and its proceeds arrive
-                when you record the Settlement; "True-up" only reconciles drift. A missing price
-                defers a Sparplan buy to the next pass.
-            </div>
+            <details class="info-fold">
+                <summary>Scope &amp; safety</summary>
+                <div class="toolbar-scope">Scope: Savings holdings and EURUSD only — “Update data” refreshes valuations
+                    without posting a trade. The equal-allocation picks mirror label is unchanged: a picks comparison, not
+                    Daily-Core strategy performance.</div>
+            </details>
+            <details class="info-fold">
+                <summary>Savings accounting rules</summary>
+                <div style="margin-top:6px;font-size:11px;color:#7aaa81">
+                    Real money — never touched by "Reset All Sims" or any backfill. Interest accrues daily at
+                    rate/365 on the cash balance and pays out monthly, like Trade Republic. "Record transaction"
+                    books each event with its own type: a Deposit
+                    moves fresh money in (a contribution); a Withdrawal moves fresh money out (an external
+                    flow that lowers net contributed capital — never a loss; only a true-up reconciles
+                    drift); Sparplan buys and one-off Buys
+                    deduct from the tracked cash and add an equal-allocation picks mirror entry (each
+                    amount split equally across the Daily-Core picks available at the time, at latest
+                    cached prices — a picks comparison, not Daily-Core strategy performance);
+                    a Saveback books TR's 1%
+                    bonus (new money, cash untouched); a Sell books the disposal and its proceeds arrive
+                    when you record the Settlement; "True-up" only reconciles drift. A missing price
+                    defers a Sparplan buy to the next pass.
+                </div>
+            </details>
         </div>
     </section>
     </section>
@@ -1886,10 +1922,13 @@
                         title="Refresh the S&amp;P 500 constituent list from the IVV holdings CSV (no candles fetched). Always the S&amp;P 500 list regardless of the maintenance universe.">Sync
                         S&amp;P 500 membership</button>
                 </div>
-                <div class="toolbar-scope">Scope: the maintenance universe above for <b>Fill data gaps</b> and <b>Load 10y
-                        history</b>. <b>Sync S&amp;P 500 membership</b> always refreshes the S&amp;P 500 constituent
-                    list regardless of the selected maintenance universe (no candles fetched). None of these changes
-                    any paper account's policy or runs a portfolio.</div>
+                <details class="info-fold">
+                    <summary>Scope &amp; safety</summary>
+                    <div class="toolbar-scope">Scope: the maintenance universe above for <b>Fill data gaps</b> and <b>Load 10y
+                            history</b>. <b>Sync S&amp;P 500 membership</b> always refreshes the S&amp;P 500 constituent
+                        list regardless of the selected maintenance universe (no candles fetched). None of these changes
+                        any paper account's policy or runs a portfolio.</div>
+                </details>
                 <div id="lab-screener-status" class="status-line" aria-live="polite"></div>
             </section>
 
@@ -1990,9 +2029,12 @@
 
                 <div class="maintenance-group" id="lab-db-group">
                     <div class="maintenance-label">Database // PROD → DEV sandbox clone</div>
-                    <p>Atomically copies the live PROD database into the DEV sandbox so replays and resets can run there. PROD
-                        is never modified by a clone. Cloning is refused while another backfill/reset/clone is running or when
-                        no DEV sandbox is configured. Cloning only refreshes the sandbox — it does not reload on-screen views.</p>
+                    <details class="info-fold">
+                        <summary>What cloning does</summary>
+                        <p>Atomically copies the live PROD database into the DEV sandbox so replays and resets can run there. PROD
+                            is never modified by a clone. Cloning is refused while another backfill/reset/clone is running or when
+                            no DEV sandbox is configured. Cloning only refreshes the sandbox — it does not reload on-screen views.</p>
+                    </details>
                     <div class="sim-actions">
                         <button id="db-clone-btn" onclick="cloneProdToDev(this)"
                             title="Copy the current PROD database into the DEV sandbox (PROD is never modified). Available while the DEV database is active.">Clone
@@ -2015,9 +2057,13 @@
                         accounts</button>
                 </div>
                 <div class="toolbar-scope">Currently effective for paper runs: <b id="policy-universe-current">unknown</b>.
-                    Applying asks for confirmation and changes the universe used by the <b>next captured run
-                    configuration</b>; recorded history is preserved and no run or backfill is started. Research
-                    browsing never changes this.</div>
+                    <details class="info-fold">
+                        <summary>Scope &amp; safety</summary>
+                        Applying asks for confirmation and changes the universe used by the <b>next captured run
+                        configuration</b>; recorded history is preserved and no run or backfill is started. Research
+                        browsing never changes this.
+                    </details>
+                </div>
             </section>
         </div>
     </section>
@@ -2038,11 +2084,17 @@
             </section>
             <section class="sim-section">
                 <h3>SAFEGUARDS</h3>
-                <p class="notice">Paper-only by design: this app places no real broker orders, holds no real broker
-                    account and shows no real broker trades. The Savings workspace is a manual real-EUR ledger and is
-                    never touched by paper resets or backfills.</p>
-                <p class="toolbar-scope">Environment limits, scheduling and provider credentials are configured on the
-                    server; this slice exposes only the active LLM model here.</p>
+                <details class="info-fold">
+                    <summary>Paper-only by design</summary>
+                    <p class="notice">Paper-only by design: this app places no real broker orders, holds no real broker
+                        account and shows no real broker trades. The Savings workspace is a manual real-EUR ledger and is
+                        never touched by paper resets or backfills.</p>
+                </details>
+                <details class="info-fold">
+                    <summary>Scope &amp; safety</summary>
+                    <p class="toolbar-scope">Environment limits, scheduling and provider credentials are configured on the
+                        server; this slice exposes only the active LLM model here.</p>
+                </details>
             </section>
             <section class="sim-section" id="settings-db">
                 <h3>DATABASE // PROD · DEV SANDBOX</h3>
@@ -2054,11 +2106,14 @@
                     </select>
                 </label>
                 <div id="db-status" class="status-line" aria-live="polite">checking database…</div>
-                <p class="toolbar-scope">What switching means: PROD holds the live paper history and the real-EUR Savings
-                    ledger. DEV is a disposable clone for experiments — Savings becomes read-only there and backfills/resets
-                    are only accepted on DEV (the server enforces both). Manual runs, rebalances and data refreshes stay
-                    allowed on whichever database is active, and the schedulers keep running on PROD. The selection is
-                    per browser (cookie <b>ts_db</b>, one year, path <b>/</b>), not per server.</p>
+                <details class="info-fold">
+                    <summary>What switching means</summary>
+                    <p class="toolbar-scope">What switching means: PROD holds the live paper history and the real-EUR Savings
+                        ledger. DEV is a disposable clone for experiments — Savings becomes read-only there and backfills/resets
+                        are only accepted on DEV (the server enforces both). Manual runs, rebalances and data refreshes stay
+                        allowed on whichever database is active, and the schedulers keep running on PROD. The selection is
+                        per browser (cookie <b>ts_db</b>, one year, path <b>/</b>), not per server.</p>
+                </details>
             </section>
         </div>
     </section>
@@ -5693,7 +5748,7 @@
                     ? ` <b style="color:#ff9f43">${fmtEur(m.pending)}</b> waiting for a fresh Daily-Core ranking — it enters the picks mirror on the next pass that has one.`
                     : '';
                 sum.innerHTML = m.allocated > 0
-                    ? `Same € that went into your positions, split equally across the Daily-Core picks available at each date (latest cached prices) — <b>${fmtEur(m.allocated)}</b> allocated, now worth <b>${fmtEur(m.total_equity)}</b> (${(m.total_equity / m.allocated * 100 - 100 >= 0 ? '+' : '') + (m.total_equity / m.allocated * 100 - 100).toFixed(2)}%). Equal-allocation picks comparison, not Daily-Core strategy performance — no rebalance, sells, protection overlays or cash timing.${pending}`
+                    ? `Same € that went into your positions, split equally across the Daily-Core picks available at each date (latest cached prices) — <b>${fmtEur(m.allocated)}</b> allocated, now worth <b>${fmtEur(m.total_equity)}</b> (${(m.total_equity / m.allocated * 100 - 100 >= 0 ? '+' : '') + (m.total_equity / m.allocated * 100 - 100).toFixed(2)}%).<details class="info-fold"><summary>How the mirror is computed</summary><div class="toolbar-scope">Equal-allocation picks comparison, not Daily-Core strategy performance — no rebalance, sells, protection overlays or cash timing.</div></details>${pending}`
                     : (m.pending > 0
                         ? `No allocation yet — <b style="color:#ff9f43">${fmtEur(m.pending)}</b> is parked until the Daily-Core ranking refreshes.${pending}`
                         : 'No picks-mirror entries yet — initialize with positions or add a Sparplan.');

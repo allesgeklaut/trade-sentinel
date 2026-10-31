@@ -1182,6 +1182,41 @@ Independent verification:
 Phase 3 is complete as specified. The next step is Phase 4 (revalidate, then
 prune strategies) on an authorized, committed base.
 
+## Phase 3 declutter pass — 2026-10-31
+
+**Declutter verified.** A user-requested polish pass over the completed
+Phase 3 UI: 19 long always-visible explanatory texts (seven toolbar scope
+notes, the screener methodology note, the paper-header LATEST RECORDED
+disclaimer, the comparison intro and "% view / NOT TWR" note, the chat
+proposal hint, the Savings "Real money" accounting paragraph, the Settings
+paper-only notice, the environment-limits note, the PROD/DEV "What switching
+means" explanation and the Lab clone explainer) collapse into one-line
+native `<details>` disclosures — full texts preserved unchanged in the DOM,
+keyboard accessible, no JavaScript. Live values stay expanded per the
+acceptance criteria: both metadata strips (LATEST RECORDED, CURRENT (next
+run)), the "Currently effective for paper runs" universe line, and the
+Savings mirror stats sentence; safety warnings, state notices, chart
+captions and tooltips are untouched.
+
+Implemented in `static/index.html` and `static/workspace.css`
+(`.info-fold`, modeled on the existing paper-live-details disclosure). The
+Savings mirror explanation lives inside the render template, so the guarded
+Savings script block was re-pinned (the guarded-block diff is exactly one
+template line); `mddOf` and `withLiveToday` are byte-identical and the
+re-pin history is documented in `tests/test_portfolio_ui.py`.
+
+Independent verification: full offline regression **1583 passed**; both
+browser gates green with the UNCHANGED helper (21/21 view checks per mode,
+10/10 and 9/9 comparison runs, every Phase 3C/3D/3E/3F check, zero provider
+attempts, zero page errors) — the collapse changes no pinned behavior;
+vision review of all five workspaces at 1440px and 390px before and after
+(11/11 PASS): every collapsed summary renders as a single line at both
+widths, every long paragraph is off the visible surface, both metadata
+strips and all amber warnings remain fully visible, and a real click opens
+a disclosure with its full text. The populated-mode Savings mirror split
+was additionally proven live (stats sentence visible, explanation
+collapsed behind its summary).
+
 ## References
 
 - [SEC Apple companyfacts](https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json)

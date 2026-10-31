@@ -837,6 +837,36 @@ select {
     overflow-wrap: anywhere
 }
 
+/* Collapsed one-line disclosures for long always-visible explanatory text.
+   The full original element (with its own class and text) stays in the DOM
+   inside the <details>, one click away. */
+.info-fold {
+    margin: 6px 0
+}
+
+.info-fold summary {
+    cursor: pointer;
+    color: #7aaa81;
+    font-size: 11.5px;
+    display: inline-block
+}
+
+.info-fold summary:hover {
+    color: #9fd8ab
+}
+
+.info-fold[open] summary {
+    color: #7aaa81
+}
+
+.info-fold > *:not(summary) {
+    margin-top: 4px
+}
+
+.info-fold .toolbar-scope {
+    margin: 0
+}
+
 @media (max-width: 390px) {
     #assistant-drawer,
     #svtxn-drawer {
