@@ -1905,6 +1905,122 @@ the forward log); KEEP the controls visible in the comparison UI (dca /
 random_n / equal_weight are the bars that make the skill claim honest —
 and 2018/2021 are the years that keep it humble).
 
+## The LLM sell layer — slice 1: consult + EXECUTE in the live accounts — 2026-10-31
+
+**The owner-approved final build, slice 1.** The concept (settled after the
+research phases): the app keeps its deterministic strategies — the monthly
+factor book and the technical sim (the owner's explicit call to keep it) —
+and the LLM becomes the SELL brain at three NARROW per-event moments,
+EXECUTING (not advising), every decision logged with the engine's
+counterfactual so the scorecard can show the with/without-LLM history. The
+owner's cautions are baked into the design: the EXISTING sim LLM layer
+(hybrid whole-cycle review) "never worked well" — nothing is modelled on
+it beyond its ledger discipline — and the LLM's value is NOT presumed:
+fail-safe everywhere means the engine's own rule stands unless the LLM
+earns it on the record.
+
+`app/selllayer.py` (new, 678 lines) — the ONLY module that wires a consult
+into live execution:
+
+- **Type A (the sim, `deterministic` mode only)**: wired in `run_cycle`
+  BETWEEN `_deterministic_propose` and `_execute_proposed`. Stop-fire SELL
+  proposals carry a machine-readable `"stop_fire"`` key (added at the
+  contract stop-fire site in `strategy.propose_trades`; no string-matching).
+  Per candidate: the A context (the 5A-1 field family via the shared
+  `sellreview._type_a_event`, extracted from the shadow's `_detect_type_a`
+  for this purpose — the CLI/research paths byte-unchanged) -> consult ->
+  CONFIRM keeps the proposal (the stop executes as today); DEFER drops it
+  and persists the re-armed ATR level on the position
+  (`SimPosition.stop_defer_level`/`stop_defer_set_at`, additive nullable
+  ALTERs) — the predeclared 5A-1 re-arm
+  `level * (1 - (rearm_mult - 1) * REARM_WIDEN)`; while deferred,
+  `strategy._standing_stop_levels` uses the frozen percent stop PLUS the
+  deferred level (the ratchet is suspended for the position, the percent
+  stop is NEVER loosened and remains the floor). Consecutive defers are
+  capped at `sell_layer_max_defers` (default 2, counted from the ledger) —
+  at the cap the stop executes regardless (a CONFIRM row with
+  `fail_reason="defer cap"`, no consult).
+- **Type B (the monthly book)**: wired in `_run_rebalance_locked` AFTER
+  `pick_portfolio`, BEFORE the SELL loop (the strict-open `fill_map` moved
+  up read-only). Candidates = held names NOT in picks with an executable
+  fill price (no quote -> pending as today, not consulted). CONFIRM ->
+  release as today; DEFER -> the name is retained one more month:
+  `executed_picks` = picks minus the LAST-ADDED new names plus the retained
+  names (capacity stays `target_n`, at most one retained per displaced
+  add; a defensive cap never exceeds target_n). The `MonthlyRebalance`
+  audit row gains an additive `sell_layer` JSON column carrying the engine
+  picks AND the executed picks — the retention difference is auditable.
+  `band_excludes_name` in the context is DERIVED from the real band (the
+  capacity edge case — a held name released while still inside the band —
+  yields False, never a hardcoded claim).
+- **Type C (the monthly book)**: a NEW nightly step at the top of
+  `run_monthly_cycle` (every trading night, BEFORE the rebuild — declared).
+  FILL step first: unfilled C-EXIT ledger rows for still-held names sell at
+  THIS session's strict exact-date open (reason "thesis-break LLM exit",
+  the documented standalone-paper stamp, `filled_at >= decided_at` always; a
+  name without an executable open stays pending, retried next cycle — no
+  pending-order persistence beyond the ledger row). SCAN step: the held
+  names' latest filing-date PIT fundamentals against the predeclared
+  thesis condition (the engine's own `_thesis_break_fundamentals`; F/P-FCF
+  alone does NOT trigger); a break is NEW when no ledger row exists for
+  that (ticker, filing) — deduped by the stable `event_id`
+  (`C:TICKER:FILING`). EXIT appends the unfilled pending row (filled at the
+  NEXT cycle); HOLD records only. The scan's self-computed frame mirrors
+  the rebuild's own construction exactly — the LIVE universe
+  (`_strategy_universe()`), the variant synced from the LIVE selection
+  (exactly like the rebuild: `settings.sim_daily_core_mom_variant =
+  _strategy_variant()`; never pinned "raw"), the same fund/close/vol loads
+  (the nightly cost is the daily-core cycle's class, DB-only — declared) —
+  because the context's cross-sectional fields are percentiles in the
+  eligible FRAME: a percentile among ~10 held names would be meaningless.
+- **The consult transport**: `app/llm.chat` (the app's configured
+  multi-backend client — the owner's backend/model selection in Settings
+  governs) wrapped in `asyncio.wait_for` at `sell_layer_timeout_s`
+  (default 60s; llm.chat's own timeout is the global 1200s, far too long
+  for a nightly cycle). NO backend configured -> short-circuit to the
+  per-type fail-safe BEFORE any transport call (`fail_reason="no
+  backend"`, zero calls — proven) — the account behaves exactly as today
+  until a backend exists, then the layer goes live.
+- **The ledger**: `LlmSellDecision` (new table, `SimLlmDecision`'s
+  conventions): `decided_at` frozen at parse, `session_date`, `event_type`
+  A|B|C, `engine` sim|monthly, the stable `event_id`, `decision`
+  CONFIRM|DEFER|EXIT|HOLD, `rationale`, `prompt_version`, `parsed`,
+  `fail_safe`, `fail_reason`, the full PIT `context` JSON, the
+  `engine_branch` counterfactual JSON (A: the fired level; B: the release;
+  C: hold-to-rebuild), the frozen fill columns (NULL together until
+  executed), `backend`/`model`/`latency_ms`. Append-only.
+- **The contamination rule, mechanical**: the layer wires ONLY into the
+  live cycle paths; the backfill/replay/research paths never import it —
+  tests prove a sim AND a monthly backfill run with an exploding mock
+  transport make ZERO consult attempts. The frozen prompts
+  (sellshadow/1, -b/1, -c/1), parsers, fail-safes and field builders are
+  REUSED from `app/sellreview.py` (the research module's CLI paths
+  untouched); the settings knobs (`sim_llm_sell_layer=True`,
+  `sim_monthly_llm_sells=True`, `sell_layer_timeout_s=60`,
+  `sell_layer_max_defers=2`) are registered in `current_config()` in the
+  same change (the provenance rule); with the knobs off (or every consult
+  fail-safed) the engines are BIT-IDENTICAL to the pre-change behavior
+  (parity tests).
+
+Independent verification (the orchestrator's gate): the worker's 27-test
+suite + my own runs — 344 green on the gate suites in the worktree, ruff
+clean over all of `app/`; the gate review found TWO context-fidelity
+defects and they were fixed + regression-pinned before acceptance: (1) the
+type-C scan's self-computed frame was built over the HELD names only
+(meaningless cross-sectional percentiles) with the momentum variant pinned
+"raw" instead of the live selection — now mirrors the rebuild's universe
+frame + live variant, pinned by test; (2) `band_excludes_name` was
+hardcoded True — now derived from the real band (False in the capacity
+edge), pinned by test. Final: the new suite 30 tests, the gate set 347
+green on my re-run, the full offline regression green in the main tree.
+Honesty limits declared in the module docstring: the A context recomputes
+the standing level from candles when `stop_price` is NULL (the 5A-1-proven
+formula); the C step's dedupe is (ticker, filing-date) so a RESTATEMENT of
+the same filing does not re-consult; the B overlay consults only
+price-quoted candidates (pending legs ride the existing retry); the
+defer-cap row is a fail-safe CONFIRM, not an LLM decision; the C fill uses
+the standalone paper stamp (the documented forward-write convention).
+
 ## References
 
 - [SEC Apple companyfacts](https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json)

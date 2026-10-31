@@ -32,6 +32,7 @@ market cap / dollar volume / momentum are comparable across the universe.
 """
 import asyncio
 import hashlib
+import json
 import logging
 import math
 from dataclasses import dataclass, field
@@ -255,6 +256,10 @@ def current_config() -> dict:
         # Fundamentals source: EDGAR-first vs yfinance-only changes the FACTS
         # a decision sees (filed dates / coverage), so it is a decision input.
         "sim_monthly_fundamentals_source": settings.sim_monthly_fundamentals_source,
+        # --- LLM sell layer (app/selllayer.py) — provenance: these knobs are
+        # decision inputs of the live monthly cycle (types B + C).
+        "sim_monthly_llm_sells": settings.sim_monthly_llm_sells,
+        "sell_layer_timeout_s": settings.sell_layer_timeout_s,
     }
 
 
@@ -1883,6 +1888,12 @@ async def _run_rebalance_locked(force: bool, now: datetime | None) -> dict[str, 
     held_before = sorted(p.ticker for p in held_rows)
     picks, _ = await asyncio.to_thread(
         pick_portfolio, me_ts, close, vol, fund, held_before, frame)
+    # Fill prices: the session's STRICT exact-date OPEN, USD-converted (never
+    # a stale/forward-filled close). Moved UP from the SELL loop: the query is
+    # read-only, and the LLM sell layer's type-B overlay needs the executable
+    # fill prices to identify its candidates (names without a quote stay
+    # pending as today — not consulted).
+    fill_map = await _open_usd_map(sorted(set(picks) | set(held_before)), f_date)
 
     # Mid-run configuration guard: the awaits above (refresh, frame math) give
     # an operator time to change the universe/variant. This pass decided under
@@ -1899,6 +1910,22 @@ async def _run_rebalance_locked(force: bool, now: datetime | None) -> dict[str, 
     # read poll or a refused/terminal pass).
     await _record_run(stamp, cfg)
 
+    # --- LLM sell layer, type B: consult per band-drop candidate AFTER
+    # pick_portfolio, BEFORE the SELL loop. CONFIRM -> as today; DEFER -> the
+    # name is retained one more month and the new name it displaced is not
+    # bought (capacity stays target_n). Fail-safe: knob off / no backend /
+    # any failure -> executed_picks == picks (bit-identical OFF).
+    from . import selllayer
+    executed_picks, sell_detail = await selllayer.overlay_type_b(
+        held_before=held_before, picks=picks, fill_map=fill_map, frame=frame,
+        close=close, fund=fund, members=tickers, me_ts=me_ts, f_date=f_date,
+        target_n=int(settings.sim_monthly_target_n),
+        hold_band=int(settings.sim_monthly_hold_band))
+    picks = executed_picks
+    if sell_detail is not None:
+        logger.info("Monthly sell layer B: engine picks %s -> executed %s",
+                    sell_detail["engine_picks"], sell_detail["executed_picks"])
+
     async with Session() as s:
         cur = await run_config.current_epoch(_ENGINE, session=s)
         # EPOCH-SCOPED: a closed epoch's audit row for the same month is
@@ -1910,9 +1937,15 @@ async def _run_rebalance_locked(force: bool, now: datetime | None) -> dict[str, 
                 run_config.epoch_clause(MonthlyRebalance, cur)))
         reb = existing or MonthlyRebalance(rebal_month=month, rebal_date=me_ts.to_pydatetime())
         reb.held_before = ",".join(held_before)
+        # "picked" stays the EXECUTED picks (what the book actually holds after
+        # the pass); the sell layer's audit JSON carries the engine picks AND
+        # the executed picks as additive JSON keys so the difference is
+        # auditable (NULL when the overlay did not consult anyone).
         reb.picked = ",".join(picks)
         reb.n_new = len(set(picks) - set(held_before))
         reb.snapshot = _snapshot_json(frame)
+        reb.sell_layer = (json.dumps(sell_detail, sort_keys=True)
+                          if sell_detail is not None else None)
         if existing is None:
             reb.mode = stamp["mode"]
             reb.config_id = stamp["config_id"]
@@ -1932,11 +1965,9 @@ async def _run_rebalance_locked(force: bool, now: datetime | None) -> dict[str, 
         await s.commit()
 
     trades: list[dict] = []
-    # Fill prices: the session's STRICT exact-date OPEN, USD-converted (never
-    # a stale/forward-filled close). A ticker without an F bar gets no fill;
-    # that leg is retried at the next session (pending_fill keeps the rebuild
-    # open, so the catch-up re-takes it at the next session's open).
-    fill_map = await _open_usd_map(sorted(set(picks) | set(held_before)), f_date)
+    # (fill_map was computed above, before the sell layer's type-B overlay —
+    # the same strict exact-date OPEN map. A ticker without an F bar gets no
+    # fill; that leg is retried at the next session.)
     # SELLs first: held names no longer picked (frees cash for the BUYs).
     pending_fill = False
     for t in held_before:
@@ -1992,6 +2023,9 @@ async def _run_rebalance_locked(force: bool, now: datetime | None) -> dict[str, 
 
     return {"rebalanced": True, "month": month, "allowance": allowance,
             "decision_date": str(me_ts.date()), "picks": picks,
+            # the sell layer's engine picks (before the type-B overlay) when it
+            # consulted anyone, else None — the audit row carries both lists
+            "engine_picks": (sell_detail or {}).get("engine_picks"),
             "held_before": held_before, "trades": trades,
             "complete": complete,
             "valuation": post, "refresh_errors": refresh_errors,
@@ -2020,22 +2054,45 @@ async def run_monthly_cycle(now: datetime | None = None) -> dict[str, Any]:
     """
     if not settings.sim_monthly_enabled:
         return {"skipped": True, "reason": "monthly portfolio disabled"}
+    # --- LLM sell layer, type C (app/selllayer.py): a NEW nightly step that
+    # runs EVERY trading night (not only pending-rebuild nights), BEFORE the
+    # rebuild step (declared order): first the FILL step (unfilled C-EXIT
+    # ledger rows for still-held names sell at THIS session's strict exact-date
+    # open), then the SCAN step (held names whose newly available PIT
+    # fundamentals break the predeclared thesis are consulted). Fail-safe:
+    # any failure is logged and never breaks the rebuild below.
+    c_result: dict[str, Any] = {"skipped": True, "reason": "sell layer off"}
+    if settings.sim_monthly_llm_sells:
+        try:
+            from . import selllayer
+            c_result = await selllayer.run_type_c_step(now=now)
+        except Exception as e:  # noqa: BLE001 — never break the rebuild
+            logger.error("Monthly sell-layer type-C step failed: %s", e, exc_info=True)
+            c_result = {"error": f"{type(e).__name__}: {e}"}
     if not _rebalance_lock.locked():
-        return await run_rebalance(now=now)
-    logger.warning("Monthly scheduler: tick delayed — waiting up to %ds for the "
-                   "rebalance lock (held by a backfill or manual run)",
-                   _TICK_LOCK_WAIT_SECONDS)
-    try:
-        async with asyncio.timeout(_TICK_LOCK_WAIT_SECONDS):
-            await _rebalance_lock.acquire()
-    except TimeoutError:
-        logger.error("Monthly scheduler: rebalance lock still held after %ds — "
-                     "skipping this tick", _TICK_LOCK_WAIT_SECONDS)
-        return {"skipped": True, "reason": "already running"}
-    try:
-        return await _run_rebalance_locked(False, now)
-    finally:
-        _rebalance_lock.release()
+        result = await run_rebalance(now=now)
+    else:
+        logger.warning("Monthly scheduler: tick delayed — waiting up to %ds for the "
+                       "rebalance lock (held by a backfill or manual run)",
+                       _TICK_LOCK_WAIT_SECONDS)
+        try:
+            async with asyncio.timeout(_TICK_LOCK_WAIT_SECONDS):
+                await _rebalance_lock.acquire()
+        except TimeoutError:
+            logger.error("Monthly scheduler: rebalance lock still held after %ds — "
+                         "skipping this tick", _TICK_LOCK_WAIT_SECONDS)
+            result = {"skipped": True, "reason": "already running"}
+        else:
+            try:
+                result = await _run_rebalance_locked(False, now)
+            finally:
+                _rebalance_lock.release()
+    # The type-C result is logged (never attached to the pinned result dict).
+    if c_result.get("fills") or c_result.get("scans"):
+        logger.info("Monthly sell layer C: %d fill(s), %d scan(s) — %s",
+                    len(c_result.get("fills", [])), len(c_result.get("scans", [])),
+                    c_result.get("as_of"))
+    return result
 
 
 # ---------------------------------------------------------------------------

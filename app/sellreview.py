@@ -1597,20 +1597,103 @@ def _series_frames(series: dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, pd.Da
     return open_px, close
 
 
+def _type_a_event(pos: dict, df: pd.DataFrame, as_of: str,
+                  next_session: str | None) -> tuple[dict | None, str | None]:
+    """Build ONE type-A candidate event context for a position, or
+    ``(None, skip_reason)`` when the position is not a stop-fire candidate.
+
+    Shared by the shadow's ``_detect_type_a`` (read-only live detection) and
+    the LIVE sell layer (``app/selllayer.py``), which passes the cycle's own
+    position/frame data. The standing level is recomputed with the engine's
+    exact formula (5A-1's recompute approach — proven to match the recorded
+    levels): the per-bar prior-known Chandelier candidate at S, the
+    position-specific monotone ratchet (max candidate over completed bars
+    since the entry anchor ``opened_at``), maxed with the frozen initial
+    percent stop (``stop_price`` when stored, else the DECLARED avg_cost
+    fallback ``avg_cost * (1 - sim_stop_pct/100)``). The candidate = the next
+    session's strict open would breach the governing level (``open <= level``
+    -> gap fill at the open).
+
+    When the position dict carries ``stop_defer_level`` (the live
+    ``SimPosition`` row does; the sell layer's active DEFER), the standing
+    stop is the frozen percent stop plus the DEFERRED ATR level — the same
+    rule ``strategy._standing_stop_levels`` applies while a defer is active
+    (the defer re-arms the ATR leg only; the percent stop is never loosened)."""
+    from .config import settings
+
+    tk = pos["ticker"]
+    if next_session is None:
+        return None, ("no stored session after the as-of date — the "
+                      "next open cannot be determined")
+    atr14_s, atr_stop_s = recompute_atr(df)
+    times = df["time"].tolist()
+    if as_of not in times:
+        return None, f"no bar at the as-of date {as_of}"
+    s_row = times.index(as_of)
+    entry = pos["opened_at"]
+    pct_stop = (pos["stop_price"] if pos["stop_price"] is not None
+                else pos["avg_cost"] * (1.0 - settings.sim_stop_pct / 100.0))
+    cand_s = float(atr_stop_s.iloc[s_row]) if pd.notna(atr_stop_s.iloc[s_row]) else None
+    ratchet_vals = [float(v) for t, v in zip(times, atr_stop_s, strict=True)
+                    if entry <= t <= as_of and pd.notna(v)]
+    ratchet = max(ratchet_vals) if ratchet_vals else None
+    defer = pos.get("stop_defer_level")
+    defer = float(defer) if defer is not None and pd.notna(defer) else None
+    if defer is not None:
+        levels = [(v, lbl) for v, lbl in ((pct_stop, "Initial stop"),
+                                          (defer, "ATR stop (deferred)"))
+                  if v is not None]
+    else:
+        levels = [(v, lbl) for v, lbl in ((pct_stop, "Initial stop"),
+                                          (ratchet, "ATR stop ratchet"),
+                                          (cand_s, "ATR stop"))
+                  if v is not None]
+    if not levels:
+        return None, "no computable standing level"
+    level, label = max(levels, key=lambda lv: lv[0])
+    f_row = df[df["time"] == next_session]
+    if f_row.empty:
+        return None, (f"no bar at the next session {next_session} — "
+                      "the standing order cannot fill at an open")
+    next_open = float(f_row["open"].iloc[0])
+    if not (next_open <= level):
+        return None, None  # the standing order does not fire at the next open
+    close_s = float(df["close"].iloc[s_row])
+    entry_row = times.index(entry) if entry in times else None
+    peak = (float(df["close"].iloc[entry_row: s_row + 1].max())
+            if entry_row is not None else close_s)
+    event = {
+        "ticker": tk, "decision_date": as_of, "fill_date": next_session,
+        "fill_price": next_open, "fill_kind": "at_open",
+        "stop_level": level, "stop_label": label,
+        "atr14": (float(atr14_s.iloc[s_row])
+                  if pd.notna(atr14_s.iloc[s_row]) else None),
+        "atr_candidate_at_S": cand_s, "atr_ratchet_since_entry": ratchet,
+        "frozen_pct_stop": pct_stop,
+        "entry_date": entry, "entry_price": pos["avg_cost"],
+        "shares": pos["shares"],
+        "current_close": close_s,
+        "pnl_pct": ((close_s / pos["avg_cost"] - 1.0) * 100.0
+                    if pos["avg_cost"] > 0 else None),
+        "giveback_pct": ((close_s / peak - 1.0) * 100.0 if peak else None),
+        "dist_to_stop_pct": ((close_s - level) / close_s * 100.0
+                             if close_s > 0 else None),
+        "stop_price_stored": pos["stop_price"] is not None,
+        "derivation": ("stop_price NULL on this row: the frozen initial stop is "
+                       "derived as avg_cost * (1 - sim_stop_pct/100) (declared "
+                       "fallback, session fill contract rule 5)" if pos["stop_price"] is None
+                       else "stop_price read from the live positions table"),
+    }
+    if defer is not None:
+        event["stop_defer_level"] = defer
+    return event, None
+
+
 def _detect_type_a(sim_positions: list[dict], series: dict[str, pd.DataFrame],
                    as_of: str, next_session: str | None) -> tuple[list[dict], list[dict]]:
     """Type-A candidates: a live sim position whose ATR trailing-stop standing
-    order would fire at the NEXT session's open. The standing level is
-    recomputed with the engine's exact formula (5A-1's recompute approach —
-    proven to match the recorded levels): the per-bar prior-known Chandelier
-    candidate at S, the position-specific monotone ratchet (max candidate over
-    completed bars since the entry anchor ``opened_at``), maxed with the frozen
-    initial percent stop (``stop_price`` when stored, else the DECLARED
-    avg_cost fallback ``avg_cost * (1 - sim_stop_pct/100)``). The candidate =
-    the next session's strict open would breach the governing level
-    (``open <= level`` -> gap fill at the open)."""
-    from .config import settings
-
+    order would fire at the NEXT session's open (per-position context built by
+    the shared ``_type_a_event``)."""
     events: list[dict] = []
     skipped: list[dict] = []
     for pos in sim_positions:
@@ -1620,67 +1703,12 @@ def _detect_type_a(sim_positions: list[dict], series: dict[str, pd.DataFrame],
             if df is None:
                 skipped.append({"ticker": tk, "reason": "no candle series in the snapshot"})
                 continue
-            if next_session is None:
-                skipped.append({"ticker": tk,
-                                "reason": "no stored session after the as-of date — the "
-                                          "next open cannot be determined"})
+            ev, reason = _type_a_event(pos, df, as_of, next_session)
+            if ev is None:
+                if reason is not None:
+                    skipped.append({"ticker": tk, "reason": reason})
                 continue
-            atr14_s, atr_stop_s = recompute_atr(df)
-            times = df["time"].tolist()
-            if as_of not in times:
-                skipped.append({"ticker": tk, "reason": f"no bar at the as-of date {as_of}"})
-                continue
-            s_row = times.index(as_of)
-            entry = pos["opened_at"]
-            pct_stop = (pos["stop_price"] if pos["stop_price"] is not None
-                        else pos["avg_cost"] * (1.0 - settings.sim_stop_pct / 100.0))
-            cand_s = float(atr_stop_s.iloc[s_row]) if pd.notna(atr_stop_s.iloc[s_row]) else None
-            ratchet_vals = [float(v) for t, v in zip(times, atr_stop_s, strict=True)
-                            if entry <= t <= as_of and pd.notna(v)]
-            ratchet = max(ratchet_vals) if ratchet_vals else None
-            levels = [(v, lbl) for v, lbl in ((pct_stop, "Initial stop"),
-                                              (ratchet, "ATR stop ratchet"),
-                                              (cand_s, "ATR stop"))
-                      if v is not None]
-            if not levels:
-                skipped.append({"ticker": tk, "reason": "no computable standing level"})
-                continue
-            level, label = max(levels, key=lambda lv: lv[0])
-            f_row = df[df["time"] == next_session]
-            if f_row.empty:
-                skipped.append({"ticker": tk,
-                                "reason": f"no bar at the next session {next_session} — "
-                                          "the standing order cannot fill at an open"})
-                continue
-            next_open = float(f_row["open"].iloc[0])
-            if not (next_open <= level):
-                continue  # the standing order does not fire at the next open
-            close_s = float(df["close"].iloc[s_row])
-            entry_row = times.index(entry) if entry in times else None
-            peak = (float(df["close"].iloc[entry_row: s_row + 1].max())
-                    if entry_row is not None else close_s)
-            events.append({
-                "ticker": tk, "decision_date": as_of, "fill_date": next_session,
-                "fill_price": next_open, "fill_kind": "at_open",
-                "stop_level": level, "stop_label": label,
-                "atr14": (float(atr14_s.iloc[s_row])
-                          if pd.notna(atr14_s.iloc[s_row]) else None),
-                "atr_candidate_at_S": cand_s, "atr_ratchet_since_entry": ratchet,
-                "frozen_pct_stop": pct_stop,
-                "entry_date": entry, "entry_price": pos["avg_cost"],
-                "shares": pos["shares"],
-                "current_close": close_s,
-                "pnl_pct": ((close_s / pos["avg_cost"] - 1.0) * 100.0
-                            if pos["avg_cost"] > 0 else None),
-                "giveback_pct": ((close_s / peak - 1.0) * 100.0 if peak else None),
-                "dist_to_stop_pct": ((close_s - level) / close_s * 100.0
-                                     if close_s > 0 else None),
-                "stop_price_stored": pos["stop_price"] is not None,
-                "derivation": ("stop_price NULL on this row: the frozen initial stop is "
-                               "derived as avg_cost * (1 - sim_stop_pct/100) (declared "
-                               "fallback, session fill contract rule 5)" if pos["stop_price"] is None
-                               else "stop_price read from the live positions table"),
-            })
+            events.append(ev)
         except Exception as e:  # noqa: BLE001 — event-level problems never raise
             skipped.append({"ticker": tk, "reason": f"{type(e).__name__}: {e}"})
     events.sort(key=lambda e: (e["fill_date"], e["ticker"]))

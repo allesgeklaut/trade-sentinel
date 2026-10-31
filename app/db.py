@@ -176,6 +176,13 @@ class SimPosition(Base):
     # rule 5. NULL on legacy rows created before the column: those keep the
     # documented fallback (level recomputed from avg_cost each cycle).
     stop_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # The LLM sell layer's type-A DEFER state (app/selllayer.py): while a
+    # defer is active the position's standing stop is the frozen percent stop
+    # plus THIS re-armed ATR level (the defer re-arms the ATR leg only — the
+    # monotone ratchet itself is untouched). NULL = no active defer. Cleared
+    # when the position closes (the row is deleted on a full sell).
+    stop_defer_level: Mapped[float | None] = mapped_column(Float, nullable=True)
+    stop_defer_set_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class SimTrade(Base):
@@ -336,6 +343,69 @@ class SimLlmDecision(Base):
     shares: Mapped[float | None] = mapped_column(Float, nullable=True)
     price: Mapped[float | None] = mapped_column(Float, nullable=True)
     cash_after: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class LlmSellDecision(Base):
+    """Append-only ledger of the LLM sell layer's decisions (app/selllayer.py).
+
+    Mirrors ``SimLlmDecision``'s conventions (session fill contract, rule 7):
+
+      * ``decided_at`` is FROZEN at parse — captured once, when the LLM
+        response is parsed, before any of the decision's orders can execute,
+        and always written from that capture.
+      * ``event_type`` is one of ``A`` (sim standing-stop fire), ``B``
+        (monthly band-drop at the rebuild) or ``C`` (monthly thesis break);
+        ``engine`` is ``sim`` or ``monthly``. ``event_id`` is the stable
+        per-event key (``"A:TICKER:DATE"`` / ``"B:TICKER:DATE"`` /
+        ``"C:TICKER:FILING"``) — type C dedupes on it: a break is NEW only
+        when no row exists for that (ticker, latest filing date).
+      * ``decision`` is CONFIRM|DEFER (A/B) or EXIT|HOLD (C).
+      * ``context`` is the full point-in-time context JSON the prompt was
+        rendered from; ``engine_branch`` is the JSON of what the ENGINE's own
+        rule would do (A: the fired level; B: the release; C: hold-to-rebuild)
+        — the counterfactual the scorecard compares against.
+      * The FILL columns (``filled_at``, ``shares``, ``price``, ``cash_after``)
+        are written ONCE, when the decision's trade actually executes (the
+        type-C EXIT fills at the NEXT session's strict open); ``filled_at`` is
+        stamped after the trade committed, so it is always >= ``decided_at``.
+        An unfilled decision keeps all four NULL — the decided-but-unfilled
+        pending record; there is NO pending-order persistence beyond this
+        ledger, so the next cycle re-scans it.
+
+    Rows are NEVER updated (except the frozen fill stamping on execution) or
+    deleted. ``fail_safe`` marks decisions where the LLM could not answer
+    (no backend / transport error / timeout / malformed / refusal) — the
+    engine's own rule stood.
+    """
+
+    __tablename__ = "llm_sell_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    decided_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # Operator-local "YYYY-MM-DD": the decision session F.
+    session_date: Mapped[str] = mapped_column(String(10))
+    event_type: Mapped[str] = mapped_column(String(1))  # A | B | C
+    engine: Mapped[str] = mapped_column(String(8))      # sim | monthly
+    event_id: Mapped[str] = mapped_column(String(96), index=True)
+    ticker: Mapped[str] = mapped_column(String(32))
+    decision: Mapped[str] = mapped_column(String(7))    # CONFIRM | DEFER | EXIT | HOLD
+    rationale: Mapped[str] = mapped_column(Text, default="")
+    prompt_version: Mapped[str] = mapped_column(String(32), default="")
+    parsed: Mapped[bool] = mapped_column(Boolean, default=False)
+    fail_safe: Mapped[bool] = mapped_column(Boolean, default=False)
+    fail_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # The full PIT context the prompt rendered + the engine's counterfactual.
+    context: Mapped[str] = mapped_column(Text, default="")
+    engine_branch: Mapped[str] = mapped_column(Text, default="")
+    # Frozen fill — all four are NULL together until the decision executes.
+    filled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    shares: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cash_after: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Which backend/model answered ("" when the no-backend short-circuit fired).
+    backend: Mapped[str] = mapped_column(String(64), default="")
+    model: Mapped[str] = mapped_column(String(128), default="")
+    latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 # =====================================================================
@@ -519,6 +589,10 @@ class MonthlyRebalance(Base):
     picked: Mapped[str] = mapped_column(Text, default="")
     n_new: Mapped[int] = mapped_column(Integer, default=0)
     snapshot: Mapped[str] = mapped_column(Text, default="")  # JSON eligibility frame
+    # Additive JSON (app/selllayer.py type-B overlay): {"engine_picks": [...],
+    # "executed_picks": [...]} so the LLM's retention difference is auditable;
+    # NULL when the sell layer did not run (engine picks == executed picks).
+    sell_layer: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     # Run provenance (Phase 2, app/run_config.py). mode/config_id are NULL on
     # rows written before stamping existed; epoch is ALWAYS set — legacy rows
@@ -1521,6 +1595,28 @@ async def _migrate_engine(db_engine):
         try:
             await conn.execute(
                 text("ALTER TABLE sim_positions ADD COLUMN stop_price FLOAT")
+            )
+        except Exception:
+            pass  # column already exists
+        # Migration for sim_positions: the LLM sell layer's type-A DEFER state
+        # (stop_defer_level / stop_defer_set_at, app/selllayer.py). Additive and
+        # nullable — legacy rows keep NULL (no active defer), no data migration.
+        for col, coltype in [
+            ("stop_defer_level", "FLOAT"),
+            ("stop_defer_set_at", "DATETIME"),
+        ]:
+            try:
+                await conn.execute(
+                    text(f"ALTER TABLE sim_positions ADD COLUMN {col} {coltype}")
+                )
+            except Exception:
+                pass  # column already exists — expected on subsequent starts
+        # Migration for monthly_rebalances: the sell-layer audit JSON (engine
+        # picks vs executed picks). Additive and nullable — NULL when the
+        # overlay did not run.
+        try:
+            await conn.execute(
+                text("ALTER TABLE monthly_rebalances ADD COLUMN sell_layer TEXT")
             )
         except Exception:
             pass  # column already exists

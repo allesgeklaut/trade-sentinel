@@ -563,6 +563,11 @@ async def current_config() -> dict:
         "sim_llm_failure_marker": settings.sim_llm_failure_marker,
         "sim_llm_fundamentals_context": settings.sim_llm_fundamentals_context,
         "sim_block_negative_roe": settings.sim_block_negative_roe,
+        # --- LLM sell layer (app/selllayer.py) — provenance: these knobs are
+        # decision inputs of the live cycle (same rule as above).
+        "sim_llm_sell_layer": settings.sim_llm_sell_layer,
+        "sell_layer_timeout_s": settings.sell_layer_timeout_s,
+        "sell_layer_max_defers": settings.sell_layer_max_defers,
         # --- hard-coded decision constants (see the contract bump rule) ---
         "code": {
             "buy_threshold": 40,
@@ -836,6 +841,9 @@ async def _exec_sell_locked(ticker: str, price: float, shares: float | None,
         acc.cash += proceeds
         pos.shares -= sell_shares
         if pos.shares <= 0.0001:
+            # The position closes: the row (and with it the sell layer's defer
+            # columns stop_defer_level/stop_defer_set_at) is deleted — the
+            # defer state is cleared when the position closes.
             await s.delete(pos)
 
         trade = SimTrade(
@@ -1111,7 +1119,11 @@ async def _deterministic_propose(
          "stop_price": pos.stop_price,
          # Position-specific monotone ATR ratchet since the entry anchor
          # (contract rule 6) — None until the position has completed bars.
-         "atr_stop_level": ratchets.get(pos.ticker)}
+         "atr_stop_level": ratchets.get(pos.ticker),
+         # The LLM sell layer's active type-A DEFER level (app/selllayer.py):
+         # while set, strategy._standing_stop_levels uses it as the ATR leg.
+         "stop_defer_level": (float(pos.stop_defer_level)
+                              if pos.stop_defer_level is not None else None)}
         for pos in open_positions
     ]
 
@@ -2918,8 +2930,17 @@ async def run_cycle() -> dict[str, Any]:
                 quality = await _quality_map(tickers)
             if strategy == "deterministic":
                 _set_progress("decide", "Deterministic engine deciding", started_at=started_at)
-                trades = await _deterministic_decide(valuation, quality_of=_quality_lookup(quality),
-                                                     decision=decision)
+                proposals = await _deterministic_propose(valuation,
+                                                         quality_of=_quality_lookup(quality),
+                                                         decision=decision)
+                # LLM sell layer, type A (deterministic mode ONLY — the
+                # hybrid/llm modes keep their existing whole-cycle review):
+                # wired BETWEEN propose and execute; stop-fire proposals carry
+                # the machine-readable "stop_fire" key. Fail-safe: knob off /
+                # no backend / any consult failure -> proposals unchanged.
+                from . import selllayer
+                proposals = await selllayer.overlay_type_a(proposals, decision)
+                trades = await _execute_proposed(proposals)
                 _last_deterministic_trades = trades
             elif strategy == "llm":
                 # Decision inputs are the cycle's frozen ones (data <= S);

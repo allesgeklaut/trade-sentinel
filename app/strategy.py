@@ -43,6 +43,9 @@ The input shapes:
 The output shape (proposals):
 
   - SELL: ``{"ticker", "side": "SELL", "price", "shares": None, "reason"}``
+    — a contract-mode standing-order stop fire additionally carries
+    ``"stop_fire": {"level": float, "label": str}`` (the machine-readable
+    marker for the LLM sell layer, app/selllayer.py)
   - BUY:  ``{"ticker", "side": "BUY",  "price", "budget", "reason",
     "entry_stop": float|None}``
 
@@ -270,6 +273,16 @@ def _standing_stop_levels(
     pct = _percent_stop_level(pos, params)
     if pct is not None:
         levels.append((pct, "Initial stop"))
+    # The LLM sell layer's type-A DEFER (app/selllayer.py): while a defer is
+    # active the standing stop is the frozen percent stop PLUS the re-armed
+    # deferred ATR level — the defer re-arms the ATR leg only; the monotone
+    # ratchet and the per-bar candidate are suspended for this position while
+    # the defer lasts (the ratchet itself is untouched upstream). The frozen
+    # percent stop is NEVER loosened.
+    defer = _bar_price(pos.get("stop_defer_level"))
+    if defer is not None:
+        levels.append((defer, "ATR stop (deferred)"))
+        return levels
     ratchet = _bar_price(pos.get("atr_stop_level"))
     if ratchet is not None:
         levels.append((ratchet, "ATR stop"))
@@ -409,17 +422,22 @@ def propose_trades(
             if levels:
                 level, label = max(levels, key=lambda lv: lv[0])
                 low = _bar_price(bars[ticker].get("low"))
+                # "stop_fire" is the MACHINE-READABLE marker for the LLM sell
+                # layer (app/selllayer.py wires between propose and execute
+                # and consults per stop-fire candidate) — no string-matching
+                # on the reason.
+                stop_fire = {"level": level, "label": label}
                 if fill <= level:
                     proposals.append({
                         "ticker": ticker, "side": "SELL", "price": fill,
-                        "shares": None,
+                        "shares": None, "stop_fire": stop_fire,
                         "reason": (f"{label} standing order: open {fill:.2f} <= "
                                    f"level {level:.2f} — filled at the open")})
                     sell_tickers.add(ticker)
                 elif low is not None and low <= level:
                     proposals.append({
                         "ticker": ticker, "side": "SELL", "price": level,
-                        "shares": None,
+                        "shares": None, "stop_fire": stop_fire,
                         "reason": (f"{label} standing order: low {low:.2f} <= "
                                    f"level {level:.2f} — filled at the level")})
                     sell_tickers.add(ticker)

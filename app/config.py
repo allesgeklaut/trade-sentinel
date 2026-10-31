@@ -96,6 +96,23 @@ class Settings(BaseSettings):
     # thin coverage) — only known-bad data blocks. Opt-in until the replay
     # A/B verdict (bull-window right-tail cost is the known risk class).
     sim_block_negative_roe: bool = False
+    # --- LLM sell layer (app/selllayer.py): the LLM as the SELL brain of the
+    # live paper accounts, EXECUTING (not just advising) at three decision
+    # moments — A: the sim's standing-stop fire, B: the monthly rebuild's
+    # band-drops, C: the monthly book's thesis breaks. Fail-safe everywhere:
+    # with the knob off (or no LLM backend configured) the engines behave
+    # exactly as without the layer. DECLARED default True: the account behaves
+    # exactly as today until a backend is configured (the no-backend
+    # short-circuit), then the layer goes live.
+    sim_llm_sell_layer: bool = True      # type A (sim standing-stop overlay)
+    sim_monthly_llm_sells: bool = True    # types B + C (monthly book overlay)
+    # Per-consult wall-clock bound (asyncio.wait_for) on top of the transport
+    # call — llm.chat's own timeout is the global 1200s setting, far too long
+    # for a nightly cycle.
+    sell_layer_timeout_s: float = 60.0
+    # Type-A defer cap: max consecutive DEFERs per position before the stop
+    # executes regardless (counted from the LlmSellDecision ledger).
+    sell_layer_max_defers: int = 2
     # Daily-core rank deployment: boost factor for the #1-ranked name's target
     # weight, decaying linearly to 1.0 at the band edge (rank N gets exactly
     # the equal weight). 0.5 = top name may hold 1.5x the equal weight while
