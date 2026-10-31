@@ -310,16 +310,102 @@ LLM stays a read-only explainer.
 **Cost/latency bound.** Consults only on stop fires (~1/day in the sim)
 plus a monthly review — a bounded call volume logged with token counts.
 
+## 4a. The monthly-buys strategies: an intra-month sell mechanism (5B — predeclared)
+
+Owner's extension (2026-10-31): a strategy combining the monthly
+fundamental (qv-mom) buys with a mechanism to sell during the month at the
+right time. Measured rationale: the factor arms' exits HAVE edge (dropped
+names subsequently lag the universe by ~1%/quarter, §1.2) but the monthly
+cadence realizes that edge up to 4–7 weeks late — and the sim evidence sets
+the boundary: tight per-name price stops destroy value (§1, §3), so the
+promising mechanisms are prompt rank-based release and portfolio-level
+scaling. The daily-core engine already carries the needed knobs (the audit
+rated their added benefit "unproven" — they were never run through the
+honest pipeline).
+
+The predeclared one-variable-at-a-time set (same window/universe/costs,
+CONTRACT fills, the 4A metric pipeline, no tuning; M0 = the reference):
+
+- **M0 baseline**: the monthly arm (band-drops wait for the month-end
+  rebalance).
+- **M1** `exit_cadence="daily"`: a band-dropped holding is released the
+  NEXT day — the core of the request; captures the measured exit edge
+  ~2–6 weeks earlier.
+- **M2** M1 + `entry_gate="not-crash"` (a buy-timing guard on the monthly
+  picks).
+- **M3** vol targeting: `target_vol` 0.20 / 0.25 (the literature's
+  best-supported risk mechanism, Barroso & Santa-Clara — scales EXISTING
+  exposure, fixing the audit's finding against the contribution-only
+  volatility gate).
+- **M4** catastrophe trailing stop 25–30% per name (skeptical prior: the
+  sim proved tight stops destroy; a wide guard on a 10-name,
+  ~9-month-hold book is a different animal — one test).
+- **M5** fundamental thesis-break exit: when a holding's newly FILED
+  fundamentals would knock it out of the eligible frame (e.g. ROE ≤ 0),
+  exit at the next open. The most fundamental-consistent intra-month sell —
+  exit when the REASON breaks, not when the price wiggles. Needs an
+  additive engine hook (filing-day eligibility re-check); deferred until
+  4B lands (same hook window as the sim's entry-grace/cadence hooks).
+
+Deliberately out of the set: the `basket_*` all-cash market-timing
+overlays (audit 3/2 — whipsaw, fragile evidence) and any tight per-name
+stop (the sim's measured failure). M1–M4 are expressible with existing
+engine knobs (zero engine changes); configs are frozen in this section
+before any run. Evaluation: full window 2015→2026 plus yearly windows,
+against 4B's controls (random_n / equal_weight) and bootstrap CIs; if a
+variant wins, it becomes a UI strategy variant candidate and a natural
+replacement for whatever 4D prunes.
+
+## 4b. Unification: one LLM sell reviewer, per-engine event adapters (5C — design)
+
+The §4 sell-decider generalizes from "sim stop fires" to a single shadow
+reviewer over CANDIDATE EXIT EVENTS from every engine, sharing one context
+schema family, one prompt/versioning discipline, one fail-safe (CONFIRM =
+the engine's own rule stands), and one counterfactual-ledger pattern:
+
+- **Event type A — sim ATR stop fires**: CONFIRM the stop / DEFER with a
+  wider re-arm (the 5A-1 machinery, built and gated).
+- **Event type B — monthly band-drop events**: at each rebalance a name
+  falls out of the hysteresis band; the reviewer CONFIRMs the release or
+  DEFERs retention to the next rebalance. The measured bar is HIGH:
+  blanket retention of dropped names is negative-edge (−1.0%/quarter
+  excess, §1.2), so deferral must find the specific subset where it wins —
+  the mirror image of the sim case.
+- **Event type C — intra-month thesis-break candidates for the factor
+  book**: filing-day re-checks (shared with M5's hook) plus
+  drawdown/momentum alarms; the reviewer proposes an early exit the
+  monthly cadence would have delayed. The live book still waits for
+  month-end unless a policy survives validation.
+
+Contexts stay PIT-only and engine-appropriate: the factor-book events add
+fundamental fields (ROE, F/P-FCF, 12-1 momentum rank, band distance, days
+since the last filing) to the price/regime fields the 5A-1 schema already
+carries. Prompts are versioned per event type (`sellshadow/1` = A; B/C
+adapters follow). The evaluation discipline is unchanged: prospective
+shadow mode only, no LLM calls on history, fail-safe to the engine's own
+rule, contamination controls per §4 — and the LLM must beat BOTH the
+engine default AND the best deterministic variant (V1/V2 for the sim; the
+M-set winner for the factor book), net of honest fills and costs. A cheap
+deterministic rule that captures the gain wins by construction.
+
 ## 5. Decision gate (nothing below happens without approval)
 
-Proposed next slice if approved (would be Phase 5A): a shadow-logger + LLM
-consult harness for the sim's stop fires — offline against the snapshot DB
-for historical stop-fire *contexts* (no LLM calls on history — contexts are
-for prompt design and v1 evaluation windows only), prospective on the live
-paper sim thereafter. In parallel, the §3 deterministic exit variants are
-one sweep away in the existing harness (`_replay` parameter variants) and
-belong in the Phase 4C study runs. No change to any live engine behavior is
-in scope for this research phase.
+Proposed sequencing (each step gated, owner approval between phases):
+
+- **5A-1** (built, gated, pending commit): the sell-shadow research harness —
+  contexts, frozen prompt + fail-safe parser, defer ledger, the sim's five
+  deterministic exit variants. Full-window verdict recorded: V1 signal
+  exits +18.5%/yr vs BASE −2.2%/yr (same buys — the entire gap is the exit
+  rule); V2 the drawdown-averse pick (27.4% maxDD); the crude portfolio
+  breaker a dead end.
+- **5B**: the monthly-book M-set (M1–M4 run in parallel on existing knobs;
+  M5's engine hook after 4B lands). Feeds the 4C study with the controls.
+- **5C**: the per-engine event adapters (B and C above) for the unified
+  reviewer, after the owner reviews 5A-1's prompt design and 5B's results.
+- In parallel, the §3 deterministic exit variants belong in the Phase 4C
+  study runs.
+
+No change to any live engine behavior is in scope for this research phase.
 
 ## References
 
