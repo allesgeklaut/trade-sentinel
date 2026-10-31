@@ -1231,6 +1231,91 @@ pins both states (`lab_replay_warning_hidden_on_prod`,
 `lab_replay_warning_visible_on_dev`). Verified: both gates green with the
 new checks, digests unchanged, and vision confirmation of both states.
 
+## Phase 4A revaluation harness — 2026-10-31
+
+**Slice 4A code-complete and independently verified. Not the Phase 4
+comparison report yet** (that is 4C, on the real snapshot; controls/regimes/
+sensitivity/uncertainty are 4B). Phase 4's data path was decided with the
+owner: a consistent snapshot of the PROD database is copied into the
+offline sandbox (SQLite online-backup over a single streamed ssh
+connection) and every revalidation runs offline against that copy,
+analysis-only; the prune is implemented at the end of Phase 4 (owner
+decision).
+
+Data basis (inventory of the snapshot, read-only): 1,581,262 candles —
+URTH 2012-01-12..2026-10-30, the stock universe 2015-01-02..2026-10-30
+(breadth 400 tickers in 2015 → 598 in 2026); 394,703 point-in-time
+fundamentals (filed 2009..2026, one row per filed version); the live
+`sp500` list (503 members as resolved). The deployed server runs
+pre-Phase-1 code — the snapshot schema predates the run registry and the
+candle-provenance columns, and the ~5-week live paper record (all accounts
+started 2026-09-23, $1,000/month) was produced by the superseded engine,
+so it is operational context, not evidence. The current `init_db()` was
+rehearsed on an exact copy: 34 → 38 tables, every row count preserved,
+`adjustment_basis=NULL` (unknown provenance, never backfilled) — the
+migration the real DB will take on the next deploy, proven safe on a copy.
+
+`app/reval.py` (new): the predeclared four-arm comparison harness —
+`dca` (broad-market DCA control buying `settings.sim_benchmark_ticker`
+in-memory at the first session's strict open; never the DB-writing
+`sim.backfill_benchmark`), `monthly` (qv-mom-v1 via
+`optimize._monthly_backtest`, target_n=10, hold_band=20), `daily_core`
+(the same factor policy with immediate deployment via
+`optimize._daily_core_backtest`, dca="rank", boost=0, all risk overlays
+off — the frozen clean baseline), `sim` (the technical strategy as
+experimental comparator via `optimize._replay` CONTRACT mode with
+`_live_sim_params`). All arms share one window, one session axis, one
+contribution schedule and the declared costs; `random_n`/`equal_weight`
+are declared 4B scaffolds (raise a pinned `NotImplementedError`). The
+harness is analysis-only and offline-only: `point_at_database` swaps the
+process to the target with SQLite `PRAGMA query_only=ON` (any write —
+even a journal-mode change — fails at the DB level), never calls
+`create_all`/`init_db`; a test proves every table's row counts unchanged
+after a full four-arm run plus a refused direct INSERT. Costs:
+`CostConfig` (stock 10 bps / etf 2 bps / fx +15 bps on non-USD listings,
+one-way on fill notional; per-ticker at fill for dca and sim) — the
+existing engine conventions won where they conflicted and each case is
+declared in the report header (monthly folds the FX leg into its flat
+swapped-notional rate; daily_core takes the stock leg through the engine's
+own flat wrapper and the FX leg as an exact post-hoc NAV debit on its
+per-leg ledger). Cash yield is a declared post-hoc assumption
+(`(1+cy)^(1/252)` compounding on the session cash curve, credited to
+equity for metrics only — the live accounts accrue 0%). Metrics per arm:
+cumulative + annualized TWR mirroring `/api/metrics/twr` (actual/365),
+dated XIRR mirroring `/api/metrics/xirr` (`dated_external_flows` +
+`performance.xirr`), unitized-NAV max drawdown plus longest underwater
+spell, annualized volatility, excess-return Sharpe with the declared
+cash yield as the rf proxy (audit finding #5), mean cash weight + share
+of fully-invested sessions, max-weight/HHI concentration, annualized
+one-way turnover mirroring the research convention (fresh contributions
+excluded), and per-metric deltas vs the `dca` arm. Report: versioned
+`reval-report/1` JSON (sorted keys, byte-identical for identical inputs,
+caller-supplied `generated_at`; full series + trade ledgers + engine
+summaries) + markdown renderer; every report embeds the declared
+assumptions, the seeds, `configs_tried` (audit finding #2) and the
+survivorship caveat (universes are current-membership snapshots —
+relative cross-arm comparisons are robust to it, absolute vs the DCA
+control is not); no winner language (audit finding #4). CLI
+`python -m app.reval run --db …` (explicit target, library-first).
+`app/optimize.py`: one additive change — `_replay(..., cost_oneway)`
+(flat rate or per-ticker callable) applied exactly like
+`_daily_core_backtest`'s fee wrapper (BUY budget capped at
+`cash/(1+rate)`, fee debited per executed leg, default `0.0` bit-identical
+to the old behaviour).
+
+Independent verification: full offline regression **1596 passed**
+(1583 + 13 new; the golden parity suites — optimize, replay fills,
+cadence parity, performance, api metrics — 180 green, proving the
+`optimize.py` addition is behaviour-preserving); the 13 new tests pin
+wrapper parity at zero cost/yield, hand-computed cost/cash-yield/metric
+expectations, byte-identical determinism, and the no-write proof. A
+real-data smoke run against the migrated snapshot (sp500, 2022 bear
+year, all four arms, 3m10s) produced plausible, internally consistent
+numbers — the DCA control's TWR −18.7% against URTH's actual −18.0%,
+the technical sim's 30× annualized turnover made visible for the first
+time — and the snapshot's row counts were re-verified unchanged after
+the run.
+
 ## References
 
 - [SEC Apple companyfacts](https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json)

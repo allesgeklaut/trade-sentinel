@@ -554,7 +554,8 @@ def _row_strength(row: dict, action: str) -> int:
 def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
             start: str | None = None, end: str | None = None,
             regime: dict[str, bool] | None = None,
-            quality: _QualityLookup | None = None) -> ReplayResult:
+            quality: _QualityLookup | None = None,
+            cost_oneway: float | Callable[[str], float] = 0.0) -> ReplayResult:
     """Run the deterministic strategy over the precomputed series.
 
     ``start``/``end`` are inclusive date strings (YYYY-MM-DD) used to bound
@@ -564,6 +565,16 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
     ``quality`` is the optional monthly fundamentals provider; when given
     together with ``params.block_negative_roe``, BUY entries into names with
     known non-positive ROE are blocked (missing data stays neutral).
+
+    ``cost_oneway`` is the research-only one-way cost hook (default ``0.0`` =
+    fee-free, exactly today's behaviour, bit-identical): either a flat rate
+    or a ``ticker -> rate`` callable. It is applied exactly like the
+    ``_daily_core_backtest`` ``cost_oneway`` wrapper around ``_fill_buy``:
+    a BUY's budget is capped at ``cash / (1 + rate)`` so the fee is reserved
+    INSIDE the spend, and every executed leg (proposal or standing stop)
+    then pays ``shares * price * rate`` out of cash on top of the notional,
+    so a full-cash buy can never drive cash negative. It is NOT the live
+    sim's policy — the paper book stays fee-free by design.
 
     Session fill contract (app/session.py):
 
@@ -617,6 +628,34 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
     last_known_prices: dict[str, float] = {}  # carry forward for missing-data days
     last_decision_prices: dict[str, float] = {}  # decision closes (<= S), carried
     sp = _replay_params_to_strategy(params)
+
+    def _cost_rate(t: str) -> float:
+        return float(cost_oneway(t)) if callable(cost_oneway) else float(cost_oneway)
+
+    def _charge_fee(trade: dict) -> None:
+        """Debit the one-way fee of one executed trade from cash (0.0 = no-op)."""
+        fee = trade["shares"] * trade["price"] * _cost_rate(trade["ticker"])
+        if fee > 0:
+            pf.cash -= fee
+            if -1e-9 < pf.cash < 0:  # ULP guard mirroring _fill_buy's exact-cash check
+                pf.cash = 0.0
+
+    def _sell_with_cost(ticker: str, price: float, reason: str, date: str,
+                        shares: float | None = None) -> None:
+        n0 = len(pf.trades)
+        pf.sell(ticker, price, shares, reason, date=date)
+        if len(pf.trades) > n0:
+            _charge_fee(pf.trades[-1])
+
+    def _execute_with_cost(p: dict) -> None:
+        p = dict(p)
+        rate = _cost_rate(p["ticker"])
+        if p["side"] == "BUY" and rate > 0:
+            p["budget"] = min(float(p.get("budget", 0.0)), pf.cash / (1.0 + rate))
+        n0 = len(pf.trades)
+        _execute_proposal(pf, p)
+        if len(pf.trades) > n0:
+            _charge_fee(pf.trades[-1])
 
     for i in range(lo, hi):
         day = days_full[i]
@@ -691,10 +730,10 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
                                  if session_bars is not None
                                  else prices.get(ticker, 0))
                         if price:
-                            pf.sell(ticker, price, None,
+                            _sell_with_cost(ticker, price,
                                     f"Portfolio stop: equity {eq_for_stop:.0f} "
                                     f"is -{dd:.1f}% from peak {portfolio_peak:.0f}",
-                                    date=day)
+                                    day)
                     risk_off = True
             elif risk_off and dd < params.portfolio_stop_pct / 2:
                 # Re-engage when drawdown recovers to half the stop level.
@@ -722,10 +761,10 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
                 legacy_close = prices.get(ticker) if session_bars is None else None
                 fill = _standing_stop_fill(bar, stop_level, legacy_close)
                 if fill is not None:
-                    pf.sell(ticker, fill, None,
+                    _sell_with_cost(ticker, fill,
                             f"Trailing stop: {fill:.2f} <= {stop_level:.2f} "
                             f"(peak {peak:.2f}, -{params.trailing_stop_pct}%)",
-                            date=day)
+                            day)
 
         # --- Core: delegate SELL to strategy.propose_trades, execute, then BUY ---
         # propose_trades works on a snapshot; SELLs must execute first so the
@@ -748,7 +787,7 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
         )
         for p in proposals:
             if p["side"] == "SELL":
-                _execute_proposal(pf, {**p, "date": day})
+                _execute_with_cost({**p, "date": day})
 
         # BUY phase: re-derive post-SELL state, re-propose for BUYs only.
         # Regime filter: block new BUYs when the broad market is below its
@@ -771,7 +810,7 @@ def _replay(series: dict[str, pd.DataFrame], params: ReplayParams,
             )
             for p in proposals2:
                 if p["side"] == "BUY":
-                    _execute_proposal(pf, {**p, "date": day})
+                    _execute_with_cost({**p, "date": day})
 
         # Record equity.
         total_equity = pf.equity(prices)
