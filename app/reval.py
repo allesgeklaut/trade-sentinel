@@ -2037,6 +2037,35 @@ async def _run_window_case(study: RevalStudy, uni: dict, inputs: _Inputs, window
     return entry, configs_tried
 
 
+def _window_infeasible(close_index: pd.DatetimeIndex, window: dict) -> str | None:
+    """A study window's infeasibility reason, from the ENGINE'S OWN refusal
+    conditions (checked before any arm runs; the study RECORDS the refusal
+    instead of raising — the engine's answer is honest, e.g. the first data
+    year cannot rank 12-1 momentum because the 253-session warmup reaches
+    past its end):
+
+    * fewer than ``settings.sim_monthly_min_history_days`` loaded sessions up
+      to the window's last session — the exact warmup condition
+      ``optimize._monthly_backtest`` refuses on; or
+    * no session inside the window; or
+    * no completed month-end inside the window (nothing to rebalance —
+      the engine's second refusal).
+    """
+    from . import monthly as monthly_mod
+    from .config import settings
+    lo, hi = pd.Timestamp(window["start"]), pd.Timestamp(window["end"])
+    idx = close_index[(close_index >= lo) & (close_index <= hi)]
+    if not len(idx):
+        return "no sessions in the window"
+    n_hist = int((close_index <= idx[-1]).sum())
+    if n_hist < settings.sim_monthly_min_history_days:
+        return (f"momentum warmup: {n_hist} loaded sessions up to "
+                f"{window['end']} < {settings.sim_monthly_min_history_days} required")
+    if not len(monthly_mod.completed_month_ends(close_index, idx[0], idx[-1])):
+        return "no completed month-end inside the window"
+    return None
+
+
 async def run_study_async(study: RevalStudy) -> dict:
     """Run the whole study (windows x cases x arms x seeds x OFAT) sharing ONE
     ``_load_inputs`` call over the full span and ONE frame cache per mom
@@ -2070,6 +2099,11 @@ async def run_study_async(study: RevalStudy) -> dict:
             per_run: list[dict] = []
             for w in windows:
                 for case in study.cases:
+                    reason = _window_infeasible(inputs.close.index, w)
+                    if reason is not None:
+                        runs.append({"window": w, "case": case,
+                                     "status": "infeasible", "reason": reason})
+                        continue
                     entry, tried = await _run_window_case(
                         study, uni, inputs, w, case, frame_caches, sim_series_cache)
                     runs.append(entry)
@@ -2125,8 +2159,13 @@ def _build_study_report(study: RevalStudy, uni: dict, inputs: _Inputs,
                           "method": "circular block bootstrap, percentile CI"},
             "configs_tried": {
                 "formula": "per window x case: 1 baseline run + n_seeds random_n runs + "
-                           "len(ofat_grid) OFAT configs when sensitivity is on",
+                           "len(ofat_grid) OFAT configs when sensitivity is on; "
+                           "infeasible windows contribute 0",
                 "per_run": per_run, "total": total},
+            "infeasible_windows": [
+                {"window": r["window"]["name"], "case": r["case"],
+                 "reason": r["reason"]}
+                for r in runs if r.get("status") == "infeasible"],
             "ambient_settings": ambient,
         },
         "windows": [{"name": w["name"], "start": w["start"], "end": w["end"],
@@ -2149,6 +2188,11 @@ def _build_study_report(study: RevalStudy, uni: dict, inputs: _Inputs,
             "configs_tried counts configurations executed by this study (baseline + OFAT "
             "variants + random_n seeds), per audit finding #2 (record the number of "
             "configurations tried).",
+            "Windows the engine itself refuses (loaded history up to the window's last "
+            "session under the momentum warmup, or no completed month-end inside) are "
+            "recorded as infeasible and contribute no arms, configs or uncertainty — "
+            "e.g. the first data year cannot rank 12-1 momentum; the overlapping full/"
+            "halves windows still cover that period.",
         ],
     }
 
@@ -2203,6 +2247,10 @@ def render_study_markdown(report: dict) -> str:
         w = run["window"]
         lines.append(f"## Window {w['name']} ({w['start']} .. {w['end']}) — case {run['case']}")
         lines.append("")
+        if run.get("status") == "infeasible":
+            lines.append(f"**INFEASIBLE — skipped, no arms run:** {run['reason']}")
+            lines.append("")
+            continue
         rc = run["regime_context"]
         lines.append("Regime context (dca arm realized on this window — numbers only): "
                      f"TWR cum {rc['dca_twr_cumulative']}, TWR ann {rc['dca_twr_annualized']}, "
@@ -2460,9 +2508,11 @@ def main(argv: list[str] | None = None) -> int:
         (out / "reval-study.json").write_text(study_json(report))
         (out / "reval-study.md").write_text(render_study_markdown(report))
         ct = report["config"]["configs_tried"]
+        n_infeasible = len(report["config"].get("infeasible_windows", []))
         print(f"study report written to {out}/reval-study.{{json,md}} "
-              f"(schema {report['schema']}, {len(report['runs'])} window x case runs, "
-              f"{len(report['windows'])} windows, configs_tried {ct['total']})")
+              f"(schema {report['schema']}, {len(report['runs'])} window x case runs "
+              f"({n_infeasible} infeasible), {len(report['windows'])} windows, "
+              f"configs_tried {ct['total']})")
         print(f"study wall-clock: {wall:.1f}s "
               f"({len(report['runs'])} runs, seeds {report['config']['n_seeds']}, "
               f"bootstrap B={report['config']['bootstrap']['B']})")

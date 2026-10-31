@@ -691,3 +691,51 @@ async def test_sim_arm_weights_finite_across_tape_gap(tape_env):
     # the sim arm really held the gapped ticker across the gap window
     sim = out["sim"]
     assert any(gap["ticker"] in w for w in sim.weights)
+
+
+# ---------------------------------------------------------------------------
+# 13. windows the engine itself refuses are recorded, never raised
+# ---------------------------------------------------------------------------
+
+async def test_study_records_infeasible_windows(tape_env, monkeypatch):
+    """The study driver records windows the ENGINE itself refuses (its own
+    momentum-warmup condition) as infeasible entries instead of raising —
+    the regression behind the first 4C crash: the real-data yearly-2015
+    window (the snapshot starts 2015-01-02, so only ~252 sessions exist by
+    year-end, under the 253-session warmup) killed the whole 57-minute study
+    with ``ValueError``. On the tape (719 sessions, 2024-01-02..2026-10-02)
+    the warmup is raised to 600 sessions: yearly-2025 ends with 522 loaded
+    sessions (infeasible) while yearly-2026/full end with 651 (feasible) —
+    the same shape as the real 2015 edge, in miniature. The guard uses the
+    engine's EXACT condition (sessions in the loaded close index up to the
+    window's last day), so a window the guard marks feasible is one the
+    engine really runs."""
+    from app.config import settings
+    monkeypatch.setattr(settings, "sim_monthly_min_history_days", 600)
+    study = _study(tape_env, windows=("full", "yearly"), cases=("contribution",),
+                   sensitivity=False, n_seeds=1)
+    rep = await reval.run_study_async(study)
+    by_key = {(r["window"]["name"], r["case"]): r for r in rep["runs"]}
+    # the refused window: recorded with the reason, no arms fabricated
+    bad = by_key[("yearly-2025", "contribution")]
+    assert bad["status"] == "infeasible"
+    assert "warmup" in bad["reason"] and "600" in bad["reason"]
+    assert "report" not in bad and "uncertainty" not in bad
+    # the feasible windows ran the real engine (proves the guard is not
+    # stricter than the engine — otherwise these would have raised)
+    for name in ("full", "yearly-2026"):
+        r = by_key[(name, "contribution")]
+        assert r.get("status") is None and "report" in r
+    # configs_tried excludes the infeasible window entirely
+    assert rep["config"]["configs_tried"]["per_run"] == [
+        {"window": "full", "case": "contribution", "configs_tried": 2},
+        {"window": "yearly-2026", "case": "contribution", "configs_tried": 2}]
+    assert rep["config"]["configs_tried"]["total"] == 4
+    assert rep["config"]["infeasible_windows"] == [
+        {"window": "yearly-2025", "case": "contribution", "reason": bad["reason"]}]
+    # the markdown renders the refusal explicitly, and the study stays
+    # byte-identical for identical inputs
+    md = reval.render_study_markdown(rep)
+    assert "INFEASIBLE" in md and bad["reason"] in md
+    rep2 = await reval.run_study_async(study)
+    assert reval.study_json(rep) == reval.study_json(rep2)
