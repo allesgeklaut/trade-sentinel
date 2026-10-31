@@ -356,6 +356,38 @@ against 4B's controls (random_n / equal_weight) and bootstrap CIs; if a
 variant wins, it becomes a UI strategy variant candidate and a natural
 replacement for whatever 4D prunes.
 
+**Results (2026-10-31, full window 2015-01-02..2026-10-30, 2,977
+sessions, sp500 snapshot, $1,000/month, flat 10bps + FX post-hoc, cash
+yield 3%, `configs_tried=7` — `monthly-variants/1`):**
+
+- **M0**: TWR +17.87%/yr, maxDD 35.1%, Sharpe 0.75, 1.31×/yr, 165 sells
+  (all band releases at the rebuild, median hold 105 sessions, PGR 0.093
+  / PLR 0.141). Parity vs the monthly arm: `contributed` exactly equal,
+  IRR 1.0pp apart (20.3% vs 21.3%, within the engine's own 5pp
+  equivalence tolerance).
+- **M1 and M2: bit-identical no-ops on real data.** All 165 band
+  releases already fill on the first session after the month-end rebuild
+  (release lag max 0 in both cadences), and the per-name not-crash gate
+  never bound once in 141 months. Confirmed at the engine level: the SELL
+  pass only runs `if order:` and the band only changes at month-end
+  rebuilds — a daily exit cadence can only change the RETRY timing of
+  failed rebuild fills, never create intra-month exits. **Mechanism
+  correction to this section's premise: the ~1%/quarter exit edge (§1.2)
+  is delayed by monthly DETECTION, not monthly response — cadence cannot
+  fix it. The owner's intra-month sell therefore rides on the
+  intra-month event sources: M5's filing-day thesis-break re-check and
+  the 5C type-C alarms.**
+- **M3a (`target_vol=0.20`): the decade's winner — better on every axis**
+  (+18.34%/yr, maxDD 33.3%, Sharpe 0.79, turnover 1.25×); M3b (0.25)
+  close behind (+18.18%, 33.4%). Vol targeting is the only predeclared
+  overlay that improved the book — the candidate UI variant pending the
+  4C controls/bootstrap context.
+- **M4a/M4b (25%/30% catastrophe trails): a dead end** — +16.68%/+17.31%
+  with WORSE drawdowns (36.4%/36.0%) and higher turnover. Per-name price
+  stops are now measured value-destroying on BOTH engines (the sim's
+  ~21pp/yr gap; the factor book's −1.2pp with worse DD) —
+  contra-indicated platform-wide, matching the skeptical prior.
+
 ## 4b. Unification: one LLM sell reviewer, per-engine event adapters (5C — design)
 
 The §4 sell-decider generalizes from "sim stop fires" to a single shadow
@@ -401,8 +433,14 @@ Proposed sequencing (each step gated, owner approval between phases):
   end; blanket deferral +2.93pp/event (positive 9 of 12 years, 61% of
   defers never re-stopping within a quarter) — the LLM's bar is beating
   the blanket rule with selectivity AND beating V1/V2 at portfolio level.
-- **5B**: the monthly-book M-set (M1–M4 run in parallel on existing knobs;
-  M5's engine hook after 4B lands). Feeds the 4C study with the controls.
+- **5B** (committed — the M-set runner + full-window verdicts): M1/M2 are
+  bit-identical no-ops on real data (the band only changes at month-end
+  rebuilds — cadence cannot create intra-month exits; the per-name
+  not-crash gate never bound), M3a vol-targeting is the decade's winner
+  (+18.34%/yr, maxDD 33.3%, better on every axis), M4 catastrophe trails
+  a dead end (worse return AND drawdown — per-name price stops
+  contra-indicated platform-wide). The owner's intra-month sell rides on
+  M5's filing-day hook and the 5C type-C alarms.
 - **5C**: the per-engine event adapters (B and C above) for the unified
   reviewer, after the owner reviews 5A-1's prompt design and 5B's results.
 - In parallel, the §3 deterministic exit variants belong in the Phase 4C

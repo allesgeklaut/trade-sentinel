@@ -31,6 +31,27 @@ authorized model id is a recorded constant, never contacted):
    NAV), reporting TWR/XIRR/maxDD/vol/excess-Sharpe/turnover, trade count,
    sell-mix by reason class, holding-period stats and Odean PGR/PLR.
 
+Phase 5B slice 5B (the monthly-book sell variants, ``mvariants``):
+
+5. ``mvariants``  — the PREDECLARED M-set of
+   ``docs/sell-exit-research-2026-10-31.md`` §4a (M0..M4b,
+   ``configs_tried = 7``): the monthly qv-mom book run through
+   ``optimize._daily_core_backtest`` with existing knobs only (zero engine
+   changes) — M0 = all "monthly/none" defaults (the engine's documented
+   equivalence to the monthly qv-mom backtest, pinned here as the parity
+   anchor vs ``optimize._monthly_backtest``), M1 = ``exit_cadence="daily"``
+   (band-dropped names released the next day), M2 = M1 +
+   ``entry_gate="not-crash"``, M3a/M3b = M1 + ``target_vol`` 0.20/0.25,
+   M4a/M4b = M1 + a 25%/30% per-name catastrophe trailing stop. Each variant
+   gets the honest metric pipeline (the per-session equity series is
+   RECONSTRUCTED from the engine's per-leg trade ledger + EOD mark policy
+   exactly like ``reval._run_daily_core_arm`` — ``BacktestSummary`` exposes
+   no per-session equity series, a declared deviation), plus the
+   factor-relevant exit stats: sell-mix by reason class (band release at
+   rebuild / intraday / trailing stop, classified from the ledger + the
+   shared frame cache's bands), holding-period stats, Odean PGR/PLR, and the
+   band-drop release lag in sessions.
+
 It is ANALYSIS-ONLY and OFFLINE-ONLY:
 
 * it never writes the database — ``reval.point_at_database`` opens the target
@@ -97,6 +118,9 @@ CLI (offline)::
         --start 2022-01-01 --end 2023-12-31 --out DIR
     python -m app.sellshadow defer    ... (same args)
     python -m app.sellshadow variants ... (same args)
+    python -m app.sellshadow mvariants --db ... --universe sp500 \
+        --universes-dir ... --start 2015-01-02 --end 2026-10-30 \
+        [--window 2022-01-01,2024-12-31] --out DIR
 
 Library-first: everything is callable as plain functions from tests.
 """
@@ -123,6 +147,7 @@ from .optimize import ReplayParams
 SCHEMA_CONTEXTS = "stopfire-context/1"
 SCHEMA_LEDGER = "defer-ledger/1"
 SCHEMA_VARIANTS = "sellshadow-variants/1"
+SCHEMA_MVARIANTS = "monthly-variants/1"
 PROMPT_VERSION = "sellshadow/1"
 
 # Recorded configuration constants — the authorized model is NEVER called in
@@ -143,6 +168,12 @@ BENCHMARK = "URTH"
 DEFAULT_START = "2015-01-02"
 DEFAULT_END = "2026-10-30"
 VARIANTS_CONFIGS_TRIED = 5
+MVARIANTS_CONFIGS_TRIED = 7
+# M0 parity tolerance: the engine's own sanity check
+# (tests/test_optimize.py TestDailyCoreMonthlyParity) allows 5pp/yr IRR
+# between the daily-core defaults and the monthly baseline; contributed must
+# match exactly (same funding calendar).
+M0_PARITY_IRR_TOL = 0.05
 
 _STOP_REASON_RE = re.compile(
     r"^ATR stop standing order: (open|low) ([0-9.]+) <= level ([0-9.]+) — filled at (the open|the level)$"
@@ -979,7 +1010,590 @@ async def run_variants(db_url: str, universe: str, universes_dir: str | None,
 
 
 # ---------------------------------------------------------------------------
-# 5. CLI
+# 5. Slice 5B: the monthly-book sell variants (the predeclared M-set, §4a)
+# ---------------------------------------------------------------------------
+
+def monthly_variant_params() -> dict[str, dict]:
+    """The PREDECLARED M-set of ``docs/sell-exit-research-2026-10-31.md`` §4a,
+    as ``optimize._daily_core_backtest`` keyword arguments (interpretation
+    pinned here): all variants share dca="monthly" (the monthly funding
+    cadence — the owner's strategy), entry_gate="none", crash_pause=False,
+    every risk overlay at its off default, and the flat ``cost_oneway``
+    convention; only the named knob differs from M0.
+
+    * M0 — all "monthly/none" defaults: the engine's documented reduction to
+      the monthly qv-mom backtest (the parity anchor, checked in
+      ``run_mvariants`` against ``optimize._monthly_backtest``).
+    * M1 — M0 + ``exit_cadence="daily"``: a band-dropped holding is released
+      the NEXT session.
+    * M2 — M1 + ``entry_gate="not-crash"``.
+    * M3a/M3b — M1 + ``target_vol`` 0.20/0.25 (Barroso-Santa-Clara scaling of
+      EXISTING exposure; the engine only caps deployment down).
+    * M4a/M4b — M1 + a per-name catastrophe trailing stop at 25%/30% from the
+      peak since entry. NOTE the engine knob is a FRACTION
+      (``level = peak * (1 - trailing_stop_pct)``), so the doc's 25%/30% is
+      plumbed as 0.25/0.30 — existing engine convention wins over the doc's
+      percent notation.
+
+    M5 (thesis-break) needs an engine hook and is explicitly out of scope.
+    """
+    base = {"dca": "monthly", "entry_gate": "none", "exit_cadence": "monthly",
+            "crash_pause": False, "vol_weight": None, "target_vol": None,
+            "portfolio_stop_pct": None, "exposure_trend_days": None,
+            "trailing_stop_pct": None}
+    daily = {**base, "exit_cadence": "daily"}
+    return {
+        "M0": dict(base),
+        "M1": dict(daily),
+        "M2": {**daily, "entry_gate": "not-crash"},
+        "M3a": {**daily, "target_vol": 0.20},
+        "M3b": {**daily, "target_vol": 0.25},
+        "M4a": {**daily, "trailing_stop_pct": 0.25},
+        "M4b": {**daily, "trailing_stop_pct": 0.30},
+    }
+
+
+@dataclass
+class CoreWindow:
+    """Everything one M-set window needs, loaded ONCE and shared by all seven
+    variants (the 4B study driver's one-load/shared-cache pattern): universe,
+    the factor frames, fundamentals and the prebuilt eligibility-frame cache."""
+    universe: dict
+    open_px: pd.DataFrame
+    close: pd.DataFrame
+    vol: pd.DataFrame
+    fund: dict
+    frame_cache: dict[pd.Timestamp, pd.DataFrame | None]
+    start: str
+    end: str
+    db_url: str
+    universes_dir: str | None = None
+
+
+def _prior_month_end(full_idx: pd.DatetimeIndex, first_day: pd.Timestamp) -> pd.Timestamp | None:
+    """The engine's pre-window ranking month-end (optimize.py's
+    ``prior_month_end`` rule, mirrored): the last stored session at/below the
+    scheduled last trading day of the window start's previous month."""
+    from . import monthly as monthly_mod
+    prev_y, prev_m = (first_day.year - 1, 12) if first_day.month == 1 else (first_day.year, first_day.month - 1)
+    pme_sched = pd.Timestamp(monthly_mod.month_last_trading_day(datetime(prev_y, prev_m, 1)))
+    prev_idx = full_idx[full_idx <= pme_sched]
+    return prev_idx[-1] if len(prev_idx) else None
+
+
+async def load_core_window(uni: dict, db_url: str, universes_dir: str | None,
+                           start: str, end: str) -> CoreWindow:
+    """Resolve the universe, point at the snapshot DB READ-ONLY, load the
+    factor OHLCV frames + fundamentals, and prebuild the eligibility-frame
+    cache for every month-end the window can touch (in-window month-ends +
+    the pre-window prior month-end), pinned to the raw mom variant — one load,
+    shared by all variants and by the M0 parity call."""
+    from . import monthly as monthly_mod
+    from . import fundamentals as fundamentals_mod
+    members = uni["members"]
+    open_px, close, vol = await monthly_mod.load_ohlcv_frames(members)
+    fund = await fundamentals_mod.load_fundamentals(members)
+    if close.empty:
+        raise ValueError("no candle data found in the snapshot for the universe")
+    full_idx = pd.DatetimeIndex(close.index)
+    lo, hi = pd.Timestamp(start), pd.Timestamp(end)
+    days_all = full_idx[(full_idx >= lo) & (full_idx <= hi)]
+    if not len(days_all):
+        raise ValueError(f"no sessions in window {start}..{end}")
+    months = monthly_mod.completed_month_ends(close.index, days_all[0], days_all[-1])
+    prior = _prior_month_end(full_idx, days_all[0])
+    frame_cache: dict[pd.Timestamp, pd.DataFrame | None] = {}
+    with reval._settings_overrides(sim_daily_core_mom_variant="raw"):
+        for me in sorted(set(months) | ({prior} if prior is not None else set())):
+            frame_cache[me] = await asyncio.to_thread(
+                monthly_mod.eligible_frame, me, close, vol, fund)
+    return CoreWindow(universe=uni, open_px=open_px, close=close, vol=vol,
+                      fund=fund, frame_cache=frame_cache, start=start, end=end,
+                      db_url=db_url, universes_dir=universes_dir)
+
+
+def _close_series(close: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """The light ``{ticker: {time, close}}`` adapter the module's existing
+    holding/disposition helpers expect, built once from the wide close frame."""
+    times = [d.strftime("%Y-%m-%d") for d in close.index]
+    return {t: pd.DataFrame({"time": times, "close": close[t].tolist()})
+            for t in close.columns}
+
+
+def _reconstruct_core_series(summary, win: CoreWindow, contribution: float,
+                             stock_rate: float, fx_rate: float) -> dict:
+    """Rebuild the per-session account from the engine's per-leg trade ledger,
+    mirroring ``reval._run_daily_core_arm`` EXACTLY (same EOD mark policy —
+    fresh forward-filled close, else cost basis — same contribution days, same
+    flat stock rate at fill, same per-fill post-hoc FX fee on non-USD legs).
+
+    ``BacktestSummary`` exposes NO per-session equity series, so the honest
+    metric pipeline's daily series is this reconstruction (declared deviation
+    from ``run_variant``, which reads ``_replay``'s own equity curve); the
+    reconstruction reproduces the engine's own EOD marks (reval's suite pins
+    ``reconstructed_final_equity == final_value`` to 1e-6).
+    """
+    from . import monthly as monthly_mod
+    from . import price_freshness
+    from .config import settings
+    from .instruments import is_usd_native
+    close = win.close
+    idx_all = pd.DatetimeIndex(close.index)
+    lo, hi = pd.Timestamp(win.start), pd.Timestamp(win.end)
+    days = idx_all[(idx_all >= lo) & (idx_all <= hi)]
+    contrib_days = optimize._contribution_days(days, {(d.year, d.month) for d in days})
+    fresh = price_freshness.freshness_mask(close, None, settings.factor_price_max_age_days)
+    close_val = close.ffill()
+
+    def eod_mark(t: str, d: pd.Timestamp, cost_basis: dict[str, float]) -> float:
+        try:
+            is_fresh = bool(fresh.at[d, t])
+        except KeyError:
+            is_fresh = False
+        if not is_fresh:
+            return cost_basis.get(t, 0.0) or 0.0
+        p = monthly_mod.px_at(close_val, d, t)
+        return p if p is not None else 0.0
+
+    trades_by_date: dict[str, list[dict]] = {}
+    for t in summary.trades:
+        trades_by_date.setdefault(t["date"], []).append(t)
+
+    shares: dict[str, float] = {}
+    cost_basis: dict[str, float] = {}
+    cash = 0.0
+    invested = 0.0
+    dates: list[str] = []
+    equity_raw: list[float] = []
+    cash_s: list[float] = []
+    invested_s: list[float] = []
+    fx_fee_cum = 0.0
+    fx_fee: list[float] = []
+    for d in days:
+        ds = d.strftime("%Y-%m-%d")
+        if d in contrib_days:
+            cash += contribution
+            invested += contribution
+        for tr in trades_by_date.get(ds, []):
+            t, notional = tr["ticker"], float(tr["notional"])
+            if tr["side"] == "BUY":
+                cash -= notional * (1.0 + stock_rate)
+                prev = shares.get(t, 0.0)
+                shares[t] = prev + float(tr["shares"])
+                cost_basis[t] = ((prev * cost_basis.get(t, 0.0) + notional) / shares[t]
+                                 if prev > 0 else float(tr["price"]))
+            else:
+                cash += notional * (1.0 - stock_rate)
+                shares.pop(t, None)
+                cost_basis.pop(t, None)
+            if not is_usd_native(t):
+                fx_fee_cum += notional * fx_rate
+        eq = cash + sum(shares[t] * eod_mark(t, d, cost_basis) for t in sorted(shares))
+        dates.append(ds)
+        equity_raw.append(eq)
+        cash_s.append(cash)
+        invested_s.append(invested)
+        fx_fee.append(fx_fee_cum)
+    contrib_by_date = {d.strftime("%Y-%m-%d"): contribution for d in sorted(contrib_days)}
+    return {"dates": dates, "equity_raw": equity_raw, "cash": cash_s,
+            "invested": invested_s, "fx_fee": fx_fee,
+            "contrib_by_date": contrib_by_date}
+
+
+def _core_band_days(win: CoreWindow, hold_band: int) -> list[dict]:
+    """Per window session: the decision band (``order[:hold_band]`` of the
+    month frame the engine itself used — ``month_for(S)`` mirrored — from the
+    shared frame cache) and whether the day is a rebuild day (first session
+    after a completed month-end). ``band=None`` marks a dead frame day (no
+    ranking -> the engine's release pass does not run there)."""
+    from . import monthly as monthly_mod
+    full_idx = pd.DatetimeIndex(win.close.index)
+    lo, hi = pd.Timestamp(win.start), pd.Timestamp(win.end)
+    days_all = full_idx[(full_idx >= lo) & (full_idx <= hi)]
+    months = monthly_mod.completed_month_ends(win.close.index, days_all[0], days_all[-1])
+    month_set = set(months)
+    locs = full_idx.get_indexer(pd.DatetimeIndex(days_all))
+    prior = _prior_month_end(full_idx, days_all[0])
+    band_of: dict[pd.Timestamp, set | None] = {}
+    for me in set(months) | ({prior} if prior is not None else set()):
+        frame = win.frame_cache.get(me)
+        if frame is None or not frame["eligible"].any():
+            band_of[me] = None
+        else:
+            _elig, order = monthly_mod._qv_order(frame)
+            band_of[me] = set(order[:hold_band])
+    out = []
+    for i, d in enumerate(days_all):
+        li = locs[i]
+        s_prev = full_idx[li - 1] if li > 0 else None
+        rebuild = s_prev is not None and s_prev in month_set
+        if s_prev is None:
+            me = prior
+        else:
+            m = [m for m in months if m <= s_prev]
+            me = m[-1] if m else prior
+        out.append({"date": d.strftime("%Y-%m-%d"), "band": band_of.get(me),
+                    "rebuild": rebuild})
+    return out
+
+
+def _classify_core_sells(summary, win: CoreWindow, band_days: list[dict],
+                         trailing_stop_pct: float | None) -> list[dict]:
+    """Classify every SELL of a daily-core run and measure the band-drop
+    release lag. DECLARED METHOD (the trade ledger carries no reason string,
+    so the classes are derived from the ledger + the frame cache, in the
+    engine's own decision order — the band-release pass runs before the
+    trailing stop):
+
+    * ``band_release_at_rebuild`` / ``band_release_intraday`` — the sold name
+      is outside the band of the fill day's decision frame (band = None days
+      never release). ``release_lag_sessions`` = sessions from the FIRST
+      session at/after the stint's entry whose decision band excludes the name
+      to the fill date: 0 = released on the first out-of-band session
+      (``exit_cadence="daily"``), up to ~21 = held to the next month-end
+      rebuild (``exit_cadence="monthly"``) when the rebuild-day fill failed
+      (no stored bar that session).
+    * ``trailing_stop`` — name still in band, but the fill (the session's
+      strict open) is through the standing level ``peak_since_entry *
+      (1 - trailing_stop_pct)`` recomputed from the ledger + closes (the same
+      peak rule the engine advances at each session's close).
+    * ``other`` — anything else.
+    """
+    day_idx = {d["date"]: i for i, d in enumerate(band_days)}
+    band_at = {d["date"]: d["band"] for d in band_days}
+    rebuild_at = {d["date"]: d["rebuild"] for d in band_days}
+    close_val = win.close.ffill()
+    close_map = {t: dict(zip([d.strftime("%Y-%m-%d") for d in close_val.index],
+                             close_val[t].tolist(), strict=True))
+                 for t in close_val.columns}
+    entry: dict[str, tuple[str, float]] = {}  # ticker -> (entry date, entry price)
+    events: list[dict] = []
+    for t in summary.trades:
+        tk = t["ticker"]
+        if t["side"] == "BUY":
+            entry.setdefault(tk, (t["date"], float(t["price"])))
+            continue
+        F = t["date"]
+        e, e_px = entry.pop(tk, (None, 0.0))
+        band = band_at.get(F)
+        lag = None
+        cls = "other"
+        if band is not None and tk not in band:
+            if e is not None:
+                for i in range(day_idx.get(e, 0), day_idx.get(F, len(band_days) - 1) + 1):
+                    b = band_days[i]["band"]
+                    if b is not None and tk not in b:
+                        lag = day_idx[F] - i
+                        break
+            cls = ("band_release_at_rebuild" if rebuild_at.get(F)
+                   else "band_release_intraday")
+        elif trailing_stop_pct:
+            peak = e_px
+            if e is not None:
+                for i in range(day_idx.get(e, 0),
+                               min(day_idx.get(F, len(band_days) - 1), len(band_days) - 1)):
+                    c = close_map.get(tk, {}).get(band_days[i]["date"])
+                    if c is not None and c > peak:
+                        peak = c
+            level = peak * (1.0 - trailing_stop_pct) if peak > 0 else 0.0
+            if level > 0 and float(t["price"]) <= level:
+                cls = "trailing_stop"
+        events.append({"ticker": tk, "fill_date": F, "class": cls,
+                       "release_lag_sessions": lag})
+    return events
+
+
+def _lag_stats(events: list[dict]) -> dict:
+    lags = sorted(e["release_lag_sessions"] for e in events
+                  if e["class"].startswith("band_release")
+                  and e["release_lag_sessions"] is not None)
+    n = len(lags)
+    med = lags[n // 2] if n % 2 else (lags[n // 2 - 1] + lags[n // 2]) / 2 if n else None
+    by_class: dict[str, dict] = {}
+    for e in events:
+        if not e["class"].startswith("band_release"):
+            continue
+        b = by_class.setdefault(e["class"], {"n": 0, "lags": []})
+        b["n"] += 1
+        if e["release_lag_sessions"] is not None:
+            b["lags"].append(e["release_lag_sessions"])
+    return {
+        "n_band_releases": n,
+        "median_sessions": med,
+        "mean_sessions": (sum(lags) / n) if n else None,
+        "max_sessions": lags[-1] if n else None,
+        "by_class": {c: {"n": b["n"],
+                         "max_lag": max(b["lags"]) if b["lags"] else None,
+                         "median_lag": (sorted(b["lags"])[len(b["lags"]) // 2]
+                                        if b["lags"] else None)}
+                     for c, b in sorted(by_class.items())},
+    }
+
+
+async def run_monthly_variant(win: CoreWindow, name: str, knobs: dict, *,
+                              series: dict[str, pd.DataFrame] | None = None,
+                              costs: reval.CostConfig | None = None,
+                              contribution: float = CONTRIBUTION) -> dict:
+    """One M-set variant through ``optimize._daily_core_backtest`` + the honest
+    metric pipeline. Mirrors ``run_variant``'s metrics dict exactly (TWR ann/cum,
+    XIRR, maxDD, vol, excess Sharpe with rf = the declared 3% cash yield,
+    annualized turnover, n_trades/n_sells) on the reconstructed per-session
+    series, PLUS the factor exit stats: sell-mix by reason class, holding-period
+    stats, Odean PGR/PLR and the band-drop release lag.
+
+    The caller holds the ambient contexts (``reval.universes_override`` for the
+    engine's own universe-file resolution; the DB context when loading).
+    Cost convention (mirrors ``reval._run_daily_core_arm``): the stock leg goes
+    through the engine's flat ``cost_oneway`` wrapper; the FX leg is a post-hoc
+    per-fill debit on non-USD legs, applied to the yield-adjusted equity.
+    """
+    import io
+    from contextlib import redirect_stdout
+    from types import SimpleNamespace
+    from .config import settings
+    from .performance import unitized_nav
+    costs = costs or reval.CostConfig()
+    stock_rate = costs.stock_oneway_bps / 1e4
+    fx_rate = costs.fx_oneway_bps / 1e4
+    target_n = int(settings.sim_monthly_target_n)
+    hold_band = int(settings.sim_monthly_hold_band)
+    with reval._settings_overrides(
+            sim_daily_core_mom_variant="raw", sim_daily_core_lowvol_tilt=False,
+            sim_daily_core_vol_weight=False, sim_daily_core_target_vol=0.0,
+            sim_daily_core_portfolio_stop=0.0, sim_daily_core_exposure_trend=0,
+            sim_daily_core_trailing_stop=0.0, sim_daily_core_basket_trend=0,
+            sim_daily_core_basket_confirm=3, sim_daily_core_basket_threshold=0.0,
+            sim_daily_core_basket_drawdown=0.0, sim_daily_core_basket_er_min=0.0,
+            sim_daily_core_basket_good_times=False, sim_daily_core_basket_arm_sma=200,
+            sim_monthly_rank_boost=0.0):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            summary = await optimize._daily_core_backtest(
+                win.start, win.end, win.universe["name"], contribution, False,
+                knobs["entry_gate"], knobs["exit_cadence"], knobs["crash_pause"],
+                knobs["dca"],
+                frame_cache=win.frame_cache, close_preloaded=(win.close, win.vol),
+                fund_preloaded=win.fund, open_preloaded=win.open_px,
+                cost_oneway=stock_rate, with_baseline=False,
+                vol_weight=knobs.get("vol_weight"),
+                target_vol=knobs.get("target_vol"),
+                portfolio_stop_pct=knobs.get("portfolio_stop_pct"),
+                exposure_trend_days=knobs.get("exposure_trend_days"),
+                trailing_stop_pct=knobs.get("trailing_stop_pct"))
+    if summary is None:
+        raise ValueError(f"daily-core backtest returned no summary for variant {name}")
+    config_line = next((ln.split("config:", 1)[1].strip()
+                        for ln in buf.getvalue().splitlines() if "config:" in ln), None)
+
+    rec = _reconstruct_core_series(summary, win, contribution, stock_rate, fx_rate)
+    dates, equity_raw = rec["dates"], rec["equity_raw"]
+    equity_adj, _interest = reval.apply_cash_yield(rec["cash"], equity_raw,
+                                                   CASH_YIELD_ANNUAL)
+    equity_adj = [e - d for e, d in zip(equity_adj, rec["fx_fee"], strict=True)]
+    nav = unitized_nav(equity_adj, rec["invested"])
+    twr = reval.twr_metrics(dates, nav)
+    trades = [{**t, "notional": float(t["notional"])} for t in summary.trades]
+    sells = [t for t in trades if t["side"] == "SELL"]
+
+    series = series if series is not None else _close_series(win.close)
+    # the daily-core ledger carries no reason strings; the holding/disposition
+    # helpers only read it on BUYs (entry_reason), so a default empty reason
+    # keeps them reusable unchanged
+    res_view = SimpleNamespace(trades=[{**t, "reason": ""} for t in summary.trades])
+    band_days = _core_band_days(win, hold_band)
+    sell_events = _classify_core_sells(summary, win, band_days,
+                                       knobs.get("trailing_stop_pct"))
+    mix: dict[str, int] = {}
+    for e in sell_events:
+        mix[e["class"]] = mix.get(e["class"], 0) + 1
+
+    return {
+        "name": name,
+        "knobs": {k: knobs[k] for k in sorted(knobs)},
+        "config_line": config_line,
+        "params": {"dca": knobs["dca"], "entry_gate": knobs["entry_gate"],
+                   "exit_cadence": knobs["exit_cadence"],
+                   "crash_pause": knobs["crash_pause"],
+                   "target_vol": knobs.get("target_vol"),
+                   "trailing_stop_pct": knobs.get("trailing_stop_pct"),
+                   "target_n": target_n, "hold_band": hold_band,
+                   "mom_variant": "raw", "contribution": contribution,
+                   "start_cash": START_CASH,
+                   "cost_oneway_flat": stock_rate},
+        "metrics": {
+            "twr_annualized": twr["twr_annualized"],
+            "twr_cumulative": twr["twr_cumulative"],
+            "xirr": reval.xirr_metric(dates, rec["invested"],
+                                     equity_adj[-1] if equity_adj else None),
+            "max_drawdown_pct": reval.drawdown_metrics(nav)["max_drawdown_pct"],
+            "vol_annualized": reval.annualized_vol(nav),
+            "sharpe_excess": reval.excess_sharpe(nav, CASH_YIELD_ANNUAL),
+            "rf_annual": CASH_YIELD_ANNUAL,
+            "turnover_annualized": reval.turnover_metrics(
+                dates, trades, equity_adj, rec["contrib_by_date"])["annualized"],
+            "n_trades": summary.n_trades,
+            "n_sells": len(sells),
+        },
+        "sell_mix": dict(sorted(mix.items())),
+        "holding": holding_period_stats(res_view, series),
+        "disposition": disposition_metrics(res_view, series),
+        "release_lag": {
+            "method": ("sessions between the first session whose decision band "
+                       "(the engine's own month frame, recomputed from the shared "
+                       "frame cache) excludes the sold name and the SELL fill date; "
+                       "0 = released on the first out-of-band session "
+                       "(exit_cadence='daily'), up to ~21 = held to the next "
+                       "month-end rebuild (exit_cadence='monthly') when the "
+                       "rebuild-day fill failed (no stored bar); trailing-stop "
+                       "sells carry no lag"),
+            **_lag_stats(sell_events),
+        },
+        "engine_summary": {
+            "irr": summary.irr, "final_value": summary.final_value,
+            "contributed": summary.contributed, "avg_turnover": summary.avg_turnover,
+            "n_trades": summary.n_trades, "window": list(summary.window),
+            "sharpe": summary.sharpe, "max_drawdown": summary.max_drawdown,
+            "brake_events": summary.brake_events, "basket_events": summary.basket_events,
+            "reconstructed_final_equity": equity_raw[-1] if equity_raw else None,
+        },
+        "final_equity": equity_adj[-1] if equity_adj else None,
+    }
+
+
+async def _m0_parity_vs_monthly(win: CoreWindow, m0: dict,
+                                costs: reval.CostConfig | None = None,
+                                contribution: float = CONTRIBUTION) -> dict:
+    """The M0 parity acceptance check: M0 (daily-core all-defaults) vs
+    ``optimize._monthly_backtest`` over the SAME window, the SAME shared frame
+    cache and the SAME flat cost — the engine's documented equivalence. The
+    invariant pair: ``contributed`` must match EXACTLY (same funding calendar);
+    IRR within ``M0_PARITY_IRR_TOL`` (5pp/yr, mirroring the engine's own sanity
+    test in tests/test_optimize.py) — final_value/avg_turnover are REPORTED,
+    not asserted: the monthly engine is an aggregate-value model marked only
+    at fills while the daily-core engine is a share ledger marked daily (the
+    documented differences between the two engines' summaries)."""
+    import io
+    from contextlib import redirect_stdout
+    costs = costs or reval.CostConfig()
+    stock_rate = costs.stock_oneway_bps / 1e4
+    with reval._settings_overrides(
+            sim_monthly_cost_oneway=stock_rate, sim_daily_core_mom_variant="raw",
+            sim_monthly_rank_boost=0.0, sim_daily_core_lowvol_tilt=False,
+            sim_daily_core_vol_weight=False, sim_daily_core_target_vol=0.0,
+            sim_daily_core_portfolio_stop=0.0, sim_daily_core_exposure_trend=0,
+            sim_daily_core_trailing_stop=0.0, sim_daily_core_basket_trend=0,
+            sim_daily_core_basket_confirm=3, sim_daily_core_basket_threshold=0.0,
+            sim_daily_core_basket_drawdown=0.0, sim_daily_core_basket_er_min=0.0,
+            sim_daily_core_basket_good_times=False, sim_daily_core_basket_arm_sma=200):
+        with redirect_stdout(io.StringIO()):
+            mb = await optimize._monthly_backtest(
+                win.start, win.end, win.universe["name"], contribution, False,
+                frame_cache=win.frame_cache, close_preloaded=(win.close, win.vol),
+                fund_preloaded=win.fund, open_preloaded=win.open_px)
+    if mb is None:
+        raise ValueError("monthly backtest returned no summary for the parity window")
+    m0e = m0["engine_summary"]
+    d_irr = m0e["irr"] - mb.irr
+    return {
+        "method": ("M0 (daily-core, all 'monthly/none' defaults) vs "
+                   "optimize._monthly_backtest on the same window, same shared "
+                   "frame cache, same flat one-way cost — the engine's documented "
+                   "equivalence sanity check"),
+        "m0_engine": {k: m0e[k] for k in ("irr", "final_value", "contributed",
+                                          "avg_turnover", "n_trades", "window")},
+        "monthly_engine": {"irr": mb.irr, "final_value": mb.final_value,
+                           "contributed": mb.contributed, "avg_turnover": mb.avg_turnover,
+                           "n_trades": mb.n_trades, "window": list(mb.window)},
+        "delta": {"irr": d_irr, "final_value": m0e["final_value"] - mb.final_value,
+                  "avg_turnover": m0e["avg_turnover"] - mb.avg_turnover},
+        "checks": {
+            "contributed_equal": m0e["contributed"] == mb.contributed,
+            "irr_abs_diff_within_tol": abs(d_irr) <= M0_PARITY_IRR_TOL,
+            "irr_tolerance": M0_PARITY_IRR_TOL,
+        },
+        "tolerance_note": ("contributed must match exactly (same funding calendar); "
+                           "IRR tolerance 5pp/yr mirrors the engine's own sanity test "
+                           "(tests/test_optimize.py TestDailyCoreMonthlyParity) — the two "
+                           "engines differ by documented aggregate-vs-share-ledger "
+                           "approximations, so final_value/avg_turnover are reported, "
+                           "not asserted"),
+    }
+
+
+async def run_mvariants(db_url: str, universe: str, universes_dir: str | None,
+                       start: str, end: str, generated_at: str | None = None,
+                       costs: reval.CostConfig | None = None) -> dict:
+    """Run the whole predeclared M-set (7 configs) on one read-only window:
+    one frame/fundamentals/frame-cache load shared by all variants, each
+    variant through ``run_monthly_variant``, plus the M0 parity check vs
+    ``optimize._monthly_backtest``. Deterministic sorted-keys JSON; the CLI
+    supplies ``generated_at``."""
+    costs = costs or reval.CostConfig()
+    uni = reval.resolve_universe(universe, universes_dir)
+    with reval.universes_override(universes_dir):
+        async with reval.point_at_database(db_url):
+            win = await load_core_window(uni, db_url, universes_dir, start, end)
+            series = _close_series(win.close)
+            variants = [await run_monthly_variant(win, name, knobs, series=series,
+                                                  costs=costs)
+                        for name, knobs in monthly_variant_params().items()]
+            parity = await _m0_parity_vs_monthly(win, variants[0], costs)
+    from .config import settings
+    return {
+        "schema": SCHEMA_MVARIANTS,
+        "generated_at": generated_at,
+        "db": {"url": db_url, "read_only": True},
+        "universe": uni,
+        "window": {"start": start, "end": end,
+                   "sessions": len(pd.DatetimeIndex(win.close.index)[
+                       (pd.DatetimeIndex(win.close.index) >= pd.Timestamp(start))
+                       & (pd.DatetimeIndex(win.close.index) <= pd.Timestamp(end))])},
+        "config": {
+            "model_id": MODEL_ID, "temperature": TEMPERATURE,
+            "note": "recorded constants only — this slice makes zero LLM/network calls",
+            "engine": ("optimize._daily_core_backtest, CONTRACT session fills, one "
+                       "shared eligibility-frame cache (mom_variant=raw) across all "
+                       "variants and the parity call"),
+            "cash_yield_annual": CASH_YIELD_ANNUAL,
+            "contribution": CONTRIBUTION, "start_cash": START_CASH,
+            "target_n": int(settings.sim_monthly_target_n),
+            "hold_band": int(settings.sim_monthly_hold_band),
+            "mom_variant": "raw",
+            "cost_rule": ("flat one-way stock bps through the engine's cost_oneway "
+                          "wrapper + FX leg post-hoc per non-USD fill, mirroring "
+                          "reval._run_daily_core_arm's declared convention"),
+            "stock_oneway_bps": costs.stock_oneway_bps, "fx_oneway_bps": costs.fx_oneway_bps,
+            "equity_series": ("per-session series RECONSTRUCTED from the engine's "
+                              "per-leg trade ledger + EOD mark policy (fresh ffilled "
+                              "close else cost basis), mirroring reval._run_daily_core_arm; "
+                              "BacktestSummary exposes no per-session equity series — "
+                              "declared deviation from run_variant"),
+            "configs_tried": MVARIANTS_CONFIGS_TRIED,
+            "caveats": [
+                "the band is the MONTH-END frame: exit_cadence='daily' releases an "
+                "out-of-band holding on the next session (including retries of fills "
+                "that failed on the rebuild day for lack of a stored bar), while "
+                "'monthly' waits for the next month-end rebuild (up to ~21 sessions)",
+                "M4a/M4b plumb the engine's fractional trailing_stop_pct knob as "
+                "0.25/0.30 (the doc's 25%/30% levels)",
+                "the reconstructed equity series is a ledger replay of the engine's "
+                "own fills/marks, not an independently observed curve; the FX debit "
+                "is post-hoc (per fill, not compounded into mid-window cash)",
+                "universes are current-membership snapshots (survivorship bias in "
+                "absolute terms; the seven variants share one universe and one "
+                "window, so their RELATIVE comparison is robust to it)",
+                "the cash yield and the risk-free proxy are post-hoc declared assumptions",
+                "M5 (thesis-break) is out of scope (needs an engine hook)",
+            ],
+        },
+        "m_set": monthly_variant_params(),
+        "parity_m0_vs_monthly": parity,
+        "variants": variants,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 6. CLI
 # ---------------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -990,7 +1604,8 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
     for name, help_ in (("contexts", "extract stop-fire contexts (stopfire-context/1)"),
                         ("defer", "build the counterfactual defer ledger (defer-ledger/1)"),
-                        ("variants", "run the five deterministic exit variants")):
+                        ("variants", "run the five deterministic exit variants"),
+                        ("mvariants", "run the predeclared monthly-book M-set (monthly-variants/1)")):
         s = sub.add_parser(name, help=help_)
         s.add_argument("--db", required=True,
                        help="database URL of the snapshot to read (opened read-only)")
@@ -1003,24 +1618,64 @@ def _build_parser() -> argparse.ArgumentParser:
         s.add_argument("--generated-at", default=None,
                        help="caller-supplied ISO timestamp recorded in the output "
                             "(default: wall-clock UTC)")
+        if name == "mvariants":
+            s.add_argument("--window", default=None,
+                           help="comma-separated START,END overriding --start/--end "
+                                "(e.g. 2022-01-01,2024-12-31 for a smoke run)")
     return p
+
+
+def _fmt_pct(x) -> str:
+    return "n/a" if x is None else f"{x * 100:.2f}%"
+
+
+def _print_mvariants_table(report: dict) -> None:
+    print(f"{'variant':<5} {'twr_ann':>9} {'xirr':>9} {'maxDD':>8} {'vol':>7} "
+          f"{'sharpe':>7} {'turn/yr':>8} {'sells':>6} {'lag_med':>8} {'lag_max':>8}  sell-mix")
+    for v in report["variants"]:
+        m = v["metrics"]
+        rl = v["release_lag"]
+        mix = ",".join(f"{k}:{n}" for k, n in v["sell_mix"].items()) or "-"
+        print(f"{v['name']:<5} {_fmt_pct(m['twr_annualized']):>9} "
+              f"{_fmt_pct(m['xirr']):>9} "
+              f"{(f'{m['max_drawdown_pct']:.1f}%' if m['max_drawdown_pct'] is not None else 'n/a'):>8} "
+              f"{_fmt_pct(m['vol_annualized']):>7} "
+              f"{(f'{m['sharpe_excess']:.2f}' if m['sharpe_excess'] is not None else 'n/a'):>7} "
+              f"{_fmt_pct(m['turnover_annualized']):>8} {m['n_sells']:>6} "
+              f"{(f'{rl['median_sessions']:g}' if rl['median_sessions'] is not None else 'n/a'):>8} "
+              f"{(f'{rl['max_sessions']:g}' if rl['max_sessions'] is not None else 'n/a'):>8}  {mix}")
+    p = report["parity_m0_vs_monthly"]
+    print(f"M0 parity vs _monthly_backtest: contributed_equal="
+          f"{p['checks']['contributed_equal']} irr_within_{p['checks']['irr_tolerance']:g}="
+          f"{p['checks']['irr_abs_diff_within_tol']} "
+          f"(M0 irr {p['m0_engine']['irr']:.4f} vs monthly {p['monthly_engine']['irr']:.4f}; "
+          f"final value {p['m0_engine']['final_value']:.2f} vs "
+          f"{p['monthly_engine']['final_value']:.2f}; avg turnover "
+          f"{p['m0_engine']['avg_turnover']:.4f} vs {p['monthly_engine']['avg_turnover']:.4f})")
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    start, end = args.start, args.end
+    if getattr(args, "window", None):
+        start, end = (w.strip() for w in args.window.split(",", 1))
     generated_at = args.generated_at or datetime.now(UTC).isoformat()
     try:
         if args.command == "contexts":
             report = asyncio.run(run_contexts(args.db, args.universe, args.universes_dir,
-                                              args.start, args.end, generated_at))
+                                              start, end, generated_at))
             fname = "stopfire-contexts.json"
         elif args.command == "defer":
             report = asyncio.run(run_defer(args.db, args.universe, args.universes_dir,
-                                           args.start, args.end, generated_at))
+                                           start, end, generated_at))
             fname = "defer-ledger.json"
+        elif args.command == "mvariants":
+            report = asyncio.run(run_mvariants(args.db, args.universe, args.universes_dir,
+                                               start, end, generated_at))
+            fname = "monthly-variants.json"
         else:
             report = asyncio.run(run_variants(args.db, args.universe, args.universes_dir,
-                                              args.start, args.end, generated_at))
+                                              start, end, generated_at))
             fname = "sellshadow-variants.json"
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -1038,6 +1693,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{fname} written to {out}/{fname} (schema {report['schema']}, "
               f"{agg['n']} events, mean delta {agg['mean']}, "
               f"share positive {agg['share_positive']})")
+    elif args.command == "mvariants":
+        print(f"{fname} written to {out}/{fname} (schema {report['schema']}, "
+              f"configs_tried {report['config']['configs_tried']}, window "
+              f"{report['window']['start']}..{report['window']['end']})")
+        _print_mvariants_table(report)
     else:
         names = ", ".join(v["name"] for v in report["variants"])
         print(f"{fname} written to {out}/{fname} (schema {report['schema']}, "

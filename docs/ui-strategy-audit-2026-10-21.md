@@ -1487,6 +1487,94 @@ changes the funding schedule (XIRR/TWR compare differently across cases
 than within one); survivorship caveat unchanged (absolute vs dca
 biased, cross-arm deltas robust).
 
+## Phase 5B monthly-book sell variants (the M-set) — 2026-10-31
+
+**Slice 5B code-complete, independently verified, and committed.** The
+owner's extension — monthly fundamental (qv-mom) buys plus a mechanism to
+sell during the month — predeclared as the seven-config M-set
+(`docs/sell-exit-research-2026-10-31.md` §4a, frozen before any run) and
+run through the honest metric pipeline on the read-only snapshot.
+
+`app/sellshadow.py` (+670 lines): `monthly_variant_params()` (the
+predeclared M-set as `_daily_core_backtest` keyword arguments — all
+variants share dca="monthly", the monthly funding cadence;
+`trailing_stop_pct` plumbed as fractions 0.25/0.30 per the engine knob's
+actual semantics), `CoreWindow`/`load_core_window()` (ONE read-only load +
+ONE shared eligibility-frame cache across all seven variants and the
+parity call — the 4B study pattern), `_reconstruct_core_series()` (the
+per-session equity series rebuilt from the engine's per-leg trade ledger
++ EOD mark policy, mirroring `reval._run_daily_core_arm` exactly and
+pinned to the engine's own final mark at 1e-6), the sell-mix classifier +
+band-release lag stats (declared method: sessions from the first
+out-of-band decision session to the fill), `run_mvariants()`
+(`monthly-variants/1`, `configs_tried=7`, sorted-keys determinism,
+conventions/caveats verbatim in the header), the M0 parity check, and the
+`mvariants` CLI. `tests/test_sellshadow.py` (+334 lines, 7 new tests on a
+new self-contained 12-ticker factor tape: schema, M0 parity, release lag,
+knob plumbing, determinism, no-write proof, CLI smoke).
+
+**Full-window verdicts (2015-01-02..2026-10-30, 2,977 sessions, sp500
+snapshot, CONTRIBUTION $1,000/month, flat 10bps + FX post-hoc, cash yield
+3%):**
+
+- **M0** (all "monthly/none" defaults — the engine's documented reduction
+  to the monthly arm): TWR +17.87%/yr, XIRR 20.04%, maxDD 35.1%, excess
+  Sharpe 0.75, 1.31×/yr turnover, 165 sells — every one a band release at
+  the rebuild, median hold 105 sessions, PGR 0.093 / PLR 0.141 (a healthy
+  disposition: the factor book holds winners ~5 months and realizes
+  losses slowly — the mirror image of the sim's 5-session stop churn).
+  Parity vs `optimize._monthly_backtest` over the same window: `contributed`
+  exactly equal ($141,000), IRR 20.27% vs 21.27% (1.0pp apart, within the
+  engine's own 5pp equivalence tolerance; final value 508.5K vs 542.9K —
+  the documented aggregate-fill-mark vs daily-share-ledger model
+  difference, amplified over 141 months but stable within tolerance).
+- **M1** (`exit_cadence="daily"` — the owner's core ask as predeclared):
+  **bit-identical to M0 across the entire decade** — all 165 band releases
+  already fill on the first session after the month-end rebuild, release
+  lag max 0 in both cadences. Verified at the engine level, not just
+  observed: the SELL pass only runs `if order:` and the band/order only
+  change at month-end rebuilds, so a daily cadence can only change the
+  retry timing of FAILED rebuild fills — which never occurred in 141
+  months on this snapshot. **The predeclared mechanism cannot deliver
+  intra-month selling because band-drops are only DETECTED monthly.** The
+  measured ~1%/quarter exit edge (§1.2) is realized at the month-end
+  frame; what cadence cannot fix is detection. The owner's ask therefore
+  rides on the intra-month EVENT sources: M5's filing-day thesis-break
+  re-check (the engine hook, next slice) and the 5C type-C alarms.
+- **M2** (M1 + `entry_gate="not-crash"`): also bit-identical — the
+  per-name not-crash gate (a buy blocked only when the name's own 5-day
+  run is ≤ −10% at the decision session) never bound once across the
+  decade. A no-op on this universe/window, honestly recorded.
+- **M3a** (`target_vol=0.20`, Barroso–Santa-Clara vol targeting):
+  **the decade's winner — better on every axis**: TWR +18.34%/yr
+  (+0.47pp vs M0), maxDD 33.3% (−1.8pp), Sharpe 0.79, turnover 1.25×
+  (LOWER than M0). M3b (0.25) close behind (+18.18%, 33.4%). The
+  literature's best-supported risk mechanism is the only predeclared
+  overlay that improved the book — a candidate UI variant pending the 4C
+  controls/bootstrap context.
+- **M4a/M4b** (per-name catastrophe trailing stops 25%/30%): **a dead
+  end** — TWR +16.68%/+17.31% (−1.2/−0.6pp vs M0) with WORSE drawdowns
+  (36.4%/36.0% vs 35.1%) and higher turnover (1.62×/1.50×); 61/34
+  trailing-stop fires. Per-name price stops now measured as
+  value-destroying on BOTH engines (the sim's ~21pp/yr gap, the factor
+  book's −1.2pp-and-worse-DD) — contra-indicated across the platform.
+
+Independent verification: the orchestrator's own runs — 19 sellshadow
+tests + 135 engine tests green, ruff clean; the full-window run above
+(4m41s wall-clock) on the read-only snapshot with parity passed and the
+snapshot's row counts/mtime re-verified unchanged; the M1/M2 no-op
+findings confirmed at the engine-code level (the SELL pass's `if order:`
+gate) and by the tape test (M0 lag 21 vs M1 lag 1 on a failed-fill
+scenario — the mechanism works, the event source is empty on this data).
+Honesty limits declared in every output: the equity series is a
+ledger-reconstructed replay of the engine's own fills/marks (not an
+independently observed curve; FX a post-hoc per-fill debit); "release
+next day" means the next SESSION after the band switch, not a daily
+re-ranking; survivorship caveat unchanged (absolute numbers biased,
+within-family comparisons robust); M1/M2's no-op verdicts are specific to
+this snapshot's dense sp500 bars (a universe with gappier members could
+produce failed rebuild fills where the cadence binds).
+
 ## References
 
 - [SEC Apple companyfacts](https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json)

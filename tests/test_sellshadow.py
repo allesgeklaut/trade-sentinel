@@ -507,3 +507,337 @@ def test_cli_smoke_offline(tmp_path):
                 "BASE", "V1_signal_exits", "V2_pct_trail_15",
                 "V3_initial_atr_only", "V4_portfolio_breaker"]
     assert _snapshot(SCRATCH_DB) == before  # CLI never wrote either
+
+
+# ---------------------------------------------------------------------------
+# Slice 5B: the monthly-book M-set (mvariants) on a small factor tape
+# ---------------------------------------------------------------------------
+#
+# A second, self-contained tape built for the FACTOR engines (the 5A-1 tape
+# above has no fundamentals): 12 USD tickers on the true US session calendar,
+# all-positive fundamentals with per-ticker ROE (T06 highest -> held from the
+# first picks), T06 additionally sinks -3%/day from 2025-11-03 (fires the M4
+# trailing stops, and by the 2025-12-31 month-end its mcap is below the
+# eligibility floor -> it drops out of the band) and its candle is MISSING on
+# 2026-01-02, the first session after the 2025-12-31 month-end — so under
+# exit_cadence="monthly" (M0) its release waits for the next rebuild
+# (2026-02-02, ~21 sessions) while under "daily" (M1) it fills on 2026-01-05
+# (1 session). Scratch DB: /tmp/opencode/reval/sell5b/scratch.db (the 5B slice
+# dir; the 5A-1 tests keep their sell5a DB untouched).
+
+M5B_DIR = Path("/tmp/opencode/reval/sell5b")
+M5B_DB = M5B_DIR / "scratch.db"
+M5B_URL = f"sqlite+aiosqlite:///{M5B_DB}"
+MUNI_NAME = "sellshadow-mtape"
+MTAPE_START = "2024-01-02"
+MTAPE_END = "2026-06-30"
+MW_START = "2025-01-02"
+MW_END = "2026-06-30"
+MW_SHORT = ("2025-06-02", "2026-06-30")
+MTICKERS = [f"T{i:02d}" for i in range(1, 13)]
+
+
+def _m_sessions() -> pd.DatetimeIndex:
+    from app import sim as sim_mod
+    dates = pd.bdate_range(MTAPE_START, MTAPE_END)
+    return pd.DatetimeIndex(
+        [d for d in dates if sim_mod.is_trading_day(d.to_pydatetime())])
+
+
+def make_mtape():
+    """The 5B factor tape: 12 tickers, piecewise paths, open != close.
+
+    T06 (highest ROE) sinks 0.97/day from 2025-11-17 and is missing its bar on
+    2026-01-02; every other name drifts up mildly with a phase-shifted wiggle
+    so month-end frames genuinely re-rank. Returns row dicts in the
+    ``market.candles()`` shape plus fundamentals in the ``load_fundamentals``
+    read schema. Timing: at the 2025-11-28 month-end T06 is still eligible and
+    in the band (mcap ~7.6e9, ROE still the top filing); by the 2025-12-31
+    month-end its sinking price puts mcap ~3.8e9 below the 5e9 floor (and the
+    2025-12-15 negative filing lands), so it drops out of the band exactly at
+    the 2025-12-31 frame."""
+    import numpy as np
+    idx = _m_sessions()
+    n = len(idx)
+    candles: dict[str, list[dict]] = {}
+    for i, t in enumerate(MTICKERS):
+        salt = sum((k + 1) * ord(c) for k, c in enumerate(t)) % 97
+        base = 100.0 + 5.0 * i
+        drift = 0.0004 + 0.0001 * (salt % 5)
+        close = base * np.exp(drift * np.arange(n))
+        if t == "T06":
+            mask = idx >= pd.Timestamp("2025-11-17")
+            k = np.cumsum(mask)
+            close = np.where(mask, base * 0.97 ** k, close)
+        phase = 0.6 * (i % 7)
+        close = close * (1.0 + 0.01 * np.sin(2 * np.pi * np.arange(n) / 9.0 + phase))
+        close = np.maximum(close, 1.0)
+        open_px = close * (1.0 - 0.002 * (np.arange(n) % 5) / 5.0)
+        rows = [{"time": d.strftime("%Y-%m-%d"),
+                 "open": round(float(o), 4), "high": round(float(max(o, c)) * 1.001, 4),
+                 "low": round(float(min(o, c)) * 0.999, 4),
+                 "close": round(float(c), 4), "volume": 1e6}
+                for d, o, c in zip(idx, open_px, close, strict=True)]
+        candles[t] = rows
+    # the deliberate missing bar on the rebuild day after the 2025-12-31 ME
+    candles["T06"] = [r for r in candles["T06"] if r["time"] != "2026-01-02"]
+
+    fundamentals: dict[str, dict[str, list[dict]]] = {}
+    for i, t in enumerate(MTICKERS):
+        roe = 0.50 if t == "T06" else 0.45 - 0.02 * i  # T06 top-ranked -> held
+        ni_entries = [{"start": "2024-01-01", "end": "2024-12-31", "filed": "2025-02-14",
+                       "val": 5e9 * roe}]
+        if t == "T06":
+            # filed 2025-12-15: from the 2025-12-31 frame on, T06's TTM NI (and
+            # with the sinking price its mcap) knocks it out of eligibility
+            ni_entries.append({"start": "2025-01-01", "end": "2025-09-30",
+                               "filed": "2025-12-15", "val": -1e9})
+        fundamentals[t] = {
+            "StockholdersEquity": [
+                {"start": None, "end": "2024-12-31", "filed": "2025-02-14", "val": 5e9}],
+            "NetIncomeLoss": ni_entries,
+            "CommonStockSharesOutstanding": [
+                {"start": None, "end": "2024-12-31", "filed": "2025-02-14", "val": 1e8}],
+            "NetCashProvidedByUsedInOperatingActivities": [
+                {"start": "2024-01-01", "end": "2024-12-31", "filed": "2025-02-14",
+                 "val": 1.0e9}],
+            "PaymentsToAcquirePropertyPlantAndEquipment": [
+                {"start": "2024-01-01", "end": "2024-12-31", "filed": "2025-02-14",
+                 "val": -2e8}],
+        }
+    return {"sessions": idx, "candles": candles, "fundamentals": fundamentals,
+            "tickers": list(MTICKERS)}
+
+
+async def _seed_m5b_db(tmp_path):
+    """Seed the M-tape (candles + fundamentals) into the fixed 5B scratch DB
+    and write its universe file; returns the universes dir."""
+    from app.db import Fundamental
+    M5B_DIR.mkdir(parents=True, exist_ok=True)
+    if M5B_DB.exists():
+        M5B_DB.unlink()
+    tape = make_mtape()
+    engine = create_async_engine(M5B_URL, connect_args={"timeout": 5})
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    candle_rows = [{"ticker": t, "timestamp": pd.Timestamp(r["time"]).to_pydatetime(),
+                    "open": r["open"], "high": r["high"], "low": r["low"],
+                    "close": r["close"], "volume": r["volume"]}
+                   for t, rows in tape["candles"].items() for r in rows]
+    fund_rows = [{"ticker": t, "tag": tag, "start": e["start"], "end": e["end"],
+                  "filed": e["filed"], "val": e["val"], "currency": "USD",
+                  "source": "edgar"}
+                 for t, tags in tape["fundamentals"].items()
+                 for tag, entries in tags.items() for e in entries]
+    async with factory() as s:
+        await s.execute(Candle.__table__.insert(), candle_rows)
+        await s.execute(Fundamental.__table__.insert(), fund_rows)
+        await s.commit()
+    await engine.dispose()
+    udir = tmp_path / "m-universes"
+    udir.mkdir(parents=True, exist_ok=True)
+    (udir / f"{MUNI_NAME}.txt").write_text("\n".join(tape["tickers"]) + "\n")
+    return str(udir)
+
+
+@pytest.fixture(scope="module")
+async def mrun(tmp_path_factory):
+    """One full M-set run on the M-tape window (settings pinned to a small
+    book so band drops actually occur: target_n=4, hold_band=8)."""
+    from app.config import settings
+    mp = pytest.MonkeyPatch()
+    mp.setattr(settings, "sim_monthly_target_n", 4)
+    mp.setattr(settings, "sim_monthly_hold_band", 8)
+    udir = await _seed_m5b_db(tmp_path_factory.mktemp("m5b"))
+    try:
+        report = await sellshadow.run_mvariants(
+            M5B_URL, MUNI_NAME, udir, MW_START, MW_END, GENERATED_AT)
+    finally:
+        mp.undo()
+    return report, udir
+
+
+def test_mvariants_schema_and_mset(mrun):
+    report, _ = mrun
+    assert report["schema"] == "monthly-variants/1"
+    assert report["config"]["configs_tried"] == 7
+    assert sellshadow.MVARIANTS_CONFIGS_TRIED == 7
+    assert [v["name"] for v in report["variants"]] == [
+        "M0", "M1", "M2", "M3a", "M3b", "M4a", "M4b"]
+    assert report["window"] == {"start": MW_START, "end": MW_END,
+                                "sessions": report["window"]["sessions"]}
+    assert report["db"]["read_only"] is True
+    assert list(report["m_set"]) == ["M0", "M1", "M2", "M3a", "M3b", "M4a", "M4b"]
+    assert report["m_set"]["M1"]["exit_cadence"] == "daily"
+    assert report["m_set"]["M2"]["entry_gate"] == "not-crash"
+    assert report["m_set"]["M3a"]["target_vol"] == 0.20
+    assert report["m_set"]["M3b"]["target_vol"] == 0.25
+    # the engine's fractional trailing-stop knob carries the doc's 25%/30%
+    assert report["m_set"]["M4a"]["trailing_stop_pct"] == 0.25
+    assert report["m_set"]["M4b"]["trailing_stop_pct"] == 0.30
+    for v in report["variants"]:
+        m = v["metrics"]
+        for key in ("twr_annualized", "twr_cumulative", "xirr", "max_drawdown_pct",
+                    "vol_annualized", "sharpe_excess", "turnover_annualized",
+                    "n_trades", "n_sells"):
+            assert key in m
+        assert m["n_trades"] > 0 and m["n_sells"] > 0
+        assert m["twr_annualized"] is not None and m["vol_annualized"] is not None
+        assert sum(v["sell_mix"].values()) == m["n_sells"]
+        assert v["holding"]["n_closed_lots"] == m["n_sells"]
+        d = v["disposition"]
+        assert d["RG"] + d["RL"] == m["n_sells"]
+        # the reconstructed series reproduces the engine's own final mark
+        assert v["engine_summary"]["reconstructed_final_equity"] == \
+            pytest.approx(v["engine_summary"]["final_value"], abs=1e-6)
+
+
+async def _m0_parity_on(udir, start, end):
+    """Direct M0-vs-_monthly_backtest parity on one window of the M-tape
+    (library level, small-book settings pinned)."""
+    from app.config import settings
+    mp = pytest.MonkeyPatch()
+    mp.setattr(settings, "sim_monthly_target_n", 4)
+    mp.setattr(settings, "sim_monthly_hold_band", 8)
+    try:
+        uni = reval.resolve_universe(MUNI_NAME, udir)
+        with reval.universes_override(udir):
+            async with reval.point_at_database(M5B_URL):
+                win = await sellshadow.load_core_window(uni, M5B_URL, udir, start, end)
+                m0 = await sellshadow.run_monthly_variant(
+                    win, "M0", sellshadow.monthly_variant_params()["M0"])
+                return await sellshadow._m0_parity_vs_monthly(win, m0)
+    finally:
+        mp.undo()
+
+
+async def test_m0_parity_vs_monthly_backtest(mrun):
+    """(1) M0's summary must parity-match optimize._monthly_backtest over the
+    same window: the funding-calendar invariant contributed EXACTLY equal (the
+    pair the two engines must share); IRR within the declared 5pp/yr on the
+    engine's own sanity-test conditions (a gentle window — on the full test
+    window the crashing T06 exercises the monthly engine's DOCUMENTED
+    approximation that a name with no bar on a fill session drops out of that
+    period's return, so the IRR delta there is reported, not asserted)."""
+    report, udir = mrun
+    p = report["parity_m0_vs_monthly"]
+    assert p["checks"]["contributed_equal"] is True, p
+    assert p["m0_engine"]["contributed"] == p["monthly_engine"]["contributed"]
+    assert p["m0_engine"]["n_trades"] > 0 and p["monthly_engine"]["final_value"] > 0
+    # gentle pre-sink window (T06's crash starts 2025-11-17): the 5pp IRR
+    # invariant, mirroring tests/test_optimize.py TestDailyCoreMonthlyParity
+    p2 = await _m0_parity_on(udir, MW_START, "2025-10-31")
+    assert p2["checks"]["contributed_equal"] is True, p2
+    assert p2["checks"]["irr_abs_diff_within_tol"] is True, p2
+    assert p2["m0_engine"]["contributed"] == p2["monthly_engine"]["contributed"]
+    assert abs(p2["delta"]["irr"]) <= sellshadow.M0_PARITY_IRR_TOL
+
+
+def test_m1_release_lag_vs_m0(mrun):
+    """(2) The mechanism REALLY changed: on the tape T06 drops out of the band
+    at the 2025-12-31 month-end and has no bar on the 2026-01-02 rebuild day,
+    so M1 (exit_cadence=daily) releases it on 2026-01-05 (lag 1 session) while
+    M0 (monthly) holds it to the next rebuild (2026-02-02, ~21 sessions)."""
+    report, _ = mrun
+    by_name = {v["name"]: v for v in report["variants"]}
+    m0, m1 = by_name["M0"]["release_lag"], by_name["M1"]["release_lag"]
+    assert m0["n_band_releases"] >= 1 and m1["n_band_releases"] >= 1
+    assert m1["max_sessions"] is not None and m1["max_sessions"] <= 1, m1
+    assert m0["max_sessions"] is not None and m0["max_sessions"] >= 14, m0
+    assert m0["max_sessions"] > m1["max_sessions"]
+    # the lagged M0 release is the T06 band drop; M1 has no such long lag
+    assert m0["by_class"].get("band_release_at_rebuild", {}).get("max_lag", 0) >= 14
+    assert by_name["M1"]["sell_mix"].get("band_release_intraday", 0) >= 1
+
+
+def test_m3_m4_knob_plumbing(mrun):
+    """(3) The engine received the knobs: each variant's captured config line
+    carries its knob, and the M4 trailing stops actually traded."""
+    report, _ = mrun
+    by_name = {v["name"]: v for v in report["variants"]}
+    assert "exit-cadence=monthly" in by_name["M0"]["config_line"]
+    assert "exit-cadence=daily" in by_name["M1"]["config_line"]
+    assert "entry-gate=not-crash" in by_name["M2"]["config_line"]
+    assert "target-vol=0.2" in by_name["M3a"]["config_line"]
+    assert "target-vol=0.25" in by_name["M3b"]["config_line"]
+    assert "trailing-stop=0.25" in by_name["M4a"]["config_line"]
+    assert "trailing-stop=0.3" in by_name["M4b"]["config_line"]
+    # the tape's T06 sink fires the 25%/30% catastrophe stops
+    assert by_name["M4a"]["sell_mix"].get("trailing_stop", 0) >= 1
+    assert by_name["M4b"]["sell_mix"].get("trailing_stop", 0) >= 1
+    # M3's vol cap binds at least once on this tape (differs from M1)
+    assert by_name["M3a"]["engine_summary"]["final_value"] != \
+        by_name["M1"]["engine_summary"]["final_value"]
+
+
+async def test_mvariants_determinism(tmp_path):
+    """(4) Byte-identical rerun: same inputs + same generated_at -> identical
+    JSON (short window keeps the suite fast)."""
+    from app.config import settings
+    mp = pytest.MonkeyPatch()
+    mp.setattr(settings, "sim_monthly_target_n", 4)
+    mp.setattr(settings, "sim_monthly_hold_band", 8)
+    udir = await _seed_m5b_db(tmp_path)
+    try:
+        r1 = await sellshadow.run_mvariants(M5B_URL, MUNI_NAME, udir,
+                                            *MW_SHORT, GENERATED_AT)
+        r2 = await sellshadow.run_mvariants(M5B_URL, MUNI_NAME, udir,
+                                            *MW_SHORT, GENERATED_AT)
+    finally:
+        mp.undo()
+    assert sellshadow._dumps(r1) == sellshadow._dumps(r2)
+    json.loads(sellshadow._dumps(r1))  # allow_nan=False writable
+
+
+async def test_mvariants_no_write_proof(tmp_path):
+    """(5) No-write proof on the 5B scratch DB: every table's row counts are
+    unchanged by a full M-set run (the run opens the DB via
+    reval.point_at_database, PRAGMA query_only=ON)."""
+    from app.config import settings
+    mp = pytest.MonkeyPatch()
+    mp.setattr(settings, "sim_monthly_target_n", 4)
+    mp.setattr(settings, "sim_monthly_hold_band", 8)
+    udir = await _seed_m5b_db(tmp_path)
+    before = _snapshot(M5B_DB)
+    try:
+        report = await sellshadow.run_mvariants(M5B_URL, MUNI_NAME, udir,
+                                                *MW_SHORT, GENERATED_AT)
+    finally:
+        mp.undo()
+    assert report["schema"] == "monthly-variants/1"
+    assert _snapshot(M5B_DB) == before
+
+
+def test_mvariants_cli_smoke_offline(tmp_path):
+    """(6) CLI smoke offline: `python -m app.sellshadow mvariants` writes
+    monthly-variants.json (schema monthly-variants/1, configs_tried=7, parity
+    block present) and prints the comparison table; the DB is untouched."""
+    import asyncio
+    udir = asyncio.run(_seed_m5b_db(tmp_path))
+    before = _snapshot(M5B_DB)
+    env = dict(os.environ)
+    env["DATABASE_URL"] = "sqlite+aiosqlite:////tmp/opencode/reval/ambient_unused.db"
+    env["DATABASE_URL_DEV"] = ""
+    out = tmp_path / "out-mvariants"
+    res = subprocess.run(
+        [sys.executable, "-m", "app.sellshadow", "mvariants",
+         "--db", M5B_URL, "--universe", MUNI_NAME, "--universes-dir", udir,
+         "--window", f"{MW_SHORT[0]},{MW_SHORT[1]}", "--out", str(out),
+         "--generated-at", GENERATED_AT],
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=600)
+    assert res.returncode == 0, res.stderr[-3000:]
+    path = out / "monthly-variants.json"
+    assert path.exists()
+    doc = json.loads(path.read_text())
+    assert doc["schema"] == "monthly-variants/1"
+    assert doc["generated_at"] == GENERATED_AT
+    assert doc["db"]["read_only"] is True
+    assert doc["config"]["configs_tried"] == 7
+    assert doc["window"]["start"] == MW_SHORT[0] and doc["window"]["end"] == MW_SHORT[1]
+    assert [v["name"] for v in doc["variants"]] == [
+        "M0", "M1", "M2", "M3a", "M3b", "M4a", "M4b"]
+    assert "parity_m0_vs_monthly" in doc
+    assert doc["parity_m0_vs_monthly"]["checks"]["contributed_equal"] is True
+    assert "M0 parity" in res.stdout and "variant" in res.stdout  # table printed
+    assert _snapshot(M5B_DB) == before  # CLI never wrote
