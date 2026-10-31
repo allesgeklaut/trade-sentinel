@@ -1111,6 +1111,71 @@
             margin-bottom: 0
         }
 
+        /* LLM sell scorecard (slice 2): per-type cards + the event history
+           table, same compact-table conventions as the paper logs. */
+        #sellscore-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 10px;
+            margin: 8px 0
+        }
+
+        #sellscore-cards .scorecard {
+            border: 1px solid #1d3a24;
+            border-radius: 6px;
+            padding: 8px 10px;
+            background: #0b1710
+        }
+
+        #sellscore-cards .scorecard h4 {
+            margin: 0 0 6px;
+            font-size: 13px;
+            color: #42ff72
+        }
+
+        #sellscore-cards .scorecard .big {
+            font-size: 18px;
+            font-weight: 600
+        }
+
+        #sellscore-cards .scorecard .row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            color: #b7ffc0
+        }
+
+        #sellscore-bars {
+            font-size: 12px;
+            color: #7aaa81;
+            margin: 6px 0;
+            white-space: pre-wrap
+        }
+
+        #sellscore-history {
+            max-height: 360px;
+            overflow-y: auto;
+            overflow-x: auto
+        }
+
+        #sellscore-history table {
+            font-size: 11px;
+            table-layout: auto
+        }
+
+        #sellscore-history td,
+        #sellscore-history th {
+            padding: 3px 4px;
+            white-space: nowrap
+        }
+
+        #sellscore-history td:last-child,
+        #sellscore-history th:last-child {
+            white-space: normal;
+            word-break: normal;
+            overflow-wrap: break-word
+        }
+
         #dailycore-view {
             display: none;
             max-width: 1400px;
@@ -1753,6 +1818,38 @@
                 backfill. They do not rewrite stored history.</div>
         </div>
     </section>
+        <!-- Slice 2: the shared LLM sell scorecard — spans BOTH paper accounts
+             (sim type A + monthly B/C), so it lives at the workspace level. -->
+        <section id="sellscore-section" class="sim-section" aria-labelledby="sellscore-title">
+            <div class="paper-comparison-head">
+                <div class="paper-comparison-heading">
+                    <div class="sim-section-title" id="sellscore-title">LLM SELL SCORECARD // WITH vs WITHOUT THE LLM (BOTH PAPER ACCOUNTS)</div>
+                    <details class="info-fold">
+                        <summary>How to read this scorecard</summary>
+                        <p class="paper-comparison-scope">Every logged sell-layer decision is scored only once its
+                            PREDECLARED forward window has completed — no mid-window peeking. The delta is the realized
+                            LLM branch minus the engine's own branch, in percentage points of the decision fill, net of the
+                            declared one-way costs and cash yield. CONFIRM/HOLD rows (and fail-safes, which fall back to
+                            the engine's rule) are no-divergence: delta 0, counted separately. The reference bars are the
+                            pre-measured blanket rules from the research (A: blanket defer +2.93pp/event; B: blanket
+                            retention −1.60pp/event; C: the M5 reconciliation) shown as context — "the LLM vs the blanket
+                            rules". Small samples are reported as-is: NO p-values, NO significance claims. The fail-safe
+                            rate is itself a verdict on the reviewer.</p>
+                    </details>
+                </div>
+                <div class="toolbar paper-comparison-controls">
+                    <button id="sellscore-refresh-btn" onclick="refreshSellScore(this)"
+                        title="Recompute the scorecard on demand from the stored ledger and prices (read-only).">Refresh
+                        scorecard</button>
+                </div>
+            </div>
+            <div id="sellscore-asof" class="paper-comparison-asof" aria-live="polite"></div>
+            <div id="sellscore-cards"></div>
+            <div id="sellscore-bars"></div>
+            <div class="bench-label">EVENT HISTORY (LAST 200 DECISIONS, NEWEST FIRST)</div>
+            <div id="sellscore-history"></div>
+            <div id="sellscore-status" class="status-line" aria-live="polite"></div>
+        </section>
     </section>
     <section id="workspace-savings" class="workspace" hidden>
         <header class="workspace-head">
@@ -3868,6 +3965,9 @@
 
         // --- Simulation view ---
         let simLoaded = false;
+        // The shared LLM sell scorecard (spans both paper accounts) loads
+        // lazily once per Paper visit, exactly like the account views.
+        let sellscoreLoaded = false;
         // A research ticker chart must not be created while the Research
         // workspace is hidden (clientWidth 0): defer the draw until visible.
         let pendingResearchDraw = null;
@@ -4156,6 +4256,8 @@
                 if (account === 'sim' && !simLoaded) { simLoaded = true; loadSimAll(); }
                 else if (account === 'monthly' && !monthlyLoaded) { monthlyLoaded = true; loadMonthlyAll(); }
                 else if (account === 'dailycore' && !dailyCoreLoaded) { dailyCoreLoaded = true; loadDailyCoreAll(); }
+                // The scorecard spans BOTH accounts: one lazy load per Paper visit.
+                if (!sellscoreLoaded) { sellscoreLoaded = true; loadSellScore(); }
                 // Live CURRENT (next-run) configuration rides along with the
                 // account/status load — one read-only GET, cached per page.
                 loadRunConfig();
@@ -4334,6 +4436,108 @@
             invalidatePaperAccount('sim');
             invalidatePaperAccount('monthly');
             invalidatePaperAccount('dailycore');
+        }
+
+        // ===================== LLM sell scorecard (slice 2) =====================
+        // The with/without-LLM history: one read-only GET /api/sellscore,
+        // rendered into per-type cards + the reference bars + the event
+        // history. Lazy-loaded once per Paper visit (sellscoreLoaded); the
+        // refresh button recomputes on demand. The empty state renders
+        // cleanly ("no decisions yet") on a fresh deploy.
+        function fmtPp(v) {
+            if (v === null || v === undefined || !Number.isFinite(v)) return '—';
+            return (v >= 0 ? '+' : '') + (v * 100).toFixed(2) + 'pp';
+        }
+
+        function fmtPct(v) {
+            if (v === null || v === undefined || !Number.isFinite(v)) return '—';
+            return (v * 100).toFixed(1) + '%';
+        }
+
+        function renderSellScore(data) {
+            const asof = document.getElementById('sellscore-asof');
+            if (asof) {
+                asof.textContent = 'as of ' + (data.data_as_of || 'no stored sessions')
+                    + ' (stored data) · computed ' + (data.generated_at || '')
+                    + ' · read-only, compute-on-demand · ' + (data.completed_window_rule || '');
+            }
+            const cards = document.getElementById('sellscore-cards');
+            const bars = document.getElementById('sellscore-bars');
+            const hist = document.getElementById('sellscore-history');
+            if (!cards || !bars || !hist) return;
+            const TYPE_LABEL = {
+                A: 'TYPE A — SIM STANDING STOP (account: sim)',
+                B: 'TYPE B — MONTHLY BAND-DROP (account: monthly)',
+                C: 'TYPE C — MONTHLY THESIS BREAK (account: monthly)',
+            };
+            const barText = (t) => {
+                const b = (data.reference_bars || {})[t] || {};
+                if (t === 'A') return 'reference bar (research): blanket deferral '
+                    + fmtPp(b.blanket_defer_pp_per_event) + '/event — ' + (b.blanket_defer_source || '');
+                if (t === 'B') return 'reference bar (research): blanket retention mean '
+                    + fmtPp(b.blanket_retention_mean_pp_per_event) + '/event, median '
+                    + fmtPp(b.blanket_retention_median_pp_per_event) + '/event, share positive '
+                    + fmtPct(b.blanket_retention_share_positive) + ' (n=' + (b.n_events_full_window || '—')
+                    + ') — ' + (b.source || '');
+                return 'reference bar (research): the M5 reconciliation '
+                    + fmtPp(b.m5_vs_m0_pp_per_year) + '/yr, ' + (b.events_per_decade || '—')
+                    + ' events/decade — ' + (b.source || '');
+            };
+            cards.innerHTML = ['A', 'B', 'C'].map((t) => {
+                const blk = (data.types || {})[t] || {};
+                const agg = blk.aggregate || {};
+                return '<div class="scorecard"><h4>' + escapeHtml(TYPE_LABEL[t]) + '</h4>'
+                    + '<div class="row"><span>decided (completed windows)</span><b>' + (blk.n_decided || 0) + '</b></div>'
+                    + '<div class="row"><span>fail-safe rate</span><b>' + fmtPct(blk.fail_safe_rate)
+                    + ' (' + (blk.n_fail_safe || 0) + '/' + (blk.n_rows || 0) + ')</b></div>'
+                    + '<div class="row"><span>divergent</span><b>' + (blk.n_divergent || 0) + '</b></div>'
+                    + '<div class="row"><span>pending</span><b>' + (blk.n_pending || 0) + '</b></div>'
+                    + '<div class="row"><span>mean delta (divergent)</span><b class="big">' + fmtPp(agg.mean) + '</b></div>'
+                    + '<div class="row"><span>median / p5 / p95</span><b>' + fmtPp(agg.median) + ' / '
+                    + fmtPp(agg.p5) + ' / ' + fmtPp(agg.p95) + '</b></div>'
+                    + '<div class="row"><span>share positive</span><b>' + fmtPct(agg.share_positive) + '</b></div>'
+                    + '</div>';
+            }).join('');
+            bars.textContent = ['A', 'B', 'C'].map((t) => TYPE_LABEL[t].split(' — ')[0]
+                + ': ' + barText(t)).join('\n')
+                + '\n' + (data.small_n_caveat || '');
+            const rows = data.decisions || [];
+            if (!rows.length) {
+                hist.innerHTML = '<div class="sim-empty">No decisions yet — the sell layer logs one row '
+                    + 'per live event (sim standing stop / monthly band-drop / monthly thesis break); '
+                    + 'scored rows appear here once their predeclared windows complete.</div>';
+                return;
+            }
+            const cell = (v) => v === null || v === undefined ? '—' : escapeHtml(String(v));
+            hist.innerHTML = '<table><tr><th>date</th><th>account</th><th>ticker</th><th>event</th>'
+                + '<th>LLM call</th><th>engine call</th><th>fail-safe</th><th>delta</th><th>status</th>'
+                + '<th>rationale</th></tr>'
+                + rows.map((d) => '<tr><td>' + cell(d.session_date) + '</td><td>' + cell(d.account)
+                + '</td><td>' + cell(d.ticker) + '</td><td>' + cell(d.event_type)
+                + '</td><td>' + cell(d.decision) + '</td><td>' + cell(d.branch)
+                + '</td><td>' + (d.fail_safe ? 'YES (' + cell(d.fail_reason) + ')' : 'no')
+                + '</td><td>' + (d.delta === null || d.delta === undefined ? 'pending'
+                    : fmtPp(d.delta)) + '</td><td>' + cell(d.status)
+                + '</td><td>' + cell(d.rationale) + '</td></tr>').join('') + '</table>';
+        }
+
+        async function loadSellScore() {
+            const st = document.getElementById('sellscore-status');
+            try {
+                if (st) st.textContent = 'Computing the scorecard from the stored ledger…';
+                const data = await api('sellscore');
+                renderSellScore(data);
+                if (st) st.textContent = '';
+            } catch (e) {
+                if (st) st.textContent = 'Scorecard failed: ' + e.message;
+            }
+        }
+
+        async function refreshSellScore(btn) {
+            const orig = btn.textContent;
+            btn.disabled = true; btn.textContent = 'Refreshing…';
+            try { await loadSellScore(); }
+            finally { btn.disabled = false; btn.textContent = orig; }
         }
 
 

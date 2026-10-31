@@ -910,6 +910,20 @@ async def monthly_refresh():
     refreshed, errors = await refresh_many(held + pairs, "2y")
     return {"refreshed": refreshed, "errors": errors}
 
+# =====================================================================
+# LLM sell scorecard (slice 2): the with/without-LLM history
+# =====================================================================
+
+@app.get('/api/sellscore')
+async def sellscore():
+    """The LLM sell scorecard: per-type with/without-LLM delta aggregates on
+    COMPLETED predeclared forward windows, the reference bars, and the recent
+    decision history (last 200 ledger rows). Compute-on-demand and read-only;
+    no cache state. Spans both paper accounts (sim type A + monthly B/C)."""
+    from . import sellscore as sellscore_mod
+    return await sellscore_mod.score_sell_decisions()
+
+
 @app.get('/api/dailycore/status')
 async def daily_core_status():
     """Daily-core portfolio status: valuation + config + today's ranking.

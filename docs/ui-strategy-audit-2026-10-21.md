@@ -2021,6 +2021,87 @@ price-quoted candidates (pending legs ride the existing retry); the
 defer-cap row is a fail-safe CONFIRM, not an LLM decision; the C fill uses
 the standalone paper stamp (the documented forward-write convention).
 
+## The sell scorecard — slice 2: the with/without-LLM history — 2026-10-31
+
+**The final build, slice 2 — the app's answer to "did the LLM's
+decisions improve things."** Slice 1 logs every sell decision with the
+engine-counterfactual; this slice scores them and shows the running
+verdict. The contamination discipline is preserved by construction: the
+scorer grades ONLY live forward-log decisions (the ledger the deployed
+layer accumulates), never history.
+
+`app/sellscore.py` (new): `score_sell_decisions()` — compute-on-demand,
+READ-ONLY (no writes, no new columns; deterministic modulo the wall-clock
+field; never raises on a single row's problems — count + skip with a
+reason). Per completed-window decision, both branches' REALIZED outcomes
+from the stored prices:
+
+- **Type A (DEFERs — the divergent rows)**: the window = [decision
+  session → the earlier of the position's next SELL fill or the
+  predeclared 63-session cap]. LLM branch = held through the window,
+  exited at the recorded fill when the stop re-fired, else marked at the
+  cap session's close, net of the one-way cost. Engine branch = sold at
+  the decision fill, proceeds at the declared cash yield over the window,
+  net of the one-way cost. CONFIRM rows = no divergence (the LLM chose
+  the engine's path; counted in n_decided/n_fail_safe, excluded from the
+  delta aggregates).
+- **Type B (DEFERs)**: the window = [this rebuild's fill → the next
+  rebuild's fill]. LLM branch = the retained name's window return (both
+  legs net of the one-way cost); engine branch = the EXACT DISPLACED
+  ADDITION (engine_picks − executed_picks from the rebuild's
+  `MonthlyRebalance.sell_layer` JSON) over the same window — falling
+  back to the equal-weight mean of the rebuild's new additions, then the
+  declared cash yield (declared fallbacks). The join is by the
+  rebuild's IDENTITY (the greatest `rebal_date` strictly before the
+  decision's fill session — the audit row's month-end vs the ledger
+  row's fill session) — the gate review caught that a month-string join
+  is dead code on live data (the fill session is always in the month
+  AFTER the governing month-end; the test fixtures had masked it), fixed
+  + pinned by a regression test that constructs the live shape.
+- **Type C (EXITS)**: the window = [the row's EXIT fill → the next
+  month-end rebuild's fill]. LLM branch = sold at the recorded fill +
+  the declared cash yield to the rebuild; engine branch = the name HELD
+  to the next rebuild's strict open (realized prices; no executable
+  price there → PENDING). HOLD rows = no divergence.
+- Conventions: `reval.CostConfig()`'s declared rates (10 bps one-way,
+  3% cash yield) with per-session COMPOUNDED accrual
+  `(1+cy)^(w/252)` — the same convention the research reference bars
+  were measured under (the gate review caught the linear-accrual
+  mismatch; fixed so the live deltas and the bars share one math).
+
+**Aggregates** per type + overall: n_decided, n_fail_safe (the fail-safe
+rate is itself a verdict, reported prominently), n_divergent, n_pending
+(windows not yet complete — the completed-window rule verbatim; no
+mid-window peeking), the delta aggregates (mean/median/p5/p95/
+share-positive, in pp) over the DIVERGENT rows, by year, and the
+REFERENCE BARS from the research ledgers (A: blanket defer
++2.93pp/event; B: blanket retention −1.60pp/event + the by-year map; C:
+the M5 reconciliation +0.80pp mean/−0.66pp median) so the UI shows "the
+LLM vs the blanket rules" — with the small-n caveat verbatim and NO
+significance claims (the research discipline).
+
+`GET /api/sellscore` (app/main.py): the aggregates + the bars + the
+last-200 decision history (date, account, ticker, event, the LLM call,
+the engine call, fail-safe/fail-reason, the scored delta or pending, the
+rationale) — read-only. The UI: a shared "LLM SELL SCORECARD" section in
+the Paper workspace (spans both accounts): per-type cards, the
+reference-bar context lines, the event-history table, a refresh control,
+a clean empty state (the fresh-deploy state), lazy-loaded per the
+workspace conventions; `node --check` on the inline scripts (the repo's
+UI smoke pattern) + endpoint-contract tests.
+
+Independent verification (the orchestrator's gate): my own runs — 159
+green on the gate set in the worktree (the new suite 12 + selllayer 30 +
+main/review/shadow/portfolio-UI/db), ruff clean over app/; the gate
+review found TWO defects, both fixed + regression-pinned before
+acceptance: (1) the displaced-add month-string join — dead code on live
+data (the fixtures' session_date convention masked it); now joined by
+the rebuild's identity with a live-shape regression test (≥2 additions,
+the exact name ≠ the mean); (2) linear vs compounded cash-yield accrual
+— now the research convention at all three accrual sites, hand-computed
+expectations updated. Full offline regression green in the main tree at
+the commit.
+
 ## References
 
 - [SEC Apple companyfacts](https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json)
