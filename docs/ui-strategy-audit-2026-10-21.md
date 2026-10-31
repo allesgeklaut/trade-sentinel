@@ -1826,6 +1826,85 @@ tables with the M0 reconstruction declared as fallback, single-name
 what-ifs, no re-entry modeling, small-n (no significance claims), and NO
 LLM grading on history — the assessor scores only the forward log.
 
+## Phase 4C — the strategy-audit study: skill vs selection (2015–2026) — 2026-10-31
+
+**The Phase 4 flagship study landed and is analyzed.** The predeclared
+multi-regime study (Phase 4's "Revalidate" step — 4A's harness + 4B's
+controls/driver/uncertainty + the infeasible-window fix) ran the full grid
+on the read-only snapshot: `full` + 11 `yearly` + 2 `halves` windows ×
+`contribution`/`fixed` cases — 30 window×case runs, **2 honestly infeasible**
+(yearly-2015 both cases: momentum warmup 252 < 253 sessions — recorded as
+infeasible, no arms/configs contributed; the fix working exactly as
+designed), seeds 100, block bootstrap B=2000 (block 21), the predeclared
+7-variant OFAT grid, `configs_tried` **3,024** (audit finding #2), declared
+costs (10 bps stock one-way, FX 15 bps, cash yield 3%), wall-clock 106m51s,
+EXIT=0. Artifacts:
+`/tmp/opencode/reval/study4c/reval-study.{json,md}` (schema `reval-study/1`);
+the analysis + the full honesty limits:
+`docs/reval/phase-4c-strategy-audit-study-2026-10-31.md`. The snapshot's
+row counts + `quick_check` re-verified unchanged after the run.
+
+**The decade verdicts (full window, 2015–2026, contribution case):**
+
+- **monthly (qv-mom-v1): SKILL, not selection luck** — TWR +18.29%/yr
+  (XIRR 21.03%, excess Sharpe 0.81), the **98th percentile** of the
+  100-seed random-placement distribution (the seed p95 is +15.88%; the
+  seed mean +12.01%), the bootstrap CI on annual excess return
+  **[+4.98%, +26.50%] excluding zero**, and robust across all 7 OFAT
+  variants (17.29%–18.92%, every one above the seed p95; the 5→20 bps
+  cost span costs 0.52pp; mom_residual leaves it HIGHER than baseline). The
+  equal_weight selection bar: +14.89%/yr — the flagship clears it by
+  +3.4pp/yr on the decade.
+- **daily_core (immediate deployment): also skill, NOT an improvement** —
+  98th percentile, +17.85%/yr, CI excluding zero — but −0.44pp/yr vs the
+  monthly book, the same honest ~35% maxDD, and a **2022 whipsaw the
+  monthly cadence avoided** (16th percentile, −13.0% vs monthly −4.2%).
+- **sim (the technical strategy): NO skill — worse than random.** The
+  **0th percentile** on the full window (both cases), TWR −2.17%/yr vs
+  the random-placement mean +12.01%/yr (−14.2pp/yr), the **worst drawdown
+  of all six arms (41.19% vs the DCA control's 34.02% — the stops failed
+  on the axis they exist for)**, 22×/yr one-way turnover (6,686 trades),
+  and a **2,207-session continuous underwater spell (8.8 years)**. Its
+  bootstrap CI [−13.98%, +6.07%] cannot exclude zero. Below the random
+  median in 27 of 28 window×case placements; best yearly placement the
+  51st percentile; at the 0th in 11 of 28.
+- **The regime map is the honesty layer:** the skill is concentrated in
+  the strong momentum years (2023/2024 at the 98th/100th, 2026-partial
+  90th, halves-2 98/98; halves-1 80/86 — above median, inside the band).
+  **2018: both factor arms lost MORE than the DCA control** (monthly
+  −14.8% vs −9.1%, 27th percentile — the momentum crash). **2020–2021:
+  equal_weight beat both factor arms** (2021: +26.3% vs +18.5%/+17.2%,
+  the factor arms at the 24th/22nd percentiles — breadth years).
+  **2022: the monthly cadence's defensive win** (−4.2% vs the control's
+  −18.9%, XIRR +4.6% — with daily_core at +3.4% the only other risk arm
+  in the black money-weighted).
+  2025: monthly badly trailed the control (+10.9% vs +22.6%) while
+  daily_core printed its 97th percentile.
+- **The funding schedule changes nothing:** the fixed-case placements are
+  identical (98/98/0 on the full window in both cases).
+- **The marks_only honesty note:** the monthly arm's 26.36% maxDD is a
+  step-NAV artifact; the same policy on daily marks shows ~35.1%
+  (daily_core's 35.09%, reconciled by 5B's M0 at 35.1%). **The flagship's
+  honest maxDD is ~35%** — essentially the same as the DCA control's
+  34.0%; its decade advantage is return and turnover discipline, not
+  drawdown.
+
+**The Phase 4D prune input (the recommendation, grounded in 4C — the
+owner decides; the predeclared rule: archive from the main UI when a
+variant adds complexity without a robust net-of-cost benefit, retain
+reproducible research):** KEEP the monthly factor book as the flagship
+(the only arm with decade skill AND the 2022 defense); ARCHIVE the
+standalone daily-core variant from the main UI (negative decade delta,
+2022 whipsaw — the engine stays: it is the M-set/5C platform and 5B's M3a
+target_vol=0.20 winner is an engine-config decision, not a UI variant);
+ARCHIVE the technical sim from the main UI (the study's most decisive
+negative — 0th percentile, worst DD, 22× turnover, 8.8 years underwater;
+the engine + research path stay, the 5A/5C machinery rides on it); AI
+stays in prospective shadow mode (now built — 5C complete; graded only on
+the forward log); KEEP the controls visible in the comparison UI (dca /
+random_n / equal_weight are the bars that make the skill claim honest —
+and 2018/2021 are the years that keep it humble).
+
 ## References
 
 - [SEC Apple companyfacts](https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json)
