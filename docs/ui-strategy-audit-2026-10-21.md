@@ -1575,6 +1575,84 @@ within-family comparisons robust); M1/M2's no-op verdicts are specific to
 this snapshot's dense sp500 bars (a universe with gappier members could
 produce failed rebuild fills where the cadence binds).
 
+## Phase 5B/M5 — the fundamental thesis-break exit hook — 2026-10-31
+
+**Slice M5 code-complete, independently verified, and committed.** The last
+predeclared M-set config — the owner's intra-month sell, as an *event
+source*: exit when the REASON breaks, not when the price wiggles. The
+research doc §4a predeclared it (4e85f69) before any run; the interpretation
+pin (the exact condition, the fill convention) was frozen in the worker
+brief and the code docstrings before the full-window run.
+
+`app/optimize.py` (+97): the default-OFF `thesis_break_exit` hook on
+`_daily_core_backtest` — at each session S, each holding's fundamentals are
+re-derived with the engine's OWN helpers (`monthly._latest_as_of` /
+`_ttm_as_of`, filing-date PIT via `_asof_entries`, restatements replace
+originals); the PREDECLARED condition (verbatim in
+`_thesis_break_fundamentals`): the fundamentals record is missing, OR
+equity ≤ 0, OR TTM NI missing, OR shares missing, OR **ROE = TTM NI /
+equity ≤ 0**. F/P-FCF changes alone do NOT trigger (the value leg is a
+rank, not a gate); price-side gates (mcap, dollar_vol, momentum, staleness)
+are explicitly NOT re-checked intraday — price events are 5C type-C
+territory. A break at S fills at F's open (the standing-order convention,
+before the BUY phase, same cost path as every other sell); a failed fill
+keeps the standing order and re-fires; re-entry is unchanged. The OFF path
+is bit-identical (an explicit full-ledger parity test + the golden suites).
+Exits are recorded per fill (`thesis_break_exits`) and counted
+(`n_thesis_break`) on the summary — the trade ledger's schema is pinned
+elsewhere, so the ledger carries no reason field. `app/config.py`: the one
+settings default (`sim_daily_core_thesis_break: bool = False`). CLI:
+`--thesis-break`. `app/sellshadow.py`: "M5" = M0 + the hook
+(`configs_tried` 7→8), the `thesis_break` sell class (post-hoc from the
+engine's own exit records, in the engine's pass order), and the two DECLARED
+lag stats — `response_lag` (the breaking filing's first-public session →
+fill) and `detection_lag` (fill → next month-end rebuild: the
+monthly-detection delay M5 avoided). `tests/test_thesis_break.py` (new, 7
+tests: OFF-parity, fires-at-open, the PIT guard, restatement, the FCF
+non-trigger, the hard gates, determinism/no-write/CLI).
+
+**Full-window verdict (2015-2026, the same window/costs as the M-set):**
+**7 thesis-break exits in 141 months** — BA 2017-07 and 2018-07, SBUX
+2019-01, HCA 2021-08, DELL 2022-03, COR 2022-11, DVA 2025-05 (all genuine
+fundamental breaks: loss filings / negative TTM NI). Response lag **1
+session on all 7** — the mechanism is exactly as fast as designed. The
+monthly-detection delay avoided: median 5, max 21 sessions. Portfolio
+impact: TWR +17.92% vs M0's +17.87% (+0.05pp), identical maxDD 35.1%,
+Sharpe 0.75, turnover 1.31× — **portfolio-neutral**. The honest reading:
+the events are real but RARE (the factor book's fundamental hard gates move
+quarterly, and the month-end frames' own hard gates catch these names at
+the next rebuild anyway) — the hook buys about a week of exit timing, seven
+times a decade. M0 parity vs the monthly arm unchanged to the cent, and
+M1–M4 reproduce the 5B run exactly (the M5 code changed nothing else).
+
+**The deterministic intra-month program is now fully measured.** M1/M2:
+no-ops (cadence cannot create exits; the per-name gate never bound). M3a
+vol targeting: the only winner (+0.47pp TWR, −1.8pp maxDD, lower turnover).
+M4: harmful (worse return AND drawdown). M5: portfolio-neutral (rare,
+real, fast — but the monthly cadence already catches these names). The
+measured conclusion for the owner's ask: the monthly factor book's exits
+are already near-optimal at monthly cadence — the platform's intra-month
+exit edge lives on the SIM side (V1 signal-exits, +18.5%/yr) and, for the
+factor book, in whatever SELECTIVITY the LLM reviewer can add over the
+engine's own rules (5C) — for which the type-C event source is now BUILT,
+with a known event density (~0.6 thesis-break candidates/year on this
+book, plus the band-drop events of type B).
+
+Independent verification: the orchestrator's own runs — 161 tests
+(sellshadow 19 + thesis_break 7 + engine 135) and the 123 golden
+optimize/replay-fills tests green, ruff clean; the full-window run (5m36s)
+with the snapshot's row counts/mtime re-verified unchanged; the worker's
+deviation claims checked (the in-process CLI smoke is excused by a
+PRE-EXISTING bug, verified at the base commit: `app.optimize --help`
+crashes on this Python via a bare `5%` in the `--basket-threshold` help
+string — fixed separately). Honesty limits declared in every output: the
+`thesis_break` class is post-hoc (engine pass order decides attribution
+when multiple rules fire on one fill); `response_lag` proxies the causal
+filing as the newest public `filed`; `detection_lag` measures the delay
+avoided, not a P&L attribution; the hook re-derives TTM per holding per
+session only when ON; survivorship caveat unchanged.
+
+
 ## References
 
 - [SEC Apple companyfacts](https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json)

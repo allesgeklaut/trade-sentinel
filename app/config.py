@@ -137,6 +137,15 @@ class Settings(BaseSettings):
     # its price falls this fraction below its own peak since entry. Targets
     # momentum-sleeve crashes the market-trend brakes cannot see (§12).
     sim_daily_core_trailing_stop: float = 0.0
+    # thesis_break (bool, default False): the M5 fundamental thesis-break
+    # exit — when a holding's newly FILED fundamentals (filing-date PIT) would
+    # knock it out of the eligible frame's HARD gates (record missing,
+    # equity <= 0, TTM NI missing, shares missing, or ROE = TTM NI / equity
+    # <= 0), exit at the next session's open. Fundamental-only: F/P-FCF
+    # changes alone do NOT trigger (the value leg is a rank, not a gate), and
+    # the price-side gates (mcap, dollar_vol, momentum, staleness) are NOT
+    # re-checked intraday. Re-entry is unchanged (the monthly ranking's rules).
+    sim_daily_core_thesis_break: bool = False
     # basket_trend_days (0 = off): "gradient filter" — N-day rate-of-change of
     # the strategy's own target basket (equal-weight top-N candidates). Cash
     # out when the gradient stays negative for basket_confirm_days, re-enter

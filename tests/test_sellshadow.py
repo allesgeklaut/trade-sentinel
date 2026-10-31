@@ -661,14 +661,15 @@ async def mrun(tmp_path_factory):
 def test_mvariants_schema_and_mset(mrun):
     report, _ = mrun
     assert report["schema"] == "monthly-variants/1"
-    assert report["config"]["configs_tried"] == 7
-    assert sellshadow.MVARIANTS_CONFIGS_TRIED == 7
+    assert report["config"]["configs_tried"] == 8
+    assert sellshadow.MVARIANTS_CONFIGS_TRIED == 8
     assert [v["name"] for v in report["variants"]] == [
-        "M0", "M1", "M2", "M3a", "M3b", "M4a", "M4b"]
+        "M0", "M1", "M2", "M3a", "M3b", "M4a", "M4b", "M5"]
     assert report["window"] == {"start": MW_START, "end": MW_END,
                                 "sessions": report["window"]["sessions"]}
     assert report["db"]["read_only"] is True
-    assert list(report["m_set"]) == ["M0", "M1", "M2", "M3a", "M3b", "M4a", "M4b"]
+    assert list(report["m_set"]) == ["M0", "M1", "M2", "M3a", "M3b", "M4a", "M4b",
+                                     "M5"]
     assert report["m_set"]["M1"]["exit_cadence"] == "daily"
     assert report["m_set"]["M2"]["entry_gate"] == "not-crash"
     assert report["m_set"]["M3a"]["target_vol"] == 0.20
@@ -676,6 +677,11 @@ def test_mvariants_schema_and_mset(mrun):
     # the engine's fractional trailing-stop knob carries the doc's 25%/30%
     assert report["m_set"]["M4a"]["trailing_stop_pct"] == 0.25
     assert report["m_set"]["M4b"]["trailing_stop_pct"] == 0.30
+    # M5 = M0 + the thesis-break exit hook (exit_cadence stays "monthly")
+    assert report["m_set"]["M5"]["thesis_break_exit"] is True
+    assert report["m_set"]["M5"]["exit_cadence"] == "monthly"
+    assert all(report["m_set"][m].get("thesis_break_exit") is False
+               for m in ("M0", "M1", "M2", "M3a", "M3b", "M4a", "M4b"))
     for v in report["variants"]:
         m = v["metrics"]
         for key in ("twr_annualized", "twr_cumulative", "xirr", "max_drawdown_pct",
@@ -691,6 +697,26 @@ def test_mvariants_schema_and_mset(mrun):
         # the reconstructed series reproduces the engine's own final mark
         assert v["engine_summary"]["reconstructed_final_equity"] == \
             pytest.approx(v["engine_summary"]["final_value"], abs=1e-6)
+        # every variant carries the thesis-break stat block (empty for M0..M4b)
+        assert v["thesis_break"]["n_thesis_break"] == \
+            v["engine_summary"]["n_thesis_break"]
+    # M5 on this tape: T06's 2025-12-15 filing (9M NI, filed <= S) makes its
+    # TTM NI uncomputable -> NI-missing thesis break; the hook exits T06 on
+    # 2025-12-16 (the session after S=2025-12-15) while still IN the band
+    m5 = next(v for v in report["variants"] if v["name"] == "M5")
+    assert m5["engine_summary"]["n_thesis_break"] >= 1
+    assert m5["sell_mix"].get("thesis_break", 0) >= 1
+    tb = m5["thesis_break"]
+    assert tb["n_thesis_break"] == m5["engine_summary"]["n_thesis_break"]
+    assert tb["response_lag"]["n"] >= 1
+    assert tb["response_lag"]["max"] <= 1  # the hook's response lag: 0-1 sessions
+    assert tb["detection_lag"]["n"] >= 1    # fill -> next month-end rebuild
+    assert any(e["ticker"] == "T06" and e["fill_date"] == "2025-12-16"
+               for e in tb["events"])
+    # M0 has no thesis-break exits (the default-OFF path is untouched)
+    m0 = next(v for v in report["variants"] if v["name"] == "M0")
+    assert m0["engine_summary"]["n_thesis_break"] == 0
+    assert "thesis_break" not in m0["sell_mix"]
 
 
 async def _m0_parity_on(udir, start, end):
@@ -763,6 +789,9 @@ def test_m3_m4_knob_plumbing(mrun):
     assert "target-vol=0.25" in by_name["M3b"]["config_line"]
     assert "trailing-stop=0.25" in by_name["M4a"]["config_line"]
     assert "trailing-stop=0.3" in by_name["M4b"]["config_line"]
+    # M5's hook is on; every other variant's config line stays clean
+    assert "thesis-break=on" in by_name["M5"]["config_line"]
+    assert "thesis-break" not in by_name["M0"]["config_line"]
     # the tape's T06 sink fires the 25%/30% catastrophe stops
     assert by_name["M4a"]["sell_mix"].get("trailing_stop", 0) >= 1
     assert by_name["M4b"]["sell_mix"].get("trailing_stop", 0) >= 1
@@ -811,7 +840,7 @@ async def test_mvariants_no_write_proof(tmp_path):
 
 def test_mvariants_cli_smoke_offline(tmp_path):
     """(6) CLI smoke offline: `python -m app.sellshadow mvariants` writes
-    monthly-variants.json (schema monthly-variants/1, configs_tried=7, parity
+    monthly-variants.json (schema monthly-variants/1, configs_tried=8, parity
     block present) and prints the comparison table; the DB is untouched."""
     import asyncio
     udir = asyncio.run(_seed_m5b_db(tmp_path))
@@ -833,10 +862,13 @@ def test_mvariants_cli_smoke_offline(tmp_path):
     assert doc["schema"] == "monthly-variants/1"
     assert doc["generated_at"] == GENERATED_AT
     assert doc["db"]["read_only"] is True
-    assert doc["config"]["configs_tried"] == 7
+    assert doc["config"]["configs_tried"] == 8
     assert doc["window"]["start"] == MW_SHORT[0] and doc["window"]["end"] == MW_SHORT[1]
     assert [v["name"] for v in doc["variants"]] == [
-        "M0", "M1", "M2", "M3a", "M3b", "M4a", "M4b"]
+        "M0", "M1", "M2", "M3a", "M3b", "M4a", "M4b", "M5"]
+    m5 = next(v for v in doc["variants"] if v["name"] == "M5")
+    assert m5["params"]["thesis_break_exit"] is True
+    assert "thesis_break" in m5  # the lag-stat block rides on every variant
     assert "parity_m0_vs_monthly" in doc
     assert doc["parity_m0_vs_monthly"]["checks"]["contributed_equal"] is True
     assert "M0 parity" in res.stdout and "variant" in res.stdout  # table printed

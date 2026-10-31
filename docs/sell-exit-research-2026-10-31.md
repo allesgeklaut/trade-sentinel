@@ -387,6 +387,29 @@ yield 3%, `configs_tried=7` — `monthly-variants/1`):**
   stops are now measured value-destroying on BOTH engines (the sim's
   ~21pp/yr gap; the factor book's −1.2pp with worse DD) —
   contra-indicated platform-wide, matching the skeptical prior.
+- **M5 (thesis-break, run 2026-10-31 after the engine hook landed)**:
+  the interpretation pin, frozen before the run: the thesis breaks when
+  the fundamentals record is missing, OR equity ≤ 0, OR TTM NI missing, OR
+  shares missing, OR **ROE = TTM NI / equity ≤ 0** — evaluated on the
+  fundamentals public as of the decision session S (filing-date PIT via
+  `monthly._asof_entries`, restatements replace originals); F/P-FCF
+  changes alone do NOT trigger; price-side gates are NOT re-checked
+  intraday; the break fills at the next session's open; re-entry
+  unchanged. **Results (full window, `configs_tried=8`): 7 breaks in 141
+  months** (BA 2017-07 and 2018-07, SBUX 2019-01, HCA 2021-08, DELL
+  2022-03, COR 2022-11, DVA 2025-05), response lag 1 session on all 7,
+  the monthly-detection delay avoided median 5 / max 21 sessions — but
+  **portfolio-neutral**: TWR +17.92% vs M0's +17.87%, identical maxDD /
+  Sharpe / turnover. The events are real but rare, and the month-end
+  frames' own hard gates catch these names at the next rebuild anyway —
+  the hook buys about a week of exit timing, seven times a decade. The
+  deterministic intra-month program is therefore fully measured: M1/M2
+  no-ops, M3a the only winner, M4 harmful, M5 neutral — the monthly
+  factor book's exits are already near-optimal at monthly cadence. The
+  platform's intra-month exit edge lives on the sim side (V1) and in the
+  reviewer's SELECTIVITY (5C) — whose type-C event source is now built,
+  with a known candidate density (~0.6 thesis-breaks/year + the type-B
+  band-drops).
 
 ## 4b. Unification: one LLM sell reviewer, per-engine event adapters (5C — design)
 

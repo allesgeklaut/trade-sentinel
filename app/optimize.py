@@ -2899,6 +2899,42 @@ class BacktestSummary:
     # (the strict-open fill price). tests/test_replay_fills.py compares it
     # against daily_core.backfill's trade rows.
     trades: list[dict] = field(default_factory=list)
+    n_thesis_break: int = 0     # thesis-break (M5) exits that fired
+    # Per thesis-break exit: {"date" (the fill), "ticker", "decision_date"
+    # (S, the session whose public fundamentals broke the thesis)}. The trade
+    # ledger carries no reason string, so the hook records its exits here for
+    # sellshadow's post-hoc classifier.
+    thesis_break_exits: list[dict] = field(default_factory=list)
+
+
+def _thesis_break_fundamentals(rec: dict | None, asof: pd.Timestamp) -> bool:
+    """The PREDECLARED M5 thesis-break condition, evaluated on the fundamentals
+    PUBLIC as of ``asof`` (filing-date PIT: an entry is public only when
+    ``filed <= asof``; restatements replace originals — ``monthly._asof_entries``):
+
+    the fundamentals record is missing, OR equity <= 0, OR TTM NI missing,
+    OR shares missing, OR **ROE = TTM NI / equity <= 0** (the quality leg
+    collapses). F/P-FCF changes alone do NOT trigger (the value leg is a
+    rank, not a gate). PRICE-side gates (mcap, dollar_vol, momentum,
+    staleness) are explicitly NOT re-checked here — price events are not
+    thesis breaks.
+
+    Uses the engine's OWN helpers (``monthly._latest_as_of`` /
+    ``monthly._ttm_as_of``), so asof=S gives exactly "the fundamentals public
+    as of session S" — the same hard gates ``monthly.eligible_frame`` applies.
+    """
+    from . import monthly as monthly_mod
+    if not rec:
+        return True
+    eq = monthly_mod._latest_as_of(rec.get("StockholdersEquity", []), asof)
+    ni = monthly_mod._ttm_as_of(rec.get("NetIncomeLoss", []), asof)
+    sh = monthly_mod._latest_as_of(
+        rec.get("CommonStockSharesOutstanding", [])
+        + rec.get("EntityCommonStockSharesOutstanding", []),
+        asof,
+    )
+    return (not eq or eq[1] <= 0 or ni is None or sh is None
+            or ni / eq[1] <= 0)
 
 
 def _inv_vol_weights(names: list[str], frame: pd.DataFrame | None,
@@ -3046,6 +3082,7 @@ async def _daily_core_backtest(
     basket_good_times: bool | None = None,
     basket_arm_sma: int | None = None,
     fixed_capital: float = 0.0,
+    thesis_break_exit: bool | None = None,
 ) -> BacktestSummary | None:
     """Deterministic "daily-core" backtest: the monthly qv-mom portfolio as the
     FUNDAMENTAL core, with minor candle-driven daily adjustments on top.
@@ -3065,6 +3102,22 @@ async def _daily_core_backtest(
         month-end rebalance, "daily" releases it the next day.
       - ``crash-pause``: pause NEW entries when the universe is in a
         pullback regime (breadth + median 5d run deeply negative).
+      - ``thesis_break_exit`` (default OFF — the no-arg path is
+        bit-identical): the M5 fundamental thesis-break exit. At each
+        session S (the decision pass, on data <= S) each holding's
+        fundamentals are re-derived with the engine's OWN helpers
+        (``monthly._latest_as_of`` / ``_ttm_as_of``, filing-date PIT). The
+        PREDECLARED thesis-break condition (fundamental-only): the
+        fundamentals record is missing, OR equity <= 0, OR TTM NI missing,
+        OR shares missing, OR **ROE = TTM NI / equity <= 0**. F/P-FCF
+        changes alone do NOT trigger (the value leg is a rank, not a gate);
+        PRICE-side gates (mcap, dollar_vol, momentum, staleness) are
+        explicitly NOT re-checked intraday. A break discovered at S schedules
+        an exit filled at F's open (the standing-order convention, in the F
+        loop before the BUY phase, same cost path as every other sell).
+        Re-entry is UNCHANGED (the ranking can bring the name back at a
+        later rebuild). Exits are counted (``n_thesis_break``) and recorded
+        per fill (``thesis_break_exits``) in the summary.
 
     With all knobs at their "monthly/none" defaults the replay reduces to the
     monthly qv-mom backtest (same eligibility, same hysteresis, same cost
@@ -3317,6 +3370,10 @@ async def _daily_core_backtest(
     pending_pick: dict[str, pd.Timestamp] = {}   # ticker -> first day seen in-band (entry-gate)
     churns: list[float] = []
     trades_log: list[tuple[str, str, str, float]] = []
+    # M5 thesis-break exits: one record per FILLED exit — the ledger carries
+    # no reason string, so the hook records {date, ticker, decision_date} here
+    # for the summary (and sellshadow's post-hoc classifier).
+    thesis_break_log: list[dict] = []
     # Monthly turnover bookkeeping: notional traded per calendar month,
     # relative to the equity at that month's start. Fresh-contribution
     # deployment is excluded (same convention as the monthly baseline,
@@ -3542,6 +3599,11 @@ async def _daily_core_backtest(
     # can be re-bought later if the ranking brings it back.
     if trailing_stop_pct is None:
         trailing_stop_pct = settings.sim_daily_core_trailing_stop
+    # thesis_break_exit (M5): the fundamental thesis-break exit — see the
+    # docstring for the predeclared condition. Default OFF via
+    # settings.sim_daily_core_thesis_break; the no-arg path is bit-identical.
+    if thesis_break_exit is None:
+        thesis_break_exit = settings.sim_daily_core_thesis_break
     # basket_trend_days (0 = off): the "gradient filter" — the N-day
     # rate-of-change (the slope) of the strategy's OWN target basket
     # (equal-weight top-N candidates). When it is negative for
@@ -3803,6 +3865,27 @@ async def _daily_core_backtest(
                 op = fill_px_of(t, d)
                 if op is not None and op <= level:
                     trade(d, t, "SELL", 0.0)
+                    pending_pick.pop(t, None)
+
+        # --- Thesis-break exit (M5): a STANDING ORDER struck at S — the
+        # fundamentals PUBLIC as of S (filing-date PIT, the engine's own
+        # _latest_as_of/_ttm_as_of helpers) — filled at F's open, before the
+        # BUY phase, same cost path as every other sell. The predeclared
+        # condition lives in ``_thesis_break_fundamentals`` (fundamental-only:
+        # record missing / equity <= 0 / TTM NI missing / shares missing /
+        # ROE <= 0; F/P-FCF changes alone do NOT trigger; price-side gates are
+        # not re-checked intraday). A failed fill (no F bar) keeps the standing
+        # order: the name stays held and the break re-fires next session.
+        # Re-entry is unchanged — the ranking can bring the name back.
+        if thesis_break_exit and s_prev is not None:
+            for t in list(shares):
+                if _thesis_break_fundamentals(fund.get(t), s_prev):
+                    if trade(d, t, "SELL", 0.0) > 0:
+                        thesis_break_log.append({
+                            "date": d.strftime("%Y-%m-%d"), "ticker": t,
+                            "decision_date": (s_prev.strftime("%Y-%m-%d")
+                                              if s_prev is not None else None),
+                        })
                     pending_pick.pop(t, None)
 
         # --- BUY phase: keep the portfolio at target weights ---
@@ -4118,6 +4201,7 @@ async def _daily_core_backtest(
            + (f" portfolio-stop={portfolio_stop_pct:g}" if portfolio_stop_pct else "")
            + (f" exposure-trend={exposure_trend_days}" if exposure_trend_days else "")
            + (f" trailing-stop={trailing_stop_pct:g}" if trailing_stop_pct else "")
+           + (" thesis-break=on" if thesis_break_exit else "")
            + (f" basket-trend={basket_trend_days}/{basket_confirm_days}"
               + (f" threshold={basket_threshold:g}" if basket_threshold else "")
               if basket_trend_days else "")
@@ -4151,7 +4235,9 @@ async def _daily_core_backtest(
           f"{(sum(churns) / len(churns)) if churns else 0:.1%}  trades: {len(trades_log)}"
           + (f"  brake events: {brake_events}" if portfolio_stop_pct else "")
           + (f"  basket events: {basket_events}"
-             if (basket_trend_days or basket_drawdown) else ""))
+             if (basket_trend_days or basket_drawdown) else "")
+          + (f"  thesis-break exits: {len(thesis_break_log)}"
+             if thesis_break_exit else ""))
     if verbose:
         print("\nLast 15 trades:")
         for td, side, t, notional, _sh, _px in trades_log[-15:]:
@@ -4189,6 +4275,8 @@ async def _daily_core_backtest(
         trades=[{"date": td, "side": side, "ticker": t,
                  "notional": notional, "shares": sh, "price": px}
                 for td, side, t, notional, sh, px in trades_log],
+        n_thesis_break=len(thesis_break_log),
+        thesis_break_exits=thesis_break_log,
     )
 
 
@@ -4229,6 +4317,7 @@ async def _main(args: argparse.Namespace) -> None:
             basket_er_min=getattr(args, "basket_er_min", None) or None,
             basket_good_times=getattr(args, "basket_good_times", False) or None,
             basket_arm_sma=getattr(args, "basket_arm_sma", None) or None,
+            thesis_break_exit=getattr(args, "thesis_break", False) or None,
         )
         return
 
@@ -5093,6 +5182,12 @@ def _build_parser() -> argparse.ArgumentParser:
     dc.add_argument("--trailing-stop", type=float, default=None,
                     help="Per-name trailing stop: exit a holding when its price falls this "
                          "fraction (e.g. 0.15) below its own peak since entry (0 = off)")
+    dc.add_argument("--thesis-break", action="store_true",
+                    help="M5 fundamental thesis-break exit: sell a holding at the next "
+                         "session's open when its newly filed fundamentals (filing-date "
+                         "PIT) would knock it out of the eligible frame's hard gates — "
+                         "record missing, equity <= 0, TTM NI missing, shares missing, or "
+                         "ROE = TTM NI / equity <= 0 (F/P-FCF changes alone do not trigger)")
     dc.add_argument("--basket-trend", type=int, default=None,
                     help="Gradient filter: N-day rate-of-change of the target basket; "
                          "cash out when negative for --basket-confirm days (0 = off)")

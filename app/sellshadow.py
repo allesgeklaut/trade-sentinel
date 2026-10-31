@@ -34,23 +34,26 @@ authorized model id is a recorded constant, never contacted):
 Phase 5B slice 5B (the monthly-book sell variants, ``mvariants``):
 
 5. ``mvariants``  — the PREDECLARED M-set of
-   ``docs/sell-exit-research-2026-10-31.md`` §4a (M0..M4b,
-   ``configs_tried = 7``): the monthly qv-mom book run through
-   ``optimize._daily_core_backtest`` with existing knobs only (zero engine
-   changes) — M0 = all "monthly/none" defaults (the engine's documented
-   equivalence to the monthly qv-mom backtest, pinned here as the parity
-   anchor vs ``optimize._monthly_backtest``), M1 = ``exit_cadence="daily"``
-   (band-dropped names released the next day), M2 = M1 +
-   ``entry_gate="not-crash"``, M3a/M3b = M1 + ``target_vol`` 0.20/0.25,
-   M4a/M4b = M1 + a 25%/30% per-name catastrophe trailing stop. Each variant
+   ``docs/sell-exit-research-2026-10-31.md`` §4a (M0..M5,
+   ``configs_tried = 8``): the monthly qv-mom book run through
+   ``optimize._daily_core_backtest`` — M0 = all "monthly/none" defaults (the
+   engine's documented equivalence to the monthly qv-mom backtest, pinned
+   here as the parity anchor vs ``optimize._monthly_backtest``), M1 =
+   ``exit_cadence="daily"`` (band-dropped names released the next day), M2 =
+   M1 + ``entry_gate="not-crash"``, M3a/M3b = M1 + ``target_vol`` 0.20/0.25,
+   M4a/M4b = M1 + a 25%/30% per-name catastrophe trailing stop, M5 = M0 +
+   ``thesis_break_exit=True`` (the fundamental thesis-break exit — the only
+   variant that needs the engine hook; exit_cadence stays "monthly" because
+   the band only changes at month-end rebuilds). Each variant
    gets the honest metric pipeline (the per-session equity series is
    RECONSTRUCTED from the engine's per-leg trade ledger + EOD mark policy
    exactly like ``reval._run_daily_core_arm`` — ``BacktestSummary`` exposes
    no per-session equity series, a declared deviation), plus the
    factor-relevant exit stats: sell-mix by reason class (band release at
-   rebuild / intraday / trailing stop, classified from the ledger + the
-   shared frame cache's bands), holding-period stats, Odean PGR/PLR, and the
-   band-drop release lag in sessions.
+   rebuild / intraday / trailing stop / thesis break, classified from the
+   ledger + the shared frame cache's bands + the engine's own thesis-break
+   exit records), holding-period stats, Odean PGR/PLR, the band-drop release
+   lag in sessions, and for M5 the thesis-break response/detection lags.
 
 It is ANALYSIS-ONLY and OFFLINE-ONLY:
 
@@ -168,7 +171,7 @@ BENCHMARK = "URTH"
 DEFAULT_START = "2015-01-02"
 DEFAULT_END = "2026-10-30"
 VARIANTS_CONFIGS_TRIED = 5
-MVARIANTS_CONFIGS_TRIED = 7
+MVARIANTS_CONFIGS_TRIED = 8
 # M0 parity tolerance: the engine's own sanity check
 # (tests/test_optimize.py TestDailyCoreMonthlyParity) allows 5pp/yr IRR
 # between the daily-core defaults and the monthly baseline; contributed must
@@ -1034,13 +1037,23 @@ def monthly_variant_params() -> dict[str, dict]:
       (``level = peak * (1 - trailing_stop_pct)``), so the doc's 25%/30% is
       plumbed as 0.25/0.30 — existing engine convention wins over the doc's
       percent notation.
-
-    M5 (thesis-break) needs an engine hook and is explicitly out of scope.
+    * M5 — M0 + ``thesis_break_exit=True`` (the fundamental thesis-break exit;
+      ``exit_cadence`` stays "monthly" — proven a no-op in 5B: the band only
+      changes at month-end rebuilds, so the thesis-break exit IS the
+      intra-month path). The PREDECLARED M5 interpretation pin (verbatim):
+      the thesis breaks when the fundamentals record is missing, OR equity
+      <= 0, OR TTM NI missing, OR shares missing, OR **ROE = TTM NI /
+      equity <= 0** — evaluated on the fundamentals public as of the decision
+      session S (filing-date PIT via ``monthly._asof_entries``; restatements
+      replace originals). F/P-FCF changes alone do NOT trigger (the value leg
+      is a rank, not a gate); price-side gates (mcap, dollar_vol, momentum,
+      staleness) are explicitly NOT re-checked intraday. A break discovered
+      at S fills at the next session F's open; re-entry is unchanged.
     """
     base = {"dca": "monthly", "entry_gate": "none", "exit_cadence": "monthly",
             "crash_pause": False, "vol_weight": None, "target_vol": None,
             "portfolio_stop_pct": None, "exposure_trend_days": None,
-            "trailing_stop_pct": None}
+            "trailing_stop_pct": None, "thesis_break_exit": False}
     daily = {**base, "exit_cadence": "daily"}
     return {
         "M0": dict(base),
@@ -1050,12 +1063,13 @@ def monthly_variant_params() -> dict[str, dict]:
         "M3b": {**daily, "target_vol": 0.25},
         "M4a": {**daily, "trailing_stop_pct": 0.25},
         "M4b": {**daily, "trailing_stop_pct": 0.30},
+        "M5": {**base, "thesis_break_exit": True},
     }
 
 
 @dataclass
 class CoreWindow:
-    """Everything one M-set window needs, loaded ONCE and shared by all seven
+    """Everything one M-set window needs, loaded ONCE and shared by all eight
     variants (the 4B study driver's one-load/shared-cache pattern): universe,
     the factor frames, fundamentals and the prebuilt eligibility-frame cache."""
     universe: dict
@@ -1238,12 +1252,14 @@ def _core_band_days(win: CoreWindow, hold_band: int) -> list[dict]:
 
 
 def _classify_core_sells(summary, win: CoreWindow, band_days: list[dict],
-                         trailing_stop_pct: float | None) -> list[dict]:
+                         trailing_stop_pct: float | None,
+                         thesis_exits: list[dict] | None = None) -> list[dict]:
     """Classify every SELL of a daily-core run and measure the band-drop
     release lag. DECLARED METHOD (the trade ledger carries no reason string,
-    so the classes are derived from the ledger + the frame cache, in the
-    engine's own decision order — the band-release pass runs before the
-    trailing stop):
+    so the classes are derived from the ledger + the frame cache + the
+    engine's own thesis-break exit records, in the engine's own decision
+    order — the band-release pass runs before the trailing stop, which runs
+    before the thesis-break pass):
 
     * ``band_release_at_rebuild`` / ``band_release_intraday`` — the sold name
       is outside the band of the fill day's decision frame (band = None days
@@ -1257,11 +1273,16 @@ def _classify_core_sells(summary, win: CoreWindow, band_days: list[dict],
       strict open) is through the standing level ``peak_since_entry *
       (1 - trailing_stop_pct)`` recomputed from the ledger + closes (the same
       peak rule the engine advances at each session's close).
+    * ``thesis_break`` — name still in the fill day's band, no trailing level
+      breached, and the engine's summary marks this (ticker, fill date) a
+      thesis-break exit (``summary.thesis_break_exits`` — the M5 hook records
+      its exits there because the ledger carries no reason).
     * ``other`` — anything else.
     """
     day_idx = {d["date"]: i for i, d in enumerate(band_days)}
     band_at = {d["date"]: d["band"] for d in band_days}
     rebuild_at = {d["date"]: d["rebuild"] for d in band_days}
+    thesis_set = {(e["ticker"], e["date"]) for e in (thesis_exits or [])}
     close_val = win.close.ffill()
     close_map = {t: dict(zip([d.strftime("%Y-%m-%d") for d in close_val.index],
                              close_val[t].tolist(), strict=True))
@@ -1298,6 +1319,8 @@ def _classify_core_sells(summary, win: CoreWindow, band_days: list[dict],
             level = peak * (1.0 - trailing_stop_pct) if peak > 0 else 0.0
             if level > 0 and float(t["price"]) <= level:
                 cls = "trailing_stop"
+        if cls == "other" and (tk, F) in thesis_set:
+            cls = "thesis_break"
         events.append({"ticker": tk, "fill_date": F, "class": cls,
                        "release_lag_sessions": lag})
     return events
@@ -1330,6 +1353,88 @@ def _lag_stats(events: list[dict]) -> dict:
     }
 
 
+def _thesis_break_lag_stats(win: CoreWindow, band_days: list[dict],
+                            thesis_exits: list[dict]) -> dict:
+    """The two DECLARED lag stats for M5's thesis-break exits.
+
+    * ``response_lag_sessions`` — sessions from the BREAKING FILING's
+      first-public session (the first window session on/after the newest
+      ``filed`` date among the ticker's entries public as of the exit's
+      decision session S — the filing that flipped the predeclared condition,
+      found via the same filing-date PIT rule the engine used) to the fill
+      session. Expected 0-1: the hook re-checks every session and the fill is
+      the next session's strict open.
+    * ``detection_lag_sessions`` — sessions from the fill to the NEXT
+      month-end rebuild day (the first session after a completed month-end,
+      from the same ``band_days`` the engine itself used). This is the
+      monthly-DETECTION delay M5 avoided: under M0 the same broken name would
+      have been released only at that rebuild.
+    """
+    day_idx = {d["date"]: i for i, d in enumerate(band_days)}
+    days = [d["date"] for d in band_days]
+
+    per_event = []
+    resp_lags: list[int] = []
+    det_lags: list[int] = []
+    for ex in thesis_exits:
+        tk, F = ex["ticker"], ex["date"]
+        fill_i = day_idx.get(F)
+        if fill_i is None:
+            continue
+        # the breaking filing: the newest `filed` among the ticker's entries
+        # PUBLIC as of the exit's decision session S (filing-date PIT — the
+        # same rule monthly._asof_entries applies)
+        s_dec = ex.get("decision_date")
+        trigger_filed = None
+        if s_dec is not None:
+            for entries in (win.fund.get(tk) or {}).values():
+                for e in entries:
+                    if e["filed"] <= s_dec and e["end"] < s_dec:
+                        if trigger_filed is None or e["filed"] > trigger_filed:
+                            trigger_filed = e["filed"]
+        resp = None
+        if trigger_filed is not None:
+            first_public = next((i for i, d in enumerate(days)
+                                 if d >= trigger_filed), None)
+            if first_public is not None:
+                resp = fill_i - first_public
+        nxt_rebuild = next((j for j in range(fill_i + 1, len(band_days))
+                            if band_days[j]["rebuild"]), None)
+        det = (nxt_rebuild - fill_i) if nxt_rebuild is not None else None
+        if resp is not None:
+            resp_lags.append(resp)
+        if det is not None:
+            det_lags.append(det)
+        per_event.append({"ticker": tk, "fill_date": F,
+                          "decision_date": s_dec,
+                          "trigger_filed": trigger_filed,
+                          "response_lag_sessions": resp,
+                          "detection_lag_sessions": det})
+
+    def _agg(vals: list[int]) -> dict:
+        if not vals:
+            return {"n": 0, "median": None, "mean": None, "max": None}
+        sv = sorted(vals)
+        n = len(sv)
+        med = sv[n // 2] if n % 2 else (sv[n // 2 - 1] + sv[n // 2]) / 2
+        return {"n": n, "median": med, "mean": sum(sv) / n, "max": sv[-1]}
+
+    return {
+        "method": ("response_lag_sessions: sessions from the breaking filing's "
+                   "first-public session (first window session on/after the newest "
+                   "filed date among the ticker's entries public as of the decision "
+                   "session S) to the fill (expected 0-1 — the hook re-checks every "
+                   "session and fills the next open); detection_lag_sessions: "
+                   "sessions from the fill to the next month-end rebuild day (the "
+                   "monthly-detection delay M5 avoided vs M0's band release at that "
+                   "rebuild)"),
+        "n_thesis_break": len(per_event),
+        "response_lag": _agg(resp_lags),
+        "detection_lag": _agg(det_lags),
+        "events": per_event,
+    }
+
+
 async def run_monthly_variant(win: CoreWindow, name: str, knobs: dict, *,
                               series: dict[str, pd.DataFrame] | None = None,
                               costs: reval.CostConfig | None = None,
@@ -1339,7 +1444,8 @@ async def run_monthly_variant(win: CoreWindow, name: str, knobs: dict, *,
     XIRR, maxDD, vol, excess Sharpe with rf = the declared 3% cash yield,
     annualized turnover, n_trades/n_sells) on the reconstructed per-session
     series, PLUS the factor exit stats: sell-mix by reason class, holding-period
-    stats, Odean PGR/PLR and the band-drop release lag.
+    stats, Odean PGR/PLR, the band-drop release lag, and (M5) the thesis-break
+    response/detection lags.
 
     The caller holds the ambient contexts (``reval.universes_override`` for the
     engine's own universe-file resolution; the DB context when loading).
@@ -1365,6 +1471,7 @@ async def run_monthly_variant(win: CoreWindow, name: str, knobs: dict, *,
             sim_daily_core_basket_confirm=3, sim_daily_core_basket_threshold=0.0,
             sim_daily_core_basket_drawdown=0.0, sim_daily_core_basket_er_min=0.0,
             sim_daily_core_basket_good_times=False, sim_daily_core_basket_arm_sma=200,
+            sim_daily_core_thesis_break=False,
             sim_monthly_rank_boost=0.0):
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -1379,7 +1486,8 @@ async def run_monthly_variant(win: CoreWindow, name: str, knobs: dict, *,
                 target_vol=knobs.get("target_vol"),
                 portfolio_stop_pct=knobs.get("portfolio_stop_pct"),
                 exposure_trend_days=knobs.get("exposure_trend_days"),
-                trailing_stop_pct=knobs.get("trailing_stop_pct"))
+                trailing_stop_pct=knobs.get("trailing_stop_pct"),
+                thesis_break_exit=knobs.get("thesis_break_exit", False))
     if summary is None:
         raise ValueError(f"daily-core backtest returned no summary for variant {name}")
     config_line = next((ln.split("config:", 1)[1].strip()
@@ -1401,11 +1509,14 @@ async def run_monthly_variant(win: CoreWindow, name: str, knobs: dict, *,
     # keeps them reusable unchanged
     res_view = SimpleNamespace(trades=[{**t, "reason": ""} for t in summary.trades])
     band_days = _core_band_days(win, hold_band)
+    thesis_exits = list(getattr(summary, "thesis_break_exits", []) or [])
     sell_events = _classify_core_sells(summary, win, band_days,
-                                       knobs.get("trailing_stop_pct"))
+                                       knobs.get("trailing_stop_pct"),
+                                       thesis_exits=thesis_exits)
     mix: dict[str, int] = {}
     for e in sell_events:
         mix[e["class"]] = mix.get(e["class"], 0) + 1
+    tb_stats = _thesis_break_lag_stats(win, band_days, thesis_exits)
 
     return {
         "name": name,
@@ -1416,6 +1527,7 @@ async def run_monthly_variant(win: CoreWindow, name: str, knobs: dict, *,
                    "crash_pause": knobs["crash_pause"],
                    "target_vol": knobs.get("target_vol"),
                    "trailing_stop_pct": knobs.get("trailing_stop_pct"),
+                   "thesis_break_exit": knobs.get("thesis_break_exit", False),
                    "target_n": target_n, "hold_band": hold_band,
                    "mom_variant": "raw", "contribution": contribution,
                    "start_cash": START_CASH,
@@ -1454,8 +1566,11 @@ async def run_monthly_variant(win: CoreWindow, name: str, knobs: dict, *,
             "n_trades": summary.n_trades, "window": list(summary.window),
             "sharpe": summary.sharpe, "max_drawdown": summary.max_drawdown,
             "brake_events": summary.brake_events, "basket_events": summary.basket_events,
+            "n_thesis_break": summary.n_thesis_break,
+            "thesis_break_exits": summary.thesis_break_exits,
             "reconstructed_final_equity": equity_raw[-1] if equity_raw else None,
         },
+        "thesis_break": tb_stats,
         "final_equity": equity_adj[-1] if equity_adj else None,
     }
 
@@ -1484,7 +1599,8 @@ async def _m0_parity_vs_monthly(win: CoreWindow, m0: dict,
             sim_daily_core_trailing_stop=0.0, sim_daily_core_basket_trend=0,
             sim_daily_core_basket_confirm=3, sim_daily_core_basket_threshold=0.0,
             sim_daily_core_basket_drawdown=0.0, sim_daily_core_basket_er_min=0.0,
-            sim_daily_core_basket_good_times=False, sim_daily_core_basket_arm_sma=200):
+            sim_daily_core_basket_good_times=False, sim_daily_core_basket_arm_sma=200,
+            sim_daily_core_thesis_break=False):
         with redirect_stdout(io.StringIO()):
             mb = await optimize._monthly_backtest(
                 win.start, win.end, win.universe["name"], contribution, False,
@@ -1523,7 +1639,7 @@ async def _m0_parity_vs_monthly(win: CoreWindow, m0: dict,
 async def run_mvariants(db_url: str, universe: str, universes_dir: str | None,
                        start: str, end: str, generated_at: str | None = None,
                        costs: reval.CostConfig | None = None) -> dict:
-    """Run the whole predeclared M-set (7 configs) on one read-only window:
+    """Run the whole predeclared M-set (8 configs) on one read-only window:
     one frame/fundamentals/frame-cache load shared by all variants, each
     variant through ``run_monthly_variant``, plus the M0 parity check vs
     ``optimize._monthly_backtest``. Deterministic sorted-keys JSON; the CLI
@@ -1580,10 +1696,16 @@ async def run_mvariants(db_url: str, universe: str, universes_dir: str | None,
                 "own fills/marks, not an independently observed curve; the FX debit "
                 "is post-hoc (per fill, not compounded into mid-window cash)",
                 "universes are current-membership snapshots (survivorship bias in "
-                "absolute terms; the seven variants share one universe and one "
+                "absolute terms; the eight variants share one universe and one "
                 "window, so their RELATIVE comparison is robust to it)",
                 "the cash yield and the risk-free proxy are post-hoc declared assumptions",
-                "M5 (thesis-break) is out of scope (needs an engine hook)",
+                "M5 (thesis_break_exit=True): fundamental-only triggers — the "
+                "fundamentals record missing, OR equity <= 0, OR TTM NI missing, OR "
+                "shares missing, OR ROE = TTM NI / equity <= 0 (filing-date PIT via "
+                "monthly._asof_entries — restatements replace originals); F/P-FCF "
+                "changes alone do NOT trigger; price-side gates (mcap, dollar_vol, "
+                "momentum, staleness) are NOT re-checked intraday; re-entry unchanged "
+                "(the monthly ranking's own rules)",
             ],
         },
         "m_set": monthly_variant_params(),
