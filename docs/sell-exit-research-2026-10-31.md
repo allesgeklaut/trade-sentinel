@@ -439,10 +439,26 @@ the engine's own rule stands), and one counterfactual-ledger pattern:
   (`sellshadow-b/1`, parameter-free DEFER) and the machinery is committed
   (`app/sellreview.py`).**
 - **Event type C — intra-month thesis-break candidates for the factor
-  book**: filing-day re-checks (shared with M5's hook) plus
-  drawdown/momentum alarms; the reviewer proposes an early exit the
-  monthly cadence would have delayed. The live book still waits for
-  month-end unless a policy survives validation.
+  book**: the M5 filing-day hook's predeclared condition (record missing
+  OR equity ≤ 0 OR TTM NI missing OR shares missing OR ROE ≤ 0; F/P-FCF
+  alone does NOT trigger; price-side gates excluded — the M-set verdict
+  contra-indicates per-name price alarms platform-wide); the reviewer
+  proposes an early exit the monthly cadence would have delayed. The live
+  book still waits for month-end unless a policy survives validation.
+  **Measured (2026-10-31, full window, `thesisbreak-ledger/1`, 7 events,
+  self-check 7/7): the early exit vs the month-end wait is a FAT-TAIL
+  SELECTION problem — mean +0.80pp/event but median −0.66pp, only 42.9%
+  positive. The blanket rule wins on average only because 2 of 7 events
+  are large (DELL 2022-03 +9.27pp dodged a −9.3% slide; DVA 2025-05
+  +4.99pp); most thesis-break dips BOUNCE by month-end (BA 2017-07
+  −2.60pp, COR 2022-11 −3.61pp, SBUX 2019-01 −2.18pp, HCA 2021-08
+  −0.66pp; BA 2018-07 +0.41pp). The per-event ledger RECONCILES with
+  M5's portfolio-level verdict (+0.05pp/yr ≈ 7 events × ~+0.8pp × ~10%
+  position weight). A reviewer that separates "broken and falling" from
+  "transient dip" beats both blanket rules; at ~0.6 candidates/year the
+  C side accumulates slowly live (declared). The C prompt is frozen
+  (`sellshadow-c/1`, parameter-free EXIT, fail-safe HOLD per the rule
+  above) and the machinery is committed (`app/sellreview.py`).**
 
 Contexts stay PIT-only and engine-appropriate: the factor-book events add
 fundamental fields (ROE, F/P-FCF, 12-1 momentum rank, band distance, days
@@ -476,8 +492,17 @@ Proposed sequencing (each step gated, owner approval between phases):
   a dead end (worse return AND drawdown — per-name price stops
   contra-indicated platform-wide). The owner's intra-month sell rides on
   M5's filing-day hook and the 5C type-C alarms.
-- **5C**: the per-engine event adapters (B and C above) for the unified
-  reviewer, after the owner reviews 5A-1's prompt design and 5B's results.
+- **5C** (committed — the unified reviewer, complete): the per-engine
+  event adapters (A via 5A-1, B and C above) + the daily `shadow`
+  command (`python -m app.sellreview shadow` — detection-only by
+  default; the deployed command accumulates the prospective evidence log)
+  + the `assess` scorer (completed-window rule, realized per-event deltas
+  vs the reference bars, fail-safe accounting — the LLM is graded ONLY on
+  the forward log). The owner signed off the `sellshadow/1` prompt design
+  and the 5C start; the engineering smoke (three canned-synthetic-context
+  consults through the live proxy, temperature 0) passed clean — correct
+  per-type decisions, rationales citing the context fields, no key
+  material logged. Grading remains prospective-only per §4.
 - In parallel, the §3 deterministic exit variants belong in the Phase 4C
   study runs.
 

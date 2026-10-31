@@ -1735,6 +1735,97 @@ deployment topology): the prospective wiring — live events →
 `consult` → the JSONL log, fail-safe to the engine's rule, evaluated
 against these ledgers.
 
+## Phase 5C-C — the type-C adapter, the daily shadow command, the assessor — 2026-10-31
+
+**Slice 5C-C code-complete, independently verified, and committed.** The
+5C program's end state, per the owner's confirmed architecture ("everything
+apart from the LLM call is in our app"): **detect → consult → assess**, all
+app code, fail-safe everywhere, the LLM graded only on the forward log.
+
+`app/sellreview.py` (+~1,560 lines): **the type-C adapter** —
+`thesisbreak_contexts` (`thesisbreak-contexts/1`, the M5 hook's recorded
+events with per-event PIT factor context, self-check style: held at the
+prior session, engine-marked, the predeclared condition holds at S on the
+public fundamentals, the fill price matches), `thesisbreak_ledger`
+(`thesisbreak-ledger/1`, the early-exit-vs-month-end counterfactual: the
+early exit's proceeds at the declared cash yield to the next rebuild vs
+the name held to the rebuild fill, both legs net of the one-way cost; the
+header declares its RECONCILIATION with the M5-vs-M0 portfolio verdict),
+the frozen `sellshadow-c/1` prompt (EXIT/HOLD semantics — the reviewer
+proposes the early exit; fail-safe HOLD per the research doc §4b: the
+live book waits for month-end unless a policy survives validation),
+`parse_response_c` (parameter-free EXIT, fail-safe HOLD), and the A/B/C
+parser/prompt/fail-safe routing maps. **The daily shadow command** —
+`python -m app.sellreview shadow --db ... [--as-of DATE] [--dry-run]`:
+detects the day's candidate events READ-ONLY from the live state (type A
+from the sim's positions + the recomputed ATR-ratchet standing level —
+the snapshot's `sim_positions.stop_price` is NULL on every row, so the
+level is RECOMPUTED with the engine's exact formula, declared; a newer
+`peak_price` column exists in the live schema that the repo model does
+not map — noted for the deployment wiring; types B/C from the live
+`monthly_positions` book at the month-end rebuilds, with a declared M0
+reconstruction fallback), builds the per-type contexts (the shared
+`_factor_fields` family — identical fields across B/C and the shadow),
+and `--dry-run` (the DEFAULT) detects + logs candidates with ZERO
+consults; without it, consults per event and appends
+`shadow-consult-log/1` JSONL. The command never raises on event-level
+problems (log + count), is read-only, fail-safe everywhere.
+**The assessor** — `python -m app.sellreview assess --log ... --db ...`:
+reads the accumulated consult log, and for each decision whose
+PREDECLARED forward window has COMPLETED (A: the defer window per 5A-1's
+rule; B/C: to the next month-end rebuild — no mid-window peeking),
+recomputes both branches' REALIZED outcomes with the same math as the
+per-type ledgers, and emits `shadow-assessment/1`: per type
+n_decided/n_fail_safe (the fail-safe rate is itself a verdict, reported
+prominently), the realized delta aggregates overall + by year, the
+REFERENCE_BARS from the committed ledgers (A: blanket defer +2.93pp +
+V1's portfolio bar; B: blanket retention −1.60pp + the by-year map; C:
+the M5 reconciliation), robust to its own log's imperfections,
+deterministic, no significance claims (small-n declared).
+`tests/test_sellreview.py` (+13 tests: C contexts/ledger, the C prompt +
+A/B/C parser map, consult-C routing, the dry-run zero-consult proof, the
+shadow mock-transport routing + JSONL, the assessor's hand-computed
+deltas / completed-window rule / fail-safe accounting / empty-log /
+determinism, CLI smokes).
+
+**The program's first real LLM calls (the engineering smoke, run by the
+orchestrator):** three consults — one per event type — with CANNED
+SYNTHETIC contexts (no historical events; engineering validation only,
+NOT a skill evaluation — the contamination rule), temperature 0, against
+the live proxy. All three: parsed=True, fail_safe=False, key present but
+never logged — type A CONFIRM ("underwater −6.8%, 12.4% giveback, 0.12
+ATR above the trail"), type B CONFIRM ("momentum decayed, 7 ranks outside
+the band — the drop-out is genuine"), type C EXIT ("TTM NI negative, ROE
+−4.8% (≤0) — the predeclared break condition"). The model demonstrably
+reads the context and applies the predeclared rules; the deployed
+plumbing is proven end-to-end. Artifacts:
+`/tmp/opencode/reval/sell5cc/smoke-llm/consult-log.jsonl`.
+
+**Full-window type-C verdict (2015-2026, 7 events, self-check 7/7):** the
+early exit vs the month-end wait — mean **+0.80pp/event, median −0.66pp,
+42.9% positive**: a fat-tail selection problem. The blanket rule wins on
+average only because 2 of 7 events are large (DELL 2022-03 **+9.27pp**
+dodged a −9.3% slide; DVA 2025-05 **+4.99pp**); most thesis-break dips
+BOUNCE by month-end (BA 2017 −2.60pp, SBUX 2019 −2.18pp, COR 2022
+−3.61pp). A reviewer that separates "broken and falling" from
+"transient dip" beats both blanket rules — with ~0.6 candidates/year,
+the C side accumulates slowly live (declared). The shadow dry-run against
+the snapshot's live state found REAL candidates (as-of 2026-10-29: 3
+type-A stop-fire candidates; at the September 2026 month-end: 4 type-B
+band-drops vs the live `monthly_positions` book) — the machinery is
+deployable, not theoretical.
+
+Independent verification: the orchestrator's own runs — 50 tests green in
+the main tree (11 + 19 sellshadow + 7 thesis-break + 13 new), ruff clean;
+the full-window tcontexts/tledger (3m56s + 3m57s) with the snapshot's row
+counts re-verified unchanged; the engineering smoke above. Honesty
+limits declared verbatim in every payload: the type-A live standing
+level is recomputed (the live `stop_price` column is NULL; the recompute
+is the 5A-1-validated formula), the B/C live sourcing prefers real state
+tables with the M0 reconstruction declared as fallback, single-name
+what-ifs, no re-entry modeling, small-n (no significance claims), and NO
+LLM grading on history — the assessor scores only the forward log.
+
 ## References
 
 - [SEC Apple companyfacts](https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json)
