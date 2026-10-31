@@ -1303,11 +1303,15 @@ async (page) => {
         const isVisible = ${dbIsVisible};
         const groups = Array.from(document.querySelectorAll("#lab-replay-groups .maintenance-group"));
         const note = document.getElementById("lab-replay-disabled");
+        const warning = document.getElementById("lab-replay-warning");
         return {
             lab_maintenance_visible: isVisible(document.getElementById("lab-maintenance")),
             lab_replay_reset_groups_hidden: groups.length > 0
                 && groups.every((group) => !isVisible(group)),
             lab_explanatory_note_visible: !!note && isVisible(note),
+            // The destructive-ops warning is DEV-only: on PROD the controls it
+            // warns about are hidden, so the box must be hidden too.
+            lab_replay_warning_hidden_on_prod: !!warning && !isVisible(warning),
             lab_data_visible: isVisible(document.getElementById("lab-data")),
             lab_policy_visible: isVisible(document.getElementById("lab-policy")),
             lab_db_group_visible: isVisible(document.getElementById("lab-db-group")),
@@ -1353,11 +1357,14 @@ async (page) => {
         const groups = Array.from(document.querySelectorAll("#lab-replay-groups .maintenance-group"));
         const note = document.getElementById("lab-replay-disabled");
         const nav = document.getElementById("nav-savings");
+        const warning = document.getElementById("lab-replay-warning");
         return {
             lab_maintenance_visible: isVisible(document.getElementById("lab-maintenance")),
             lab_replay_reset_groups_visible: groups.length > 0
                 && groups.every((group) => isVisible(group)),
             lab_replay_note_hidden: !!note && !isVisible(note),
+            // The destructive-ops warning appears exactly where the controls do.
+            lab_replay_warning_visible_on_dev: !!warning && isVisible(warning),
             nav_savings_hidden: !!nav && !isVisible(nav),
         };
     })()`));

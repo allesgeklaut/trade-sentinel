@@ -1934,7 +1934,11 @@
 
             <section class="sim-section" id="lab-maintenance">
                 <h3>PAPER ACCOUNT MAINTENANCE // REPLAYS &amp; RESETS</h3>
-                <p class="notice warn">Replays and resets are destructive to <b>recorded paper history</b>. A backfill
+                <!-- The destructive-ops warning is shown only where the destructive
+                     controls are (DEV). On PROD the controls are hidden and the
+                     #lab-replay-disabled notice is the honest, sufficient explanation —
+                     warning about hidden controls is noise. -->
+                <p class="notice warn" id="lab-replay-warning" hidden>Replays and resets are destructive to <b>recorded paper history</b>. A backfill
                     replaces the account's state with a synthetic replay of the strategy. A reset clears the account's
                     current book and starts a <b>new epoch</b> for the Daily Sim, Monthly and Daily-Core paper accounts
                     (their closed-epoch rows stay in the database for audit but no longer feed the charts).
@@ -3753,6 +3757,10 @@
             const groups = document.getElementById('lab-replay-groups');
             const note = document.getElementById('lab-replay-disabled');
             const extra = document.getElementById('lab-replay-disabled-extra');
+            // The destructive-ops warning follows the same rule as the groups:
+            // visible exactly where the destructive controls are (settled DEV).
+            const warning = document.getElementById('lab-replay-warning');
+            if (warning) warning.hidden = !(dbState.settled && dbIsDev());
             if (groups && note) {
                 if (!dbState.settled) {
                     groups.hidden = true;

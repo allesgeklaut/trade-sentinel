@@ -1215,7 +1215,21 @@ widths, every long paragraph is off the visible surface, both metadata
 strips and all amber warnings remain fully visible, and a real click opens
 a disclosure with its full text. The populated-mode Savings mirror split
 was additionally proven live (stats sentence visible, explanation
-collapsed behind its summary).
+collapsed behind its summary). Measured impact: **mobile pages 10.3%
+shorter** (Paper −354px, Savings −290px at 390px); desktop 2.3% on page
+height (the perceptual win is the header-to-chart prose stack, since wide
+layouts reflow prose into few lines and side-by-side panels set page
+height).
+
+Follow-up the same day, from user feedback on the Lab view: the static
+destructive-ops warning ("Replays and resets are destructive…") warned
+about controls that are hidden on PROD — noise stacked on the honest
+"disabled on PROD" notice. It is now `#lab-replay-warning`, shown exactly
+where the destructive controls are (settled DEV, hidden while pending and
+on PROD), following the same rule as `#lab-replay-groups`; the gate helper
+pins both states (`lab_replay_warning_hidden_on_prod`,
+`lab_replay_warning_visible_on_dev`). Verified: both gates green with the
+new checks, digests unchanged, and vision confirmation of both states.
 
 ## References
 
