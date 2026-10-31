@@ -90,10 +90,6 @@ def _mark_fresh(ticker: str) -> None:
     _fresh_at[ticker] = time.monotonic()
 
 
-def fresh_count() -> int:
-    return len(_fresh_at)
-
-
 def _is_fresh(ticker: str, max_age_seconds: float, now: float) -> bool:
     return (now - _fresh_at.get(ticker, float("-inf"))) < max_age_seconds
 

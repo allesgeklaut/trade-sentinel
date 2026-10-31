@@ -545,28 +545,6 @@ async def _stock_context(ticker: str) -> str:
             f"{news_section}"
         )
 
-@app.post('/api/chat/{ticker}')
-async def chat(ticker: str, req: ChatRequest):
-    """Multi-turn chat about a stock. Pass the full message history; the system context is rebuilt each turn."""
-    ticker = ticker.upper()
-    if not req.messages:
-        raise HTTPException(400, "messages must not be empty")
-    # Sanitise: keep only the last 20 messages, only role/content, only known roles
-    history_msgs = []
-    for m in req.messages[-20:]:
-        if m.role in ('user', 'assistant') and m.content.strip():
-            history_msgs.append({"role": m.role, "content": m.content})
-    if not history_msgs:
-        raise HTTPException(400, "no valid messages")
-    system_prompt = await _stock_context(ticker)
-    try:
-        out = await llm_mod.chat([{"role": "system", "content": system_prompt}] + history_msgs)
-        return {"text": out["text"], "model": out["model"] or await llm_mod.current_model_label()}
-    except Exception as e:
-        logger.warning("Chat LLM call failed for %s: %s", ticker, e)
-        return {"text": f"LLM unavailable: {e}", "model": await llm_mod.current_model_label()}
-
-
 async def _sse_event(data: dict) -> str:
     """Serialize ``data`` as a single Server-Sent Events ``data:`` line."""
     return "data: " + json.dumps(data) + "\n\n"
@@ -821,11 +799,6 @@ async def _backfill_all_locked(start: str | None) -> dict:
 async def sim_reasoning():
     """Return structured LLM reasoning summary from the most recent sim cycle."""
     return sim.get_last_llm_summary()
-
-@app.get('/api/sim/raw_reasoning')
-async def sim_raw_reasoning():
-    """Return the raw LLM reasoning text (for debugging/full text view)."""
-    return {"reasoning": sim.get_last_llm_reasoning()}
 
 # =====================================================================
 # Monthly qv-mom portfolio endpoints (separate paper portfolio)

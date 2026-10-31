@@ -821,7 +821,7 @@ def test_db_guard_parity_leaves_unguarded_routes_alone():
         ("POST", "/api/sim/universe"),
         ("POST", "/api/screener/sync"),
         ("POST", "/api/screener/run/diversified-plus"),
-        ("POST", "/api/chat/AAPL"),
+        ("POST", "/api/chat/AAPL/stream"),
         ("POST", "/api/llm/select"),
         ("DELETE", "/api/sim/chat/history"),
         ("DELETE", "/api/watchlist/AAPL"),
@@ -975,10 +975,8 @@ def test_run_config_route_serves_canned_live_config_both_modes():
         assert "fixture_ack" not in dev.json()
 
 
-def test_ticker_chat_envelope_drops_legacy_trades_key():
+def test_ticker_chat_stream_envelope_drops_legacy_trades_key():
     backend = FixtureBackend(mode="populated")
-    payload = backend.dispatch("POST", "/api/chat/AAPL", body=b'{"messages": []}').json()
-    assert "text" in payload and "trades" not in set(_walk_keys(payload))
     sse = backend.dispatch("POST", "/api/chat/AAPL/stream", body=b"{}")
     text = sse.body.decode("utf-8")
     assert '"trades"' not in text and '"actions_executed"' not in text

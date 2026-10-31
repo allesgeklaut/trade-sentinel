@@ -33,8 +33,8 @@ down. Measured on the pre-adoption code (synthetic probe, same fixtures):
                                  -> None, no mutation
 
 The backfill's ``do_buy`` / ``do_sell`` already tolerated bad inputs (they
-sized through ``monthly.share_size``, itself a ``factor_fills.share_size``
-wrapper, and pre-checked ``p is None or p <= 0``), so for them the adoption is
+sized through the shared ``factor_fills.share_size`` and pre-checked
+``p is None or p <= 0``), so for them the adoption is
 pure arithmetic consolidation: invalid input still books nothing and moves
 nothing — the same behaviour, one formula.
 

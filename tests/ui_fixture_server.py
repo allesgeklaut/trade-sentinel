@@ -643,9 +643,6 @@ class FixtureBackend:
                 return self._json(200, _as_dict(portfolio.get("run_status"), "sim.run_status"), mode, "fixture_api")
             if tail == ["reasoning"]:
                 return self._json(200, _as_dict(portfolio.get("reasoning"), "sim.reasoning"), mode, "fixture_api")
-            if tail == ["raw_reasoning"]:
-                reasoning = _as_dict(portfolio.get("reasoning"), "sim.reasoning")
-                return self._json(200, {"reasoning": reasoning.get("raw", "")}, mode, "fixture_api")
             if tail == ["chat", "history"]:
                 return self._json(200, copy.deepcopy(_as_list(portfolio.get("chat_history"), "sim.chat_history")), mode, "fixture_api")
         if account == "monthly" and tail == ["rebalances"]:
@@ -774,8 +771,6 @@ class FixtureBackend:
             return self._ack(mode, payload)
         if api == ["sim", "chat", "reject"]:
             return self._ack(mode, {"ok": True})
-        if len(api) == 2 and api[0] == "chat":
-            return self._ack(mode, {"text": self._chat_text(), "model": "fixture-chat-model"})
         if len(api) == 3 and api[0] == "chat" and api[2] == "stream":
             return self._sse(mode)
 

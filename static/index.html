@@ -2420,10 +2420,6 @@
             openAssistant('explain');
         }
 
-        function closeExplainModal() {
-            closeAssistant();
-        }
-
         // Esc closes whichever overlay is open; backdrop click closes too.
         document.addEventListener('keydown', e => {
             if (e.key === 'Escape') {
@@ -4626,31 +4622,16 @@
 
         // Small caption under each equity chart marking the last data date —
         // makes stale curves visible instead of silently flat (#20).
-        function updateAsOf(which, lastTime) {
-            const el = document.getElementById(which + '-asof');
-            if (!el) return;
-            const today = new Date().toISOString().slice(0, 10);
-            const stale = lastTime && lastTime < today;
-            el.textContent = lastTime ? `data as of ${lastTime}${stale ? ' (stale — live valuation may differ)' : ''}` : '';
-            el.style.color = stale ? '#e6a23c' : '#7aaa81';
-        }
+        // (Byte-pinned end marker of the mddOf source guard; the caption
+        // itself is populated by the account loaders.)
 
         // ===================== Shared paper comparison (Phase 3B) =====================
         // ONE comparison view + ONE chart instance for the selected Paper
         // account and its two USD paper peers plus the derived DCA benchmark.
-        // The three legacy per-tab builders are replaced by this path; the
-        // legacy function names, range limits and loaded flags stay callable.
         const PAPER_RANGES = ['6M', '1Y', '2Y', '5Y', 'MAX'];
         const PAPER_RANGE_LIMIT = { '6M': 126, '1Y': 252, '2Y': 504, '5Y': 1260, 'MAX': 12000 };
         let paperRange = '1Y';
         let paperMode = 'pct';
-        // Legacy aliases (kept as real bindings for old callers/tests).
-        let simRange = paperRange;
-        let monthlyRange = paperRange;
-        let dcRange = paperRange;
-        let simCompareMode = paperMode;
-        let compareMode = paperMode;
-        let dcCompareMode = paperMode;
         let paperComparisonChart = null;
         // Last-started comparison data request wins; a range toggle can never
         // be overwritten by an older in-flight account/chart load.
@@ -4668,13 +4649,6 @@
             return PAPER_RANGE_LIMIT[paperRange] || 12000;
         }
 
-        // Keep the legacy range/mode variables readable/writable for old
-        // callers; the shared view remains the single source of truth.
-        function syncLegacyAnalysisState() {
-            simRange = monthlyRange = dcRange = paperRange;
-            simCompareMode = compareMode = dcCompareMode = paperMode;
-        }
-
         function syncPaperComparisonControls() {
             const range = document.getElementById('paper-range');
             if (range && range.value !== paperRange) range.value = paperRange;
@@ -4684,7 +4658,6 @@
 
         function setPaperRange(range) {
             paperRange = PAPER_RANGES.indexOf(range) >= 0 ? range : '1Y';
-            syncLegacyAnalysisState();
             syncPaperComparisonControls();
             // Range is a server ROW limit; re-read the four equity curves with
             // GETs only. No status/POST endpoint is touched by a range change.
@@ -4692,28 +4665,18 @@
         }
 
         // Lab backfill sets MAX for the account it will reload on the next
-        // Paper visit: update controls + legacy aliases WITHOUT fetching or
-        // drawing inside a hidden workspace.
+        // Paper visit: update controls WITHOUT fetching or drawing inside a
+        // hidden workspace.
         function queuePaperRange(range) {
             paperRange = PAPER_RANGES.indexOf(range) >= 0 ? range : paperRange;
-            syncLegacyAnalysisState();
             syncPaperComparisonControls();
         }
 
         function setPaperMode(mode) {
             paperMode = mode === 'usd' ? 'usd' : 'pct';
-            syncLegacyAnalysisState();
             syncPaperComparisonControls();
             drawPaperComparison();   // pure redraw from payloads already loaded
         }
-
-        // Legacy aliases — same names, one shared implementation.
-        function setSimRange(r) { setPaperRange(r); }
-        function setMonthlyRange(r) { setPaperRange(r); }
-        function setDCRange(r) { setPaperRange(r); }
-        function setSimCompareMode(mode) { setPaperMode(mode); }
-        function setCompareMode(mode) { setPaperMode(mode); }
-        function setDCCompareMode(mode) { setPaperMode(mode); }
 
         function paperChartEntry(account) {
             return paperChartData[account] || { snapshots: null, live: null, liveKnown: false, limit: null };
@@ -6209,38 +6172,6 @@
         }
 
         const VIENNA_TZ = 'Europe/Vienna';
-
-        function fmtVienna(iso, withSeconds) {
-            if (!iso) return '';
-            return new Intl.DateTimeFormat('en-GB', {
-                timeZone: VIENNA_TZ,
-                year: 'numeric', month: 'short', day: 'numeric',
-                hour: '2-digit', minute: '2-digit', ...(withSeconds ? { second: '2-digit' } : {}),
-                timeZoneName: 'short',
-            }).format(new Date(iso));
-        }
-
-        function viennaTimeParts(ts) {
-            const p = {};
-            for (const part of new Intl.DateTimeFormat('en-GB', {
-                timeZone: VIENNA_TZ,
-                year: 'numeric', month: 'short', day: 'numeric',
-                hour: '2-digit', minute: '2-digit',
-            }).formatToParts(new Date(ts * 1000))) {
-                p[part.type] = part.value;
-            }
-            return p;
-        }
-
-        function viennaTickMarkFormatter(time, tickMarkType) {
-            // Tick types (v4): 0 = year start, 1 = month start, 2 = day
-            // start, 3+ = time. Same mapping rules as the dashboard chart.
-            const p = viennaTimeParts(time);
-            if (tickMarkType === 0) return p.year;
-            if (tickMarkType === 1) return p.month;
-            if (tickMarkType === 2) return `${p.day} ${p.month}`;
-            return `${p.hour}:${p.minute}`;
-        }
 
         // Trade-log timestamp helpers. The date goes into a full-width
         // divider row between day groups, so the Time column only holds

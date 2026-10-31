@@ -2102,6 +2102,89 @@ the exact name ≠ the mean); (2) linear vs compounded cash-yield accrual
 expectations updated. Full offline regression green in the main tree at
 the commit.
 
+## The dead-code retirement — the owner's final bookkeeping pass, part 1 — 2026-10-31
+
+**The owner's requested final pass: "in the end we should also make a code
+bookkeeping we probably have lots of dead code we could retire."**
+Evidence-based and conservative: a very-thorough inventory (per-module
+symbol listing cross-referenced against every caller surface — app/,
+tests/, the UI's fetch calls, the fixture server's route table, scripts,
+docs — with the research paths excluded BY POLICY as the reproducible
+evidence record, not dead code), then independent verification of every
+candidate before any deletion. The verification mattered: the inventory's
+"retire analysis.persist/history + the Signal model" item was WRONG —
+they are called (unqualified) by `GET /api/dashboard/{ticker}`
+(main.py:439-440), invisible to a qualified-reference search. Caught
+before any code was touched; the lesson is in the method: grep the
+unqualified call form of every imported name before declaring it dead.
+
+The six retirements (all zero-reference anywhere including the UI/JS):
+
+- **The legacy non-contract fill path** (app/sim.py): the `decision=None`
+  branch of `_deterministic_propose` — fills at the latest cached close,
+  NOT contract-compliant; its own docstring said "kept only until every
+  caller is wired", and every app caller now passes `decision`.
+  `decision` is now a required parameter of both `_deterministic_propose`
+  and `_deterministic_decide`; the `signals` parameter is gone (the
+  contract path reads `decision.signals`). The 7 test call sites
+  (`TestTopUpAtCap`, `TestDeterministicEntryAndStops`) were REWIRED to
+  the `_DecisionInputs` contract pattern (test_fills_contract.py's
+  shape) with coverage and assertions preserved — the one recomputed
+  assertion (the ATR-stop test) is now STRONGER: it pins the
+  standing-order fill at F's open (90 <= the 95 level) instead of the
+  old close-comparison "ATR stop hit". The stale backfill docstring
+  claiming "The live sim runs SIM_STRATEGY=hybrid" now states the truth:
+  the deterministic cycle is the live decision path (the sell layer
+  wires there); llm/hybrid remain selectable modes (the owner has since
+  decided to retire them — part 2, below).
+- **The dead UI/JS cluster** (static/index.html): `closeExplainModal`,
+  `updateAsOf`, the legacy alias cluster (six variables +
+  `syncLegacyAnalysisState` + its three call sites + the six alias
+  functions), `fmtVienna`, `viennaTimeParts` + `viennaTickMarkFormatter`
+  — all definition-only. One subtlety: `updateAsOf`'s caption comment is
+  the byte-pinned END MARKER of the mddOf source guard
+  (tests/fixtures/portfolio_ui_cases.json) — it stays, marked as the
+  pinned marker; the digest pins pass unchanged. `withLiveToday` is NOT
+  in this slice (digest-pinned; the owner decided to retire it with a
+  deliberate re-pin — part 2).
+- **POST /api/chat/{ticker}** (the non-stream per-ticker chat): the UI
+  posts only the `/stream` variant; the endpoint, its fixture-server
+  mirror route, and the dispatch self-test retired together (the stream
+  variant and its test stay; the route-coverage list keeps parity with
+  the real app).
+- **GET /api/sim/raw_reasoning** + `sim.get_last_llm_reasoning`: the
+  reasoning panel reads `r.raw` from `/api/sim/reasoning`; the endpoint,
+  the accessor, and the fixture route retired. `/api/sim/reasoning`
+  itself (the degraded-state endpoint) stays.
+- **monthly.share_size** (the compat wrapper): monthly's own execution
+  path uses `factor_fills.buy_fill` directly; the wrapper's only callers
+  were its parity test (retired) and test_optimize.py's sizing pin
+  (rewired to `factor_fills.share_size` — the wrapper delegated 1:1,
+  the pin's intent unchanged). `factor_fills.share_size` — the ONE
+  sizing formula — is heavily live and untouched.
+- **market.fresh_count**: zero references repo-wide.
+
+The judgment calls went to the owner with the measured blast radius, and
+their verdicts: RETIRE the sim's llm/hybrid whole-cycle modes (their own
+words: they "never worked well"; the sell layer covers the deterministic
+cycle) and `withLiveToday` (with the digest re-pin) — both in part 2,
+the next slice; KEEP `sim_chat` + the non-stream sim chat (the test
+classes lean on it) and KEEP `DELETE /api/savings/positions/{ticker}`
+(tested, documented manual surface).
+
+Independent verification (the orchestrator's gate): the diff review (the
+signature surgery is keyword-safe at both remaining callers); my own
+runs — 467 green on the touched suites plus test_main, test_selllayer
+and test_run_config_adoption (the file with the stale no-op monkeypatch
+seam, verified still passing); ruff clean over app/ and tests/; and a
+zero-reference grep per retired symbol (the only `share_size` left is
+the live factor_fills primitive). Full offline regression green in the
+main tree at the commit. Worker deviations, all verified reasonable:
+the pinned-marker comment kept verbatim; the chat-envelope test renamed
+(it also covered the stream variant, which stays); `_latest_close`
+mocks kept in the two tests where `valuate()` genuinely uses them (live
+infrastructure, not legacy plumbing).
+
 ## References
 
 - [SEC Apple companyfacts](https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json)

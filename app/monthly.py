@@ -1495,20 +1495,6 @@ async def _deposit_allowance_locked(month: str, *, mode: str | None,
                 "month": month, "cash": acc.cash}
 
 
-def share_size(budget: float, price: float) -> float:
-    """Fractional-share size toward `budget` at `price`, floored to 4dp.
-
-    Thin compatibility wrapper around ``factor_fills.share_size`` — the ONE
-    sizing formula for the factor engines: the live ``_exec_buy``, both
-    persisted replays and the optimize replay (which imports this name) must
-    size identical budgets identically, or the golden parity
-    (tests/test_cadence_parity.py) breaks. Kept public because callers
-    outside this module import it; new code should use ``factor_fills``.
-    Returns 0.0 when the leg is not executable (no positive price / sub-dollar
-    budget / unusable input)."""
-    return factor_fills.share_size(budget, price)
-
-
 async def _exec_buy(ticker: str, price: float, budget: float, reason: str, *,
                     mode: str | None = None, config_id: int | None = None,
                     epoch: int | None = None) -> dict | None:

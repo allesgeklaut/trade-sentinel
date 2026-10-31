@@ -89,8 +89,8 @@ def _legacy_formula_fill(cash: float, price: float, delta_value: float,
 def _legacy_share_size_fill(cash: float, price: float, delta_value: float,
                             cost: float) -> tuple[float, float, float] | None:
     """The pre-wrapper ``_fill_buy`` EXACTLY: identical arithmetic, but sizing
-    through ``monthly.share_size`` (the lazy engine-to-engine import the
-    factor_fills adoption removed) instead of the literal floor."""
+    through the shared ``factor_fills.share_size`` (the engine-to-engine
+    import the factor_fills adoption removed) instead of the literal floor."""
     budget = delta_value
     if cost > 0:
         budget = min(budget, max(cash, 0.0) / (1.0 + cost))

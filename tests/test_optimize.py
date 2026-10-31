@@ -1514,7 +1514,7 @@ class TestDailyCoreMonthlyParity:
 class TestFillBuy:
     """The daily-core BUY fill must reserve the one-way fee inside the spend
     so a full-cash buy can never drive cash negative AND floor the share
-    count through ``monthly.share_size`` (the live ``_exec_buy`` /
+    count through ``factor_fills.share_size`` (the live ``_exec_buy`` /
     ``daily_core.backfill.do_buy`` rule) — research fills must be
     byte-identical to the live executor's on the same budget/fill price."""
 
@@ -1538,7 +1538,7 @@ class TestFillBuy:
         assert cash_after == pytest.approx(1000.0 - 300.0 - 0.3)
 
     def test_shares_match_the_live_share_size_floor(self):
-        from app.monthly import share_size
+        from app.factor_fills import share_size
         fill = optimize._fill_buy(cash=1000.0, price=137.31,
                                   delta_value=1000.0, cost=0.0)
         assert fill is not None

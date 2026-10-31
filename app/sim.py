@@ -1052,64 +1052,33 @@ def _session_fill_open(session_bars: dict[str, dict], ticker: str) -> float | No
 
 async def _deterministic_propose(
     valuation: dict[str, Any],
-    signals: dict[str, dict] | None = None,
+    decision: _DecisionInputs,
     quality_of: Callable[[str], dict[str, float | None] | None] | None = None,
-    decision: _DecisionInputs | None = None,
 ) -> list[dict]:
     """Propose deterministic trades WITHOUT executing them.
 
     Thin wrapper over ``strategy.propose_trades`` — loads positions from the
-    DB, resolves prices, gathers signals if not pre-supplied, converts
-    to plain data, and delegates the SELL/BUY logic to the shared module.
-    The hybrid strategy passes the proposals to the LLM for review/veto
-    before any DB write happens.
+    DB, converts to plain data, and delegates the SELL/BUY logic to the
+    shared module. The hybrid strategy passes the proposals to the LLM for
+    review/veto before any DB write happens.
 
     Each proposal carries everything ``_execute_proposed`` needs:
       - SELL: {"ticker", "side": "SELL", "price", "shares": None, "reason"}
       - BUY:  {"ticker", "side": "BUY",  "price", "budget", "reason", "entry_stop"}
 
-    With ``decision`` (the cycle's frozen decision inputs — the normal
-    path) the proposals follow the session fill contract: decision data
-    <= S, fills at F's open via the strict session bars, stops as standing
-    orders (rule 4), the position's persisted frozen percent stop plus the
-    monotone ATR ratchet (rules 5-6) passed through. With ``decision=None``
-    (legacy callers/tests) the old behaviour is kept: signals from the
-    full cached candles, fills at the latest cached close — NOT contract-
-    compliant, kept only until every caller is wired.
+    ``decision`` is the cycle's frozen decision inputs — the only path: the
+    proposals follow the session fill contract: decision data <= S, fills
+    at F's open via the strict session bars, stops as standing orders
+    (rule 4), the position's persisted frozen percent stop plus the
+    monotone ATR ratchet (rules 5-6) passed through.
     """
     async with Session() as s:
         open_positions = (await s.scalars(select(SimPosition))).all()
 
-    if decision is None:
-        # Legacy path: the old candles()-per-ticker gather and latest-close
-        # fills. Kept for backward compatibility with existing callers and
-        # tests until they are wired to the contract.
-        if signals is None:
-            signals = {}
-            for t in await _candidate_tickers():
-                try:
-                    signals[t] = compute(await candles(t))
-                except Exception:
-                    continue
-
-        # Fetch current prices for all held + candidate tickers.
-        prices: dict[str, float] = {}
-        for pos in open_positions:
-            price = await _latest_close(pos.ticker)
-            if price is not None:
-                prices[pos.ticker] = price
-        for t in signals:
-            if t not in prices:
-                price = await _latest_close(t)
-                if price is not None:
-                    prices[t] = price
-        session_bars = None
-        ratchets: dict[str, float | None] = {}
-    else:
-        signals = decision.signals
-        prices = decision.prices
-        session_bars = decision.session_bars
-        ratchets = decision.ratchets
+    signals = decision.signals
+    prices = decision.prices
+    session_bars = decision.session_bars
+    ratchets = decision.ratchets
 
     positions = [
         {"ticker": pos.ticker, "shares": pos.shares, "avg_cost": pos.avg_cost,
@@ -1200,16 +1169,15 @@ async def _execute_proposed(proposals: list[dict]) -> list[dict]:
 
 
 async def _deterministic_decide(valuation: dict[str, Any],
-                                quality_of: Callable[[str], dict[str, float | None] | None] | None = None,
-                                decision: _DecisionInputs | None = None) -> list[dict]:
+                                decision: _DecisionInputs,
+                                quality_of: Callable[[str], dict[str, float | None] | None] | None = None) -> list[dict]:
     """Rule-based strategy: propose + execute deterministic trades.
 
     Thin wrapper over ``_deterministic_propose`` + ``_execute_proposed`` so
     the deterministic-only strategy keeps its original behaviour. The hybrid
     strategy calls the two halves separately so the LLM can review proposals
     before they execute. ``decision`` = the cycle's frozen decision inputs
-    (session fill contract); None = legacy behaviour (fills at the latest
-    cached close).
+    (session fill contract).
     """
     proposals = await _deterministic_propose(valuation, quality_of=quality_of,
                                              decision=decision)
@@ -3115,11 +3083,6 @@ def start_run_cycle_background() -> dict[str, Any]:
 # Query helpers (for API endpoints)
 # ---------------------------------------------------------------------------
 
-def get_last_llm_reasoning() -> str:
-    """Return the raw LLM reasoning text from the most recent sim cycle."""
-    return _last_llm_reasoning
-
-
 def get_run_progress() -> dict[str, Any]:
     """Return the current/last run-cycle progress for the frontend poller."""
     return dict(_run_progress)
@@ -3324,13 +3287,15 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
     """Replay the DETERMINISTIC sim strategy over historical data and REPLACE
     the portfolio state with the replay's end state.
 
-    The live sim runs ``SIM_STRATEGY=hybrid`` (deterministic engine + LLM
-    review), but the LLM cannot be replayed faithfully (tokens, and its
-    cloud behaviour isn't reproducible), so this backfill is a DETERMINISTIC
-    APPROXIMATION: the engine's own rules only — the same SELL/ATR-stop/BUY
-    logic, the same risk config (max-positions, stops, run-up block, cash
-    floor), zero LLM calls. The curve approximates the engine the hybrid
-    mode overlays; treat it as context for comparison, not a track record.
+    The live sim's deterministic cycle is the live decision path (the LLM
+    sell layer wires into it); ``llm``/``hybrid`` remain selectable
+    strategy modes, but the LLM cannot be replayed faithfully (tokens, and
+    its cloud behaviour isn't reproducible), so this backfill is a
+    DETERMINISTIC APPROXIMATION: the engine's own rules only — the same
+    SELL/ATR-stop/BUY logic, the same risk config (max-positions, stops,
+    run-up block, cash floor), zero LLM calls. The curve approximates the
+    deterministic engine; treat it as context for comparison, not a track
+    record.
 
     Wipes account/positions/trades/allowances/snapshots (NOT the benchmark,
     NOT chat history), then walks every stored trading day from `start` to

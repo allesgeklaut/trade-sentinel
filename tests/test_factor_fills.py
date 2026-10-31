@@ -15,8 +15,7 @@ These tests pin the primitive itself, independently of any engine:
   * sells liquidate every positive supplied share with no re-flooring;
   * a buy→sell round trip conserves cash exactly (same price, no fee);
   * ``Fill`` is immutable and carries exactly the four documented fields;
-  * the module stays pure (no DB/strategy imports) and ``monthly.share_size``
-    remains a thin wrapper over it for existing callers.
+  * the module stays pure (no DB/strategy imports).
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from app import factor_fills, monthly
+from app import factor_fills
 from app.factor_fills import Fill, buy_fill, sell_fill, share_size
 
 # Inputs whose arithmetic overflows: (cash, budget, price) for BUY and
@@ -257,19 +256,6 @@ def test_fill_is_immutable_with_the_documented_fields():
 # ---------------------------------------------------------------------------
 # Adoption / purity guards
 # ---------------------------------------------------------------------------
-
-def test_monthly_share_size_is_a_thin_compatibility_wrapper():
-    """Existing callers (optimize, daily-core backfill) import
-    ``monthly.share_size``: it must delegate to the shared helper for every
-    input, including the invalid ones the old inline formula raised on."""
-    grid = [(1000.0, 3.0), (1.0, 10000.0), (99.9999, 1e6), (123.45, 5.0),
-            (4000.0, 137.31)]
-    for budget, price in grid:
-        assert monthly.share_size(budget, price) == share_size(budget, price)
-    for bad in (float("nan"), float("inf"), -1.0, 0.0, None):
-        assert monthly.share_size(1000.0, bad) == 0.0
-        assert monthly.share_size(bad, 10.0) == 0.0
-
 
 def test_module_is_pure_stdlib_only():
     """No DB/strategy imports: the primitive must be importable (and

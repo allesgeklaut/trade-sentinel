@@ -17,6 +17,7 @@ import random
 from datetime import UTC, datetime, timedelta
 
 import httpx
+import pandas as pd
 import pytest
 from sqlalchemy import StaticPool, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -1328,11 +1329,6 @@ class TestTopUpAtCap:
         signals = {f"HELD{i}": buy_signal(f"HELD{i}") for i in range(10)}
         signals["NEW1"] = buy_signal("NEW1")
 
-        # Mock _candidate_tickers to return the held + new tickers.
-        async def mock_candidates():
-            return list(signals.keys())
-        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
-
         # Keep max_positions at the default (10) — the portfolio is at cap.
         monkeypatch.setattr(settings, "sim_max_positions", 10)
 
@@ -1343,7 +1339,18 @@ class TestTopUpAtCap:
             await s.commit()
         valuation = await sim.valuate()
 
-        proposals = await sim._deterministic_propose(valuation, signals)
+        # Contract path: frozen decision inputs — decision closes (S) for
+        # held + candidate tickers, F's bars for the held tickers (fills at
+        # F's open), no ratchets yet.
+        prices = {f"HELD{i}": 60.0 for i in range(10)}
+        prices["NEW1"] = 100.0
+        session_bars = {f"HELD{i}": {"open": 60.0, "low": 59.0, "close": 60.0}
+                        for i in range(10)}
+        decision = sim._DecisionInputs(
+            f_ts=pd.Timestamp("2026-03-03"), s_ts=pd.Timestamp("2026-03-02"),
+            signals=signals, prices=prices, session_bars=session_bars,
+            ratchets={f"HELD{i}": None for i in range(10)})
+        proposals = await sim._deterministic_propose(valuation, decision=decision)
 
         # Split proposals by whether the ticker is already held.
         held_tickers = {f"HELD{i}" for i in range(10)}
@@ -1363,9 +1370,9 @@ class TestTopUpAtCap:
 
     async def test_top_up_executes_and_deploys_cash(self, with_cash, monkeypatch):
         """End-to-end: propose + execute at the cap should actually buy more of
-        a held ticker and reduce cash. Calls _deterministic_propose (with
-        pre-built signals) + _execute_proposed directly, mirroring the hybrid
-        branch's propose→execute flow."""
+        a held ticker and reduce cash. Calls _deterministic_propose (with a
+        pre-built _DecisionInputs) + _execute_proposed directly, mirroring
+        the hybrid branch's propose→execute flow."""
         from app.db import SimPosition
 
         # Seed 10 positions at low cost basis.
@@ -1384,10 +1391,6 @@ class TestTopUpAtCap:
             }
         signals = {f"HELD{i}": buy_signal(f"HELD{i}") for i in range(10)}
 
-        async def mock_candidates():
-            return list(signals.keys())
-        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
-
         monkeypatch.setattr(settings, "sim_max_positions", 10)
 
         # Give excess cash so top-ups can deploy it.
@@ -1398,9 +1401,16 @@ class TestTopUpAtCap:
         cash_before = acc.cash
 
         valuation = await sim.valuate()
-        # Propose with pre-built signals (skip the candles() gather path),
+        # Propose on the contract path with pre-built frozen decision inputs,
         # then execute — same flow as the hybrid branch.
-        proposals = await sim._deterministic_propose(valuation, signals)
+        prices = {f"HELD{i}": 60.0 for i in range(10)}
+        session_bars = {f"HELD{i}": {"open": 60.0, "low": 59.0, "close": 60.0}
+                        for i in range(10)}
+        decision = sim._DecisionInputs(
+            f_ts=pd.Timestamp("2026-03-03"), s_ts=pd.Timestamp("2026-03-02"),
+            signals=signals, prices=prices, session_bars=session_bars,
+            ratchets={f"HELD{i}": None for i in range(10)})
+        proposals = await sim._deterministic_propose(valuation, decision=decision)
         trades = await sim._execute_proposed(proposals)
 
         # BUY trades should exist (top-ups of held tickers).
@@ -1456,16 +1466,12 @@ class TestDeterministicEntryAndStops:
         sig = self._hold_signal(net=-65, trend_up=False, dist_above=-8.0,
                                  weekly=False, strength=65)
 
-        async def mock_close(ticker):
-            return 100.0
-        monkeypatch.setattr(sim, "_latest_close", mock_close)
-
-        async def mock_candidates():
-            return ["BEAR"]
-        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
-
         valuation = await sim.valuate()
-        proposals = await sim._deterministic_propose(valuation, {"BEAR": sig})
+        decision = sim._DecisionInputs(
+            f_ts=pd.Timestamp("2026-03-03"), s_ts=pd.Timestamp("2026-03-02"),
+            signals={"BEAR": sig}, prices={"BEAR": 100.0}, session_bars={},
+            ratchets={})
+        proposals = await sim._deterministic_propose(valuation, decision=decision)
         assert [p for p in proposals if p["side"] == "BUY"] == []
 
     async def test_near_threshold_hold_is_bought_when_eligible(
@@ -1475,19 +1481,17 @@ class TestDeterministicEntryAndStops:
         sig = self._hold_signal(net=25, trend_up=True, dist_above=5.0,
                                  weekly=True, strength=45)
 
-        async def mock_close(ticker):
-            return 100.0
-        monkeypatch.setattr(sim, "_latest_close", mock_close)
-
-        async def mock_candidates():
-            return ["GOOD"]
-        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
-
         valuation = await sim.valuate()
-        proposals = await sim._deterministic_propose(valuation, {"GOOD": sig})
+        decision = sim._DecisionInputs(
+            f_ts=pd.Timestamp("2026-03-03"), s_ts=pd.Timestamp("2026-03-02"),
+            signals={"GOOD": sig}, prices={"GOOD": 100.0},
+            session_bars={"GOOD": {"open": 100.0, "low": 99.0, "close": 100.0}},
+            ratchets={})
+        proposals = await sim._deterministic_propose(valuation, decision=decision)
         buys = [p for p in proposals if p["side"] == "BUY"]
         assert len(buys) == 1
         assert buys[0]["ticker"] == "GOOD"
+        assert buys[0]["price"] == 100.0  # fills at F's open (contract)
         assert "relaxed HOLD entry" in buys[0]["reason"]
 
     async def test_atr_stop_sells_a_broken_position(self, with_cash, monkeypatch):
@@ -1497,19 +1501,24 @@ class TestDeterministicEntryAndStops:
                                  weekly=True, strength=10, atr_stop=95.0,
                                  close=90.0)
 
+        # valuate() marks the held position at the latest close.
         async def mock_close(ticker):
             return 90.0
         monkeypatch.setattr(sim, "_latest_close", mock_close)
 
-        async def mock_candidates():
-            return ["AAA"]
-        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
-
         valuation = await sim.valuate()
-        proposals = await sim._deterministic_propose(valuation, {"AAA": sig})
+        # Contract path: the ATR level is a standing order for F — F's open
+        # 90 <= level 95, so the stop fills AT THE OPEN (not at a stale close).
+        decision = sim._DecisionInputs(
+            f_ts=pd.Timestamp("2026-03-03"), s_ts=pd.Timestamp("2026-03-02"),
+            signals={"AAA": sig}, prices={"AAA": 90.0},
+            session_bars={"AAA": {"open": 90.0, "low": 89.0, "close": 90.0}},
+            ratchets={"AAA": None})
+        proposals = await sim._deterministic_propose(valuation, decision=decision)
         sells = [p for p in proposals if p["side"] == "SELL"]
         assert len(sells) == 1
-        assert sells[0]["reason"].startswith("ATR stop hit")
+        assert sells[0]["price"] == 90.0
+        assert sells[0]["reason"].startswith("ATR stop standing order")
 
     async def test_no_buy_below_the_published_atr_level(self, with_cash, monkeypatch):
         """The ATR level is anchored to the market's 20-bar high, so a pullback
@@ -1532,16 +1541,13 @@ class TestDeterministicEntryAndStops:
             },
         }
 
-        async def mock_close(ticker):
-            return 128.46
-        monkeypatch.setattr(sim, "_latest_close", mock_close)
-
-        async def mock_candidates():
-            return ["AAA"]
-        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
-
         valuation = await sim.valuate()
-        proposals = await sim._deterministic_propose(valuation, {"AAA": sig})
+        decision = sim._DecisionInputs(
+            f_ts=pd.Timestamp("2026-03-03"), s_ts=pd.Timestamp("2026-03-02"),
+            signals={"AAA": sig}, prices={"AAA": 128.46},
+            session_bars={"AAA": {"open": 128.46, "low": 128.0, "close": 128.46}},
+            ratchets={})
+        proposals = await sim._deterministic_propose(valuation, decision=decision)
         assert [p for p in proposals if p["side"] == "BUY"] == []
 
     async def test_no_rebuy_of_a_ticker_sold_in_the_same_cycle(
@@ -1566,16 +1572,18 @@ class TestDeterministicEntryAndStops:
             },
         }
 
+        # valuate() marks the held position at the latest close.
         async def mock_close(ticker):
             return 85.0
         monkeypatch.setattr(sim, "_latest_close", mock_close)
 
-        async def mock_candidates():
-            return ["AAA"]
-        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
-
         valuation = await sim.valuate()
-        proposals = await sim._deterministic_propose(valuation, {"AAA": sig})
+        decision = sim._DecisionInputs(
+            f_ts=pd.Timestamp("2026-03-03"), s_ts=pd.Timestamp("2026-03-02"),
+            signals={"AAA": sig}, prices={"AAA": 85.0},
+            session_bars={"AAA": {"open": 85.0, "low": 84.0, "close": 85.0}},
+            ratchets={"AAA": None})
+        proposals = await sim._deterministic_propose(valuation, decision=decision)
         sides = [(p["ticker"], p["side"]) for p in proposals]
         assert ("AAA", "SELL") in sides
         assert ("AAA", "BUY") not in sides, (
