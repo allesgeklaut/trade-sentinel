@@ -829,6 +829,359 @@ revalidation. Phase 3 UI simplification and Phase 4 research validation/pruning
 remain the next roadmap work; Phase 2 acceptance is not a claim of investment
 edge or live-provider correctness.
 
+## Phase 3A implementation progress — 2026-10-30
+
+**Phase 3A shell verified. Not full Phase 3 acceptance.** Phase 2 was committed
+as `97bf7c5`; this first UI slice remains
+uncommitted pending separate authorization.
+
+The bounded first slice introduces Research / Paper Portfolios / Savings / Lab
+navigation, a separate Settings workspace and a paper-account selector reusing
+the existing, financially separate account views. Research universe browsing
+becomes a local preference, independent of portfolio policy and Lab maintenance.
+Deep-history, membership, backfill and reset controls move into Lab. Existing
+financial calculations and API contracts must remain unchanged.
+
+Implemented in `static/index.html` and `static/workspace.css`:
+
+- Four workspaces plus Settings, canonical `#/paper/{account}` routes, preserved
+  legacy aliases, browser history and a labelled paper-account selector.
+- Independent persisted Research and Lab maintenance universe selections;
+  portfolio policy changes only through a confirmed, explicitly global Lab action.
+- Scoped data updates that do not run/rebalance/replay accounts. Lab maintenance
+  invalidates accounts for lazy reload rather than creating hidden charts.
+- Latest-recorded snapshot mode/config/epoch, explicitly not live configuration;
+  missing provenance is labelled not recorded. Separate USD-paper/EUR-real labels.
+- Responsive toolbars, labelled controls and local table containment, without
+  document-wide horizontal clipping. Research chart creation waits for visibility.
+- Reset disclosures preserve the Phase 2 DCA exception: Daily Sim reset also
+  deletes the derived DCA benchmark book/curve **without epoch preservation**;
+  the three strategy accounts retain closed-epoch rows for audit.
+
+Independent browser verification used the standalone synthetic fixture server in
+`tests/ui_fixture_server.py`, never the application lifespan, production database
+or provider/LLM APIs. The fail-closed helper `tests/ui_phase3_smoke.js` passed
+**42 checks**: seven views, populated and empty, at **390/768/1440px**, with a fresh
+document for each viewport. No document overflow, application JavaScript errors
+or provider API attempts were observed. The two CDN scripts were blocked by CSP
+on each navigation; request/CSP observations are reported separately, not summed.
+Lightweight Charts and marked were explicitly stubbed: this verifies shell/layout
+and renderer wiring, **not real canvas/chart or markdown fidelity**.
+
+Additional independent browser assertions covered back/forward, legacy hashes,
+keyboard Settings navigation, persistent labels/no duplicate IDs, browsing without
+policy POSTs, cancelled/confirmed policy changes, selector preservation through
+membership sync, maintenance and account refresh endpoint scopes, persistent Lab
+feedback despite stale completed polls, and no hidden account loads from Lab.
+A delayed refresh POST followed by navigation to Lab produced no hidden chart;
+reopening the stale account fetched fresh data. All mutations were fixture-only
+acknowledgements, not real trades, maintenance, provider calls or database writes.
+
+The fixture has traversal/unknown-API refusal and body-length validation; its
+**18 tests passed** independently. Review confirmed financial helpers, portfolio
+curve comparison and Savings accounting unchanged; status-loader additions only
+record provenance. An independent source comparison confirmed 13 protected
+financial/curve/Savings/chat functions byte-identical to Phase 2.
+
+Final frozen-source regression: **1453 passed in 246.30s**,
+`EXTERNAL_NETWORK_CONNECTION_ATTEMPTS: []`,
+`LOOPBACK_FIXTURE_TEST_CONNECTIONS: 8`,
+`SOURCE_FILES_CHANGED_DURING_GATE: []`. The eight loopback connections belong to
+the fixture harness's own local HTTP tests, not providers. All application/test
+Ruff checks, both inline JavaScript syntax checks, helper syntax and
+`git diff --check` passed. Evidence: `/tmp/opencode/phase3-final3.log` and
+`/tmp/opencode/phase3-final3-manifest.json`. Browser screenshots are under
+`/opt/stacks/.playwright-out/phase3-fixture-*`. The guarded synthetic server was
+stopped with zero outbound connection attempts; no production app was started.
+
+The shared portfolio comparator/renderers, contextual assistant and confirmed
+paper proposals, Savings transaction drawer, and remaining metadata/control
+consolidation are later Phase 3 slices. This shell does not complete the roadmap.
+
+## Phase 3B shared paper comparator — 2026-10-30
+
+**Comparator verified. Not full Phase 3 acceptance.** Phase 3B replaces the
+three duplicated paper equity charts and positions renderers with one shared
+comparison view. The slice remains uncommitted pending separate authorization.
+
+Implemented in `static/index.html`, `static/portfolio.js` (new pure module) and
+`static/workspace.css`:
+
+- One `#paper-comparison` view with labelled `#paper-range` (6M/1Y/2Y/5Y/MAX,
+  server row limits 126/252/504/1260/12000) and `#paper-mode` (pct/USD) selects,
+  one chart owner (`drawPaperComparison`), a legend marking the primary account
+  and the derived DCA benchmark, warnings and an as-of caption.
+- `PaperPortfolioUI.buildComparisonSeries` is a pure transform: daily UTC
+  last-input-row-wins dedupe, live-today appended/replaced only from supplied
+  payloads, primary requires recorded snapshots (live alone stays empty), and
+  a `%` point with a zero/negative/missing contribution is omitted with a
+  warning instead of being shown as a fabricated value. A row with finite
+  equity but a non-finite contribution keeps its USD point; only that day's
+  contributed-baseline point is dropped.
+- The three per-account chart builders became payload plumbers into one store;
+  legacy names (`loadSimEquity`, `setSimRange`, compare-mode aliases) alias the
+  shared path. Invalidation (refresh, policy, backfill, reset) clears the
+  cached payloads — including the derived DCA payload on a Daily Sim reset —
+  and never creates a chart for a hidden workspace.
+- Account books remain financially separate; Savings (real EUR) is untouched;
+  `mddOf`, `withLiveToday` and all Savings/chat functions are byte-identical to
+  the accepted Phase 3A baseline, and the status loaders' metric math is
+  unchanged (they only accept pre-fetched payloads and delegate positions
+  markup to the shared renderer).
+
+Intentional presentation differences (disclosed, not silent fixes): one daily
+UTC axis replaces the Daily-Sim intraday/second axis and its raw (un-deduped,
+no-live-today) DCA overlay; one overlay set (all three accounts + DCA) with
+primary solid 2px / overlays 1px / DCA dotted; USD mode puts every series on a
+single visible axis (the old hidden left scale is gone); `%` is explicitly
+labelled gain-on-contributions, not TWR. The Max-DD chip windows remain as
+before (Sim full history, Monthly/Daily-Core range-limited) — unifying them
+would change displayed metrics and is deliberately not part of this slice.
+
+Independent verification: **32 new parity tests**
+(`tests/test_portfolio_ui.py`, committed golden pins, no baseline-path
+dependency) pass; the fail-closed browser helper passed **21 view checks per
+fixture mode** at 390/768/1440px plus **19 comparison runs** (10 populated,
+9 empty) with zero provider/API attempts, zero page errors and no document
+overflow. Orchestrator assertions additionally confirmed: mode toggles make
+zero requests; range changes issue exactly four GET equity/benchmark reads and
+no POST; account switches move the primary; cached revisits do not refetch;
+and no comparison chart instance is ever created while a non-Paper workspace
+is active. Frozen-source regression: **1485 passed in 246.32s**,
+`EXTERNAL_NETWORK_CONNECTION_ATTEMPTS: []`,
+`LOOPBACK_FIXTURE_TEST_CONNECTIONS: 8` (the fixture harness's own loopback
+unit tests), `SOURCE_FILES_CHANGED_DURING_GATE: []`
+(`/tmp/opencode/phase3b-final.log`, `phase3b-final-manifest.json`). As before,
+the browser used labelled chart/markdown stubs — shell, wiring and payload
+parity are proven, not real canvas fidelity.
+
+Remaining Phase 3 work at this point: contextual assistant drawer with a
+genuine backend proposal/confirm step (chat trades still executed server-side
+in-stream), the Savings "Record transaction" consolidation, and
+live-configuration metadata — all landed and verified in the 2026-10-31
+Phase 3D/3E/3F section below.
+
+**Experiment isolation — integrated and verified in Phase 3C (next section).**
+The `origin/feature/dev-prod-db-switch` reference (2 unmerged commits,
+2026-10-01) was ported **by principle, not by merge**: it predates the Phase 3
+workspace UI and conflicts with the Phase 2 accounting work, so its guards,
+scheduler semantics and UI anchors were re-derived on the current base, and
+the branch itself stays unmerged. PROD's destructive operations are now
+refused server-side (403) with the UI hiding the controls outright;
+confirmation dialogs remain as DEV-side UX, not as PROD's safety mechanism.
+
+## Phase 3C PROD/DEV database switch — 2026-10-31
+
+**Switch verified. Not full Phase 3 acceptance.** Phase 3C lands the PROD/DEV
+database switch: PROD keeps the live books and is append-only through the
+API; DEV is a disposable sandbox, cloned from PROD, where backfills and
+resets are allowed. Selection is per browser (`ts_db` cookie) and every guard
+is server-side. The slice remains uncommitted pending separate
+authorization; `docs/dev-prod-db.md` documents the feature invariants-first.
+
+Backend (`app/config.py`, `app/db.py`, `app/main.py`, `app/sim.py`,
+`app/monthly.py`, `app/daily_core.py`, `conftest.py`, `.env.example`):
+
+- `DATABASE_URL_DEV` names the second SQLite file; empty = the feature is
+  fully off (no dev engine, every request serves PROD). Unsafe configs —
+  `:memory:`, non-file URLs, or a dev path that resolves to the PROD file —
+  are refused with an error log and the feature stays off; startup never
+  dies, and a DEV-side failure degrades to feature-off so PROD never depends
+  on the sandbox.
+- Guards are FastAPI dependencies, so direct Python calls (maintenance
+  scripts, tests) keep bypassing them by design. The seven destructive
+  endpoints (five backfills, two resets) answer 403 unless dev-routed —
+  unconditionally, so with the feature off no database accepts them; the
+  twenty Savings write endpoints answer 403 on DEV (Savings is PROD-only);
+  manual runs carry only the clone-race 409, and only when dev-routed.
+- Atomic prod→dev clone: SQLite online backup into a temp file, `os.replace`
+  swap, stale-sidecar cleanup, and mutual exclusion with backfills/runs via
+  the shared backfill-all lock plus the three portfolio locks re-checked
+  inside it. DEV auto-seeds from PROD at startup without clobbering a
+  seeded sandbox.
+- The schedulers always operate on PROD and no longer drop work when a DEV
+  experiment holds a portfolio lock: the scheduled sim/monthly/daily-core
+  entries bounded-wait (2 h) instead of skipping; a skipped sim wake defers
+  via a fire-and-forget bounded retry; the monthly daily-mark defers behind
+  `_rebalance_lock` instead of being lost; the manual HTTP paths keep their
+  fail-fast answers. Per-DB state files (`sim_state_dev.json`,
+  `daily_core_state_dev.json`) ensure a DEV run can never silence the PROD
+  tick. `conftest.py` pins `DATABASE_URL_DEV=""` so no test builds a dev
+  engine from a live `.env`.
+
+UI (`static/index.html`, `static/workspace.css`): the PROD/DEV selector and
+status live in Settings (the reference branch's header toggle was re-anchored
+to the Phase 3 workspace design); the clone button and database status sit in
+Lab › Maintenance; an amber DEV banner marks every view while DEV is active;
+the Lab backfill/reset groups are hidden on PROD behind an append-only
+explanatory note; the Savings nav is hidden on DEV and the `#/savings` route
+shows a PROD-only panel instead of the tracker.
+
+Independent verification:
+
+- **`tests/test_db_switch.py` — 68 tests, no skips**: file-level PROD/DEV
+  isolation proofs, guard-fires-before-any-engine-work, misconfig refusals
+  (`:memory:`, non-file, dev==prod through a non-normalized path), clone
+  atomicity and mutual exclusion, bounded-wait and deferred-retry semantics,
+  per-DB state files, lifespan auto-seed and dual migration. Two acceptance
+  fixes, both test-side (the backend was correct): test 61 held
+  `_run_cycle_lock` across `run_cycle()`, which now bounded-waits — a
+  self-deadlock; the injection moved to `current_config()`, which escapes
+  `run_cycle` before the inner stage-try. Test 67 parked its holder in
+  `refresh_data`, which the body can never reach without a database (the
+  task died on the first DB access and the test hung forever); the holder
+  now parks in `_pending_rebuild`, the first await inside the locked body.
+  Neither test had ever executed — earlier runs wedged at test 61.
+- **Offline browser gates, populated and empty, both green**: 21/21 view
+  checks per mode at 390/768/1440px, 10/10 (populated) and 9/9 (empty)
+  comparison runs, zero provider-API attempts in every observation layer,
+  zero page errors, and the 3C database pass green in both states (status
+  routing, banner, hidden savings nav, PROD-only panel, 403/ack parity in
+  both directions, clone flow updating the UI status).
+- The populated gate **caught a real harness bug on its first run**: the
+  fixture server joined its two cookies into one comma-joined `Set-Cookie`
+  header; RFC 6265 allows exactly one cookie per header, so real Chromium
+  silently dropped `ts_db` and every DEV check failed. Fixed to one
+  `Set-Cookie` line per cookie — proven at three levels (27 fixture-server
+  unit tests including a wire-level `headers.get_all("Set-Cookie")` proof,
+  the re-run gate green, and an in-browser `active: "dev"` status
+  confirmation). Unit tests alone had missed it: they read the header
+  string, not the wire.
+- **Vision review of 11 screenshots** (PROD/DEV settings/lab/savings at
+  1440px, 390px wrapping, empty mode): all pass — banner styled and
+  legible, controls correctly shown/hidden per state, panel texts correct
+  and explicit, no overflow, no unstyled markup.
+- **Full confirmation suite** — the eight backend-facing files
+  (`test_db_switch`, `test_main`, `test_sim`, `test_monthly`,
+  `test_daily_core`, `test_savings_flows`, `test_performance`,
+  `test_run_config_adoption`) against a fresh PROD database: **467 passed
+  in 41.03s**, clean exit, no warnings; the regression files confirm the
+  new bounded-wait and per-DB-state semantics break no existing behaviour.
+
+The remaining Phase 3 work listed above was landed and verified in the
+2026-10-31 Phase 3D/3E/3F section (next section): the assistant drawer with
+its backend proposal/confirm step, the Savings "Record transaction"
+consolidation, and live-configuration metadata complete the Phase 3 roadmap.
+
+## Phase 3D/3E/3F assistant drawer, Savings transaction drawer, live configuration — 2026-10-31
+
+**Phase 3 roadmap complete and verified.** This lands the last three Phase 3
+items: the contextual assistant drawer with a genuine backend
+proposal/confirm step (chat trades no longer execute server-side in-stream),
+the Savings "Record transaction" consolidation, and live-configuration
+metadata. The Phase 3 acceptance criteria now hold — no horizontal overflow at
+390/768/1440px in either fixture mode, one obvious refresh action per scope,
+account mode/currency/configuration always visible, and labelled,
+keyboard-accessible controls. The work remains uncommitted pending separate
+authorization.
+
+Backend (`app/sim.py`, `app/main.py`, `tests/test_chat_proposals.py`):
+
+- `sim_chat`/`sim_chat_stream` stop executing trades: the envelope is now
+  `{"text", "proposals", "history"}` (stream `done` adds `raw`), the
+  `trades`/`actions_executed` keys are removed entirely, and a turn that only
+  proposes writes nothing — no stamp, no trade rows, no snapshot, no ledger,
+  no `RunExecution`.
+- `[[ACTION]]` blocks become pending proposals with server-computed
+  per-action previews. One shared `_action_preview` helper computes both the
+  proposal previews and the confirm-time execution plan, so preview and
+  execution cannot diverge. Previews carry feasibility with machine-readable
+  issues (`no price`, `no position`, `insufficient cash`, `position at max`,
+  `budget < 1`) plus estimated price/shares/value/cash-after/position-after.
+- The pending registry is in-memory only (proposals die with the process):
+  `uuid4` ids, a 30-minute TTL measured against the Rule-7 `decided_at` frozen
+  at parse time, a cap of 20 with oldest-first eviction, and atomic pops
+  under an `asyncio.Lock` (a concurrent duplicate confirm 404s).
+- `POST /api/sim/chat/confirm` re-validates every action with fresh state,
+  executes through the shared preview path, stamps the run with the DECIDED
+  configuration, snapshots when anything traded, and freezes the LLM decision
+  ledger with the proposal's parse-time `decided_at` (Rule 7 preserved through
+  the ISO-8601 round-trip). Unknown/expired → 404; run configuration changed
+  since the proposal → 409 with the pending entry dropped; DEV-routed
+  confirms answer 409 while a PROD→DEV clone runs. `POST /api/sim/chat/reject`
+  drops a proposal; `GET /api/run-config` returns each engine's live
+  `current_config()` plus its current epoch (cookie-following;
+  `app/run_config.py` is untouched — its public `current_epoch` was reused).
+- The chat system prompt keeps the `[[ACTION]]` format but now states the
+  actions are proposed and execute only after explicit user confirmation.
+
+UI (`static/index.html`, `static/workspace.css`):
+
+- One contextual assistant drawer with **Explain** and **Paper proposals**
+  modes. The research ticker chat and the paper manager chat moved into it
+  (the research panel keeps its freed space; the "Ask local LLM"/"Explain
+  This Screen" buttons open the drawer). Explain mode renders deterministic
+  per-view help plus the glossary without any LLM; Paper proposals mode
+  renders proposal cards — decided_at, per-action BUY/SELL badges, the LLM's
+  reasons, preview numbers for feasible actions, the honest issue for
+  infeasible ones — with Confirm/Reject, honest 404/409 messaging, data
+  reloads when a confirmed snapshot lands, and stacking for multiple
+  proposals. Esc closes the drawer; the paper toolbar button defaults to
+  proposals mode on Daily Sim.
+- One Savings "Record transaction" drawer replaces the four separate prompt
+  buttons: eleven event types (deposit, withdrawal, Saveback, dividend, fee,
+  tax, buy, sell, settlement, split, correction) map 1:1 to the existing
+  endpoints with their real request-model fields, per-type accounting help
+  carried over from the old tooltips, dates defaulting to today, and a
+  labelled "Preview (estimate)" line — cash before → after when a tracker is
+  initialized, and an honest "tracker not initialized — no cash/position
+  preview available" notice when it is not. True-up stays a separate
+  reconciliation action; the ✕ remove-position button — the P1-B
+  "removal plus true-up" anti-pattern — is retired in favour of a Sell
+  shortcut that prefills the drawer.
+- The paper header gains "CURRENT (next run)" beside "LATEST RECORDED":
+  engine label, live epoch, a compact strategy/universe summary and a
+  disclosure with the full effective configuration, with the disclaimer
+  updated to say the live configuration is shown separately.
+
+Independent verification:
+
+- **Full offline regression at the final accepted state: 1583 passed in
+  258.48s** (`tests/`, clean exit; includes the 16-test chat-proposal suite,
+  the 68 switch-invariant tests and the digest-guarded `test_portfolio_ui.py`).
+  The pinned backend set alone (`test_chat_proposals`, `test_sim`,
+  `test_llm_decision_ledger`, `test_run_config_adoption`, `test_main`,
+  `test_db_switch`) passes **258** with the preview==execution parity and
+  Rule-7 freeze proven by assertion; the UI/harness files pass **64** (32
+  fixture-server unit tests including the new envelope/confirm/run-config
+  routes, 32 portfolio-UI digest and golden-parity tests).
+- **Offline browser gates, populated and empty, both green** with the new
+  3D/3E/3F section: 21/21 view checks per mode at 390/768/1440px, 10/10
+  (populated) and 9/9 (empty) comparison runs, the 3C database pass green in
+  both modes, zero provider-API attempts in every observation layer, zero
+  page errors, and every drawer/strip check green — proposal cards render
+  from the fixture's canned proposal (feasible BUY with preview numbers,
+  infeasible SELL with its issue), Confirm/Reject POST and resolve the card,
+  the transaction drawer switches all eleven event types with today-defaulted
+  dates, and the CURRENT strip shows a real epoch beside LATEST RECORDED.
+- The populated gate **caught two real 3E defects on its first run**: the
+  event-type select re-rendered with a stale type (selecting "sell" kept the
+  deposit fields), and the submit handler wiped its own success message by
+  re-rendering after writing it. Both fixed — the select now updates its type
+  before rendering, and the render now precedes the status message — with the
+  savings-block digest re-pinned and both gates re-run green. The same run
+  exposed two harness-side defects (a failure collector counting raw
+  informational values as failures, and a recorded-epoch expectation the
+  fixture's honest no-provenance payload could not satisfy); both fixed in
+  the helper, and the empty gate additionally fixed one mode-blind preview
+  check to require the honest not-initialized notice in empty mode.
+- **Vision review of 6 screenshots** (live-config strip, assistant proposal
+  card and transaction drawer at 1440px and 390px): all pass — strips, cards,
+  fields, preview lines and buttons legible with the intended wording,
+  drawers styled consistently with the dark theme, no overflow or clipped
+  controls at 390px.
+- Digest pins were re-pinned deliberately, not blindly: the `ui_phase3.json`
+  fixture payload and the guarded Savings block moved in
+  `tests/fixtures/portfolio_ui_cases.json` (the Savings block because slice
+  3E replaced the prompt buttons and removed the ✕ remove-position path),
+  with the re-pin history and intactness evidence documented in
+  `tests/test_portfolio_ui.py`; `mddOf` and `withLiveToday` pins are
+  byte-identical to the Phase 3A baseline and the golden overlay parity
+  tests all pass.
+
+Phase 3 is complete as specified. The next step is Phase 4 (revalidate, then
+prune strategies) on an authorized, committed base.
+
 ## References
 
 - [SEC Apple companyfacts](https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json)

@@ -1,0 +1,845 @@
+/* Phase 3A workspace shell — Research / Paper Portfolios / Savings / Lab /
+   Settings. Loaded after the inline terminal theme; it only adds the shell,
+   persistent labels and responsive containment, and never hides errors or
+   off-screen controls behind overflow clipping. Phase 3B adds the shared
+   comparison view styles below. */
+
+/* --- Shell ------------------------------------------------------------- */
+.workspace {
+    max-width: 1400px;
+    margin: 0 auto;
+    min-width: 0
+}
+
+.workspace[hidden] {
+    display: none
+}
+
+#workspace-research {
+    max-width: none;
+    margin: 0
+}
+
+.workspace-inner {
+    padding: 18px;
+    min-width: 0
+}
+
+.workspace-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 8px 18px;
+    padding: 18px 18px 0;
+    min-width: 0
+}
+
+.workspace-title {
+    margin: 0;
+    font-size: 15px;
+    letter-spacing: 2px;
+    color: #42ff72;
+    font-weight: bold
+}
+
+.workspace-sub {
+    margin: 4px 0 0;
+    font-size: 12px;
+    color: #7aaa81;
+    line-height: 1.5;
+    max-width: 820px
+}
+
+/* --- Paper workspace header -------------------------------------------- */
+.paper-header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+    gap: 10px 18px;
+    padding: 18px 18px 0;
+    min-width: 0
+}
+
+.paper-head-main {
+    min-width: 0
+}
+
+.paper-kicker {
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: #42ff72
+}
+
+.paper-title {
+    margin: 2px 0;
+    font-size: 18px;
+    color: #b7ffc0
+}
+
+.paper-desc {
+    margin: 0;
+    font-size: 12px;
+    color: #7aaa81;
+    line-height: 1.5;
+    max-width: 760px
+}
+
+.paper-strategy {
+    margin: 6px 0 0;
+    font-size: 12px;
+    color: #b7ffc0;
+    overflow-wrap: anywhere
+}
+
+.paper-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    justify-content: flex-end;
+    gap: 8px;
+    min-width: 0
+}
+
+.paper-meta {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 18px;
+    border: 1px solid #12351c;
+    background: #071009;
+    padding: 8px 10px;
+    font-size: 11px;
+    color: #7aaa81;
+    min-width: 0
+}
+
+.paper-meta b {
+    color: #b7ffc0;
+    font-weight: normal
+}
+
+.paper-meta .meta-note {
+    flex: 1 1 100%;
+    line-height: 1.45
+}
+
+.paper-notice {
+    grid-column: 1 / -1;
+    margin: 0;
+    border: 1px solid #5c4a1d;
+    background: #140f05;
+    color: #ffd65c;
+    padding: 6px 10px;
+    font-size: 11px;
+    line-height: 1.45
+}
+
+#paper-refresh-status {
+    grid-column: 1 / -1
+}
+
+/* --- Phase 3B shared comparison view ---------------------------------- */
+#paper-comparison {
+    margin: 12px 18px 18px
+}
+
+.paper-comparison-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 8px 18px;
+    min-width: 0
+}
+
+.paper-comparison-heading {
+    min-width: 0;
+    flex: 1 1 320px
+}
+
+.paper-comparison-scope {
+    margin: 4px 0 10px;
+    font-size: 12px;
+    color: #7aaa81;
+    line-height: 1.5;
+    max-width: 820px
+}
+
+.paper-comparison-controls {
+    margin: 0 0 10px;
+    flex: 0 1 auto
+}
+
+.paper-comparison-note {
+    margin: 0 0 10px;
+    border: 1px solid #12351c;
+    background: #071009;
+    padding: 8px 10px;
+    font-size: 11px;
+    line-height: 1.55;
+    color: #7aaa81
+}
+
+.paper-comparison-note b {
+    color: #b7ffc0;
+    font-weight: normal
+}
+
+.paper-comparison-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 16px;
+    font-size: 12px;
+    color: #b7ffc0;
+    margin: 0 0 8px;
+    min-width: 0
+}
+
+.paper-comparison-legend:empty {
+    display: none
+}
+
+.cmp-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    overflow-wrap: anywhere
+}
+
+.cmp-legend-item small {
+    color: #7aaa81;
+    font-size: 10px
+}
+
+.cmp-swatch {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+    flex: none
+}
+
+.cmp-legend-contrib {
+    color: #7aaa81
+}
+
+.paper-comparison-asof {
+    font-size: 10px;
+    color: #7aaa81;
+    text-align: right;
+    margin-top: 2px;
+    overflow-wrap: anywhere
+}
+
+.paper-comparison-asof:empty {
+    margin: 0
+}
+
+.paper-comparison-warnings {
+    font-size: 11px;
+    line-height: 1.5;
+    color: #e6a23c;
+    margin-top: 4px;
+    overflow-wrap: anywhere
+}
+
+.paper-comparison-warnings:empty {
+    display: none
+}
+
+/* --- Persistent labels + grouped toolbars ------------------------------ */
+.toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 8px 10px;
+    margin: 0 0 8px;
+    min-width: 0
+}
+
+.field-label {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-size: 11px;
+    letter-spacing: .4px;
+    color: #7aaa81;
+    min-width: 0;
+    max-width: 100%
+}
+
+.field-label>span {
+    white-space: normal
+}
+
+.field-label select,
+.field-label input {
+    background: #09140c;
+    color: #b7ffc0;
+    border: 1px solid #318e43;
+    padding: 6px 8px;
+    font-size: 12px;
+    max-width: 100%;
+    min-width: 0
+}
+
+.toolbar-scope {
+    font-size: 11px;
+    color: #7aaa81;
+    line-height: 1.5;
+    margin: 0 0 8px;
+    overflow-wrap: anywhere
+}
+
+.toolbar-scope b {
+    color: #b7ffc0;
+    font-weight: normal
+}
+
+.primary-action {
+    border-color: #42ff72;
+    background: #0a2412;
+    font-weight: bold
+}
+
+/* --- Lab / maintenance ------------------------------------------------- */
+.maintenance-group {
+    border: 1px dashed #12351c;
+    padding: 10px;
+    margin: 10px 0;
+    min-width: 0
+}
+
+.maintenance-group .sim-actions {
+    margin-top: 8px
+}
+
+.maintenance-label {
+    font-size: 11px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: #7aaa81
+}
+
+.maintenance-group p {
+    font-size: 12px;
+    color: #7aaa81;
+    line-height: 1.5;
+    margin: 6px 0
+}
+
+.danger-group {
+    border-color: #5c2a30;
+    background: #140708
+}
+
+.danger-group .maintenance-label {
+    color: #ff8a97
+}
+
+.status-line {
+    margin-top: 8px;
+    font-size: 12px;
+    color: #7aaa81;
+    min-height: 14px;
+    overflow-wrap: anywhere
+}
+
+.notice {
+    border: 1px solid #1d6030;
+    background: #071009;
+    padding: 8px 10px;
+    font-size: 12px;
+    color: #7aaa81;
+    line-height: 1.5;
+    margin: 8px 0
+}
+
+.notice.warn {
+    border-color: #5c4a1d;
+    color: #ffd65c
+}
+
+/* --- Settings ---------------------------------------------------------- */
+.settings-field {
+    max-width: 420px
+}
+
+#llm-model {
+    width: 100%
+}
+
+/* --- Responsive containment (real fixes, no body-wide clipping) -------- */
+header {
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 14px;
+    min-width: 0
+}
+
+header>b {
+    min-width: 0;
+    overflow-wrap: anywhere
+}
+
+#status {
+    min-width: 0;
+    overflow-wrap: anywhere
+}
+
+.nav-toggle {
+    flex-wrap: wrap;
+    min-width: 0
+}
+
+.nav-toggle button {
+    max-width: 100%
+}
+
+.nav-toggle button[aria-current="page"] {
+    background: #1d6030;
+    color: #b7ffc0;
+    border-color: #42ff72
+}
+
+main {
+    min-width: 0
+}
+
+main>* {
+    min-width: 0
+}
+
+#dashboard-view {
+    grid-template-columns: minmax(0, 230px) minmax(0, 1fr) minmax(0, 350px)
+}
+
+.chart-panel,
+.chat-panel,
+.screen-panel {
+    min-width: 0
+}
+
+#add {
+    position: relative
+}
+
+/* Populated tables get a local scroll container instead of widening the
+   document. The panel itself must be allowed to shrink (min-width:0). */
+.screener-scroll {
+    overflow-x: auto;
+    max-width: 100%
+}
+
+.sim-section {
+    min-width: 0;
+    overflow-wrap: anywhere
+}
+
+.sim-actions {
+    flex-wrap: wrap;
+    row-gap: 8px
+}
+
+#sim-summary,
+#monthly-summary,
+#dailycore-summary,
+#savings-summary {
+    display: flex;
+    flex-wrap: wrap;
+    min-width: 0
+}
+
+.metric {
+    max-width: 100%;
+    overflow-wrap: anywhere
+}
+
+td,
+th {
+    overflow-wrap: anywhere
+}
+
+select {
+    max-width: 100%
+}
+
+/* Compact empty chart states: only when the chart container holds nothing
+   but the placeholder, so the first screen leads with useful content. The
+   chart height/math is untouched whenever a chart is actually drawn. */
+#paper-comparison-chart:has(> .sim-empty),
+#savings-chart:has(> .sim-empty),
+#chart:has(> .sim-empty) {
+    height: auto;
+    min-height: 0
+}
+
+/* Visible keyboard focus on every native control. */
+:focus-visible {
+    outline: 2px solid #42ff72;
+    outline-offset: 2px
+}
+
+@media (max-width: 900px) {
+    #dashboard-view {
+        grid-template-columns: 1fr
+    }
+
+    .workspace-inner {
+        padding: 10px
+    }
+
+    .workspace-head,
+    .paper-header {
+        padding: 10px 10px 0
+    }
+
+    .paper-header {
+        grid-template-columns: 1fr
+    }
+
+    #paper-comparison {
+        margin: 10px 10px 12px
+    }
+
+    .paper-controls {
+        justify-content: flex-start
+    }
+}
+
+/* --- Phase 3C PROD/DEV database switch ---------------------------------- */
+/* Amber banner under the header when the DEV sandbox is active. Full-width,
+   box-sizing border-box so it can never push the document sideways. */
+.db-banner {
+    box-sizing: border-box;
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 6px 18px;
+    border-bottom: 1px solid #5c4a1d;
+    background: #140f05;
+    color: #ffd65c;
+    font-size: 12px;
+    line-height: 1.5;
+    min-width: 0;
+    overflow-wrap: anywhere
+}
+
+.db-banner[hidden] {
+    display: none
+}
+
+/* Header chip: always-visible active-database awareness. Neutral while the
+   status is pending, calm green on PROD, amber on DEV. */
+.db-chip {
+    display: inline-block;
+    border: 1px solid #12351c;
+    border-radius: 3px;
+    background: #071009;
+    color: #7aaa81;
+    padding: 2px 8px;
+    font-size: 11px;
+    letter-spacing: 1px;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    white-space: nowrap
+}
+
+.db-chip.db-prod {
+    border-color: #1d6030;
+    background: #0a2412;
+    color: #42ff72
+}
+
+.db-chip.db-dev {
+    border-color: #5c4a1d;
+    background: #140f05;
+    color: #ffd65c
+}
+
+/* Savings workspace notice shown instead of the tracker on DEV. */
+#savings-dev-notice {
+    margin: 0 18px 18px
+}
+
+#savings-dev-notice[hidden] {
+    display: none
+}
+
+/* Lab: hidden replay/reset container + disabled-reason hint under the clone
+   button. Explicit [hidden] rules because these are plain divs. */
+#lab-replay-groups[hidden] {
+    display: none
+}
+
+#lab-replay-disabled[hidden] {
+    display: none
+}
+
+.db-clone-hint {
+    margin-top: 6px;
+    font-size: 11px;
+    color: #7aaa81;
+    line-height: 1.5;
+    overflow-wrap: anywhere
+}
+
+.db-clone-hint:empty {
+    display: none
+}
+
+/* Settings database card: the toggle reuses .field-label select styling; the
+   status line reuses .status-line. */
+#db-toggle {
+    max-width: 100%
+}
+
+#db-toggle:disabled {
+    opacity: .6
+}
+
+@media (max-width: 900px) {
+    .db-banner {
+        padding: 6px 10px
+    }
+
+    #savings-dev-notice {
+        margin: 0 10px 12px
+    }
+}
+
+/* --- Phase 3D/3E slide-over drawers (assistant + record transaction) ------- */
+/* Right-side slide-over, dark theme matching the app. At 390px it goes
+   (nearly) full width; Esc and the backdrop close it; the open buttons are
+   plain <button>s so they stay keyboard accessible. */
+#assistant-backdrop,
+#svtxn-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 90;
+    background: rgba(0, 0, 0, .65)
+}
+
+#assistant-backdrop[hidden],
+#svtxn-backdrop[hidden] {
+    display: none
+}
+
+#assistant-drawer,
+#svtxn-drawer {
+    position: fixed;
+    top: 0;
+    right: 0;
+    z-index: 100;
+    box-sizing: border-box;
+    width: min(480px, 100vw);
+    height: 100dvh;
+    max-width: 100vw;
+    overflow-y: auto;
+    background: #071009;
+    border-left: 1px solid #1d6030;
+    color: #b7ffc0;
+    padding: 14px 16px;
+    transform: translateX(102%);
+    visibility: hidden;
+    transition: transform .18s ease-out, visibility .18s
+}
+
+#assistant-drawer.open,
+#svtxn-drawer.open {
+    transform: translateX(0);
+    visibility: visible
+}
+
+.drawer-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    border-bottom: 1px solid #1d6030;
+    padding-bottom: 10px;
+    margin-bottom: 10px;
+    color: #42ff72;
+    letter-spacing: 2px;
+    font-size: 13px
+}
+
+.drawer-tabs {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap
+}
+
+.drawer-tabs button.tab-active {
+    background: #1d6030;
+    color: #b7ffc0;
+    border-color: #42ff72
+}
+
+.drawer-mode {
+    min-width: 0
+}
+
+.drawer-mode[hidden] {
+    display: none
+}
+
+.drawer-help {
+    max-height: 40vh;
+    overflow-y: auto;
+    border: 1px solid #12351c;
+    background: #050d07;
+    padding: 8px 10px;
+    margin-bottom: 10px;
+    font-size: 12px
+}
+
+#assistant-drawer .ai-thread {
+    max-height: 34vh
+}
+
+/* Proposal cards (paper-proposals mode): preview + confirm/reject. */
+#assistant-proposals {
+    margin-top: 8px
+}
+
+.proposal-card {
+    border: 1px solid #318e43;
+    border-radius: 6px;
+    background: #0a1a10;
+    padding: 10px;
+    margin-bottom: 10px;
+    font-size: 12px;
+    overflow-wrap: anywhere
+}
+
+.proposal-card.done {
+    border-color: #12351c;
+    opacity: .85
+}
+
+.prop-head {
+    color: #7aaa81;
+    font-size: 11px;
+    margin-bottom: 6px
+}
+
+.prop-action {
+    padding: 4px 0;
+    border-top: 1px solid #12351c
+}
+
+.prop-reason {
+    color: #b7ffc0;
+    font-size: 11px;
+    line-height: 1.45
+}
+
+.prop-preview {
+    color: #7aaa81;
+    font-size: 11px;
+    margin-top: 2px
+}
+
+.prop-preview.infeasible {
+    color: #ff8a97
+}
+
+.prop-buttons {
+    margin-top: 8px
+}
+
+.prop-result {
+    margin-top: 8px;
+    font-size: 11px;
+    color: #42ff72;
+    line-height: 1.5
+}
+
+/* Savings Record-transaction drawer fields/preview. */
+.svtxn-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 8px 0;
+    min-width: 0
+}
+
+.svtxn-field input,
+.svtxn-field select {
+    background: #09140c;
+    color: #b7ffc0;
+    border: 1px solid #318e43;
+    padding: 6px 8px;
+    font-size: 12px;
+    max-width: 100%;
+    min-width: 0
+}
+
+#svtxn-type {
+    background: #09140c;
+    color: #b7ffc0;
+    border: 1px solid #318e43;
+    padding: 6px 8px;
+    font-size: 12px;
+    max-width: 100%
+}
+
+.svtxn-preview {
+    border: 1px dashed #12351c;
+    background: #050d07;
+    color: #e6a23c;
+    font-size: 11px;
+    line-height: 1.5;
+    padding: 8px 10px;
+    margin: 8px 0;
+    overflow-wrap: anywhere
+}
+
+.svtxn-preview:empty {
+    display: none
+}
+
+/* The CURRENT (next-run) live-config side of the paper meta strip, visually
+   distinct from LATEST RECORDED but in the same strip. */
+.paper-meta .paper-live {
+    color: #4d9fff
+}
+
+.paper-meta .paper-live b {
+    color: #9ecbff;
+    font-weight: normal
+}
+
+.paper-live-details {
+    flex: 1 1 100%;
+    min-width: 0
+}
+
+.paper-live-details summary {
+    cursor: pointer;
+    color: #4d9fff;
+    font-size: 11px
+}
+
+.paper-live-details pre {
+    margin: 6px 0 0;
+    max-height: 220px;
+    overflow: auto;
+    background: #050d07;
+    border: 1px solid #12351c;
+    padding: 8px;
+    font-size: 10px;
+    color: #7aaa81;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere
+}
+
+@media (max-width: 390px) {
+    #assistant-drawer,
+    #svtxn-drawer {
+        width: 100vw
+    }
+}

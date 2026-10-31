@@ -382,6 +382,11 @@ async def _epoch_seed(s) -> float:
 # manual UI run) would both pass the gate and double-deposit the allowance /
 # duplicate trades. Mirrors sim._run_cycle_lock.
 _rebalance_lock: asyncio.Lock = asyncio.Lock()
+# Upper bound on how long the scheduler entry waits for the busy lock before
+# giving up with the old "skipped" semantics (a DEV backfill can hold it for
+# minutes; a wedged holder should not park the scheduler forever). The manual
+# run_rebalance() keeps its own fail-fast skip.
+_TICK_LOCK_WAIT_SECONDS = 7200
 
 # Serialises every STATE/CASH/HISTORY mutation against a reset's boundary (the
 # stamp/reset TOCTOU): a stamp captured before a reset is validated against the
@@ -2001,10 +2006,36 @@ async def run_monthly_cycle(now: datetime | None = None) -> dict[str, Any]:
     month-end tick is the decision, the next open is the execution), and any
     later session fills it too while the rebuild is still pending (catch-up).
     Legs that cannot fill retry at the following sessions; a newer month-end
-    ranking supersedes a pending one."""
+    ranking supersedes a pending one.
+
+    Concurrency: a DEV backfill holding the lock must DELAY the month-end
+    rebalance, not skip it — a missed month has no catch-up. The free path
+    delegates to run_rebalance() (asyncio.Lock's uncontended acquire sets the
+    flag synchronously, so no other task can slip in between this check and
+    run_rebalance's own acquire). The busy path waits, bounded by
+    ``_TICK_LOCK_WAIT_SECONDS``, and holds the lock through the rebalance
+    body. Only a holder wedged past the bound skips (error-logged). The
+    manual /api/monthly/run path calls run_rebalance() directly and keeps
+    its fail-fast answer.
+    """
     if not settings.sim_monthly_enabled:
         return {"skipped": True, "reason": "monthly portfolio disabled"}
-    return await run_rebalance(now=now)
+    if not _rebalance_lock.locked():
+        return await run_rebalance(now=now)
+    logger.warning("Monthly scheduler: tick delayed — waiting up to %ds for the "
+                   "rebalance lock (held by a backfill or manual run)",
+                   _TICK_LOCK_WAIT_SECONDS)
+    try:
+        async with asyncio.timeout(_TICK_LOCK_WAIT_SECONDS):
+            await _rebalance_lock.acquire()
+    except TimeoutError:
+        logger.error("Monthly scheduler: rebalance lock still held after %ds — "
+                     "skipping this tick", _TICK_LOCK_WAIT_SECONDS)
+        return {"skipped": True, "reason": "already running"}
+    try:
+        return await _run_rebalance_locked(False, now)
+    finally:
+        _rebalance_lock.release()
 
 
 # ---------------------------------------------------------------------------

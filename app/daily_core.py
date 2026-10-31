@@ -55,7 +55,7 @@ from . import price_freshness
 from . import run_config
 from .config import settings
 from .db import (DailyCoreAccount, DailyCoreAllowance, DailyCorePosition,
-                 DailyCoreSnapshot, DailyCoreTrade, Session)
+                 DailyCoreSnapshot, DailyCoreTrade, Session, current_db)
 from .screener import tickers as universe_tickers, universe_names
 
 logger = logging.getLogger("trade_sentinel.daily_core")
@@ -85,7 +85,18 @@ STRATEGY_VARIANTS: dict[str, str] = {
     "residual": "Residual momentum (Blitz-Huij-Martens, §11 winner)",
 }
 
-_STATE_FILE = Path("/data/daily_core_state.json")
+_STATE_FILE = Path("/data/daily_core_state.json")          # PROD (live book)
+_STATE_FILE_DEV = Path("/data/daily_core_state_dev.json")  # DEV sandbox
+
+
+def _state_file() -> Path:
+    """Per-DB state file: the strategy choice is read by BOTH the live
+    scheduler and backfills, so dev experiments must never change what the
+    live PROD book runs. The globals stay patchable — tests point
+    ``_STATE_FILE`` at a temp path."""
+    return _STATE_FILE_DEV if current_db() == "dev" else _STATE_FILE
+
+
 # Serialises read-modify-write of the state file: the runtime setters and the
 # protection decision all read the file, change one key, and write it back, so
 # two concurrent writers could drop each other's field. The critical sections
@@ -94,24 +105,26 @@ _state_lock = threading.Lock()
 
 
 def _load_state() -> dict:
+    path = _state_file()
     try:
-        return json.loads(_STATE_FILE.read_text())
+        return json.loads(path.read_text())
     except FileNotFoundError:
         return {}
     except Exception as e:
-        logger.warning("Could not read daily-core state file: %s", e)
+        logger.warning("Could not read daily-core state file %s: %s", path, e)
         return {}
 
 
 def _save_state(state: dict) -> None:
+    path = _state_file()
     try:
-        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         # Atomic replace so a concurrent reader never sees a half-written file.
-        tmp = _STATE_FILE.with_suffix(_STATE_FILE.suffix + ".tmp")
+        tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(state, indent=2))
-        os.replace(tmp, _STATE_FILE)
+        os.replace(tmp, path)
     except Exception as e:
-        logger.warning("Could not write daily-core state file %s: %s", _STATE_FILE, e)
+        logger.warning("Could not write daily-core state file %s: %s", path, e)
 
 
 def _reset_basket_state(state: dict) -> None:
@@ -875,6 +888,11 @@ async def _protection_decision(band: list[str],
 # pass the gate and double-deposit / duplicate trades. Mirrors
 # sim._run_cycle_lock and monthly._rebalance_lock.
 _cycle_lock: asyncio.Lock = asyncio.Lock()
+# Upper bound on how long a scheduled/deferred cycle waits for the busy lock
+# before giving up with the old "skipped" semantics (a DEV backfill can hold
+# it for minutes; a wedged holder should not park the scheduler forever).
+# The manual trigger passes wait=False and never waits.
+_TICK_LOCK_WAIT_SECONDS = 7200
 
 # Serialises every STATE/CASH/HISTORY mutation against a reset's boundary
 # (the stamp/reset TOCTOU). A caller's frozen stamp is validated against the
@@ -2379,7 +2397,8 @@ async def backfill(start: str | None = None,
                 "snapshots": len(snaps), "mom_variant": current_variant()}
 
 
-async def run_daily_cycle(force: bool = False, now: datetime | None = None) -> dict:
+async def run_daily_cycle(force: bool = False, now: datetime | None = None,
+                           *, wait: bool = True) -> dict:
     """Scheduler entry: one full daily-core cycle.
 
     deposit allowance (new month) -> refresh data -> deployment pass ->
@@ -2388,14 +2407,33 @@ async def run_daily_cycle(force: bool = False, now: datetime | None = None) -> d
     (top-ups stop when targets are met), so a re-run is harmless.
     ``now`` is injectable for the parity tests; None = now.
 
+    ``wait`` (default, the scheduler's contract): a busy lock DELAYS the
+    cycle (bounded by ``_TICK_LOCK_WAIT_SECONDS``) instead of dropping it —
+    a DEV backfill may hold the lock for minutes and a skipped day has no
+    catch-up. The manual trigger passes wait=False so an HTTP request
+    never hangs behind a backfill.
+
     Provenance: ONE paper stamp is resolved for the whole cycle and threaded
     to the deposit, the deployment's trades/ranking and the snapshot — one
     logical run, one configuration (resolving per leg could stamp two configs
     into one cycle).
     """
     if _cycle_lock.locked() and not force:
+        if not wait:
+            return {"skipped": True, "reason": "already running"}
+        logger.warning("Daily-core cycle: a cycle/backfill holds the lock — "
+                       "waiting up to %ds", _TICK_LOCK_WAIT_SECONDS)
+    # Bound ONLY the wait for the lock: acquire manually under asyncio.timeout
+    # and hold it through the cycle (wrapping the whole body would bound —
+    # and could cancel — a long-but-legitimate cycle, not just the wait).
+    try:
+        async with asyncio.timeout(_TICK_LOCK_WAIT_SECONDS):
+            await _cycle_lock.acquire()
+    except TimeoutError:
+        logger.error("Daily-core cycle skipped — the cycle lock was still held "
+                     "after %ds", _TICK_LOCK_WAIT_SECONDS)
         return {"skipped": True, "reason": "already running"}
-    async with _cycle_lock:
+    try:
         if not settings.sim_daily_core_enabled:
             return {"skipped": True, "reason": "daily-core portfolio disabled"}
 
@@ -2418,6 +2456,10 @@ async def run_daily_cycle(force: bool = False, now: datetime | None = None) -> d
 
         return {"allowance": allowance, "refresh_errors": refresh_errors,
                 "deployment": deployment, "snapshot": snap}
+    finally:
+        # Manual release pairs with the bounded acquire above (the body is
+        # deliberately NOT re-indented into an `async with`).
+        _cycle_lock.release()
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,11 @@
+import asyncio
+import logging
+import os
+import sqlite3
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, UTC
+from pathlib import Path
 
 from sqlalchemy import String, Float, Integer, UniqueConstraint, Text, Boolean, event, text
 from sqlalchemy import DateTime as _DateTime
@@ -7,6 +14,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 from .config import settings
+
+logger = logging.getLogger("trade_sentinel.db")
 
 
 def _utcnow() -> datetime:
@@ -1232,16 +1241,238 @@ def create_db_engine(database_url: str):
 # Note: WAL mode persists in the DB file itself, so it only needs setting
 # once per database — but re-applying it per connection is harmless.
 engine = create_db_engine(settings.database_url)
-Session = async_sessionmaker(engine, expire_on_commit=False)
+
+
+# =====================================================================
+# PROD/DEV database switch
+#
+# PROD is the live book. DEV is a disposable sandbox that may be cloned from
+# PROD at any time (see ``clone_prod_to_dev``). Selection is PER REQUEST via
+# a ContextVar set by the ``ts_db`` cookie middleware; everything that runs
+# outside a request (the schedulers) keeps the default "prod".
+# =====================================================================
+
+def _sqlite_path(eng) -> Path:
+    """Filesystem path of a SQLite engine's database (from its URL).
+
+    Raises for anything that is not a real SQLite file: the DEV engine must
+    be a clone target a backup can land on, and never ``:memory:``.
+    """
+    url = eng.sync_engine.url
+    if not url.drivername.startswith("sqlite"):
+        raise RuntimeError(f"expected a SQLite engine, got {url.drivername!r}")
+    database = url.database
+    if not database or database == ":memory:":
+        raise RuntimeError("expected a file-backed SQLite engine")
+    return Path(database)
+
+
+def _create_dev_engine(prod_engine, dev_url: str):
+    """Create the DEV engine, or return None (error-logged) when DEV is unsafe.
+
+    Two misconfigurations are refused instead of obeyed, because
+    ``clone_prod_to_dev`` would otherwise let ``os.replace`` land a backup
+    copy on the wrong file:
+
+    * a non-file URL (``:memory:``, a non-SQLite backend) — a clone target
+      must be a real file;
+    * a path that resolves to the PROD database — a copy-pasted
+      ``DATABASE_URL_DEV`` would overwrite the live book with its own clone.
+
+    An empty URL is the documented "DEV disabled" switch and returns None
+    silently: the feature is off by default.
+    """
+    if not dev_url:
+        return None
+    try:
+        dev_engine = create_db_engine(dev_url)
+        dev_path = _sqlite_path(dev_engine)
+        prod_path = _sqlite_path(prod_engine)
+    except Exception as e:  # noqa: BLE001 — a misconfigured DEV must not kill startup
+        logger.error("DATABASE_URL_DEV %r is not usable (%s) — DEV database disabled",
+                     dev_url, e)
+        return None
+    if dev_path.resolve() == prod_path.resolve():
+        logger.error("DATABASE_URL_DEV resolves to the PROD database (%s) — DEV "
+                     "disabled to protect PROD", prod_path)
+        return None
+    return dev_engine
+
+
+engine_dev = _create_dev_engine(engine, settings.database_url_dev)
+DB_NAMES = ("prod", "dev")
+
+# Per-request DB selection. ContextVars are task-local: the cookie middleware
+# wraps a request in ``use_db``, while background scheduler tasks keep the
+# "prod" default and can never be redirected by a browser.
+_active_db: ContextVar[str] = ContextVar("trade_sentinel_active_db", default="prod")
+
+# name -> (engine it was built from, sessionmaker). The engine identity is
+# remembered so a swapped engine (tests, maintenance) transparently gets a
+# fresh sessionmaker instead of a factory bound to a disposed engine.
+_sessionmakers: dict[str, tuple[object, async_sessionmaker]] = {}
+
+
+def current_db() -> str:
+    """The database serving the current context: "prod" (default) or "dev"."""
+    return _active_db.get()
+
+
+@contextmanager
+def use_db(name: str):
+    """Pin the active DB for a block (request middleware, tests, seeding).
+
+    Resets to the previous value on exit — including on an exception — so a
+    failed request can never leak its selection into the next one.
+    """
+    if name not in DB_NAMES:
+        raise ValueError(f"unknown db name {name!r} (choose from {DB_NAMES})")
+    token = _active_db.set(name)
+    try:
+        yield
+    finally:
+        _active_db.reset(token)
+
+
+def active_engine():
+    """The SQLAlchemy engine behind the active DB.
+
+    Use this (or, preferably, just ``Session()``) anywhere code needs the
+    engine object rather than a session: a request routed to DEV must never
+    accidentally read PROD. Raises when DEV is selected but not configured.
+    """
+    name = current_db()
+    eng = engine if name == "prod" else engine_dev
+    if eng is None:
+        raise RuntimeError(
+            f"the {name.upper()} database is not configured — DATABASE_URL_DEV is unset")
+    return eng
+
+
+def dev_enabled() -> bool:
+    """True when a usable DEV engine exists (ie. the switch is on)."""
+    return engine_dev is not None
+
+
+def _sessionmaker_for(name: str, eng) -> async_sessionmaker:
+    cached = _sessionmakers.get(name)
+    if cached is not None and cached[0] is eng:
+        return cached[1]
+    maker = async_sessionmaker(eng, expire_on_commit=False)
+    _sessionmakers[name] = (eng, maker)
+    return maker
+
+
+def Session():
+    """Session factory bound to the ACTIVE database (PROD by default).
+
+    Modules keep their ``from .db import Session`` + ``Session()`` contract —
+    this function resolves the ContextVar at CALL time, so a call made while
+    the request middleware's ``use_db("dev")`` block is active talks to the
+    sandbox, and a background task (no context, default "prod") always talks
+    to the live book.
+    """
+    name = current_db()
+    return _sessionmaker_for(name, active_engine())()
+
+
+def _disable_dev(reason) -> None:
+    """Switch the feature off for this process (error-logged).
+
+    A DEV database that cannot even be opened must degrade to "feature
+    disabled" — never take the app (and therefore PROD) down with it.
+    """
+    global engine_dev
+    if engine_dev is not None:
+        logger.error("DEV database unusable (%s) — PROD/DEV switch disabled for "
+                     "this run; every request is served by PROD", reason)
+    engine_dev = None
+    _sessionmakers.pop("dev", None)
+
+
+def dev_db_exists() -> bool:
+    return engine_dev is not None and _sqlite_path(engine_dev).exists()
+
+
+def prod_db_exists() -> bool:
+    return _sqlite_path(engine).exists()
+
+
+async def clone_prod_to_dev() -> dict:
+    """Overwrite DEV with a fresh copy of PROD (SQLite online-backup API).
+
+    Safe while PROD is live: the backup API snapshots committed pages under
+    WAL. The copy lands in a temp file next to the DEV file and is swapped in
+    with ``os.replace`` (atomic on one filesystem); the DEV engine is
+    disposed around the swap so no pooled connection keeps pointing at the
+    replaced inode, and stale ``-wal``/``-shm`` sidecars of the OLD file are
+    removed — they must never pair with the new file.
+    """
+    if engine is None or engine_dev is None:
+        raise RuntimeError("DATABASE_URL_DEV is not configured — no DEV engine to clone into")
+    prod_path, dev_path = _sqlite_path(engine), _sqlite_path(engine_dev)
+    if not prod_path.exists():
+        raise RuntimeError(f"PROD database {prod_path} does not exist — nothing to clone")
+    # Defense in depth: _create_dev_engine already refuses a DEV URL that
+    # resolves to PROD, but a programmatic engine swap must never let
+    # os.replace overwrite PROD with the backup copy either.
+    if prod_path.resolve() == dev_path.resolve():
+        raise RuntimeError("DEV database path resolves to the PROD database — refusing to clone over PROD")
+    tmp_path = dev_path.with_suffix(dev_path.suffix + ".tmp")
+    dev_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _backup() -> None:
+        # closing(): `with sqlite3.connect(...)` commits but does NOT close.
+        # A leftover tmp from a crashed clone must never poison this backup
+        # (sqlite3.connect would open it as-is and the backup would write
+        # into it).
+        tmp_path.unlink(missing_ok=True)
+        with closing(sqlite3.connect(str(prod_path), timeout=30)) as src, \
+                closing(sqlite3.connect(str(tmp_path))) as dst:
+            src.backup(dst)
+
+    try:
+        await asyncio.to_thread(_backup)
+        await engine_dev.dispose()  # no pooled connection may hold the old inode
+        os.replace(tmp_path, dev_path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)  # never leave a half-written copy behind
+        except OSError:
+            pass
+        raise
+    for sidecar in (f"{dev_path}-wal", f"{dev_path}-shm"):
+        Path(sidecar).unlink(missing_ok=True)
+    return {"ok": True, "path": str(dev_path), "size_bytes": dev_path.stat().st_size,
+            "cloned_at": datetime.now(UTC).isoformat()}
 
 
 async def init_db(db_engine=None):
     """Create the schema and converge existing databases (idempotent).
 
-    ``db_engine`` exists for tests and maintenance scripts that run the
-    migrations against their own engine; the app always uses ``engine``.
+    Without arguments it migrates BOTH configured databases: PROD and, when
+    the switch is on, DEV (so the sandbox always has a current schema, even
+    before the auto-seed clone replaces it). ``db_engine`` exists for tests
+    and maintenance scripts that run the migrations against one specific
+    engine; the app always calls it bare.
+
+    A DEV database that cannot be opened is disabled with an error log
+    instead of failing startup — PROD must never depend on the sandbox.
     """
-    target = db_engine if db_engine is not None else engine
+    if db_engine is not None:
+        await _migrate_engine(db_engine)
+        return
+    await _migrate_engine(engine)
+    if engine_dev is not None:
+        try:
+            await _migrate_engine(engine_dev)
+        except Exception as e:  # noqa: BLE001 — PROD stays up whatever DEV does
+            _disable_dev(e)
+
+
+async def _migrate_engine(db_engine):
+    """Bring ONE engine's schema up to date (create_all + additive ALTERs)."""
+    target = db_engine
     async with target.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # Phase 2 run provenance: the run_configs/run_epochs registry and the

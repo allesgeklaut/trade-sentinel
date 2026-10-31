@@ -1110,6 +1110,8 @@ async def test_legacy_rows_read_as_epoch_one_then_are_excluded_after_reset(run_d
 
 
 async def test_sim_chat_action_stamps_trade_and_snapshot_paper(run_db, monkeypatch):
+    """A chat turn only PROPOSES (no forward record); the CONFIRM is the
+    forward paper record — trade + snapshot + RunExecution, all stamped paper."""
     monkeypatch.setattr(sim, "_utcnow", lambda: datetime(2026, 10, 5, 12, 0, tzinfo=UTC))
     monkeypatch.setattr(sim, "_current_month", lambda: "2026-10")
     async with run_db() as s:
@@ -1132,8 +1134,18 @@ async def test_sim_chat_action_stamps_trade_and_snapshot_paper(run_db, monkeypat
     monkeypatch.setattr(sim, "_latest_close", fake_close)
 
     out = await sim.sim_chat([{"role": "user", "content": "buy AAPL"}])
-    assert out["actions_executed"] is True
-    assert [(t["ticker"], t["side"]) for t in out["trades"]] == [("AAPL", "BUY")]
+    # The turn alone books NOTHING: no trades/snapshots/executions, honest envelope.
+    assert "trades" not in out and "actions_executed" not in out
+    assert len(out["proposals"]) == 1
+    assert out["proposals"][0]["actions"][0]["preview"]["feasible"] is True
+    assert await _all(run_db, SimTrade) == []
+    assert await _all(run_db, SimSnapshot) == []
+    assert await _all(run_db, RunExecution) == []
+
+    conf = await sim.confirm_chat_proposal(out["proposals"][0]["proposal_id"])
+    assert conf["ok"] is True
+    assert [(t["ticker"], t["side"]) for t in conf["trades"]] == [("AAPL", "BUY")]
+    assert conf["snapshot_taken"] is True
 
     _assert_stamped(await _all(run_db, SimTrade), mode="paper", epoch=1)
     _assert_stamped(await _all(run_db, SimSnapshot), mode="paper", epoch=1)

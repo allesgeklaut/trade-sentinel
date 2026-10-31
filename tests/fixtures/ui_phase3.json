@@ -1,0 +1,6463 @@
+{
+  "label": "phase3-ui-fixture",
+  "version": 1,
+  "as_of": "2026-10-30",
+  "notice": "Synthetic offline UI fixture - testing only. No real market data, trades, accounts, provider or LLM calls.",
+  "modes": {
+    "populated": {
+      "description": "Populated synthetic Phase 3 fixture: 3 USD paper books + EUR savings, no real data.",
+      "watchlist": [
+        "AAPL",
+        "MSFT",
+        "NVDA",
+        "JPM"
+      ],
+      "names": {
+        "AAPL": "Apple Inc.",
+        "MSFT": "Microsoft Corporation",
+        "NVDA": "NVIDIA Corporation",
+        "JPM": "JPMorgan Chase & Co.",
+        "XOM": "Exxon Mobil Corporation",
+        "UNH": "UnitedHealth Group Incorporated",
+        "VWCE.DE": "Vanguard FTSE All-World UCITS ETF",
+        "SAP.DE": "SAP SE",
+        "IFX.DE": "Infineon Technologies AG"
+      },
+      "symbols": [
+        {
+          "symbol": "AAPL",
+          "name": "Apple Inc.",
+          "exchange": "NASDAQ",
+          "country": "United States",
+          "type": "EQUITY"
+        },
+        {
+          "symbol": "MSFT",
+          "name": "Microsoft Corporation",
+          "exchange": "NASDAQ",
+          "country": "United States",
+          "type": "EQUITY"
+        },
+        {
+          "symbol": "NVDA",
+          "name": "NVIDIA Corporation",
+          "exchange": "NASDAQ",
+          "country": "United States",
+          "type": "EQUITY"
+        },
+        {
+          "symbol": "JPM",
+          "name": "JPMorgan Chase & Co.",
+          "exchange": "NYSE",
+          "country": "United States",
+          "type": "EQUITY"
+        },
+        {
+          "symbol": "XOM",
+          "name": "Exxon Mobil Corporation",
+          "exchange": "NYSE",
+          "country": "United States",
+          "type": "EQUITY"
+        },
+        {
+          "symbol": "UNH",
+          "name": "UnitedHealth Group Incorporated",
+          "exchange": "NYSE",
+          "country": "United States",
+          "type": "EQUITY"
+        },
+        {
+          "symbol": "VWCE.DE",
+          "name": "Vanguard FTSE All-World UCITS ETF",
+          "exchange": "XETRA",
+          "country": "Germany",
+          "type": "ETF"
+        },
+        {
+          "symbol": "SAP.DE",
+          "name": "SAP SE",
+          "exchange": "XETRA",
+          "country": "Germany",
+          "type": "EQUITY"
+        },
+        {
+          "symbol": "IFX.DE",
+          "name": "Infineon Technologies AG",
+          "exchange": "XETRA",
+          "country": "Germany",
+          "type": "EQUITY"
+        }
+      ],
+      "dashboards": {
+        "AAPL": {
+          "action": "BUY",
+          "reason": "BUY (score +42): close 214.50 > SMA50 204.20 > SMA200 190.25; RSI 58.4; ADX 27; MACD bullish.",
+          "strength": 68,
+          "snapshot": {
+            "close": 214.5,
+            "net_score": 42.0,
+            "strength": 68,
+            "rsi": 58.4,
+            "sma20": 211.28,
+            "sma50": 204.2,
+            "sma200": 190.26,
+            "macd": 1.42,
+            "macd_signal": 1.1,
+            "macd_hist": 0.32,
+            "atr14": 4.7,
+            "atr_pct": 2.19,
+            "atr_stop": 198.41,
+            "adx": 27.3,
+            "vol_surge": 1.31,
+            "weekly_trend_up": true,
+            "rsi_3d_change": 2.1,
+            "macd_hist_3d_change": 0.08,
+            "run_5d": 2.86
+          },
+          "candles": [
+            {
+              "time": "2026-08-31",
+              "open": 186.83,
+              "high": 188.12,
+              "low": 186.13,
+              "close": 187.32,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-01",
+              "open": 187.54,
+              "high": 188.89,
+              "low": 186.64,
+              "close": 187.94,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-02",
+              "open": 188.15,
+              "high": 189.65,
+              "low": 187.45,
+              "close": 188.55,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-03",
+              "open": 188.77,
+              "high": 189.97,
+              "low": 187.87,
+              "close": 189.17,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-04",
+              "open": 189.39,
+              "high": 190.74,
+              "low": 188.69,
+              "close": 189.79,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-09-07",
+              "open": 190.01,
+              "high": 191.51,
+              "low": 189.11,
+              "close": 190.41,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-09-08",
+              "open": 190.62,
+              "high": 191.83,
+              "low": 189.92,
+              "close": 191.03,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-09-09",
+              "open": 191.24,
+              "high": 192.59,
+              "low": 190.34,
+              "close": 191.64,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-09-10",
+              "open": 191.86,
+              "high": 193.36,
+              "low": 191.16,
+              "close": 192.26,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-09-11",
+              "open": 192.48,
+              "high": 193.68,
+              "low": 191.58,
+              "close": 192.88,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-14",
+              "open": 193.09,
+              "high": 194.45,
+              "low": 192.39,
+              "close": 193.5,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-15",
+              "open": 193.71,
+              "high": 195.21,
+              "low": 192.81,
+              "close": 194.11,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-16",
+              "open": 194.33,
+              "high": 195.53,
+              "low": 193.63,
+              "close": 194.73,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-17",
+              "open": 194.95,
+              "high": 196.3,
+              "low": 194.05,
+              "close": 195.35,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-09-18",
+              "open": 195.57,
+              "high": 197.07,
+              "low": 194.87,
+              "close": 195.97,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-09-21",
+              "open": 196.18,
+              "high": 197.39,
+              "low": 195.28,
+              "close": 196.59,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-09-22",
+              "open": 196.8,
+              "high": 198.15,
+              "low": 196.1,
+              "close": 197.2,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-09-23",
+              "open": 197.42,
+              "high": 198.92,
+              "low": 196.52,
+              "close": 197.82,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-09-24",
+              "open": 198.04,
+              "high": 199.24,
+              "low": 197.34,
+              "close": 198.44,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-25",
+              "open": 198.65,
+              "high": 200.01,
+              "low": 197.75,
+              "close": 199.06,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-28",
+              "open": 199.27,
+              "high": 200.77,
+              "low": 198.57,
+              "close": 199.67,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-29",
+              "open": 199.89,
+              "high": 201.09,
+              "low": 198.99,
+              "close": 200.29,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-30",
+              "open": 200.51,
+              "high": 201.86,
+              "low": 199.81,
+              "close": 200.91,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-01",
+              "open": 201.13,
+              "high": 202.63,
+              "low": 200.23,
+              "close": 201.53,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-02",
+              "open": 201.74,
+              "high": 202.94,
+              "low": 201.04,
+              "close": 202.14,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-05",
+              "open": 202.36,
+              "high": 203.71,
+              "low": 201.46,
+              "close": 202.76,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-06",
+              "open": 202.98,
+              "high": 204.48,
+              "low": 202.28,
+              "close": 203.38,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-10-07",
+              "open": 203.6,
+              "high": 204.8,
+              "low": 202.7,
+              "close": 204.0,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-10-08",
+              "open": 204.21,
+              "high": 205.57,
+              "low": 203.51,
+              "close": 204.62,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-10-09",
+              "open": 204.83,
+              "high": 206.33,
+              "low": 203.93,
+              "close": 205.23,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-10-12",
+              "open": 205.45,
+              "high": 206.65,
+              "low": 204.75,
+              "close": 205.85,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-10-13",
+              "open": 206.07,
+              "high": 207.42,
+              "low": 205.17,
+              "close": 206.47,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-14",
+              "open": 206.69,
+              "high": 208.19,
+              "low": 205.99,
+              "close": 207.09,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-15",
+              "open": 207.3,
+              "high": 208.5,
+              "low": 206.4,
+              "close": 207.7,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-16",
+              "open": 207.92,
+              "high": 209.27,
+              "low": 207.22,
+              "close": 208.32,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-19",
+              "open": 208.54,
+              "high": 210.04,
+              "low": 207.64,
+              "close": 208.94,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-10-20",
+              "open": 209.16,
+              "high": 210.36,
+              "low": 208.46,
+              "close": 209.56,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-10-21",
+              "open": 209.77,
+              "high": 211.13,
+              "low": 208.87,
+              "close": 210.18,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-10-22",
+              "open": 210.39,
+              "high": 211.89,
+              "low": 209.69,
+              "close": 210.79,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-10-23",
+              "open": 211.01,
+              "high": 212.21,
+              "low": 210.11,
+              "close": 211.41,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-10-26",
+              "open": 211.63,
+              "high": 212.98,
+              "low": 210.93,
+              "close": 212.03,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-27",
+              "open": 212.25,
+              "high": 213.75,
+              "low": 211.35,
+              "close": 212.65,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-28",
+              "open": 212.86,
+              "high": 214.06,
+              "low": 212.16,
+              "close": 213.26,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-29",
+              "open": 213.48,
+              "high": 214.83,
+              "low": 212.58,
+              "close": 213.88,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-30",
+              "open": 214.1,
+              "high": 215.6,
+              "low": 213.4,
+              "close": 214.5,
+              "volume": 28000000
+            }
+          ],
+          "history": [
+            {
+              "at": "2026-10-29T20:00:00+00:00",
+              "action": "BUY",
+              "reason": "BUY (score +42): close 214.50 > SMA50 204.20 > SMA200 190.25; RSI 58.4; ADX 27; MACD bullish.",
+              "strength": 66,
+              "snapshot": {
+                "close": 213.21,
+                "net_score": 42.0,
+                "strength": 68,
+                "rsi": 58.4,
+                "sma20": 210.01,
+                "sma50": 202.98,
+                "sma200": 189.12,
+                "macd": 1.42,
+                "macd_signal": 1.1,
+                "macd_hist": 0.32,
+                "atr14": 4.7,
+                "atr_pct": 2.19,
+                "atr_stop": 197.22,
+                "adx": 27.3,
+                "vol_surge": 1.31,
+                "weekly_trend_up": true,
+                "rsi_3d_change": 2.1,
+                "macd_hist_3d_change": 0.08,
+                "run_5d": 2.86
+              }
+            }
+          ]
+        },
+        "MSFT": {
+          "action": "BUY",
+          "reason": "BUY (score +51): close 438.75 > SMA50 417.60 > SMA200 389.20; RSI 61.2; ADX 27; MACD bullish.",
+          "strength": 74,
+          "snapshot": {
+            "close": 438.75,
+            "net_score": 51.0,
+            "strength": 74,
+            "rsi": 61.2,
+            "sma20": 432.17,
+            "sma50": 417.69,
+            "sma200": 389.17,
+            "macd": 1.42,
+            "macd_signal": 1.1,
+            "macd_hist": 0.32,
+            "atr14": 4.7,
+            "atr_pct": 2.19,
+            "atr_stop": 405.84,
+            "adx": 27.3,
+            "vol_surge": 1.31,
+            "weekly_trend_up": true,
+            "rsi_3d_change": 2.1,
+            "macd_hist_3d_change": 0.08,
+            "run_5d": 2.86
+          },
+          "candles": [
+            {
+              "time": "2026-08-31",
+              "open": 396.67,
+              "high": 398.5,
+              "low": 395.97,
+              "close": 397.7,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-01",
+              "open": 398.03,
+              "high": 399.59,
+              "low": 397.13,
+              "close": 398.64,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-02",
+              "open": 398.96,
+              "high": 400.67,
+              "low": 398.26,
+              "close": 399.57,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-03",
+              "open": 399.9,
+              "high": 401.3,
+              "low": 399.0,
+              "close": 400.5,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-04",
+              "open": 400.83,
+              "high": 402.38,
+              "low": 400.13,
+              "close": 401.43,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-09-07",
+              "open": 401.76,
+              "high": 403.47,
+              "low": 400.86,
+              "close": 402.37,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-09-08",
+              "open": 402.69,
+              "high": 404.1,
+              "low": 401.99,
+              "close": 403.3,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-09-09",
+              "open": 403.63,
+              "high": 405.18,
+              "low": 402.73,
+              "close": 404.23,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-09-10",
+              "open": 404.56,
+              "high": 406.27,
+              "low": 403.86,
+              "close": 405.17,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-09-11",
+              "open": 405.49,
+              "high": 406.9,
+              "low": 404.59,
+              "close": 406.1,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-14",
+              "open": 406.43,
+              "high": 407.98,
+              "low": 405.73,
+              "close": 407.03,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-15",
+              "open": 407.36,
+              "high": 409.06,
+              "low": 406.46,
+              "close": 407.96,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-16",
+              "open": 408.29,
+              "high": 409.7,
+              "low": 407.59,
+              "close": 408.9,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-17",
+              "open": 409.22,
+              "high": 410.78,
+              "low": 408.32,
+              "close": 409.83,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-09-18",
+              "open": 410.16,
+              "high": 411.86,
+              "low": 409.46,
+              "close": 410.76,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-09-21",
+              "open": 411.09,
+              "high": 412.5,
+              "low": 410.19,
+              "close": 411.7,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-09-22",
+              "open": 412.02,
+              "high": 413.58,
+              "low": 411.32,
+              "close": 412.63,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-09-23",
+              "open": 412.96,
+              "high": 414.66,
+              "low": 412.06,
+              "close": 413.56,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-09-24",
+              "open": 413.89,
+              "high": 415.3,
+              "low": 413.19,
+              "close": 414.5,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-25",
+              "open": 414.82,
+              "high": 416.38,
+              "low": 413.92,
+              "close": 415.43,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-28",
+              "open": 415.75,
+              "high": 417.46,
+              "low": 415.05,
+              "close": 416.36,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-29",
+              "open": 416.69,
+              "high": 418.09,
+              "low": 415.79,
+              "close": 417.29,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-30",
+              "open": 417.62,
+              "high": 419.18,
+              "low": 416.92,
+              "close": 418.23,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-01",
+              "open": 418.55,
+              "high": 420.26,
+              "low": 417.65,
+              "close": 419.16,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-02",
+              "open": 419.49,
+              "high": 420.89,
+              "low": 418.79,
+              "close": 420.09,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-05",
+              "open": 420.42,
+              "high": 421.98,
+              "low": 419.52,
+              "close": 421.03,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-06",
+              "open": 421.35,
+              "high": 423.06,
+              "low": 420.65,
+              "close": 421.96,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-10-07",
+              "open": 422.28,
+              "high": 423.69,
+              "low": 421.38,
+              "close": 422.89,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-10-08",
+              "open": 423.22,
+              "high": 424.77,
+              "low": 422.52,
+              "close": 423.82,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-10-09",
+              "open": 424.15,
+              "high": 425.86,
+              "low": 423.25,
+              "close": 424.76,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-10-12",
+              "open": 425.08,
+              "high": 426.49,
+              "low": 424.38,
+              "close": 425.69,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-10-13",
+              "open": 426.02,
+              "high": 427.57,
+              "low": 425.12,
+              "close": 426.62,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-14",
+              "open": 426.95,
+              "high": 428.66,
+              "low": 426.25,
+              "close": 427.56,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-15",
+              "open": 427.88,
+              "high": 429.29,
+              "low": 426.98,
+              "close": 428.49,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-16",
+              "open": 428.81,
+              "high": 430.37,
+              "low": 428.11,
+              "close": 429.42,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-19",
+              "open": 429.75,
+              "high": 431.45,
+              "low": 428.85,
+              "close": 430.35,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-10-20",
+              "open": 430.68,
+              "high": 432.09,
+              "low": 429.98,
+              "close": 431.29,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-10-21",
+              "open": 431.61,
+              "high": 433.17,
+              "low": 430.71,
+              "close": 432.22,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-10-22",
+              "open": 432.55,
+              "high": 434.25,
+              "low": 431.85,
+              "close": 433.15,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-10-23",
+              "open": 433.48,
+              "high": 434.89,
+              "low": 432.58,
+              "close": 434.09,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-10-26",
+              "open": 434.41,
+              "high": 435.97,
+              "low": 433.71,
+              "close": 435.02,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-27",
+              "open": 435.34,
+              "high": 437.05,
+              "low": 434.44,
+              "close": 435.95,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-28",
+              "open": 436.28,
+              "high": 437.68,
+              "low": 435.58,
+              "close": 436.88,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-29",
+              "open": 437.21,
+              "high": 438.77,
+              "low": 436.31,
+              "close": 437.82,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-30",
+              "open": 438.14,
+              "high": 439.85,
+              "low": 437.44,
+              "close": 438.75,
+              "volume": 28000000
+            }
+          ],
+          "history": [
+            {
+              "at": "2026-10-29T20:00:00+00:00",
+              "action": "BUY",
+              "reason": "BUY (score +51): close 438.75 > SMA50 417.60 > SMA200 389.20; RSI 61.2; ADX 27; MACD bullish.",
+              "strength": 66,
+              "snapshot": {
+                "close": 436.12,
+                "net_score": 51.0,
+                "strength": 74,
+                "rsi": 61.2,
+                "sma20": 429.58,
+                "sma50": 415.19,
+                "sma200": 386.84,
+                "macd": 1.42,
+                "macd_signal": 1.1,
+                "macd_hist": 0.32,
+                "atr14": 4.7,
+                "atr_pct": 2.19,
+                "atr_stop": 403.41,
+                "adx": 27.3,
+                "vol_surge": 1.31,
+                "weekly_trend_up": true,
+                "rsi_3d_change": 2.1,
+                "macd_hist_3d_change": 0.08,
+                "run_5d": 2.86
+              }
+            }
+          ]
+        },
+        "NVDA": {
+          "action": "BUY",
+          "reason": "BUY (score +47): close 132.68 > SMA50 126.30 > SMA200 117.70; RSI 64.8; ADX 27; MACD bullish.",
+          "strength": 71,
+          "snapshot": {
+            "close": 132.68,
+            "net_score": 47.0,
+            "strength": 71,
+            "rsi": 64.8,
+            "sma20": 130.69,
+            "sma50": 126.31,
+            "sma200": 117.69,
+            "macd": 1.42,
+            "macd_signal": 1.1,
+            "macd_hist": 0.32,
+            "atr14": 4.7,
+            "atr_pct": 2.19,
+            "atr_stop": 122.73,
+            "adx": 27.3,
+            "vol_surge": 1.31,
+            "weekly_trend_up": true,
+            "rsi_3d_change": 2.1,
+            "macd_hist_3d_change": 0.08,
+            "run_5d": 2.86
+          },
+          "candles": [
+            {
+              "time": "2026-08-31",
+              "open": 114.18,
+              "high": 115.28,
+              "low": 113.48,
+              "close": 114.48,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-01",
+              "open": 114.62,
+              "high": 115.84,
+              "low": 113.72,
+              "close": 114.89,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-02",
+              "open": 115.04,
+              "high": 116.41,
+              "low": 114.34,
+              "close": 115.31,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-03",
+              "open": 115.45,
+              "high": 116.52,
+              "low": 114.55,
+              "close": 115.72,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-04",
+              "open": 115.86,
+              "high": 117.08,
+              "low": 115.16,
+              "close": 116.13,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-09-07",
+              "open": 116.28,
+              "high": 117.65,
+              "low": 115.38,
+              "close": 116.55,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-09-08",
+              "open": 116.69,
+              "high": 117.76,
+              "low": 115.99,
+              "close": 116.96,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-09-09",
+              "open": 117.11,
+              "high": 118.32,
+              "low": 116.21,
+              "close": 117.37,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-09-10",
+              "open": 117.52,
+              "high": 118.89,
+              "low": 116.82,
+              "close": 117.79,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-09-11",
+              "open": 117.93,
+              "high": 119.0,
+              "low": 117.03,
+              "close": 118.2,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-14",
+              "open": 118.35,
+              "high": 119.57,
+              "low": 117.65,
+              "close": 118.62,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-15",
+              "open": 118.76,
+              "high": 120.13,
+              "low": 117.86,
+              "close": 119.03,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-16",
+              "open": 119.17,
+              "high": 120.24,
+              "low": 118.47,
+              "close": 119.44,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-17",
+              "open": 119.59,
+              "high": 120.81,
+              "low": 118.69,
+              "close": 119.86,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-09-18",
+              "open": 120.0,
+              "high": 121.37,
+              "low": 119.3,
+              "close": 120.27,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-09-21",
+              "open": 120.41,
+              "high": 121.48,
+              "low": 119.51,
+              "close": 120.68,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-09-22",
+              "open": 120.83,
+              "high": 122.05,
+              "low": 120.13,
+              "close": 121.1,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-09-23",
+              "open": 121.24,
+              "high": 122.61,
+              "low": 120.34,
+              "close": 121.51,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-09-24",
+              "open": 121.66,
+              "high": 122.72,
+              "low": 120.96,
+              "close": 121.92,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-25",
+              "open": 122.07,
+              "high": 123.29,
+              "low": 121.17,
+              "close": 122.34,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-28",
+              "open": 122.48,
+              "high": 123.85,
+              "low": 121.78,
+              "close": 122.75,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-29",
+              "open": 122.9,
+              "high": 123.97,
+              "low": 122.0,
+              "close": 123.17,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-30",
+              "open": 123.31,
+              "high": 124.53,
+              "low": 122.61,
+              "close": 123.58,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-01",
+              "open": 123.72,
+              "high": 125.09,
+              "low": 122.82,
+              "close": 123.99,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-02",
+              "open": 124.14,
+              "high": 125.21,
+              "low": 123.44,
+              "close": 124.41,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-05",
+              "open": 124.55,
+              "high": 125.77,
+              "low": 123.65,
+              "close": 124.82,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-06",
+              "open": 124.97,
+              "high": 126.33,
+              "low": 124.27,
+              "close": 125.23,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-10-07",
+              "open": 125.38,
+              "high": 126.45,
+              "low": 124.48,
+              "close": 125.65,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-10-08",
+              "open": 125.79,
+              "high": 127.01,
+              "low": 125.09,
+              "close": 126.06,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-10-09",
+              "open": 126.21,
+              "high": 127.58,
+              "low": 125.31,
+              "close": 126.48,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-10-12",
+              "open": 126.62,
+              "high": 127.69,
+              "low": 125.92,
+              "close": 126.89,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-10-13",
+              "open": 127.03,
+              "high": 128.25,
+              "low": 126.13,
+              "close": 127.3,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-14",
+              "open": 127.45,
+              "high": 128.82,
+              "low": 126.75,
+              "close": 127.72,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-15",
+              "open": 127.86,
+              "high": 128.93,
+              "low": 126.96,
+              "close": 128.13,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-16",
+              "open": 128.27,
+              "high": 129.49,
+              "low": 127.57,
+              "close": 128.54,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-19",
+              "open": 128.69,
+              "high": 130.06,
+              "low": 127.79,
+              "close": 128.96,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-10-20",
+              "open": 129.1,
+              "high": 130.17,
+              "low": 128.4,
+              "close": 129.37,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-10-21",
+              "open": 129.52,
+              "high": 130.73,
+              "low": 128.62,
+              "close": 129.78,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-10-22",
+              "open": 129.93,
+              "high": 131.3,
+              "low": 129.23,
+              "close": 130.2,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-10-23",
+              "open": 130.34,
+              "high": 131.41,
+              "low": 129.44,
+              "close": 130.61,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-10-26",
+              "open": 130.76,
+              "high": 131.98,
+              "low": 130.06,
+              "close": 131.03,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-27",
+              "open": 131.17,
+              "high": 132.54,
+              "low": 130.27,
+              "close": 131.44,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-28",
+              "open": 131.58,
+              "high": 132.65,
+              "low": 130.88,
+              "close": 131.85,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-29",
+              "open": 132.0,
+              "high": 133.22,
+              "low": 131.1,
+              "close": 132.27,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-30",
+              "open": 132.41,
+              "high": 133.78,
+              "low": 131.71,
+              "close": 132.68,
+              "volume": 28000000
+            }
+          ],
+          "history": [
+            {
+              "at": "2026-10-29T20:00:00+00:00",
+              "action": "BUY",
+              "reason": "BUY (score +47): close 132.68 > SMA50 126.30 > SMA200 117.70; RSI 64.8; ADX 27; MACD bullish.",
+              "strength": 66,
+              "snapshot": {
+                "close": 131.88,
+                "net_score": 47.0,
+                "strength": 71,
+                "rsi": 64.8,
+                "sma20": 129.9,
+                "sma50": 125.55,
+                "sma200": 116.98,
+                "macd": 1.42,
+                "macd_signal": 1.1,
+                "macd_hist": 0.32,
+                "atr14": 4.7,
+                "atr_pct": 2.19,
+                "atr_stop": 121.99,
+                "adx": 27.3,
+                "vol_surge": 1.31,
+                "weekly_trend_up": true,
+                "rsi_3d_change": 2.1,
+                "macd_hist_3d_change": 0.08,
+                "run_5d": 2.86
+              }
+            }
+          ]
+        },
+        "JPM": {
+          "action": "HOLD",
+          "reason": "HOLD (score +38): close 238.10, SMA50 226.70, SMA200 211.20; RSI 55.1; MACD mixed.",
+          "strength": 63,
+          "snapshot": {
+            "close": 238.1,
+            "net_score": 38.0,
+            "strength": 63,
+            "rsi": 55.1,
+            "sma20": 234.53,
+            "sma50": 226.67,
+            "sma200": 211.19,
+            "macd": 1.42,
+            "macd_signal": 1.1,
+            "macd_hist": 0.32,
+            "atr14": 4.7,
+            "atr_pct": 2.19,
+            "atr_stop": 220.24,
+            "adx": 27.3,
+            "vol_surge": 1.31,
+            "weekly_trend_up": true,
+            "rsi_3d_change": 2.1,
+            "macd_hist_3d_change": 0.08,
+            "run_5d": 2.86
+          },
+          "candles": [
+            {
+              "time": "2026-08-31",
+              "open": 220.78,
+              "high": 222.15,
+              "low": 220.08,
+              "close": 221.35,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-01",
+              "open": 221.49,
+              "high": 222.68,
+              "low": 220.59,
+              "close": 221.73,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-02",
+              "open": 221.87,
+              "high": 223.21,
+              "low": 221.17,
+              "close": 222.11,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-03",
+              "open": 222.25,
+              "high": 223.3,
+              "low": 221.35,
+              "close": 222.5,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-04",
+              "open": 222.63,
+              "high": 223.83,
+              "low": 221.93,
+              "close": 222.88,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-09-07",
+              "open": 223.01,
+              "high": 224.36,
+              "low": 222.11,
+              "close": 223.26,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-09-08",
+              "open": 223.39,
+              "high": 224.44,
+              "low": 222.69,
+              "close": 223.64,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-09-09",
+              "open": 223.77,
+              "high": 224.97,
+              "low": 222.87,
+              "close": 224.02,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-09-10",
+              "open": 224.15,
+              "high": 225.5,
+              "low": 223.45,
+              "close": 224.4,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-09-11",
+              "open": 224.53,
+              "high": 225.58,
+              "low": 223.63,
+              "close": 224.78,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-14",
+              "open": 224.91,
+              "high": 226.11,
+              "low": 224.21,
+              "close": 225.16,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-15",
+              "open": 225.29,
+              "high": 226.64,
+              "low": 224.39,
+              "close": 225.54,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-16",
+              "open": 225.67,
+              "high": 226.72,
+              "low": 224.97,
+              "close": 225.92,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-17",
+              "open": 226.05,
+              "high": 227.25,
+              "low": 225.15,
+              "close": 226.3,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-09-18",
+              "open": 226.43,
+              "high": 227.78,
+              "low": 225.73,
+              "close": 226.68,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-09-21",
+              "open": 226.81,
+              "high": 227.86,
+              "low": 225.91,
+              "close": 227.06,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-09-22",
+              "open": 227.2,
+              "high": 228.39,
+              "low": 226.5,
+              "close": 227.44,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-09-23",
+              "open": 227.58,
+              "high": 228.92,
+              "low": 226.68,
+              "close": 227.82,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-09-24",
+              "open": 227.96,
+              "high": 229.0,
+              "low": 227.26,
+              "close": 228.2,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-25",
+              "open": 228.34,
+              "high": 229.53,
+              "low": 227.44,
+              "close": 228.58,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-28",
+              "open": 228.72,
+              "high": 230.07,
+              "low": 228.02,
+              "close": 228.97,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-29",
+              "open": 229.1,
+              "high": 230.15,
+              "low": 228.2,
+              "close": 229.35,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-30",
+              "open": 229.48,
+              "high": 230.68,
+              "low": 228.78,
+              "close": 229.73,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-01",
+              "open": 229.86,
+              "high": 231.21,
+              "low": 228.96,
+              "close": 230.11,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-02",
+              "open": 230.24,
+              "high": 231.29,
+              "low": 229.54,
+              "close": 230.49,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-05",
+              "open": 230.62,
+              "high": 231.82,
+              "low": 229.72,
+              "close": 230.87,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-06",
+              "open": 231.0,
+              "high": 232.35,
+              "low": 230.3,
+              "close": 231.25,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-10-07",
+              "open": 231.38,
+              "high": 232.43,
+              "low": 230.48,
+              "close": 231.63,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-10-08",
+              "open": 231.76,
+              "high": 232.96,
+              "low": 231.06,
+              "close": 232.01,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-10-09",
+              "open": 232.14,
+              "high": 233.49,
+              "low": 231.24,
+              "close": 232.39,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-10-12",
+              "open": 232.52,
+              "high": 233.57,
+              "low": 231.82,
+              "close": 232.77,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-10-13",
+              "open": 232.9,
+              "high": 234.1,
+              "low": 232.0,
+              "close": 233.15,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-14",
+              "open": 233.29,
+              "high": 234.63,
+              "low": 232.59,
+              "close": 233.53,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-15",
+              "open": 233.67,
+              "high": 234.71,
+              "low": 232.77,
+              "close": 233.91,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-16",
+              "open": 234.05,
+              "high": 235.24,
+              "low": 233.35,
+              "close": 234.29,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-19",
+              "open": 234.43,
+              "high": 235.77,
+              "low": 233.53,
+              "close": 234.67,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-10-20",
+              "open": 234.81,
+              "high": 235.86,
+              "low": 234.11,
+              "close": 235.06,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-10-21",
+              "open": 235.19,
+              "high": 236.39,
+              "low": 234.29,
+              "close": 235.44,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-10-22",
+              "open": 235.57,
+              "high": 236.92,
+              "low": 234.87,
+              "close": 235.82,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-10-23",
+              "open": 235.95,
+              "high": 237.0,
+              "low": 235.05,
+              "close": 236.2,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-10-26",
+              "open": 236.33,
+              "high": 237.53,
+              "low": 235.63,
+              "close": 236.58,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-27",
+              "open": 236.71,
+              "high": 238.06,
+              "low": 235.81,
+              "close": 236.96,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-28",
+              "open": 237.09,
+              "high": 238.14,
+              "low": 236.39,
+              "close": 237.34,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-29",
+              "open": 237.47,
+              "high": 238.67,
+              "low": 236.57,
+              "close": 237.72,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-30",
+              "open": 237.85,
+              "high": 239.2,
+              "low": 237.15,
+              "close": 238.1,
+              "volume": 28000000
+            }
+          ],
+          "history": [
+            {
+              "at": "2026-10-29T20:00:00+00:00",
+              "action": "HOLD",
+              "reason": "HOLD (score +38): close 238.10, SMA50 226.70, SMA200 211.20; RSI 55.1; MACD mixed.",
+              "strength": 66,
+              "snapshot": {
+                "close": 236.67,
+                "net_score": 38.0,
+                "strength": 63,
+                "rsi": 55.1,
+                "sma20": 233.12,
+                "sma50": 225.31,
+                "sma200": 209.93,
+                "macd": 1.42,
+                "macd_signal": 1.1,
+                "macd_hist": 0.32,
+                "atr14": 4.7,
+                "atr_pct": 2.19,
+                "atr_stop": 218.92,
+                "adx": 27.3,
+                "vol_surge": 1.31,
+                "weekly_trend_up": true,
+                "rsi_3d_change": 2.1,
+                "macd_hist_3d_change": 0.08,
+                "run_5d": 2.86
+              }
+            }
+          ]
+        },
+        "XOM": {
+          "action": "HOLD",
+          "reason": "HOLD (score +12): close 118.42, SMA50 112.70, SMA200 105.00; RSI 49.6; MACD mixed.",
+          "strength": 54,
+          "snapshot": {
+            "close": 118.42,
+            "net_score": 12.0,
+            "strength": 54,
+            "rsi": 49.6,
+            "sma20": 116.64,
+            "sma50": 112.74,
+            "sma200": 105.04,
+            "macd": 1.42,
+            "macd_signal": 1.1,
+            "macd_hist": 0.32,
+            "atr14": 4.7,
+            "atr_pct": 2.19,
+            "atr_stop": 109.54,
+            "adx": 27.3,
+            "vol_surge": 1.31,
+            "weekly_trend_up": true,
+            "rsi_3d_change": 2.1,
+            "macd_hist_3d_change": 0.08,
+            "run_5d": 2.86
+          },
+          "candles": [
+            {
+              "time": "2026-08-31",
+              "open": 109.04,
+              "high": 110.12,
+              "low": 108.34,
+              "close": 109.32,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-01",
+              "open": 109.39,
+              "high": 110.48,
+              "low": 108.49,
+              "close": 109.53,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-02",
+              "open": 109.6,
+              "high": 110.83,
+              "low": 108.9,
+              "close": 109.73,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-03",
+              "open": 109.81,
+              "high": 110.74,
+              "low": 108.91,
+              "close": 109.94,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-04",
+              "open": 110.01,
+              "high": 111.1,
+              "low": 109.31,
+              "close": 110.15,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-09-07",
+              "open": 110.22,
+              "high": 111.45,
+              "low": 109.32,
+              "close": 110.35,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-09-08",
+              "open": 110.43,
+              "high": 111.36,
+              "low": 109.73,
+              "close": 110.56,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-09-09",
+              "open": 110.63,
+              "high": 111.72,
+              "low": 109.73,
+              "close": 110.77,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-09-10",
+              "open": 110.84,
+              "high": 112.07,
+              "low": 110.14,
+              "close": 110.97,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-09-11",
+              "open": 111.05,
+              "high": 111.98,
+              "low": 110.15,
+              "close": 111.18,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-14",
+              "open": 111.25,
+              "high": 112.34,
+              "low": 110.55,
+              "close": 111.39,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-15",
+              "open": 111.46,
+              "high": 112.69,
+              "low": 110.56,
+              "close": 111.59,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-16",
+              "open": 111.67,
+              "high": 112.6,
+              "low": 110.97,
+              "close": 111.8,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-17",
+              "open": 111.87,
+              "high": 112.96,
+              "low": 110.97,
+              "close": 112.01,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-09-18",
+              "open": 112.08,
+              "high": 113.32,
+              "low": 111.38,
+              "close": 112.22,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-09-21",
+              "open": 112.29,
+              "high": 113.22,
+              "low": 111.39,
+              "close": 112.42,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-09-22",
+              "open": 112.49,
+              "high": 113.58,
+              "low": 111.79,
+              "close": 112.63,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-09-23",
+              "open": 112.7,
+              "high": 113.94,
+              "low": 111.8,
+              "close": 112.84,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-09-24",
+              "open": 112.91,
+              "high": 113.84,
+              "low": 112.21,
+              "close": 113.04,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-25",
+              "open": 113.12,
+              "high": 114.2,
+              "low": 112.22,
+              "close": 113.25,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-28",
+              "open": 113.32,
+              "high": 114.56,
+              "low": 112.62,
+              "close": 113.46,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-29",
+              "open": 113.53,
+              "high": 114.46,
+              "low": 112.63,
+              "close": 113.66,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-30",
+              "open": 113.74,
+              "high": 114.82,
+              "low": 113.04,
+              "close": 113.87,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-01",
+              "open": 113.94,
+              "high": 115.18,
+              "low": 113.04,
+              "close": 114.08,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-02",
+              "open": 114.15,
+              "high": 115.08,
+              "low": 113.45,
+              "close": 114.28,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-05",
+              "open": 114.36,
+              "high": 115.44,
+              "low": 113.46,
+              "close": 114.49,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-06",
+              "open": 114.56,
+              "high": 115.8,
+              "low": 113.86,
+              "close": 114.7,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-10-07",
+              "open": 114.77,
+              "high": 115.7,
+              "low": 113.87,
+              "close": 114.9,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-10-08",
+              "open": 114.98,
+              "high": 116.06,
+              "low": 114.28,
+              "close": 115.11,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-10-09",
+              "open": 115.18,
+              "high": 116.42,
+              "low": 114.28,
+              "close": 115.32,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-10-12",
+              "open": 115.39,
+              "high": 116.32,
+              "low": 114.69,
+              "close": 115.52,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-10-13",
+              "open": 115.6,
+              "high": 116.68,
+              "low": 114.7,
+              "close": 115.73,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-14",
+              "open": 115.8,
+              "high": 117.04,
+              "low": 115.1,
+              "close": 115.94,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-15",
+              "open": 116.01,
+              "high": 116.94,
+              "low": 115.11,
+              "close": 116.14,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-16",
+              "open": 116.22,
+              "high": 117.3,
+              "low": 115.52,
+              "close": 116.35,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-19",
+              "open": 116.42,
+              "high": 117.66,
+              "low": 115.52,
+              "close": 116.56,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-10-20",
+              "open": 116.63,
+              "high": 117.57,
+              "low": 115.93,
+              "close": 116.77,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-10-21",
+              "open": 116.84,
+              "high": 117.92,
+              "low": 115.94,
+              "close": 116.97,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-10-22",
+              "open": 117.04,
+              "high": 118.28,
+              "low": 116.34,
+              "close": 117.18,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-10-23",
+              "open": 117.25,
+              "high": 118.19,
+              "low": 116.35,
+              "close": 117.39,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-10-26",
+              "open": 117.46,
+              "high": 118.54,
+              "low": 116.76,
+              "close": 117.59,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-27",
+              "open": 117.67,
+              "high": 118.9,
+              "low": 116.77,
+              "close": 117.8,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-28",
+              "open": 117.87,
+              "high": 118.81,
+              "low": 117.17,
+              "close": 118.01,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-29",
+              "open": 118.08,
+              "high": 119.16,
+              "low": 117.18,
+              "close": 118.21,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-30",
+              "open": 118.29,
+              "high": 119.52,
+              "low": 117.59,
+              "close": 118.42,
+              "volume": 28000000
+            }
+          ],
+          "history": [
+            {
+              "at": "2026-10-29T20:00:00+00:00",
+              "action": "HOLD",
+              "reason": "HOLD (score +12): close 118.42, SMA50 112.70, SMA200 105.00; RSI 49.6; MACD mixed.",
+              "strength": 66,
+              "snapshot": {
+                "close": 117.71,
+                "net_score": 12.0,
+                "strength": 54,
+                "rsi": 49.6,
+                "sma20": 115.94,
+                "sma50": 112.06,
+                "sma200": 104.41,
+                "macd": 1.42,
+                "macd_signal": 1.1,
+                "macd_hist": 0.32,
+                "atr14": 4.7,
+                "atr_pct": 2.19,
+                "atr_stop": 108.88,
+                "adx": 27.3,
+                "vol_surge": 1.31,
+                "weekly_trend_up": true,
+                "rsi_3d_change": 2.1,
+                "macd_hist_3d_change": 0.08,
+                "run_5d": 2.86
+              }
+            }
+          ]
+        },
+        "UNH": {
+          "action": "SELL",
+          "reason": "SELL (score -44): close 328.60 < SMA50 345.20; RSI 37.2; ADX 27; MACD bearish.",
+          "strength": 61,
+          "snapshot": {
+            "close": 328.6,
+            "net_score": -44.0,
+            "strength": 61,
+            "rsi": 37.2,
+            "sma20": 323.67,
+            "sma50": 312.83,
+            "sma200": 291.47,
+            "macd": 1.42,
+            "macd_signal": 1.1,
+            "macd_hist": 0.32,
+            "atr14": 4.7,
+            "atr_pct": 2.19,
+            "atr_stop": 303.96,
+            "adx": 27.3,
+            "vol_surge": 1.31,
+            "weekly_trend_up": false,
+            "rsi_3d_change": 2.1,
+            "macd_hist_3d_change": 0.08,
+            "run_5d": 2.86
+          },
+          "candles": [
+            {
+              "time": "2026-08-31",
+              "open": 351.94,
+              "high": 353.66,
+              "low": 351.24,
+              "close": 352.86,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-01",
+              "open": 352.67,
+              "high": 353.62,
+              "low": 351.41,
+              "close": 352.31,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-02",
+              "open": 352.11,
+              "high": 353.21,
+              "low": 351.06,
+              "close": 351.76,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-03",
+              "open": 351.56,
+              "high": 352.36,
+              "low": 350.31,
+              "close": 351.21,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-04",
+              "open": 351.01,
+              "high": 351.96,
+              "low": 349.95,
+              "close": 350.65,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-09-07",
+              "open": 350.46,
+              "high": 351.56,
+              "low": 349.2,
+              "close": 350.1,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-09-08",
+              "open": 349.91,
+              "high": 350.71,
+              "low": 348.85,
+              "close": 349.55,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-09-09",
+              "open": 349.36,
+              "high": 350.31,
+              "low": 348.1,
+              "close": 349.0,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-09-10",
+              "open": 348.81,
+              "high": 349.91,
+              "low": 347.75,
+              "close": 348.45,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-09-11",
+              "open": 348.26,
+              "high": 349.06,
+              "low": 347.0,
+              "close": 347.9,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-14",
+              "open": 347.7,
+              "high": 348.65,
+              "low": 346.65,
+              "close": 347.35,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-15",
+              "open": 347.15,
+              "high": 348.25,
+              "low": 345.89,
+              "close": 346.79,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-16",
+              "open": 346.6,
+              "high": 347.4,
+              "low": 345.54,
+              "close": 346.24,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-17",
+              "open": 346.05,
+              "high": 347.0,
+              "low": 344.79,
+              "close": 345.69,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-09-18",
+              "open": 345.5,
+              "high": 346.6,
+              "low": 344.44,
+              "close": 345.14,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-09-21",
+              "open": 344.95,
+              "high": 345.75,
+              "low": 343.69,
+              "close": 344.59,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-09-22",
+              "open": 344.4,
+              "high": 345.35,
+              "low": 343.34,
+              "close": 344.04,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-09-23",
+              "open": 343.84,
+              "high": 344.94,
+              "low": 342.59,
+              "close": 343.49,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-09-24",
+              "open": 343.29,
+              "high": 344.09,
+              "low": 342.23,
+              "close": 342.93,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-09-25",
+              "open": 342.74,
+              "high": 343.69,
+              "low": 341.48,
+              "close": 342.38,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-09-28",
+              "open": 342.19,
+              "high": 343.29,
+              "low": 341.13,
+              "close": 341.83,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-09-29",
+              "open": 341.64,
+              "high": 342.44,
+              "low": 340.38,
+              "close": 341.28,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-09-30",
+              "open": 341.09,
+              "high": 342.04,
+              "low": 340.03,
+              "close": 340.73,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-01",
+              "open": 340.54,
+              "high": 341.64,
+              "low": 339.28,
+              "close": 340.18,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-02",
+              "open": 339.99,
+              "high": 340.79,
+              "low": 338.93,
+              "close": 339.63,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-05",
+              "open": 339.43,
+              "high": 340.38,
+              "low": 338.18,
+              "close": 339.08,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-06",
+              "open": 338.88,
+              "high": 339.98,
+              "low": 337.82,
+              "close": 338.52,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-10-07",
+              "open": 338.33,
+              "high": 339.13,
+              "low": 337.07,
+              "close": 337.97,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-10-08",
+              "open": 337.78,
+              "high": 338.73,
+              "low": 336.72,
+              "close": 337.42,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-10-09",
+              "open": 337.23,
+              "high": 338.33,
+              "low": 335.97,
+              "close": 336.87,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-10-12",
+              "open": 336.68,
+              "high": 337.48,
+              "low": 335.62,
+              "close": 336.32,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-10-13",
+              "open": 336.13,
+              "high": 337.08,
+              "low": 334.87,
+              "close": 335.77,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-14",
+              "open": 335.57,
+              "high": 336.67,
+              "low": 334.52,
+              "close": 335.22,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-15",
+              "open": 335.02,
+              "high": 335.82,
+              "low": 333.76,
+              "close": 334.66,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-16",
+              "open": 334.47,
+              "high": 335.42,
+              "low": 333.41,
+              "close": 334.11,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-19",
+              "open": 333.92,
+              "high": 335.02,
+              "low": 332.66,
+              "close": 333.56,
+              "volume": 28000000
+            },
+            {
+              "time": "2026-10-20",
+              "open": 333.37,
+              "high": 334.17,
+              "low": 332.31,
+              "close": 333.01,
+              "volume": 18000000
+            },
+            {
+              "time": "2026-10-21",
+              "open": 332.82,
+              "high": 333.77,
+              "low": 331.56,
+              "close": 332.46,
+              "volume": 19250000
+            },
+            {
+              "time": "2026-10-22",
+              "open": 332.27,
+              "high": 333.37,
+              "low": 331.21,
+              "close": 331.91,
+              "volume": 20500000
+            },
+            {
+              "time": "2026-10-23",
+              "open": 331.72,
+              "high": 332.52,
+              "low": 330.46,
+              "close": 331.36,
+              "volume": 21750000
+            },
+            {
+              "time": "2026-10-26",
+              "open": 331.16,
+              "high": 332.11,
+              "low": 330.11,
+              "close": 330.81,
+              "volume": 23000000
+            },
+            {
+              "time": "2026-10-27",
+              "open": 330.61,
+              "high": 331.71,
+              "low": 329.35,
+              "close": 330.25,
+              "volume": 24250000
+            },
+            {
+              "time": "2026-10-28",
+              "open": 330.06,
+              "high": 330.86,
+              "low": 329.0,
+              "close": 329.7,
+              "volume": 25500000
+            },
+            {
+              "time": "2026-10-29",
+              "open": 329.51,
+              "high": 330.46,
+              "low": 328.25,
+              "close": 329.15,
+              "volume": 26750000
+            },
+            {
+              "time": "2026-10-30",
+              "open": 328.96,
+              "high": 330.06,
+              "low": 327.9,
+              "close": 328.6,
+              "volume": 28000000
+            }
+          ],
+          "history": [
+            {
+              "at": "2026-10-29T20:00:00+00:00",
+              "action": "SELL",
+              "reason": "SELL (score -44): close 328.60 < SMA50 345.20; RSI 37.2; ADX 27; MACD bearish.",
+              "strength": 66,
+              "snapshot": {
+                "close": 326.63,
+                "net_score": -44.0,
+                "strength": 61,
+                "rsi": 37.2,
+                "sma20": 321.73,
+                "sma50": 310.95,
+                "sma200": 289.72,
+                "macd": 1.42,
+                "macd_signal": 1.1,
+                "macd_hist": 0.32,
+                "atr14": 4.7,
+                "atr_pct": 2.19,
+                "atr_stop": 302.13,
+                "adx": 27.3,
+                "vol_surge": 1.31,
+                "weekly_trend_up": false,
+                "rsi_3d_change": 2.1,
+                "macd_hist_3d_change": 0.08,
+                "run_5d": 2.86
+              }
+            }
+          ]
+        }
+      },
+      "universes": [
+        "diversified-plus",
+        "sp500",
+        "us-large-cap"
+      ],
+      "screener": {
+        "status": {
+          "running": false,
+          "op": "update",
+          "universe": "diversified-plus",
+          "current": "",
+          "done": 6,
+          "total": 6,
+          "started_at": "2026-10-30T20:00:00+00:00",
+          "updated_at": "2026-10-30T20:00:00+00:00",
+          "error": null
+        },
+        "results": {
+          "diversified-plus": [
+            {
+              "ticker": "MSFT",
+              "score": 82.4,
+              "trend": "BULLISH",
+              "return_20d": 6.12,
+              "return_60d": 12.24,
+              "rsi": 61.2,
+              "relative_volume": 1.18,
+              "close": 438.75,
+              "updated_at": "2026-10-30T20:00:00+00:00",
+              "action": "BUY",
+              "strength": 74
+            },
+            {
+              "ticker": "AAPL",
+              "score": 79.1,
+              "trend": "BULLISH",
+              "return_20d": 5.96,
+              "return_60d": 11.91,
+              "rsi": 58.4,
+              "relative_volume": 1.18,
+              "close": 214.5,
+              "updated_at": "2026-10-30T20:00:00+00:00",
+              "action": "BUY",
+              "strength": 68
+            },
+            {
+              "ticker": "NVDA",
+              "score": 76.8,
+              "trend": "BULLISH",
+              "return_20d": 5.84,
+              "return_60d": 11.68,
+              "rsi": 64.8,
+              "relative_volume": 1.18,
+              "close": 132.68,
+              "updated_at": "2026-10-30T20:00:00+00:00",
+              "action": "BUY",
+              "strength": 71
+            },
+            {
+              "ticker": "JPM",
+              "score": 68.2,
+              "trend": "BULLISH",
+              "return_20d": 5.41,
+              "return_60d": 10.82,
+              "rsi": 55.1,
+              "relative_volume": 1.18,
+              "close": 238.1,
+              "updated_at": "2026-10-30T20:00:00+00:00",
+              "action": "HOLD",
+              "strength": 63
+            },
+            {
+              "ticker": "XOM",
+              "score": 61.4,
+              "trend": "BULLISH",
+              "return_20d": 5.07,
+              "return_60d": 10.14,
+              "rsi": 49.6,
+              "relative_volume": 1.18,
+              "close": 118.42,
+              "updated_at": "2026-10-30T20:00:00+00:00",
+              "action": "HOLD",
+              "strength": 54
+            },
+            {
+              "ticker": "UNH",
+              "score": 44.0,
+              "trend": "NEUTRAL",
+              "return_20d": 4.2,
+              "return_60d": 8.4,
+              "rsi": 37.2,
+              "relative_volume": 1.18,
+              "close": 328.6,
+              "updated_at": "2026-10-30T20:00:00+00:00",
+              "action": "SELL",
+              "strength": 61
+            }
+          ],
+          "sp500": [
+            {
+              "ticker": "AAPL",
+              "score": 79.1,
+              "trend": "BULLISH",
+              "return_20d": 5.96,
+              "return_60d": 11.91,
+              "rsi": 58.4,
+              "relative_volume": 1.18,
+              "close": 214.5,
+              "updated_at": "2026-10-30T20:00:00+00:00",
+              "action": "BUY",
+              "strength": 68
+            },
+            {
+              "ticker": "MSFT",
+              "score": 82.4,
+              "trend": "BULLISH",
+              "return_20d": 6.12,
+              "return_60d": 12.24,
+              "rsi": 61.2,
+              "relative_volume": 1.18,
+              "close": 438.75,
+              "updated_at": "2026-10-30T20:00:00+00:00",
+              "action": "BUY",
+              "strength": 74
+            },
+            {
+              "ticker": "NVDA",
+              "score": 76.8,
+              "trend": "BULLISH",
+              "return_20d": 5.84,
+              "return_60d": 11.68,
+              "rsi": 64.8,
+              "relative_volume": 1.18,
+              "close": 132.68,
+              "updated_at": "2026-10-30T20:00:00+00:00",
+              "action": "BUY",
+              "strength": 71
+            },
+            {
+              "ticker": "JPM",
+              "score": 68.2,
+              "trend": "BULLISH",
+              "return_20d": 5.41,
+              "return_60d": 10.82,
+              "rsi": 55.1,
+              "relative_volume": 1.18,
+              "close": 238.1,
+              "updated_at": "2026-10-30T20:00:00+00:00",
+              "action": "HOLD",
+              "strength": 63
+            },
+            {
+              "ticker": "XOM",
+              "score": 61.4,
+              "trend": "BULLISH",
+              "return_20d": 5.07,
+              "return_60d": 10.14,
+              "rsi": 49.6,
+              "relative_volume": 1.18,
+              "close": 118.42,
+              "updated_at": "2026-10-30T20:00:00+00:00",
+              "action": "HOLD",
+              "strength": 54
+            }
+          ],
+          "us-large-cap": [
+            {
+              "ticker": "MSFT",
+              "score": 82.4,
+              "trend": "BULLISH",
+              "return_20d": 6.12,
+              "return_60d": 12.24,
+              "rsi": 61.2,
+              "relative_volume": 1.18,
+              "close": 438.75,
+              "updated_at": "2026-10-30T20:00:00+00:00",
+              "action": "BUY",
+              "strength": 74
+            },
+            {
+              "ticker": "AAPL",
+              "score": 79.1,
+              "trend": "BULLISH",
+              "return_20d": 5.96,
+              "return_60d": 11.91,
+              "rsi": 58.4,
+              "relative_volume": 1.18,
+              "close": 214.5,
+              "updated_at": "2026-10-30T20:00:00+00:00",
+              "action": "BUY",
+              "strength": 68
+            },
+            {
+              "ticker": "NVDA",
+              "score": 76.8,
+              "trend": "BULLISH",
+              "return_20d": 5.84,
+              "return_60d": 11.68,
+              "rsi": 64.8,
+              "relative_volume": 1.18,
+              "close": 132.68,
+              "updated_at": "2026-10-30T20:00:00+00:00",
+              "action": "BUY",
+              "strength": 71
+            },
+            {
+              "ticker": "JPM",
+              "score": 68.2,
+              "trend": "BULLISH",
+              "return_20d": 5.41,
+              "return_60d": 10.82,
+              "rsi": 55.1,
+              "relative_volume": 1.18,
+              "close": 238.1,
+              "updated_at": "2026-10-30T20:00:00+00:00",
+              "action": "HOLD",
+              "strength": 63
+            },
+            {
+              "ticker": "UNH",
+              "score": 44.0,
+              "trend": "NEUTRAL",
+              "return_20d": 4.2,
+              "return_60d": 8.4,
+              "rsi": 37.2,
+              "relative_volume": 1.18,
+              "close": 328.6,
+              "updated_at": "2026-10-30T20:00:00+00:00",
+              "action": "SELL",
+              "strength": 61
+            }
+          ]
+        },
+        "sync": {
+          "universe": "sp500",
+          "as_of": "2026-10-29",
+          "count": 500,
+          "added": [
+            "FIXT"
+          ],
+          "removed": [],
+          "changed": true
+        }
+      },
+      "llm": {
+        "backends": [
+          {
+            "name": "fixture-offline",
+            "type": "openai",
+            "url": "fixture://offline/llm",
+            "models": [
+              "fixture-chat-model"
+            ],
+            "error": null
+          }
+        ],
+        "active_backend": "fixture-offline",
+        "active_model": "fixture-chat-model"
+      },
+      "portfolios": {
+        "sim": {
+          "status": {
+            "cash": 4125.55,
+            "positions": [
+              {
+                "ticker": "AAPL",
+                "shares": 18.0,
+                "avg_cost": 180.25,
+                "current_price": 214.5,
+                "value": 3861.0,
+                "pnl_pct": 19.0,
+                "thesis": "core trend leader",
+                "buy_date": "2026-09-08"
+              },
+              {
+                "ticker": "MSFT",
+                "shares": 6.0,
+                "avg_cost": 402.1,
+                "current_price": 438.75,
+                "value": 2632.5,
+                "pnl_pct": 9.12,
+                "thesis": "quality compounder",
+                "buy_date": "2026-09-15"
+              },
+              {
+                "ticker": "NVDA",
+                "shares": 4.0,
+                "avg_cost": 118.4,
+                "current_price": 132.68,
+                "value": 530.72,
+                "pnl_pct": 12.06,
+                "thesis": "momentum sleeve",
+                "buy_date": "2026-10-06"
+              }
+            ],
+            "positions_value": 7024.22,
+            "total_equity": 11149.77,
+            "allowance_total": 10000.0,
+            "sim_enabled": true,
+            "sim_strategy": "deterministic",
+            "sim_universe": "diversified-plus",
+            "benchmark_enabled": true,
+            "benchmark_ticker": "URTH"
+          },
+          "trades": [
+            {
+              "id": 104,
+              "ticker": "NVDA",
+              "side": "BUY",
+              "shares": 4.0,
+              "price": 118.4,
+              "cash_after": 4526.4,
+              "reason": "score +47, trend aligned, ATR stop 109.80",
+              "at": "2026-10-27T20:00:00+00:00"
+            },
+            {
+              "id": 103,
+              "ticker": "MSFT",
+              "side": "BUY",
+              "shares": 6.0,
+              "price": 402.1,
+              "cash_after": 2412.8,
+              "reason": "score +51, quality breakout",
+              "at": "2026-10-19T20:00:00+00:00"
+            },
+            {
+              "id": 102,
+              "ticker": "AAPL",
+              "side": "BUY",
+              "shares": 18.0,
+              "price": 180.25,
+              "cash_after": 2980.3,
+              "reason": "score +42, SMA alignment",
+              "at": "2026-10-07T20:00:00+00:00"
+            },
+            {
+              "id": 101,
+              "ticker": "UNH",
+              "side": "SELL",
+              "shares": 2.0,
+              "price": 338.1,
+              "cash_after": 7821.5,
+              "reason": "score -44 and close below SMA50",
+              "at": "2026-09-28T20:00:00+00:00"
+            }
+          ],
+          "allowances": [
+            {
+              "id": 202610,
+              "amount": 1000.0,
+              "month": "2026-10",
+              "at": "2026-10-30T20:00:00+00:00",
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "id": 202609,
+              "amount": 1000.0,
+              "month": "2026-09",
+              "at": "2026-08-31T20:00:00+00:00",
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            }
+          ],
+          "equity": [
+            {
+              "at": "2026-08-31T20:00:00+00:00",
+              "cash": 10500.0,
+              "positions_value": -1542.0,
+              "total_equity": 8958.0,
+              "allowance_total": 8000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-01T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -520.5,
+              "total_equity": 8979.5,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-02T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -499.0,
+              "total_equity": 9001.0,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-03T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -477.5,
+              "total_equity": 9022.5,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-04T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -456.0,
+              "total_equity": 9044.0,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-07T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -434.5,
+              "total_equity": 9065.5,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-08T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -413.0,
+              "total_equity": 9087.0,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-09T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -489.5,
+              "total_equity": 9010.5,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-10T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -468.0,
+              "total_equity": 9032.0,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-11T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -446.5,
+              "total_equity": 9053.5,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-14T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -425.0,
+              "total_equity": 9075.0,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-15T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -403.5,
+              "total_equity": 9096.5,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-16T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -382.0,
+              "total_equity": 9118.0,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-17T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -360.5,
+              "total_equity": 9139.5,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-18T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -437.0,
+              "total_equity": 9063.0,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-21T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -415.5,
+              "total_equity": 9084.5,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-22T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -394.0,
+              "total_equity": 9106.0,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-23T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -372.5,
+              "total_equity": 9127.5,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-24T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -351.0,
+              "total_equity": 9149.0,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-25T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -329.5,
+              "total_equity": 9170.5,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-28T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -308.0,
+              "total_equity": 9192.0,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-29T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -384.5,
+              "total_equity": 9115.5,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-09-30T20:00:00+00:00",
+              "cash": 9500.0,
+              "positions_value": -363.0,
+              "total_equity": 9137.0,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-01T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 658.5,
+              "total_equity": 9158.5,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-02T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 680.0,
+              "total_equity": 9180.0,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-05T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 701.5,
+              "total_equity": 9201.5,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-06T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 723.0,
+              "total_equity": 9223.0,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-07T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 744.5,
+              "total_equity": 9244.5,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-08T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 668.0,
+              "total_equity": 9168.0,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-09T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 689.5,
+              "total_equity": 9189.5,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-12T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 711.0,
+              "total_equity": 9211.0,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-13T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 732.5,
+              "total_equity": 9232.5,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-14T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 754.0,
+              "total_equity": 9254.0,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-15T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 775.5,
+              "total_equity": 9275.5,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-16T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 797.0,
+              "total_equity": 9297.0,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-19T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 720.5,
+              "total_equity": 9220.5,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-20T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 742.0,
+              "total_equity": 9242.0,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-21T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 763.5,
+              "total_equity": 9263.5,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-22T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 785.0,
+              "total_equity": 9285.0,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-23T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 806.5,
+              "total_equity": 9306.5,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-26T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 828.0,
+              "total_equity": 9328.0,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-27T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 849.5,
+              "total_equity": 9349.5,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-28T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 773.0,
+              "total_equity": 9273.0,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-29T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 794.5,
+              "total_equity": 9294.5,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "at": "2026-10-30T20:00:00+00:00",
+              "cash": 8500.0,
+              "positions_value": 816.0,
+              "total_equity": 9316.0,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            }
+          ],
+          "benchmark": {
+            "ticker": "URTH",
+            "shares": 30.45,
+            "avg_cost": 118.1,
+            "current_price": 132.0,
+            "total_equity": 4019.4,
+            "allowance_total": 3000.0
+          },
+          "benchmark_equity": [
+            {
+              "at": "2026-08-31T20:00:00+00:00",
+              "shares": 6.75,
+              "price": 132.0,
+              "total_equity": 891.0,
+              "allowance_total": 1000.0
+            },
+            {
+              "at": "2026-09-01T20:00:00+00:00",
+              "shares": 6.8674,
+              "price": 132.0,
+              "total_equity": 906.5,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-02T20:00:00+00:00",
+              "shares": 6.9848,
+              "price": 132.0,
+              "total_equity": 922.0,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-03T20:00:00+00:00",
+              "shares": 7.1023,
+              "price": 132.0,
+              "total_equity": 937.5,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-04T20:00:00+00:00",
+              "shares": 7.2197,
+              "price": 132.0,
+              "total_equity": 953.0,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-07T20:00:00+00:00",
+              "shares": 7.1667,
+              "price": 132.0,
+              "total_equity": 946.0,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-08T20:00:00+00:00",
+              "shares": 7.2841,
+              "price": 132.0,
+              "total_equity": 961.5,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-09T20:00:00+00:00",
+              "shares": 7.4015,
+              "price": 132.0,
+              "total_equity": 977.0,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-10T20:00:00+00:00",
+              "shares": 7.5189,
+              "price": 132.0,
+              "total_equity": 992.5,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-11T20:00:00+00:00",
+              "shares": 7.6364,
+              "price": 132.0,
+              "total_equity": 1008.0,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-14T20:00:00+00:00",
+              "shares": 7.5833,
+              "price": 132.0,
+              "total_equity": 1001.0,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-15T20:00:00+00:00",
+              "shares": 7.7008,
+              "price": 132.0,
+              "total_equity": 1016.5,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-16T20:00:00+00:00",
+              "shares": 7.8182,
+              "price": 132.0,
+              "total_equity": 1032.0,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-17T20:00:00+00:00",
+              "shares": 7.9356,
+              "price": 132.0,
+              "total_equity": 1047.5,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-18T20:00:00+00:00",
+              "shares": 8.053,
+              "price": 132.0,
+              "total_equity": 1063.0,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-21T20:00:00+00:00",
+              "shares": 8.0,
+              "price": 132.0,
+              "total_equity": 1056.0,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-22T20:00:00+00:00",
+              "shares": 8.1174,
+              "price": 132.0,
+              "total_equity": 1071.5,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-23T20:00:00+00:00",
+              "shares": 8.2348,
+              "price": 132.0,
+              "total_equity": 1087.0,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-24T20:00:00+00:00",
+              "shares": 8.3523,
+              "price": 132.0,
+              "total_equity": 1102.5,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-25T20:00:00+00:00",
+              "shares": 8.4697,
+              "price": 132.0,
+              "total_equity": 1118.0,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-28T20:00:00+00:00",
+              "shares": 8.4167,
+              "price": 132.0,
+              "total_equity": 1111.0,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-29T20:00:00+00:00",
+              "shares": 8.5341,
+              "price": 132.0,
+              "total_equity": 1126.5,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-09-30T20:00:00+00:00",
+              "shares": 8.6515,
+              "price": 132.0,
+              "total_equity": 1142.0,
+              "allowance_total": 2000.0
+            },
+            {
+              "at": "2026-10-01T20:00:00+00:00",
+              "shares": 8.7689,
+              "price": 132.0,
+              "total_equity": 1157.5,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-02T20:00:00+00:00",
+              "shares": 8.8864,
+              "price": 132.0,
+              "total_equity": 1173.0,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-05T20:00:00+00:00",
+              "shares": 8.8333,
+              "price": 132.0,
+              "total_equity": 1166.0,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-06T20:00:00+00:00",
+              "shares": 8.9508,
+              "price": 132.0,
+              "total_equity": 1181.5,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-07T20:00:00+00:00",
+              "shares": 9.0682,
+              "price": 132.0,
+              "total_equity": 1197.0,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-08T20:00:00+00:00",
+              "shares": 9.1856,
+              "price": 132.0,
+              "total_equity": 1212.5,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-09T20:00:00+00:00",
+              "shares": 9.303,
+              "price": 132.0,
+              "total_equity": 1228.0,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-12T20:00:00+00:00",
+              "shares": 9.25,
+              "price": 132.0,
+              "total_equity": 1221.0,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-13T20:00:00+00:00",
+              "shares": 9.3674,
+              "price": 132.0,
+              "total_equity": 1236.5,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-14T20:00:00+00:00",
+              "shares": 9.4848,
+              "price": 132.0,
+              "total_equity": 1252.0,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-15T20:00:00+00:00",
+              "shares": 9.6023,
+              "price": 132.0,
+              "total_equity": 1267.5,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-16T20:00:00+00:00",
+              "shares": 9.7197,
+              "price": 132.0,
+              "total_equity": 1283.0,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-19T20:00:00+00:00",
+              "shares": 9.6667,
+              "price": 132.0,
+              "total_equity": 1276.0,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-20T20:00:00+00:00",
+              "shares": 9.7841,
+              "price": 132.0,
+              "total_equity": 1291.5,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-21T20:00:00+00:00",
+              "shares": 9.9015,
+              "price": 132.0,
+              "total_equity": 1307.0,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-22T20:00:00+00:00",
+              "shares": 10.0189,
+              "price": 132.0,
+              "total_equity": 1322.5,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-23T20:00:00+00:00",
+              "shares": 10.1364,
+              "price": 132.0,
+              "total_equity": 1338.0,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-26T20:00:00+00:00",
+              "shares": 10.0833,
+              "price": 132.0,
+              "total_equity": 1331.0,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-27T20:00:00+00:00",
+              "shares": 10.2008,
+              "price": 132.0,
+              "total_equity": 1346.5,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-28T20:00:00+00:00",
+              "shares": 10.3182,
+              "price": 132.0,
+              "total_equity": 1362.0,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-29T20:00:00+00:00",
+              "shares": 10.4356,
+              "price": 132.0,
+              "total_equity": 1377.5,
+              "allowance_total": 3000.0
+            },
+            {
+              "at": "2026-10-30T20:00:00+00:00",
+              "shares": 10.553,
+              "price": 132.0,
+              "total_equity": 1393.0,
+              "allowance_total": 3000.0
+            }
+          ],
+          "reasoning": {
+            "raw": "",
+            "summary": "",
+            "deterministic_trades": [
+              {
+                "ticker": "AAPL",
+                "side": "BUY",
+                "reason": "score +42"
+              },
+              {
+                "ticker": "NVDA",
+                "side": "BUY",
+                "reason": "score +47"
+              }
+            ],
+            "changes": [],
+            "confirmations": [],
+            "holds": [
+              {
+                "ticker": "JPM",
+                "reason": "score +38 below BUY threshold"
+              }
+            ],
+            "vetoes": [],
+            "fallback": false,
+            "strategy": "deterministic",
+            "failure_marker": false,
+            "mode_aware_prompt": false,
+            "llm_called": false
+          },
+          "run_status": {
+            "running": false,
+            "stage": "done",
+            "started_at": "2026-10-30T20:00:00+00:00",
+            "updated_at": "2026-10-30T20:00:00+00:00",
+            "detail": "Fixture cycle complete - no LLM or provider call",
+            "error": null
+          },
+          "chat_history": [
+            {
+              "role": "user",
+              "content": "Summarize the paper book."
+            },
+            {
+              "role": "assistant",
+              "content": "**Fixture chat stub.** This markdown exists only to exercise the UI. No LLM or provider call was made."
+            }
+          ]
+        },
+        "monthly": {
+          "status": {
+            "cash": 1220.35,
+            "positions": [
+              {
+                "ticker": "MSFT",
+                "shares": 8.0,
+                "avg_cost": 401.2,
+                "current_price": 438.75,
+                "value": 3510.0,
+                "pnl_pct": 9.36,
+                "opened_at": "2026-07-31",
+                "stale": false
+              },
+              {
+                "ticker": "AAPL",
+                "shares": 12.0,
+                "avg_cost": 192.4,
+                "current_price": 214.5,
+                "value": 2574.0,
+                "pnl_pct": 11.49,
+                "opened_at": "2026-07-31",
+                "stale": false
+              },
+              {
+                "ticker": "JPM",
+                "shares": 10.0,
+                "avg_cost": 229.8,
+                "current_price": 238.1,
+                "value": 2381.0,
+                "pnl_pct": 3.61,
+                "opened_at": "2026-08-31",
+                "stale": false
+              },
+              {
+                "ticker": "XOM",
+                "shares": 12.0,
+                "avg_cost": 109.5,
+                "current_price": 118.42,
+                "value": 1421.04,
+                "pnl_pct": 8.15,
+                "opened_at": "2026-09-30",
+                "stale": false
+              }
+            ],
+            "positions_value": 9886.04,
+            "total_equity": 11106.39,
+            "allowance_total": 12000.0,
+            "sim_monthly_enabled": true,
+            "sim_monthly_universe": "diversified-plus",
+            "sim_monthly_contribution": 1000.0,
+            "sim_monthly_target_n": 12,
+            "next_rebalance": "2026-11-30"
+          },
+          "trades": [
+            {
+              "ticker": "XOM",
+              "side": "BUY",
+              "shares": 12.0,
+              "price": 109.5,
+              "cash_after": 2106.35,
+              "reason": "qv-mom September basket entry",
+              "date": "2026-10-01T20:00:00+00:00"
+            },
+            {
+              "ticker": "JPM",
+              "side": "BUY",
+              "shares": 10.0,
+              "price": 229.8,
+              "cash_after": 1808.35,
+              "reason": "qv-mom August basket entry",
+              "date": "2026-10-29T20:00:00+00:00"
+            },
+            {
+              "ticker": "UNH",
+              "side": "SELL",
+              "shares": 5.0,
+              "price": 341.2,
+              "cash_after": 3514.35,
+              "reason": "dropped from the monthly top-N basket",
+              "date": "2026-10-01T20:00:00+00:00"
+            }
+          ],
+          "allowances": [
+            {
+              "id": 202610,
+              "amount": 1000.0,
+              "month": "2026-10",
+              "at": "2026-10-30T20:00:00+00:00",
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "id": 202609,
+              "amount": 1000.0,
+              "month": "2026-09",
+              "at": "2026-08-31T20:00:00+00:00",
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            }
+          ],
+          "equity": [
+            {
+              "date": "2026-08-31",
+              "cash": 11000.0,
+              "positions_value": -31.0,
+              "total_equity": 10969.0,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-01",
+              "cash": 10000.0,
+              "positions_value": 985.13,
+              "total_equity": 10985.13,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-02",
+              "cash": 10000.0,
+              "positions_value": 1001.27,
+              "total_equity": 11001.27,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-03",
+              "cash": 10000.0,
+              "positions_value": 1017.4,
+              "total_equity": 11017.4,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-04",
+              "cash": 10000.0,
+              "positions_value": 1033.53,
+              "total_equity": 11033.53,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-07",
+              "cash": 10000.0,
+              "positions_value": 1049.67,
+              "total_equity": 11049.67,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-08",
+              "cash": 10000.0,
+              "positions_value": 1065.8,
+              "total_equity": 11065.8,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-09",
+              "cash": 10000.0,
+              "positions_value": 1009.6,
+              "total_equity": 11009.6,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-10",
+              "cash": 10000.0,
+              "positions_value": 1025.73,
+              "total_equity": 11025.73,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-11",
+              "cash": 10000.0,
+              "positions_value": 1041.87,
+              "total_equity": 11041.87,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-14",
+              "cash": 10000.0,
+              "positions_value": 1058.0,
+              "total_equity": 11058.0,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-15",
+              "cash": 10000.0,
+              "positions_value": 1074.13,
+              "total_equity": 11074.13,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-16",
+              "cash": 10000.0,
+              "positions_value": 1090.27,
+              "total_equity": 11090.27,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-17",
+              "cash": 10000.0,
+              "positions_value": 1106.4,
+              "total_equity": 11106.4,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-18",
+              "cash": 10000.0,
+              "positions_value": 1050.2,
+              "total_equity": 11050.2,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-21",
+              "cash": 10000.0,
+              "positions_value": 1066.33,
+              "total_equity": 11066.33,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-22",
+              "cash": 10000.0,
+              "positions_value": 1082.47,
+              "total_equity": 11082.47,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-23",
+              "cash": 10000.0,
+              "positions_value": 1098.6,
+              "total_equity": 11098.6,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-24",
+              "cash": 10000.0,
+              "positions_value": 1114.73,
+              "total_equity": 11114.73,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-25",
+              "cash": 10000.0,
+              "positions_value": 1130.87,
+              "total_equity": 11130.87,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-28",
+              "cash": 10000.0,
+              "positions_value": 1147.0,
+              "total_equity": 11147.0,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-29",
+              "cash": 10000.0,
+              "positions_value": 1090.8,
+              "total_equity": 11090.8,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-30",
+              "cash": 10000.0,
+              "positions_value": 1106.93,
+              "total_equity": 11106.93,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-01",
+              "cash": 9000.0,
+              "positions_value": 2123.07,
+              "total_equity": 11123.07,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-02",
+              "cash": 9000.0,
+              "positions_value": 2139.2,
+              "total_equity": 11139.2,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-05",
+              "cash": 9000.0,
+              "positions_value": 2155.33,
+              "total_equity": 11155.33,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-06",
+              "cash": 9000.0,
+              "positions_value": 2171.47,
+              "total_equity": 11171.47,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-07",
+              "cash": 9000.0,
+              "positions_value": 2187.6,
+              "total_equity": 11187.6,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-08",
+              "cash": 9000.0,
+              "positions_value": 2131.4,
+              "total_equity": 11131.4,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-09",
+              "cash": 9000.0,
+              "positions_value": 2147.53,
+              "total_equity": 11147.53,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-12",
+              "cash": 9000.0,
+              "positions_value": 2163.67,
+              "total_equity": 11163.67,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-13",
+              "cash": 9000.0,
+              "positions_value": 2179.8,
+              "total_equity": 11179.8,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-14",
+              "cash": 9000.0,
+              "positions_value": 2195.93,
+              "total_equity": 11195.93,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-15",
+              "cash": 9000.0,
+              "positions_value": 2212.07,
+              "total_equity": 11212.07,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-16",
+              "cash": 9000.0,
+              "positions_value": 2228.2,
+              "total_equity": 11228.2,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-19",
+              "cash": 9000.0,
+              "positions_value": 2172.0,
+              "total_equity": 11172.0,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-20",
+              "cash": 9000.0,
+              "positions_value": 2188.13,
+              "total_equity": 11188.13,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-21",
+              "cash": 9000.0,
+              "positions_value": 2204.27,
+              "total_equity": 11204.27,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-22",
+              "cash": 9000.0,
+              "positions_value": 2220.4,
+              "total_equity": 11220.4,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-23",
+              "cash": 9000.0,
+              "positions_value": 2236.53,
+              "total_equity": 11236.53,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-26",
+              "cash": 9000.0,
+              "positions_value": 2252.67,
+              "total_equity": 11252.67,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-27",
+              "cash": 9000.0,
+              "positions_value": 2268.8,
+              "total_equity": 11268.8,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-28",
+              "cash": 9000.0,
+              "positions_value": 2212.6,
+              "total_equity": 11212.6,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-29",
+              "cash": 9000.0,
+              "positions_value": 2228.73,
+              "total_equity": 11228.73,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-30",
+              "cash": 9000.0,
+              "positions_value": 2244.87,
+              "total_equity": 11244.87,
+              "allowance_total": 12000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            }
+          ],
+          "rebalances": [
+            {
+              "month": "2026-10",
+              "date": "2026-10-30",
+              "held_before": [
+                "MSFT",
+                "AAPL",
+                "JPM"
+              ],
+              "picked": [
+                "MSFT",
+                "AAPL",
+                "JPM",
+                "XOM"
+              ],
+              "n_new": 1
+            },
+            {
+              "month": "2026-09",
+              "date": "2026-09-30",
+              "held_before": [
+                "MSFT",
+                "AAPL"
+              ],
+              "picked": [
+                "MSFT",
+                "AAPL",
+                "JPM"
+              ],
+              "n_new": 1
+            },
+            {
+              "month": "2026-08",
+              "date": "2026-08-31",
+              "held_before": [],
+              "picked": [
+                "MSFT",
+                "AAPL"
+              ],
+              "n_new": 2
+            }
+          ]
+        },
+        "daily_core": {
+          "status": {
+            "valuation": {
+              "cash": 2450.5,
+              "positions": [
+                {
+                  "ticker": "MSFT",
+                  "shares": 7.0,
+                  "avg_cost": 401.0,
+                  "current_price": 438.75,
+                  "value": 3071.25,
+                  "pnl_pct": 9.41,
+                  "opened_at": "2026-09-02",
+                  "stale": false
+                },
+                {
+                  "ticker": "AAPL",
+                  "shares": 11.0,
+                  "avg_cost": 193.5,
+                  "current_price": 214.5,
+                  "value": 2359.5,
+                  "pnl_pct": 10.85,
+                  "opened_at": "2026-09-04",
+                  "stale": false
+                },
+                {
+                  "ticker": "NVDA",
+                  "shares": 8.0,
+                  "avg_cost": 121.2,
+                  "current_price": 132.68,
+                  "value": 1061.44,
+                  "pnl_pct": 9.47,
+                  "opened_at": "2026-10-08",
+                  "stale": false
+                },
+                {
+                  "ticker": "JPM",
+                  "shares": 6.0,
+                  "avg_cost": 229.1,
+                  "current_price": 238.1,
+                  "value": 1428.6,
+                  "pnl_pct": 3.93,
+                  "opened_at": "2026-10-12",
+                  "stale": false
+                }
+              ],
+              "positions_value": 7920.79,
+              "total_equity": 10371.29,
+              "allowance_total": 11000.0,
+              "stale_marks": []
+            },
+            "sim_daily_core_enabled": true,
+            "band": [
+              "AAPL",
+              "MSFT",
+              "NVDA",
+              "JPM",
+              "XOM",
+              "UNH",
+              "VWCE.DE",
+              "SAP.DE",
+              "IFX.DE",
+              "GOOGL",
+              "AMZN",
+              "META"
+            ],
+            "picks": [
+              "AAPL",
+              "MSFT",
+              "NVDA",
+              "JPM",
+              "XOM",
+              "UNH"
+            ],
+            "ranking_date": "2026-10-30",
+            "rank_map": {
+              "AAPL": 1,
+              "MSFT": 2,
+              "NVDA": 3,
+              "JPM": 4,
+              "XOM": 5,
+              "UNH": 6,
+              "VWCE.DE": 7,
+              "SAP.DE": 8,
+              "IFX.DE": 9,
+              "GOOGL": 10,
+              "AMZN": 11,
+              "META": 12
+            },
+            "mom_variant": "residual",
+            "mom_variants": {
+              "raw": "Raw 12-1 momentum (classic qv-mom)",
+              "residual": "Residual momentum (Blitz-Huij-Martens, §11 winner)"
+            },
+            "gate": "200",
+            "gates": {
+              "off": "No deployment gate — deploy normally",
+              "200": "Park buys while below SMA200",
+              "100": "Park buys while below SMA100",
+              "50": "Park buys while below SMA50"
+            },
+            "gradient": "100",
+            "gradients": {
+              "off": "No gradient cash-out",
+              "always": "Cash out on a negative basket slope (always armed)",
+              "200": "Cash out in good times only (above SMA200)",
+              "100": "Cash out in good times only (above SMA100)",
+              "50": "Cash out in good times only (above SMA50)"
+            },
+            "target_vol": 0.15,
+            "target_vols": {
+              "off": "Off (deploy all cash — no vol control)",
+              "0.10": "Target 10% volatility",
+              "0.15": "Target 15% volatility",
+              "0.20": "Target 20% volatility",
+              "0.25": "Target 25% volatility"
+            },
+            "universe": "diversified-plus",
+            "universes": [
+              "diversified-plus",
+              "sp500",
+              "us-large-cap"
+            ]
+          },
+          "trades": [
+            {
+              "ticker": "JPM",
+              "side": "BUY",
+              "shares": 6.0,
+              "price": 229.1,
+              "cash_after": 3075.9,
+              "reason": "rank 4 target-weight top-up",
+              "date": "2026-10-14T20:00:00+00:00"
+            },
+            {
+              "ticker": "NVDA",
+              "side": "BUY",
+              "shares": 8.0,
+              "price": 121.2,
+              "cash_after": 2440.7,
+              "reason": "rank 3 core deployment",
+              "date": "2026-10-09T20:00:00+00:00"
+            },
+            {
+              "ticker": "AAPL",
+              "side": "BUY",
+              "shares": 11.0,
+              "price": 193.5,
+              "cash_after": 3085.9,
+              "reason": "rank 1 core deployment",
+              "date": "2026-09-25T20:00:00+00:00"
+            },
+            {
+              "ticker": "XOM",
+              "side": "SELL",
+              "shares": 9.0,
+              "price": 116.1,
+              "cash_after": 4130.8,
+              "reason": "rank fell out of the top-10 band",
+              "date": "2026-09-22T20:00:00+00:00"
+            }
+          ],
+          "allowances": [
+            {
+              "id": 202610,
+              "amount": 1000.0,
+              "month": "2026-10",
+              "at": "2026-10-30T20:00:00+00:00",
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "id": 202609,
+              "amount": 1000.0,
+              "month": "2026-09",
+              "at": "2026-08-31T20:00:00+00:00",
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            }
+          ],
+          "equity": [
+            {
+              "date": "2026-08-31",
+              "cash": 9500.0,
+              "positions_value": -26.0,
+              "total_equity": 9474.0,
+              "allowance_total": 9000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-01",
+              "cash": 8500.0,
+              "positions_value": 989.27,
+              "total_equity": 9489.27,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-02",
+              "cash": 8500.0,
+              "positions_value": 1004.53,
+              "total_equity": 9504.53,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-03",
+              "cash": 8500.0,
+              "positions_value": 1019.8,
+              "total_equity": 9519.8,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-04",
+              "cash": 8500.0,
+              "positions_value": 1035.07,
+              "total_equity": 9535.07,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-07",
+              "cash": 8500.0,
+              "positions_value": 1050.33,
+              "total_equity": 9550.33,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-08",
+              "cash": 8500.0,
+              "positions_value": 1065.6,
+              "total_equity": 9565.6,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-09",
+              "cash": 8500.0,
+              "positions_value": 1020.2,
+              "total_equity": 9520.2,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-10",
+              "cash": 8500.0,
+              "positions_value": 1035.47,
+              "total_equity": 9535.47,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-11",
+              "cash": 8500.0,
+              "positions_value": 1050.73,
+              "total_equity": 9550.73,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-14",
+              "cash": 8500.0,
+              "positions_value": 1066.0,
+              "total_equity": 9566.0,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-15",
+              "cash": 8500.0,
+              "positions_value": 1081.27,
+              "total_equity": 9581.27,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-16",
+              "cash": 8500.0,
+              "positions_value": 1096.53,
+              "total_equity": 9596.53,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-17",
+              "cash": 8500.0,
+              "positions_value": 1111.8,
+              "total_equity": 9611.8,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-18",
+              "cash": 8500.0,
+              "positions_value": 1066.4,
+              "total_equity": 9566.4,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-21",
+              "cash": 8500.0,
+              "positions_value": 1081.67,
+              "total_equity": 9581.67,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-22",
+              "cash": 8500.0,
+              "positions_value": 1096.93,
+              "total_equity": 9596.93,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-23",
+              "cash": 8500.0,
+              "positions_value": 1112.2,
+              "total_equity": 9612.2,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-24",
+              "cash": 8500.0,
+              "positions_value": 1127.47,
+              "total_equity": 9627.47,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-25",
+              "cash": 8500.0,
+              "positions_value": 1142.73,
+              "total_equity": 9642.73,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-28",
+              "cash": 8500.0,
+              "positions_value": 1158.0,
+              "total_equity": 9658.0,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-29",
+              "cash": 8500.0,
+              "positions_value": 1112.6,
+              "total_equity": 9612.6,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-09-30",
+              "cash": 8500.0,
+              "positions_value": 1127.87,
+              "total_equity": 9627.87,
+              "allowance_total": 10000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-01",
+              "cash": 7500.0,
+              "positions_value": 2143.13,
+              "total_equity": 9643.13,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-02",
+              "cash": 7500.0,
+              "positions_value": 2158.4,
+              "total_equity": 9658.4,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-05",
+              "cash": 7500.0,
+              "positions_value": 2173.67,
+              "total_equity": 9673.67,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-06",
+              "cash": 7500.0,
+              "positions_value": 2188.93,
+              "total_equity": 9688.93,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-07",
+              "cash": 7500.0,
+              "positions_value": 2204.2,
+              "total_equity": 9704.2,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-08",
+              "cash": 7500.0,
+              "positions_value": 2158.8,
+              "total_equity": 9658.8,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-09",
+              "cash": 7500.0,
+              "positions_value": 2174.07,
+              "total_equity": 9674.07,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-12",
+              "cash": 7500.0,
+              "positions_value": 2189.33,
+              "total_equity": 9689.33,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-13",
+              "cash": 7500.0,
+              "positions_value": 2204.6,
+              "total_equity": 9704.6,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-14",
+              "cash": 7500.0,
+              "positions_value": 2219.87,
+              "total_equity": 9719.87,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-15",
+              "cash": 7500.0,
+              "positions_value": 2235.13,
+              "total_equity": 9735.13,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-16",
+              "cash": 7500.0,
+              "positions_value": 2250.4,
+              "total_equity": 9750.4,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-19",
+              "cash": 7500.0,
+              "positions_value": 2205.0,
+              "total_equity": 9705.0,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-20",
+              "cash": 7500.0,
+              "positions_value": 2220.27,
+              "total_equity": 9720.27,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-21",
+              "cash": 7500.0,
+              "positions_value": 2235.53,
+              "total_equity": 9735.53,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-22",
+              "cash": 7500.0,
+              "positions_value": 2250.8,
+              "total_equity": 9750.8,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-23",
+              "cash": 7500.0,
+              "positions_value": 2266.07,
+              "total_equity": 9766.07,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-26",
+              "cash": 7500.0,
+              "positions_value": 2281.33,
+              "total_equity": 9781.33,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-27",
+              "cash": 7500.0,
+              "positions_value": 2296.6,
+              "total_equity": 9796.6,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-28",
+              "cash": 7500.0,
+              "positions_value": 2251.2,
+              "total_equity": 9751.2,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-29",
+              "cash": 7500.0,
+              "positions_value": 2266.47,
+              "total_equity": 9766.47,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            },
+            {
+              "date": "2026-10-30",
+              "cash": 7500.0,
+              "positions_value": 2281.73,
+              "total_equity": 9781.73,
+              "allowance_total": 11000.0,
+              "mode": "paper",
+              "config_id": 42,
+              "epoch": 1
+            }
+          ]
+        }
+      },
+      "metrics": {
+        "xirr": {
+          "sim": {
+            "ok": true,
+            "scope": "sim",
+            "xirr": 0.0874,
+            "xirr_pct": 8.74,
+            "final_value": 11149.77,
+            "final_date": "2026-10-30",
+            "window_days": 44,
+            "contributed": 10000.0,
+            "points": 5,
+            "flows": [
+              {
+                "date": "2026-08-31",
+                "amount": 8000.0
+              },
+              {
+                "date": "2026-09-01",
+                "amount": 1000.0
+              },
+              {
+                "date": "2026-10-01",
+                "amount": 1000.0
+              }
+            ],
+            "reason": null
+          },
+          "monthly": {
+            "ok": true,
+            "scope": "monthly",
+            "xirr": 0.0732,
+            "xirr_pct": 7.32,
+            "final_value": 11106.39,
+            "final_date": "2026-10-30",
+            "window_days": 44,
+            "contributed": 10000.0,
+            "points": 5,
+            "flows": [
+              {
+                "date": "2026-08-31",
+                "amount": 8000.0
+              },
+              {
+                "date": "2026-09-01",
+                "amount": 1000.0
+              },
+              {
+                "date": "2026-10-01",
+                "amount": 1000.0
+              }
+            ],
+            "reason": null
+          },
+          "daily_core": {
+            "ok": true,
+            "scope": "daily_core",
+            "xirr": 0.0915,
+            "xirr_pct": 9.15,
+            "final_value": 10371.29,
+            "final_date": "2026-10-30",
+            "window_days": 44,
+            "contributed": 10000.0,
+            "points": 5,
+            "flows": [
+              {
+                "date": "2026-08-31",
+                "amount": 8000.0
+              },
+              {
+                "date": "2026-09-01",
+                "amount": 1000.0
+              },
+              {
+                "date": "2026-10-01",
+                "amount": 1000.0
+              }
+            ],
+            "reason": null
+          }
+        },
+        "twr": {
+          "sim": {
+            "ok": true,
+            "scope": "sim",
+            "points": [
+              {
+                "date": "2026-09-01",
+                "nav": 1.0,
+                "return_pct": 0.0,
+                "total_equity": 11029.77,
+                "contributed": 9000.0
+              },
+              {
+                "date": "2026-09-30",
+                "nav": 1.032,
+                "return_pct": 3.2,
+                "total_equity": 11094.77,
+                "contributed": 10000.0
+              },
+              {
+                "date": "2026-10-30",
+                "nav": 1.058,
+                "return_pct": 5.8,
+                "total_equity": 11149.77,
+                "contributed": 10000.0
+              }
+            ],
+            "twr_pct": 5.8,
+            "nav_start": 1.0,
+            "start": "2026-09-01",
+            "end": "2026-10-30",
+            "reason": null
+          },
+          "monthly": {
+            "ok": true,
+            "scope": "monthly",
+            "points": [
+              {
+                "date": "2026-09-01",
+                "nav": 1.0,
+                "return_pct": 0.0,
+                "total_equity": 10986.39,
+                "contributed": 9000.0
+              },
+              {
+                "date": "2026-09-30",
+                "nav": 1.032,
+                "return_pct": 3.2,
+                "total_equity": 11051.39,
+                "contributed": 10000.0
+              },
+              {
+                "date": "2026-10-30",
+                "nav": 1.058,
+                "return_pct": 5.8,
+                "total_equity": 11106.39,
+                "contributed": 10000.0
+              }
+            ],
+            "twr_pct": 5.8,
+            "nav_start": 1.0,
+            "start": "2026-09-01",
+            "end": "2026-10-30",
+            "reason": null
+          },
+          "daily_core": {
+            "ok": true,
+            "scope": "daily_core",
+            "points": [
+              {
+                "date": "2026-09-01",
+                "nav": 1.0,
+                "return_pct": 0.0,
+                "total_equity": 10251.29,
+                "contributed": 9000.0
+              },
+              {
+                "date": "2026-09-30",
+                "nav": 1.032,
+                "return_pct": 3.2,
+                "total_equity": 10316.29,
+                "contributed": 10000.0
+              },
+              {
+                "date": "2026-10-30",
+                "nav": 1.058,
+                "return_pct": 5.8,
+                "total_equity": 10371.29,
+                "contributed": 10000.0
+              }
+            ],
+            "twr_pct": 5.8,
+            "nav_start": 1.0,
+            "start": "2026-09-01",
+            "end": "2026-10-30",
+            "reason": null
+          }
+        }
+      },
+      "savings": {
+        "status": {
+          "initialized": true,
+          "cash": 3250.18,
+          "accrued_interest": 12.44,
+          "mirror_pending": 0.0,
+          "interest_rate": 3.25,
+          "monthly_transfer": 250.0,
+          "positions": [
+            {
+              "ticker": "VWCE.DE",
+              "shares": 12.5,
+              "avg_cost": 108.2,
+              "current_price": 114.6,
+              "value": 1432.5,
+              "pnl_pct": 5.91,
+              "buy_date": "2026-06-02"
+            },
+            {
+              "ticker": "SAP.DE",
+              "shares": 3.0,
+              "avg_cost": 196.4,
+              "current_price": 208.1,
+              "value": 624.3,
+              "pnl_pct": 5.96,
+              "buy_date": "2026-07-15"
+            },
+            {
+              "ticker": "IFX.DE",
+              "shares": 5.0,
+              "avg_cost": 31.2,
+              "current_price": 34.08,
+              "value": 170.4,
+              "pnl_pct": 9.23,
+              "buy_date": "2026-09-02"
+            }
+          ],
+          "positions_value": 2227.2,
+          "total_equity": 5489.82,
+          "contributed": 4700.0,
+          "events": [
+            {
+              "kind": "SPARPLAN",
+              "amount": -150.0,
+              "ticker": "VWCE.DE",
+              "note": "Sparplan execution day 2",
+              "date": "2026-10-05T20:00:00+00:00"
+            },
+            {
+              "kind": "DEPOSIT",
+              "amount": 250.0,
+              "ticker": "",
+              "note": "Monthly transfer from bank",
+              "date": "2026-10-02T20:00:00+00:00"
+            },
+            {
+              "kind": "DIVIDEND",
+              "amount": 5.4,
+              "ticker": "VWCE.DE",
+              "note": "Accumulating ETF demo - distribution event",
+              "date": "2026-10-15T20:00:00+00:00"
+            },
+            {
+              "kind": "SAVEBACK",
+              "amount": 3.1,
+              "ticker": "SAP.DE",
+              "note": "Trade Republic 1% Saveback",
+              "date": "2026-10-21T20:00:00+00:00"
+            },
+            {
+              "kind": "INTEREST",
+              "amount": 12.44,
+              "ticker": "",
+              "note": "Monthly interest accrual",
+              "date": "2026-10-30T20:00:00+00:00"
+            }
+          ],
+          "plans": [
+            {
+              "id": 1,
+              "ticker": "VWCE.DE",
+              "amount": 150.0,
+              "day_of_month": 2,
+              "active": true
+            },
+            {
+              "id": 2,
+              "ticker": "SAP.DE",
+              "amount": 100.0,
+              "day_of_month": 15,
+              "active": true
+            }
+          ],
+          "mirror": {
+            "positions": [
+              {
+                "ticker": "AAPL",
+                "shares": 2.1,
+                "avg_cost": 198.4,
+                "current_price": 214.5,
+                "value": 450.45,
+                "pnl_pct": 8.12
+              },
+              {
+                "ticker": "MSFT",
+                "shares": 1.8,
+                "avg_cost": 412.1,
+                "current_price": 438.75,
+                "value": 789.75,
+                "pnl_pct": 6.47
+              },
+              {
+                "ticker": "NVDA",
+                "shares": 3.4,
+                "avg_cost": 123.2,
+                "current_price": 132.68,
+                "value": 451.11,
+                "pnl_pct": 7.69
+              }
+            ],
+            "positions_value": 1691.31,
+            "total_equity": 1691.31,
+            "allocated": 1600.0,
+            "pending": 0.0,
+            "entries": 6
+          }
+        },
+        "equity": [
+          {
+            "date": "2026-08-31",
+            "cash": 3250.18,
+            "positions_value": 1087.82,
+            "accrued_interest": 12.44,
+            "total_equity": 4338.0,
+            "contributed": 4200.0
+          },
+          {
+            "date": "2026-09-01",
+            "cash": 3500.18,
+            "positions_value": 845.02,
+            "accrued_interest": 12.44,
+            "total_equity": 4345.2,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-02",
+            "cash": 3500.18,
+            "positions_value": 852.22,
+            "accrued_interest": 12.44,
+            "total_equity": 4352.4,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-03",
+            "cash": 3500.18,
+            "positions_value": 859.42,
+            "accrued_interest": 12.44,
+            "total_equity": 4359.6,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-04",
+            "cash": 3500.18,
+            "positions_value": 866.62,
+            "accrued_interest": 12.44,
+            "total_equity": 4366.8,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-07",
+            "cash": 3500.18,
+            "positions_value": 873.82,
+            "accrued_interest": 12.44,
+            "total_equity": 4374.0,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-08",
+            "cash": 3500.18,
+            "positions_value": 857.02,
+            "accrued_interest": 12.44,
+            "total_equity": 4357.2,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-09",
+            "cash": 3500.18,
+            "positions_value": 864.22,
+            "accrued_interest": 12.44,
+            "total_equity": 4364.4,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-10",
+            "cash": 3500.18,
+            "positions_value": 871.42,
+            "accrued_interest": 12.44,
+            "total_equity": 4371.6,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-11",
+            "cash": 3500.18,
+            "positions_value": 878.62,
+            "accrued_interest": 12.44,
+            "total_equity": 4378.8,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-14",
+            "cash": 3500.18,
+            "positions_value": 885.82,
+            "accrued_interest": 12.44,
+            "total_equity": 4386.0,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-15",
+            "cash": 3500.18,
+            "positions_value": 893.02,
+            "accrued_interest": 12.44,
+            "total_equity": 4393.2,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-16",
+            "cash": 3500.18,
+            "positions_value": 876.22,
+            "accrued_interest": 12.44,
+            "total_equity": 4376.4,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-17",
+            "cash": 3500.18,
+            "positions_value": 883.42,
+            "accrued_interest": 12.44,
+            "total_equity": 4383.6,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-18",
+            "cash": 3500.18,
+            "positions_value": 890.62,
+            "accrued_interest": 12.44,
+            "total_equity": 4390.8,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-21",
+            "cash": 3500.18,
+            "positions_value": 897.82,
+            "accrued_interest": 12.44,
+            "total_equity": 4398.0,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-22",
+            "cash": 3500.18,
+            "positions_value": 905.02,
+            "accrued_interest": 12.44,
+            "total_equity": 4405.2,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-23",
+            "cash": 3500.18,
+            "positions_value": 912.22,
+            "accrued_interest": 12.44,
+            "total_equity": 4412.4,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-24",
+            "cash": 3500.18,
+            "positions_value": 895.42,
+            "accrued_interest": 12.44,
+            "total_equity": 4395.6,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-25",
+            "cash": 3500.18,
+            "positions_value": 902.62,
+            "accrued_interest": 12.44,
+            "total_equity": 4402.8,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-28",
+            "cash": 3500.18,
+            "positions_value": 909.82,
+            "accrued_interest": 12.44,
+            "total_equity": 4410.0,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-29",
+            "cash": 3500.18,
+            "positions_value": 917.02,
+            "accrued_interest": 12.44,
+            "total_equity": 4417.2,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-09-30",
+            "cash": 3500.18,
+            "positions_value": 924.22,
+            "accrued_interest": 12.44,
+            "total_equity": 4424.4,
+            "contributed": 4450.0
+          },
+          {
+            "date": "2026-10-01",
+            "cash": 3750.18,
+            "positions_value": 681.42,
+            "accrued_interest": 12.44,
+            "total_equity": 4431.6,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-02",
+            "cash": 3750.18,
+            "positions_value": 664.62,
+            "accrued_interest": 12.44,
+            "total_equity": 4414.8,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-05",
+            "cash": 3750.18,
+            "positions_value": 671.82,
+            "accrued_interest": 12.44,
+            "total_equity": 4422.0,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-06",
+            "cash": 3750.18,
+            "positions_value": 679.02,
+            "accrued_interest": 12.44,
+            "total_equity": 4429.2,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-07",
+            "cash": 3750.18,
+            "positions_value": 686.22,
+            "accrued_interest": 12.44,
+            "total_equity": 4436.4,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-08",
+            "cash": 3750.18,
+            "positions_value": 693.42,
+            "accrued_interest": 12.44,
+            "total_equity": 4443.6,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-09",
+            "cash": 3750.18,
+            "positions_value": 700.62,
+            "accrued_interest": 12.44,
+            "total_equity": 4450.8,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-12",
+            "cash": 3750.18,
+            "positions_value": 683.82,
+            "accrued_interest": 12.44,
+            "total_equity": 4434.0,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-13",
+            "cash": 3750.18,
+            "positions_value": 691.02,
+            "accrued_interest": 12.44,
+            "total_equity": 4441.2,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-14",
+            "cash": 3750.18,
+            "positions_value": 698.22,
+            "accrued_interest": 12.44,
+            "total_equity": 4448.4,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-15",
+            "cash": 3750.18,
+            "positions_value": 705.42,
+            "accrued_interest": 12.44,
+            "total_equity": 4455.6,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-16",
+            "cash": 3750.18,
+            "positions_value": 712.62,
+            "accrued_interest": 12.44,
+            "total_equity": 4462.8,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-19",
+            "cash": 3750.18,
+            "positions_value": 719.82,
+            "accrued_interest": 12.44,
+            "total_equity": 4470.0,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-20",
+            "cash": 3750.18,
+            "positions_value": 703.02,
+            "accrued_interest": 12.44,
+            "total_equity": 4453.2,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-21",
+            "cash": 3750.18,
+            "positions_value": 710.22,
+            "accrued_interest": 12.44,
+            "total_equity": 4460.4,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-22",
+            "cash": 3750.18,
+            "positions_value": 717.42,
+            "accrued_interest": 12.44,
+            "total_equity": 4467.6,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-23",
+            "cash": 3750.18,
+            "positions_value": 724.62,
+            "accrued_interest": 12.44,
+            "total_equity": 4474.8,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-26",
+            "cash": 3750.18,
+            "positions_value": 731.82,
+            "accrued_interest": 12.44,
+            "total_equity": 4482.0,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-27",
+            "cash": 3750.18,
+            "positions_value": 739.02,
+            "accrued_interest": 12.44,
+            "total_equity": 4489.2,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-28",
+            "cash": 3750.18,
+            "positions_value": 722.22,
+            "accrued_interest": 12.44,
+            "total_equity": 4472.4,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-29",
+            "cash": 3750.18,
+            "positions_value": 729.42,
+            "accrued_interest": 12.44,
+            "total_equity": 4479.6,
+            "contributed": 4700.0
+          },
+          {
+            "date": "2026-10-30",
+            "cash": 3750.18,
+            "positions_value": 736.62,
+            "accrued_interest": 12.44,
+            "total_equity": 4486.8,
+            "contributed": 4700.0
+          }
+        ],
+        "mirror": {
+          "positions": [
+            {
+              "ticker": "AAPL",
+              "shares": 2.1,
+              "avg_cost": 198.4,
+              "current_price": 214.5,
+              "value": 450.45,
+              "pnl_pct": 8.12
+            },
+            {
+              "ticker": "MSFT",
+              "shares": 1.8,
+              "avg_cost": 412.1,
+              "current_price": 438.75,
+              "value": 789.75,
+              "pnl_pct": 6.47
+            },
+            {
+              "ticker": "NVDA",
+              "shares": 3.4,
+              "avg_cost": 123.2,
+              "current_price": 132.68,
+              "value": 451.11,
+              "pnl_pct": 7.69
+            }
+          ],
+          "positions_value": 1691.31,
+          "total_equity": 1691.31,
+          "allocated": 1600.0,
+          "pending": 0.0,
+          "entries": 6,
+          "curve": [
+            {
+              "date": "2026-08-31",
+              "allocated": 4200.0,
+              "value": 4185.0
+            },
+            {
+              "date": "2026-09-01",
+              "allocated": 4450.0,
+              "value": 4200.5
+            },
+            {
+              "date": "2026-09-02",
+              "allocated": 4450.0,
+              "value": 4216.0
+            },
+            {
+              "date": "2026-09-03",
+              "allocated": 4450.0,
+              "value": 4231.5
+            },
+            {
+              "date": "2026-09-04",
+              "allocated": 4450.0,
+              "value": 4247.0
+            },
+            {
+              "date": "2026-09-07",
+              "allocated": 4450.0,
+              "value": 4225.0
+            },
+            {
+              "date": "2026-09-08",
+              "allocated": 4450.0,
+              "value": 4240.5
+            },
+            {
+              "date": "2026-09-09",
+              "allocated": 4450.0,
+              "value": 4256.0
+            },
+            {
+              "date": "2026-09-10",
+              "allocated": 4450.0,
+              "value": 4271.5
+            },
+            {
+              "date": "2026-09-11",
+              "allocated": 4450.0,
+              "value": 4287.0
+            },
+            {
+              "date": "2026-09-14",
+              "allocated": 4450.0,
+              "value": 4265.0
+            },
+            {
+              "date": "2026-09-15",
+              "allocated": 4450.0,
+              "value": 4280.5
+            },
+            {
+              "date": "2026-09-16",
+              "allocated": 4450.0,
+              "value": 4296.0
+            },
+            {
+              "date": "2026-09-17",
+              "allocated": 4450.0,
+              "value": 4311.5
+            },
+            {
+              "date": "2026-09-18",
+              "allocated": 4450.0,
+              "value": 4327.0
+            },
+            {
+              "date": "2026-09-21",
+              "allocated": 4450.0,
+              "value": 4305.0
+            },
+            {
+              "date": "2026-09-22",
+              "allocated": 4450.0,
+              "value": 4320.5
+            },
+            {
+              "date": "2026-09-23",
+              "allocated": 4450.0,
+              "value": 4336.0
+            },
+            {
+              "date": "2026-09-24",
+              "allocated": 4450.0,
+              "value": 4351.5
+            },
+            {
+              "date": "2026-09-25",
+              "allocated": 4450.0,
+              "value": 4367.0
+            },
+            {
+              "date": "2026-09-28",
+              "allocated": 4450.0,
+              "value": 4345.0
+            },
+            {
+              "date": "2026-09-29",
+              "allocated": 4450.0,
+              "value": 4360.5
+            },
+            {
+              "date": "2026-09-30",
+              "allocated": 4450.0,
+              "value": 4376.0
+            },
+            {
+              "date": "2026-10-01",
+              "allocated": 4700.0,
+              "value": 4391.5
+            },
+            {
+              "date": "2026-10-02",
+              "allocated": 4700.0,
+              "value": 4407.0
+            },
+            {
+              "date": "2026-10-05",
+              "allocated": 4700.0,
+              "value": 4385.0
+            },
+            {
+              "date": "2026-10-06",
+              "allocated": 4700.0,
+              "value": 4400.5
+            },
+            {
+              "date": "2026-10-07",
+              "allocated": 4700.0,
+              "value": 4416.0
+            },
+            {
+              "date": "2026-10-08",
+              "allocated": 4700.0,
+              "value": 4431.5
+            },
+            {
+              "date": "2026-10-09",
+              "allocated": 4700.0,
+              "value": 4447.0
+            },
+            {
+              "date": "2026-10-12",
+              "allocated": 4700.0,
+              "value": 4425.0
+            },
+            {
+              "date": "2026-10-13",
+              "allocated": 4700.0,
+              "value": 4440.5
+            },
+            {
+              "date": "2026-10-14",
+              "allocated": 4700.0,
+              "value": 4456.0
+            },
+            {
+              "date": "2026-10-15",
+              "allocated": 4700.0,
+              "value": 4471.5
+            },
+            {
+              "date": "2026-10-16",
+              "allocated": 4700.0,
+              "value": 4487.0
+            },
+            {
+              "date": "2026-10-19",
+              "allocated": 4700.0,
+              "value": 4465.0
+            },
+            {
+              "date": "2026-10-20",
+              "allocated": 4700.0,
+              "value": 4480.5
+            },
+            {
+              "date": "2026-10-21",
+              "allocated": 4700.0,
+              "value": 4496.0
+            },
+            {
+              "date": "2026-10-22",
+              "allocated": 4700.0,
+              "value": 4511.5
+            },
+            {
+              "date": "2026-10-23",
+              "allocated": 4700.0,
+              "value": 4527.0
+            },
+            {
+              "date": "2026-10-26",
+              "allocated": 4700.0,
+              "value": 4505.0
+            },
+            {
+              "date": "2026-10-27",
+              "allocated": 4700.0,
+              "value": 4520.5
+            },
+            {
+              "date": "2026-10-28",
+              "allocated": 4700.0,
+              "value": 4536.0
+            },
+            {
+              "date": "2026-10-29",
+              "allocated": 4700.0,
+              "value": 4551.5
+            },
+            {
+              "date": "2026-10-30",
+              "allocated": 4700.0,
+              "value": 4567.0
+            }
+          ]
+        },
+        "metrics": {
+          "xirr": {
+            "ok": true,
+            "scope": "savings",
+            "xirr": 0.0621,
+            "xirr_pct": 6.21,
+            "final_value": 5489.82,
+            "final_date": "2026-10-30",
+            "window_days": 44,
+            "contributed": 4700.0,
+            "points": 5,
+            "flows": [
+              {
+                "date": "2026-08-31",
+                "amount": 4200.0
+              },
+              {
+                "date": "2026-09-01",
+                "amount": 250.0
+              },
+              {
+                "date": "2026-10-01",
+                "amount": 250.0
+              }
+            ],
+            "reason": null
+          },
+          "twr": {
+            "ok": true,
+            "scope": "savings",
+            "points": [
+              {
+                "date": "2026-09-01",
+                "nav": 1.0,
+                "return_pct": 0.0,
+                "total_equity": 4350.0,
+                "contributed": 4450.0
+              },
+              {
+                "date": "2026-09-30",
+                "nav": 1.027,
+                "return_pct": 2.7,
+                "total_equity": 4588.0,
+                "contributed": 4450.0
+              },
+              {
+                "date": "2026-10-30",
+                "nav": 1.041,
+                "return_pct": 4.1,
+                "total_equity": 5489.82,
+                "contributed": 4700.0
+              }
+            ],
+            "twr_pct": 4.1,
+            "nav_start": 1.0,
+            "start": "2026-09-01",
+            "end": "2026-10-30",
+            "max_drawdown_pct": 1.8,
+            "reason": null
+          }
+        }
+      },
+      "db": {
+        "description": "Synthetic database-switch state for testing only: the dev database is enabled and seeded.",
+        "dev_enabled": true,
+        "dev_seeded": true,
+        "cloning": false,
+        "clone_size_bytes": 20971520
+      },
+      "chat_proposal": {
+        "proposal_id": "fixture-proposal-3d-0001",
+        "decided_at": "2026-10-30T12:00:00+00:00",
+        "config": {
+          "strategy": "fixture-hybrid",
+          "universe": "diversified-plus"
+        },
+        "actions": [
+          {
+            "ticker": "NVDA",
+            "action": "BUY",
+            "reason": "Fixture proposal: momentum leader, within risk limits.",
+            "preview": {
+              "feasible": true,
+              "issue": null,
+              "price": 132.68,
+              "est_shares": 7.5,
+              "est_value": 995.1,
+              "est_cash_after": 3130.45,
+              "est_position_value_after": 1525.82
+            }
+          },
+          {
+            "ticker": "MSFT",
+            "action": "SELL",
+            "reason": "Fixture proposal: trim the largest position.",
+            "preview": {
+              "feasible": false,
+              "issue": "no price",
+              "price": null,
+              "est_shares": null,
+              "est_value": null,
+              "est_cash_after": null,
+              "est_position_value_after": null
+            }
+          }
+        ]
+      },
+      "chat_confirm": {
+        "ok": true,
+        "trades": [
+          {
+            "id": 105,
+            "ticker": "NVDA",
+            "side": "BUY",
+            "shares": 7.5,
+            "price": 132.68,
+            "cash_after": 3130.45,
+            "reason": "confirmed fixture proposal fixture-proposal-3d-0001",
+            "at": "2026-10-30T12:05:00+00:00"
+          }
+        ],
+        "skipped": [],
+        "snapshot_taken": true
+      },
+      "run_config": {
+        "sim": {
+          "engine": "sim",
+          "epoch": 1,
+          "strategy": "fixture-hybrid",
+          "universe": "diversified-plus",
+          "risk_band": "moderate"
+        },
+        "monthly": {
+          "engine": "monthly",
+          "epoch": 1,
+          "strategy": "qv-mom-v1",
+          "target_n": 10
+        },
+        "daily_core": {
+          "engine": "daily_core",
+          "epoch": 1,
+          "mom_variant": "residual",
+          "target_vol": 0.15
+        }
+      }
+    },
+    "empty": {
+      "description": "Empty-state fixture: no positions, trades, allowances, equity or tickers.",
+      "watchlist": [],
+      "names": {},
+      "symbols": [],
+      "dashboards": {},
+      "universes": [
+        "diversified-plus"
+      ],
+      "screener": {
+        "status": {
+          "running": false,
+          "op": "",
+          "universe": "",
+          "current": "",
+          "done": 0,
+          "total": 0,
+          "started_at": "",
+          "updated_at": "",
+          "error": null
+        },
+        "results": {
+          "diversified-plus": []
+        },
+        "sync": {
+          "universe": "sp500",
+          "as_of": "2026-10-29",
+          "count": 500,
+          "added": [
+            "FIXT"
+          ],
+          "removed": [],
+          "changed": true
+        }
+      },
+      "llm": {
+        "backends": [],
+        "active_backend": "",
+        "active_model": ""
+      },
+      "portfolios": {
+        "sim": {
+          "status": {
+            "cash": 0.0,
+            "positions": [],
+            "positions_value": 0.0,
+            "total_equity": 0.0,
+            "allowance_total": 0.0,
+            "sim_enabled": true,
+            "sim_strategy": "deterministic",
+            "sim_universe": "diversified-plus",
+            "benchmark_enabled": true,
+            "benchmark_ticker": "URTH"
+          },
+          "trades": [],
+          "allowances": [],
+          "equity": [],
+          "benchmark": {
+            "ticker": "URTH",
+            "shares": 0.0,
+            "avg_cost": 0.0,
+            "current_price": 0.0,
+            "total_equity": 0.0,
+            "allowance_total": 0.0
+          },
+          "benchmark_equity": [],
+          "reasoning": {
+            "raw": "",
+            "summary": "",
+            "deterministic_trades": [],
+            "changes": [],
+            "confirmations": [],
+            "holds": [],
+            "vetoes": [],
+            "fallback": false,
+            "strategy": "deterministic",
+            "failure_marker": false,
+            "mode_aware_prompt": false,
+            "llm_called": false
+          },
+          "run_status": {
+            "running": false,
+            "stage": "",
+            "started_at": "",
+            "updated_at": "",
+            "detail": "",
+            "error": null
+          },
+          "chat_history": []
+        },
+        "monthly": {
+          "status": {
+            "cash": 0.0,
+            "positions": [],
+            "positions_value": 0.0,
+            "total_equity": 0.0,
+            "allowance_total": 0.0,
+            "stale_marks": [],
+            "sim_monthly_enabled": true,
+            "sim_monthly_universe": "diversified-plus",
+            "sim_monthly_contribution": 1000.0,
+            "sim_monthly_target_n": 12,
+            "next_rebalance": "2026-11-30"
+          },
+          "trades": [],
+          "allowances": [],
+          "equity": [],
+          "rebalances": []
+        },
+        "daily_core": {
+          "status": {
+            "valuation": {
+              "cash": 0.0,
+              "positions": [],
+              "positions_value": 0.0,
+              "total_equity": 0.0,
+              "allowance_total": 0.0,
+              "stale_marks": []
+            },
+            "sim_daily_core_enabled": true,
+            "band": [],
+            "picks": [],
+            "ranking_date": null,
+            "rank_map": {},
+            "mom_variant": "residual",
+            "mom_variants": {
+              "raw": "Raw 12-1 momentum (classic qv-mom)",
+              "residual": "Residual momentum (Blitz-Huij-Martens, §11 winner)"
+            },
+            "gate": "off",
+            "gates": {
+              "off": "No deployment gate — deploy normally",
+              "200": "Park buys while below SMA200",
+              "100": "Park buys while below SMA100",
+              "50": "Park buys while below SMA50"
+            },
+            "gradient": "off",
+            "gradients": {
+              "off": "No gradient cash-out",
+              "always": "Cash out on a negative basket slope (always armed)",
+              "200": "Cash out in good times only (above SMA200)",
+              "100": "Cash out in good times only (above SMA100)",
+              "50": "Cash out in good times only (above SMA50)"
+            },
+            "target_vol": 0.0,
+            "target_vols": {
+              "off": "Off (deploy all cash — no vol control)",
+              "0.10": "Target 10% volatility",
+              "0.15": "Target 15% volatility",
+              "0.20": "Target 20% volatility",
+              "0.25": "Target 25% volatility"
+            },
+            "universe": "diversified-plus",
+            "universes": [
+              "diversified-plus",
+              "sp500",
+              "us-large-cap"
+            ]
+          },
+          "trades": [],
+          "allowances": [],
+          "equity": []
+        }
+      },
+      "metrics": {
+        "xirr": {
+          "sim": {
+            "ok": true,
+            "scope": "sim",
+            "xirr": null,
+            "xirr_pct": null,
+            "final_value": null,
+            "final_date": null,
+            "window_days": null,
+            "contributed": null,
+            "points": 0,
+            "flows": [],
+            "reason": "no equity snapshots for this scope yet"
+          },
+          "monthly": {
+            "ok": true,
+            "scope": "monthly",
+            "xirr": null,
+            "xirr_pct": null,
+            "final_value": null,
+            "final_date": null,
+            "window_days": null,
+            "contributed": null,
+            "points": 0,
+            "flows": [],
+            "reason": "no equity snapshots for this scope yet"
+          },
+          "daily_core": {
+            "ok": true,
+            "scope": "daily_core",
+            "xirr": null,
+            "xirr_pct": null,
+            "final_value": null,
+            "final_date": null,
+            "window_days": null,
+            "contributed": null,
+            "points": 0,
+            "flows": [],
+            "reason": "no equity snapshots for this scope yet"
+          }
+        },
+        "twr": {
+          "sim": {
+            "ok": true,
+            "scope": "sim",
+            "points": [],
+            "twr_pct": null,
+            "nav_start": null,
+            "start": null,
+            "end": null,
+            "reason": "no equity snapshots for this scope yet"
+          },
+          "monthly": {
+            "ok": true,
+            "scope": "monthly",
+            "points": [],
+            "twr_pct": null,
+            "nav_start": null,
+            "start": null,
+            "end": null,
+            "reason": "no equity snapshots for this scope yet"
+          },
+          "daily_core": {
+            "ok": true,
+            "scope": "daily_core",
+            "points": [],
+            "twr_pct": null,
+            "nav_start": null,
+            "start": null,
+            "end": null,
+            "reason": "no equity snapshots for this scope yet"
+          }
+        }
+      },
+      "savings": {
+        "status": {
+          "initialized": false,
+          "events": [],
+          "plans": []
+        },
+        "equity": [],
+        "mirror": {
+          "positions": [],
+          "positions_value": 0.0,
+          "total_equity": 0.0,
+          "allocated": 0.0,
+          "pending": 0.0,
+          "entries": 0,
+          "curve": []
+        },
+        "metrics": {
+          "xirr": {
+            "ok": true,
+            "scope": "savings",
+            "xirr": null,
+            "xirr_pct": null,
+            "final_value": null,
+            "final_date": null,
+            "window_days": null,
+            "contributed": null,
+            "points": 0,
+            "flows": [],
+            "reason": "no equity snapshots for this savings account yet"
+          },
+          "twr": {
+            "ok": true,
+            "scope": "savings",
+            "points": [],
+            "twr_pct": null,
+            "nav_start": null,
+            "start": null,
+            "end": null,
+            "max_drawdown_pct": null,
+            "reason": "no equity snapshots for this savings account yet"
+          }
+        }
+      },
+      "db": {
+        "description": "Synthetic database-switch state for testing only: the dev database is enabled but not seeded.",
+        "dev_enabled": true,
+        "dev_seeded": false,
+        "cloning": false,
+        "clone_size_bytes": 0
+      },
+      "chat_proposal": {
+        "proposal_id": "fixture-proposal-3d-0001",
+        "decided_at": "2026-10-30T12:00:00+00:00",
+        "config": {
+          "strategy": "fixture-hybrid",
+          "universe": "diversified-plus"
+        },
+        "actions": [
+          {
+            "ticker": "NVDA",
+            "action": "BUY",
+            "reason": "Fixture proposal: momentum leader, within risk limits.",
+            "preview": {
+              "feasible": true,
+              "issue": null,
+              "price": 132.68,
+              "est_shares": 7.5,
+              "est_value": 995.1,
+              "est_cash_after": 3130.45,
+              "est_position_value_after": 1525.82
+            }
+          },
+          {
+            "ticker": "MSFT",
+            "action": "SELL",
+            "reason": "Fixture proposal: trim the largest position.",
+            "preview": {
+              "feasible": false,
+              "issue": "no price",
+              "price": null,
+              "est_shares": null,
+              "est_value": null,
+              "est_cash_after": null,
+              "est_position_value_after": null
+            }
+          }
+        ]
+      },
+      "chat_confirm": {
+        "ok": true,
+        "trades": [
+          {
+            "id": 105,
+            "ticker": "NVDA",
+            "side": "BUY",
+            "shares": 7.5,
+            "price": 132.68,
+            "cash_after": 3130.45,
+            "reason": "confirmed fixture proposal fixture-proposal-3d-0001",
+            "at": "2026-10-30T12:05:00+00:00"
+          }
+        ],
+        "skipped": [],
+        "snapshot_taken": true
+      },
+      "run_config": {
+        "sim": {
+          "engine": "sim",
+          "epoch": 1,
+          "strategy": "fixture-hybrid",
+          "universe": "diversified-plus",
+          "risk_band": "moderate"
+        },
+        "monthly": {
+          "engine": "monthly",
+          "epoch": 1,
+          "strategy": "qv-mom-v1",
+          "target_n": 10
+        },
+        "daily_core": {
+          "engine": "daily_core",
+          "epoch": 1,
+          "mom_variant": "residual",
+          "target_vol": 0.15
+        }
+      }
+    }
+  }
+}

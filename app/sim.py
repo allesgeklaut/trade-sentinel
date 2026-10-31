@@ -27,6 +27,7 @@ import logging
 import math
 import os
 import threading
+import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, UTC
@@ -56,6 +57,7 @@ from .db import (
     SimSnapshot,
     SimTrade,
     Session,
+    current_db as db_current_db,
 )
 from .market import candles, latest_close, refresh, refresh_many
 from .screener import tickers as universe_tickers
@@ -82,7 +84,8 @@ _ENGINE = "sim"
 _CONFIG_CONTRACT_VERSION = "phase2-v1"
 
 # The LOGICAL RUN's frozen paper stamp ({"mode","config_id","epoch"}).
-# run_cycle / sim_chat / sim_chat_stream set it for their duration; the deep
+# run_cycle sets it for its duration (the chat confirm path threads its stamp
+# explicitly instead); the deep
 # executors (_exec_buy/_exec_sell and the snapshot writer) read it instead of
 # resolving per leg. A ContextVar (not a module global) keeps concurrent runs
 # isolated and propagates through awaited calls in the same task; an explicit
@@ -112,8 +115,15 @@ _run_progress: dict[str, Any] = {"running": False, "stage": "", "started_at": ""
 
 # Serializes run_cycle() calls so the scheduler and a manual "Run Bot Now"
 # click can't execute simultaneously. If a cycle is already running, a
-# second call returns immediately instead of racing on trades/snapshots.
+# scheduled/deferred call WAITS (bounded below) instead of dropping the day's
+# cycle; the manual HTTP path keeps its own fail-fast pre-check
+# (start_run_cycle_background).
 _run_cycle_lock: asyncio.Lock = asyncio.Lock()
+
+# Upper bound on how long a scheduled/deferred call waits for the busy lock
+# before giving up with the old "skipped" semantics (a DEV backfill can hold
+# it for minutes; a wedged holder should not park the scheduler forever).
+_TICK_LOCK_WAIT_SECONDS = 7200
 
 # Serialises every STATE/CASH/HISTORY mutation against a reset's boundary (the
 # stamp/reset TOCTOU): a stamp captured before a reset is validated against the
@@ -144,29 +154,41 @@ _SIM_REFRESH_PERIOD = "2y"
 # mid-cycle must never lead to a second fill pass) and reset by backfill /
 # reset_sim, which replace the whole portfolio and must leave the next
 # cycle free.
-_STATE_FILE = Path("/data/sim_state.json")
+_STATE_FILE = Path("/data/sim_state.json")          # PROD (live book)
+_STATE_FILE_DEV = Path("/data/sim_state_dev.json")   # DEV sandbox
 _state_lock = threading.Lock()
 
 
+def _state_file() -> Path:
+    """Per-DB state file (same convention as daily_core): the session guard
+    is stamped by BOTH the live scheduler and DEV experiments, so a DEV run
+    stamping the shared file would make the PROD tick silently skip the
+    session (and vice versa). The globals stay patchable — tests point
+    ``_STATE_FILE`` at a temp path."""
+    return _STATE_FILE_DEV if db_current_db() == "dev" else _STATE_FILE
+
+
 def _load_state() -> dict:
+    path = _state_file()
     try:
-        return json.loads(_STATE_FILE.read_text())
+        return json.loads(path.read_text())
     except FileNotFoundError:
         return {}
     except Exception as e:
-        logger.warning("Could not read sim state file %s: %s", _STATE_FILE, e)
+        logger.warning("Could not read sim state file %s: %s", path, e)
         return {}
 
 
 def _save_state(state: dict) -> None:
+    path = _state_file()
     try:
-        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         # Atomic replace so a concurrent reader never sees a half-written file.
-        tmp = _STATE_FILE.with_suffix(_STATE_FILE.suffix + ".tmp")
+        tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(state, indent=2))
-        os.replace(tmp, _STATE_FILE)
+        os.replace(tmp, path)
     except Exception as e:
-        logger.warning("Could not write sim state file %s: %s", _STATE_FILE, e)
+        logger.warning("Could not write sim state file %s: %s", path, e)
 
 
 def _session_guard_key() -> str:
@@ -686,8 +708,9 @@ async def _write_snapshot(post: dict, *, mode: str | None = None,
                           epoch: int | None = None) -> None:
     """Write one equity-curve point stamped with the logical run's stamp.
 
-    The three forward writers (run_cycle, sim_chat, sim_chat_stream) all go
-    through here: chat-driven marks are forward records too.
+    The forward writers (run_cycle, and the chat confirm path
+    confirm_chat_proposal) all go through here: chat-driven marks are forward
+    records too.
     """
     async with _state_write_lock:
         stamp = await _resolve_paper_stamp(mode=mode, config_id=config_id, epoch=epoch)
@@ -2764,21 +2787,29 @@ async def run_cycle() -> dict[str, Any]:
 
     This is called by the scheduler or the manual trigger endpoint.
 
-    Concurrency: an asyncio.Lock serialises calls. If a cycle is already
-    running, a second call returns immediately with an "already running"
-    result instead of racing on trades/snapshots/progress state.
+    Concurrency: an asyncio.Lock serialises calls. A call that finds the
+    lock held WAITS for the holder (bounded by ``_TICK_LOCK_WAIT_SECONDS``)
+    instead of dropping the day's cycle — a DEV backfill may hold the lock
+    for minutes, and a scheduled tick delayed by it is still correct, only
+    one dropped is not. Only a holder wedged past the bound skips
+    (error-logged). The manual HTTP path keeps its fail-fast pre-check in
+    ``start_run_cycle_background`` and never queues behind a backfill.
     """
     global _last_deterministic_trades, _last_llm_reasoning, _last_llm_summary
     global _last_llm_decisions, _last_llm_vetoes
 
-    # Non-blocking acquire: if another cycle is in flight, bail out
-    # immediately rather than waiting (which would queue a third cycle
-    # behind the current one and double-execute when the lock frees).
-    if _run_cycle_lock.locked():
-        logger.info("run_cycle() skipped — another cycle is already running")
+    # Bounded manual acquire (was: skip-early + `async with`): the wait is
+    # bounded but the HELD time is not, so a long-but-legitimate cycle is
+    # never cancelled — only the wait for the previous holder can time out.
+    try:
+        async with asyncio.timeout(_TICK_LOCK_WAIT_SECONDS):
+            await _run_cycle_lock.acquire()
+    except TimeoutError:
+        logger.error("run_cycle() skipped — the cycle lock was still held after %ds",
+                     _TICK_LOCK_WAIT_SECONDS)
         return {"skipped": True, "reason": "already running"}
 
-    async with _run_cycle_lock:
+    try:
         # Per-session guard (session fill contract, rule 2): exactly one
         # decision/fill cycle per session F. A second cycle in the same
         # session — a scheduled retry, a manual click after the scheduled
@@ -3027,6 +3058,10 @@ async def run_cycle() -> dict[str, Any]:
             # The logical run is over — the frozen stamp must not leak into a
             # later standalone write in the same task.
             _RUN_STAMP.reset(stamp_token)
+    finally:
+        # Manual release pairs with the bounded acquire above (the body is
+        # deliberately NOT re-indented into an `async with`).
+        _run_cycle_lock.release()
 
 
 def start_run_cycle_background() -> dict[str, Any]:
@@ -3899,6 +3934,57 @@ async def backfill_benchmark(start: str | None = None) -> dict[str, Any]:
 _scheduler_task: asyncio.Task | None = None
 _daily_snapshot_task: asyncio.Task | None = None
 
+# --- Deferred scheduled retries -------------------------------------------
+#
+# A scheduled tick that finds its portfolio lock held by a DEV backfill or a
+# manual run must DELAY the scheduled action, never silently drop it. The
+# tick keeps its immediate pre-check (skip the stage this wake so the later
+# stages still run), and schedules this fire-and-forget retry: the first
+# attempt waits _DEFERRED_RETRY_DELAY_SECONDS (long enough that a
+# test-driven tick never wakes its retry inside the test), then polls the
+# lock until it frees, bounded by _DEFERRED_RETRY_WAIT_SECONDS. The action
+# reference is captured at SCHEDULE time, so a test's monkeypatched fake is
+# what a retry would call.
+_DEFERRED_RETRY_DELAY_SECONDS = 60.0
+_DEFERRED_RETRY_WAIT_SECONDS = 7200.0
+_deferred_retry_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_deferred_retry(run, *, label: str, lock: asyncio.Lock) -> None:
+    """Defer a scheduled action behind a busy lock (fire-and-forget).
+
+    The retry does NOT hold the lock across ``run()`` — the actions acquire
+    the lock themselves (run_cycle waits bounded; take_snapshot skips), so
+    holding it here would deadlock them. It only waits for the lock to be
+    FREE, then calls the captured reference.
+    """
+
+    async def _retry() -> None:
+        waited = 0.0
+        while lock.locked():
+            if waited >= _DEFERRED_RETRY_WAIT_SECONDS:
+                logger.error("%s: the lock was still held %.0fs after the "
+                             "scheduled tick — giving up on this deferred retry",
+                             label, waited)
+                return
+            await asyncio.sleep(_DEFERRED_RETRY_DELAY_SECONDS)
+            waited += _DEFERRED_RETRY_DELAY_SECONDS
+        try:
+            result = await run()
+            if isinstance(result, dict) and result.get("skipped"):
+                logger.info("%s: deferred retry skipped — %s",
+                            label, result.get("reason"))
+            else:
+                logger.info("%s: deferred retry complete", label)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — a deferred tick must not kill the loop
+            logger.error("%s: deferred retry failed: %s", label, e, exc_info=True)
+
+    task = asyncio.create_task(_retry())
+    _deferred_retry_tasks.add(task)
+    task.add_done_callback(_deferred_retry_tasks.discard)
+
 
 # --- Trading-day calendar (US NYSE) ---------------------------------------
 
@@ -4017,14 +4103,21 @@ async def _scheduler_tick() -> None:
         logger.error("Monthly rebalance failed: %s", e, exc_info=True)
 
     try:
-        # Skip if a manual run is in flight (e.g. the user clicked "Run
-        # Bot Now" shortly before the scheduled time). The lock check in
-        # run_cycle() also guards against this, but checking here too
-        # avoids logging a confusing "skipped — already running" entry
-        # every scheduled night a manual run overlaps. NOTE: this must not
-        # skip the daily-core stage below — it runs regardless.
+        # Skip if a manual run / DEV backfill is in flight (e.g. the user
+        # clicked "Run Bot Now" shortly before the scheduled time). The lock
+        # check in run_cycle() also guards against this, but checking here too
+        # avoids logging a confusing "skipped — already running" entry every
+        # scheduled night a manual run overlaps — and lets this tick return
+        # promptly instead of blocking behind a multi-minute DEV backfill.
+        # The scheduled cycle itself is DEFERRED, never dropped: the
+        # fire-and-forget retry waits for the lock (bounded) and then runs
+        # the same run_cycle. NOTE: this must not skip the daily-core stage
+        # below — it runs regardless.
         if _run_cycle_lock.locked():
-            logger.info("Sim scheduler: skipping scheduled run — a cycle is already in progress")
+            logger.info("Sim scheduler: a cycle is already in progress — deferring "
+                        "the scheduled run (never dropped)")
+            _schedule_deferred_retry(run_cycle, label="Sim scheduler cycle",
+                                     lock=_run_cycle_lock)
         else:
             result = await run_cycle()
             if result.get("skipped"):
@@ -4069,7 +4162,8 @@ async def _scheduler_loop():
 async def _daily_monthly_snapshot_loop():
     # Imported here (not at module top) to avoid a circular import:
     # monthly imports market/screener lazily at call time.
-    from .monthly import deposit_allowance, refresh_holdings, take_snapshot
+    from .monthly import (_rebalance_lock, deposit_allowance, refresh_holdings,
+                         take_snapshot)
 
     """Background loop that marks the Monthly qv-mom portfolio once a day.
 
@@ -4120,7 +4214,18 @@ async def _daily_monthly_snapshot_loop():
                 logger.warning("Monthly daily scheduler: refresh errors: %s", refresh["errors"])
             snap = await take_snapshot()
             if snap.get("skipped"):
-                logger.info("Monthly daily scheduler: snapshot skipped — %s", snap.get("reason"))
+                reason = snap.get("reason", "")
+                if "rebalance" in reason:
+                    # A DEV backfill or manual rebalance holds the lock (a
+                    # mark racing it mid-execution would distort the curve).
+                    # The day's mark is DEFERRED, never dropped: a delayed
+                    # mark beats a hole in the equity curve.
+                    logger.warning("Monthly daily scheduler: mark deferred — %s", reason)
+                    _schedule_deferred_retry(take_snapshot,
+                                             label="Monthly daily mark",
+                                             lock=_rebalance_lock)
+                else:
+                    logger.info("Monthly daily scheduler: snapshot skipped — %s", reason)
             else:
                 logger.info("Monthly daily scheduler: snapshot equity=%.2f", snap.get("total_equity", 0))
         except Exception as e:
@@ -4149,11 +4254,307 @@ def stop_scheduler():
     if _daily_snapshot_task and not _daily_snapshot_task.done():
         _daily_snapshot_task.cancel()
     _daily_snapshot_task = None
+    # Deferred scheduled retries belong to the scheduler lifecycle: a
+    # shutdown must not leave a task that could fire a cycle afterwards.
+    for task in list(_deferred_retry_tasks):
+        task.cancel()
+    _deferred_retry_tasks.clear()
 
 
 # ---------------------------------------------------------------------------
 # Interactive LLM chat (sim portfolio manager)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Pending chat proposals (Phase 3, slice 3D): an [[ACTION]] block only
+# PROPOSES trades — they execute solely when the user explicitly confirms the
+# proposal (POST /api/sim/chat/confirm → confirm_chat_proposal). The registry
+# is in-memory on purpose: an unconfirmed proposal books NOTHING (no stamp,
+# no ledger row, no snapshot, no trade) and dies with the process — a reload
+# drops it and a confirm then 404s with an honest reason.
+# ---------------------------------------------------------------------------
+
+# A pending proposal expires after this long; afterwards confirm/reject
+# answer 404 and the UI must ask the LLM again.
+_PROPOSAL_TTL_SECONDS = 30 * 60
+# Registry cap: beyond this many pending proposals the OLDEST is evicted.
+_PROPOSAL_CAP = 20
+
+# proposal_id -> proposal dict (built by _build_chat_proposal).
+_pending_proposals: dict[str, dict] = {}
+_pending_proposals_lock: asyncio.Lock = asyncio.Lock()
+
+
+class ProposalNotFound(LookupError):
+    """The proposal id is unknown or expired — confirm/reject answer 404."""
+
+
+class ProposalConfigChanged(Exception):
+    """The effective run configuration moved since the proposal — 409."""
+
+
+def _proposal_expired(proposal: dict) -> bool:
+    """TTL check against the proposal's frozen parse-time ``decided_at``."""
+    try:
+        decided_at = datetime.fromisoformat(proposal["decided_at"])
+        age = (_utcnow() - decided_at).total_seconds()
+    except Exception:  # noqa: BLE001 — a malformed entry fails safe (stale)
+        return True
+    return age > _PROPOSAL_TTL_SECONDS
+
+
+async def _register_proposal(proposal: dict) -> dict:
+    """Store one proposal, sweeping expired entries and enforcing the cap
+    (oldest first — dict insertion order)."""
+    async with _pending_proposals_lock:
+        for pid in [pid for pid, p in _pending_proposals.items()
+                    if _proposal_expired(p)]:
+            _pending_proposals.pop(pid, None)
+        _pending_proposals[proposal["proposal_id"]] = proposal
+        while len(_pending_proposals) > _PROPOSAL_CAP:
+            oldest = next(iter(_pending_proposals))
+            logger.info("Chat proposal %s evicted (pending cap %d reached)",
+                        oldest, _PROPOSAL_CAP)
+            _pending_proposals.pop(oldest, None)
+    return proposal
+
+
+async def _pop_pending_proposal(proposal_id: str) -> dict:
+    """Remove and return the pending proposal, or raise ProposalNotFound.
+
+    Unknown AND expired both mean "not found" to the caller (the entry is
+    dropped either way, so a stale id can never be confirmed twice).
+    """
+    async with _pending_proposals_lock:
+        proposal = _pending_proposals.pop(proposal_id, None)
+    if proposal is None or _proposal_expired(proposal):
+        raise ProposalNotFound("proposal not found or expired")
+    return proposal
+
+
+# The preview keys exposed on the wire. The internal plan computed by
+# _action_preview additionally carries the exact execution params
+# (``target_shares`` / ``budget``) the confirm executor feeds to
+# _exec_sell / _exec_buy — same math, never re-derived.
+_CHAT_PREVIEW_KEYS = ("feasible", "issue", "price", "est_shares", "est_value",
+                      "est_cash_after", "est_position_value_after")
+
+
+async def _action_preview(action: dict, valuation: dict | None = None,
+                          acc: SimAccount | None = None) -> dict:
+    """Validate + size ONE chat action against the CURRENT state.
+
+    This is the SINGLE source of the per-action feasibility/size math: the
+    proposal builder calls it to estimate what a confirm would do, and the
+    confirm executor calls it again with FRESH state to re-validate right
+    before executing — the preview can never diverge from the execution rules
+    because both run this exact code (prices/cash/positions may move between
+    proposal and confirm; the confirm response then shows the fresh numbers).
+
+    Returns a plan dict with the wire preview fields (``feasible``, ``issue``,
+    ``price``, ``est_shares``, ``est_value``, ``est_cash_after``,
+    ``est_position_value_after``) plus the execution params (``target_shares``
+    for SELL, ``budget`` for BUY). ``issue`` is a machine-readable skip reason
+    when not feasible: "no price", "no position", "insufficient cash",
+    "position at max", "budget < 1".
+    """
+    ticker = str(action.get("ticker", ""))
+    act = str(action.get("action", "")).upper()
+    if valuation is None:
+        valuation = await valuate()
+    if acc is None:
+        acc = await _account()
+    plan: dict[str, Any] = {
+        "feasible": False, "issue": None, "price": None,
+        "est_shares": None, "est_value": None, "est_cash_after": None,
+        "est_position_value_after": None,
+        "target_shares": None, "budget": None,
+    }
+    price = await _latest_close(ticker)
+    plan["price"] = price
+    if price is None or price <= 0:
+        plan["issue"] = "no price"
+        return plan
+
+    total_equity = valuation["total_equity"]
+    min_cash = total_equity * (settings.sim_min_cash_pct / 100)
+    max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+
+    async with Session() as s:
+        pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
+
+    if act == "SELL":
+        if pos is None or pos.shares <= 0:
+            plan["issue"] = "no position"
+            return plan
+        # Optional partial size: "shares" (exact) or "amount" (dollars).
+        target: float | None = None
+        if "shares" in action:
+            target = action["shares"]
+        elif "amount" in action:
+            target = action["amount"] / price
+        est_shares = pos.shares if target is None else min(target, pos.shares)
+        if est_shares <= 0:
+            plan["issue"] = "budget < 1"
+            return plan
+        proceeds = est_shares * price
+        plan.update(
+            feasible=True, target_shares=est_shares,
+            est_shares=est_shares, est_value=round(proceeds, 2),
+            est_cash_after=round(acc.cash + proceeds, 2),
+            est_position_value_after=round((pos.shares - est_shares) * price, 2),
+        )
+        return plan
+
+    if act == "BUY":
+        # Normally the cash reserve is a hard floor. The user can explicitly
+        # authorise spending it via "use_reserve": true — then the buy may
+        # spend down to zero cash.
+        floor = 0.0 if action.get("use_reserve") else min_cash
+        if acc.cash < floor:
+            plan["issue"] = "insufficient cash"
+            return plan
+        current_value = (pos.shares * price) if pos else 0.0
+        if current_value >= max_position_value:
+            plan["issue"] = "position at max"
+            return plan
+        max_budget = min(acc.cash - floor, max_position_value - current_value)
+        # Optional partial size: "shares" or "amount" (dollars), clamped to
+        # the risk-limited budget so cash/position limits are never breached.
+        if "shares" in action:
+            budget = min(max_budget, action["shares"] * price)
+        elif "amount" in action:
+            budget = min(max_budget, action["amount"])
+        else:
+            budget = max_budget
+        if budget < 1:
+            plan["issue"] = "budget < 1"
+            return plan
+        # Same fractional-share floor as _exec_buy (never round up past budget).
+        est_shares = math.floor(budget / price * 10000) / 10000
+        if est_shares < 0.0001:
+            plan["issue"] = "budget < 1"
+            return plan
+        cost = est_shares * price
+        plan.update(
+            feasible=True, budget=budget,
+            est_shares=est_shares, est_value=round(cost, 2),
+            est_cash_after=round(acc.cash - cost, 2),
+            est_position_value_after=round(current_value + cost, 2),
+        )
+        return plan
+
+    plan["issue"] = "unknown action"
+    return plan
+
+
+async def _build_chat_proposal(actions: list[dict], cfg_at_start: dict,
+                               decided_at: datetime) -> dict:
+    """Build + register ONE pending proposal for a parsed [[ACTION]] block.
+
+    Shape: {"proposal_id": uuid4 hex, "decided_at": <parse-time freeze, rule 7,
+    as an ISO string so the proposal is JSON-serializable end-to-end (SSE
+    included)>, "config": <the turn's cfg_at_start, so a confirm can compare>,
+    "actions": [<parsed action fields> + {"preview": <_action_preview against
+    the CURRENT state>}]}. Estimates only — the confirm executor re-validates
+    with fresh state.
+    """
+    proposal: dict[str, Any] = {
+        "proposal_id": uuid.uuid4().hex,
+        "decided_at": decided_at.isoformat(),
+        "config": cfg_at_start,
+        "actions": [],
+    }
+    valuation = await valuate()
+    acc = await _account()
+    for action in actions:
+        plan = await _action_preview(action, valuation, acc)
+        proposal["actions"].append({
+            **action,
+            "preview": {k: plan[k] for k in _CHAT_PREVIEW_KEYS},
+        })
+    await _register_proposal(proposal)
+    return proposal
+
+
+async def confirm_chat_proposal(proposal_id: str) -> dict:
+    """Execute ONE pending chat proposal (the user explicitly confirmed it).
+
+    Flow: pop the pending entry (ProposalNotFound when unknown/expired) →
+    config gate: if the effective configuration changed since the proposal,
+    raise ProposalConfigChanged (the entry is already dropped) → else resolve
+    the stamp with the DECIDED config (the decision's configuration, not
+    confirm-time's), record the run once, execute every action through the
+    SAME validation/sizing helper the preview used — re-run against FRESH
+    prices/state per action — snapshot if anything traded, and freeze the
+    ledger with the proposal's frozen parse-time decided_at (rule 7).
+
+    Returns {"ok": True, "trades": [...], "skipped": [{"ticker", "reason"}],
+    "snapshot_taken": bool}.
+    """
+    proposal = await _pop_pending_proposal(proposal_id)
+    cfg = proposal["config"]
+    if await _config_changed(cfg):
+        raise ProposalConfigChanged(
+            "run configuration changed since the proposal — ask again")
+    decided_at = datetime.fromisoformat(proposal["decided_at"])
+    actions = proposal["actions"]
+
+    # Chat trades and marks are forward records: one paper stamp for the whole
+    # confirmed turn, resolved with the DECIDED configuration and recorded
+    # once after the config gate (a refused confirm never appears in the
+    # execution ledger).
+    stamp = await _paper_stamp(cfg, record=False)
+    await _record_run(stamp, cfg)
+
+    executed_trades: list[dict] = []
+    skipped: list[dict] = []
+    for action in actions:
+        ticker = action["ticker"]
+        act = action["action"]
+        reason = action["reason"]
+        # Fresh state per action: an earlier action in the same proposal may
+        # have moved cash/positions, so the shared math is re-run, never reused.
+        plan = await _action_preview(action, await valuate(), await _account())
+        if not plan["feasible"]:
+            logger.info("Sim chat confirm %s %s skipped: %s", act, ticker,
+                        plan["issue"])
+            skipped.append({"ticker": ticker, "reason": plan["issue"]})
+            continue
+        price = plan["price"]
+        if act == "SELL":
+            t = await _exec_sell(ticker, price, plan["target_shares"],
+                                 f"User chat: {reason}", **stamp)
+        else:
+            override_tag = " [reserve spent]" if action.get("use_reserve") else ""
+            t = await _exec_buy(ticker, price, plan["budget"],
+                                f"User chat:{override_tag} {reason}", **stamp)
+        if t:
+            executed_trades.append(t)
+        else:
+            skipped.append({"ticker": ticker, "reason": "execution refused"})
+
+    snapshot_taken = False
+    if executed_trades:
+        post_val = await valuate()
+        await _write_snapshot(post_val, **stamp)
+        snapshot_taken = True
+
+    # Rule 7: freeze this turn's actions with the PROPOSAL's parse-time stamp
+    # (best-effort — a skipped action keeps NULL fill columns, a ledger
+    # failure never fails the confirm).
+    await _freeze_llm_decisions(
+        _ledger_chat_rows(actions, executed_trades, decided_at))
+
+    return {"ok": True, "trades": executed_trades, "skipped": skipped,
+            "snapshot_taken": snapshot_taken}
+
+
+async def reject_chat_proposal(proposal_id: str) -> dict:
+    """Drop a pending proposal without executing anything (no DB writes)."""
+    await _pop_pending_proposal(proposal_id)  # ProposalNotFound when gone
+    return {"ok": True}
+
 
 _SIM_CHAT_SYSTEM_PROMPT = (
     "You are a portfolio manager for a paper-trading simulation bot. "
@@ -4169,6 +4570,10 @@ _SIM_CHAT_SYSTEM_PROMPT = (
     "   [[ACTION]]\n"
     "   {\"actions\": [{\"ticker\": \"...\", \"action\": \"BUY\"|\"SELL\", \"reason\": \"...\"}]}\n"
     "   [[/ACTION]]\n"
+    "   The actions in this block are only PROPOSED to the user: they execute "
+    "solely after the user explicitly confirms them in the UI. Never say or "
+    "imply that the trades were executed — say they are proposed and are "
+    "waiting for the user's confirmation.\n"
     "3. You may propose multiple actions in one response (e.g. sell one ticker, buy another).\n"
     "4. You can specify a partial position size per action using optional fields:\n"
     "   - \"shares\": exact number of shares to trade (e.g. 3.5).\n"
@@ -4385,8 +4790,15 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
     persistent storage, merged, sent to the LLM, and the new messages are
     saved so the thread survives page reloads.
 
-    If the LLM includes an [[ACTION]] block, executes the proposed trades.
-    Returns the text response, any executed trades, and the full history.
+    If the LLM includes an [[ACTION]] block, its actions are only PROPOSED:
+    they come back as one pending proposal (with a server-computed preview per
+    action) and execute solely via confirm_chat_proposal after the user
+    explicitly confirms. A turn that only proposes records NOTHING — no
+    stamp, no ledger row, no snapshot, no trade.
+
+    Returns {"text": display_text, "proposals": [...], "history": history}.
+    The old "trades"/"actions_executed" keys are gone: the envelope is honest
+    about the fact that this endpoint never executes.
     """
     # Load persisted history and fold in this turn's incoming messages.
     history = await _chat_history(limit=40)
@@ -4402,11 +4814,12 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
             await _append_chat_message("user", content)
 
     if not history:
-        return {"text": "No messages to send.", "trades": [], "actions_executed": False, "history": []}
+        return {"text": "No messages to send.", "proposals": [], "history": []}
 
     context = await _build_sim_chat_context()
     # The turn's configuration is captured BEFORE the (potentially slow) LLM
-    # call; the action block executes only if it did not change meanwhile.
+    # call; the proposal carries it so a confirm can detect a configuration
+    # change that happened while the proposal was pending.
     cfg_at_start = await current_config()
 
     try:
@@ -4416,16 +4829,15 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
         ] + history)
     except Exception as e:
         logger.warning("Sim chat LLM call failed: %s", e)
-        return {"text": f"LLM unavailable: {e}", "trades": [], "actions_executed": False, "history": history}
+        return {"text": f"LLM unavailable: {e}", "proposals": [], "history": history}
 
     content = out["text"]
-    # Rule 7: frozen when the response is PARSED — the ledger write below
-    # must never re-stamp it.
+    # Rule 7: frozen when the response is PARSED — a later confirm's ledger
+    # write must never re-stamp it.
     decided_at = _utcnow()
 
     # Check for action block
     actions = _parse_action_block(content)
-    executed_trades: list[dict] = []
 
     # Strip the action block from the visible text so it isn't shown to the
     # user or persisted into history.
@@ -4442,109 +4854,13 @@ async def sim_chat(messages: list[dict]) -> dict[str, Any]:
         await _append_chat_message("assistant", display_text)
         history.append({"role": "assistant", "content": display_text})
 
+    # Propose only — never execute here. The pending proposal books nothing;
+    # confirm_chat_proposal is the sole execution path.
+    proposals: list[dict] = []
     if actions:
-        # Chat trades and marks are forward records: one paper stamp for the
-        # turn, threaded explicitly (a refusal never stamps a changed config).
-        # Resolve without recording: a turn REFUSED by the config gate must
-        # not appear in the execution ledger. Recorded once after the gate.
-        stamp = await _paper_stamp(cfg_at_start, record=False)
-        if await _config_changed(cfg_at_start):
-            return {"text": display_text, "trades": [], "actions_executed": False,
-                    "history": history,
-                    "skipped": "run configuration changed mid-run — retry"}
-        await _record_run(stamp, cfg_at_start)
-        # Execute the proposed actions
-        valuation = await valuate()
-        total_equity = valuation["total_equity"]
-        min_cash = total_equity * (settings.sim_min_cash_pct / 100)
-        max_position_value = total_equity * (settings.sim_max_position_pct / 100)
+        proposals.append(await _build_chat_proposal(actions, cfg_at_start, decided_at))
 
-        for action in actions:
-            ticker = action["ticker"]
-            act = action["action"]
-            reason = action["reason"]
-
-            price = await _latest_close(ticker)
-            if price is None or price <= 0:
-                logger.warning("Sim chat action skipped %s: no price", ticker)
-                continue
-
-            if act == "SELL":
-                # Optional partial size: "shares" (exact) or "amount" (dollars).
-                target_shares: float | None = None
-                if "shares" in action:
-                    target_shares = action["shares"]
-                elif "amount" in action:
-                    target_shares = action["amount"] / price
-                t = await _exec_sell(ticker, price, target_shares,
-                                     f"User chat: {reason}", **stamp)
-                if t:
-                    executed_trades.append(t)
-                    valuation = await valuate()
-                    total_equity = valuation["total_equity"]
-                    min_cash = total_equity * (settings.sim_min_cash_pct / 100)
-                    max_position_value = total_equity * (settings.sim_max_position_pct / 100)
-
-            elif act == "BUY":
-                acc = await _account()
-                # Normally the cash reserve is a hard floor. The user can
-                # explicitly authorise spending it via "use_reserve": true in
-                # the chat action — then we allow buying down to zero cash.
-                floor = 0.0 if action.get("use_reserve") else min_cash
-                if acc.cash < floor:
-                    logger.info("Sim chat BUY %s skipped: cash %.2f < floor %.2f (reserve override=%s)",
-                                ticker, acc.cash, floor, bool(action.get("use_reserve")))
-                    continue
-
-                async with Session() as s:
-                    pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
-                current_value = (pos.shares * price) if pos else 0
-                if current_value >= max_position_value:
-                    logger.info("Sim chat BUY %s skipped: position at max", ticker)
-                    continue
-
-                max_budget = min(acc.cash - floor, max_position_value - current_value)
-
-                # Optional partial size: "shares" or "amount" (dollars). Clamp
-                # to the risk-limited budget so we never breach cash/position limits.
-                if "shares" in action:
-                    budget = min(max_budget, action["shares"] * price)
-                elif "amount" in action:
-                    budget = min(max_budget, action["amount"])
-                else:
-                    budget = max_budget
-
-                if budget < 1:
-                    continue
-
-                override_tag = " [reserve spent]" if action.get("use_reserve") else ""
-                t = await _exec_buy(ticker, price, budget,
-                                    f"User chat:{override_tag} {reason}", **stamp)
-                if t:
-                    executed_trades.append(t)
-                    valuation = await valuate()
-                    total_equity = valuation["total_equity"]
-                    min_cash = total_equity * (settings.sim_min_cash_pct / 100)
-                    max_position_value = total_equity * (settings.sim_max_position_pct / 100)
-
-        # Take a snapshot after chat-driven trades
-        if executed_trades:
-            post_val = await valuate()
-            await _write_snapshot(post_val, **stamp)
-
-        # Rule 7: freeze this turn's actions (best-effort — a skipped action
-        # keeps NULL fill columns, a ledger failure never fails the turn).
-        await _freeze_llm_decisions(
-            _ledger_chat_rows(actions, executed_trades, decided_at))
-
-        return {
-            "text": display_text,
-            "trades": executed_trades,
-            "actions_executed": True,
-            "history": history,
-        }
-
-    return {"text": display_text, "trades": [], "actions_executed": False, "history": history}
+    return {"text": display_text, "proposals": proposals, "history": history}
 
 
 async def sim_chat_stream(messages: list[dict]):
@@ -4554,8 +4870,9 @@ async def sim_chat_stream(messages: list[dict]):
       - {"type": "delta", "text": "..."}: raw LLM content chunks (may include
         the ``[[ACTION]]`` block as it is generated — the frontend will swap the
         raw text for the stripped display_text when ``done`` arrives).
-      - {"type": "done", "text": display_text, "trades": [...],
-         "actions_executed": bool, "raw": full_raw_text, "history": [...]}
+      - {"type": "done", "text": display_text, "proposals": [...],
+         "raw": full_raw_text, "history": [...]} (plus "error" on the error
+        path).
 
     Persistence (user message, assistant display_text) happens AFTER the LLM
     stream completes, so a refresh mid-stream leaves the previous state intact
@@ -4563,6 +4880,10 @@ async def sim_chat_stream(messages: list[dict]):
 
     If the LLM stream errors out after yielding some text, a partial ``done``
     event is emitted with ``error`` set, so the frontend can show what arrived.
+
+    Like sim_chat, this only PROPOSES: an [[ACTION]] block becomes a pending
+    proposal in the done event; execution happens solely via
+    confirm_chat_proposal after explicit user confirmation.
     """
     history = await _chat_history(limit=40)
     new_user_contents: list[str] = []
@@ -4581,8 +4902,7 @@ async def sim_chat_stream(messages: list[dict]):
         yield {
             "type": "done",
             "text": "No messages to send.",
-            "trades": [],
-            "actions_executed": False,
+            "proposals": [],
             "raw": "",
             "history": [],
         }
@@ -4590,7 +4910,8 @@ async def sim_chat_stream(messages: list[dict]):
 
     context = await _build_sim_chat_context()
     # The turn's configuration is captured BEFORE the (potentially slow) LLM
-    # stream; the action block executes only if it did not change meanwhile.
+    # stream; the proposal carries it so a confirm can detect a configuration
+    # change that happened while the proposal was pending.
     cfg_at_start = await current_config()
     full_parts: list[str] = []
     error_msg: str | None = None
@@ -4640,8 +4961,7 @@ async def sim_chat_stream(messages: list[dict]):
         yield {
             "type": "done",
             "text": err_text,
-            "trades": [],
-            "actions_executed": False,
+            "proposals": [],
             "raw": "",
             "history": history,
             "error": error_msg,
@@ -4670,105 +4990,15 @@ async def sim_chat_stream(messages: list[dict]):
         await _append_chat_message("assistant", display_text)
         history.append({"role": "assistant", "content": display_text})
 
-    executed_trades: list[dict] = []
-    actions_executed = False
+    # Propose only — never execute here (same contract as sim_chat).
+    proposals: list[dict] = []
     if actions:
-        # Chat trades and marks are forward records: one paper stamp for the
-        # turn, threaded explicitly (a refusal never stamps a changed config).
-        # Resolve without recording: a turn REFUSED by the config gate must
-        # not appear in the execution ledger. Recorded once after the gate.
-        stamp = await _paper_stamp(cfg_at_start, record=False)
-        if await _config_changed(cfg_at_start):
-            yield {
-                "type": "done",
-                "text": display_text,
-                "trades": [],
-                "actions_executed": False,
-                "raw": raw_content,
-                "history": history,
-                "skipped": "run configuration changed mid-run — retry",
-            }
-            return
-        await _record_run(stamp, cfg_at_start)
-        # Execute proposed actions (same risk logic as sim_chat).
-        valuation = await valuate()
-        total_equity = valuation["total_equity"]
-        min_cash = total_equity * (settings.sim_min_cash_pct / 100)
-        max_position_value = total_equity * (settings.sim_max_position_pct / 100)
-
-        for action in actions:
-            ticker = action["ticker"]
-            act = action["action"]
-            reason = action["reason"]
-
-            price = await _latest_close(ticker)
-            if price is None or price <= 0:
-                logger.warning("Sim chat action skipped %s: no price", ticker)
-                continue
-
-            if act == "SELL":
-                target_shares: float | None = None
-                if "shares" in action:
-                    target_shares = action["shares"]
-                elif "amount" in action:
-                    target_shares = action["amount"] / price
-                t = await _exec_sell(ticker, price, target_shares,
-                                     f"User chat: {reason}", **stamp)
-                if t:
-                    executed_trades.append(t)
-                    valuation = await valuate()
-                    total_equity = valuation["total_equity"]
-                    min_cash = total_equity * (settings.sim_min_cash_pct / 100)
-                    max_position_value = total_equity * (settings.sim_max_position_pct / 100)
-
-            elif act == "BUY":
-                acc = await _account()
-                floor = 0.0 if action.get("use_reserve") else min_cash
-                if acc.cash < floor:
-                    logger.info("Sim chat BUY %s skipped: cash %.2f < floor %.2f",
-                                ticker, acc.cash, floor)
-                    continue
-
-                async with Session() as s:
-                    pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
-                current_value = (pos.shares * price) if pos else 0
-                if current_value >= max_position_value:
-                    logger.info("Sim chat BUY %s skipped: position at max", ticker)
-                    continue
-
-                max_budget = min(acc.cash - floor, max_position_value - current_value)
-                if "shares" in action:
-                    budget = min(max_budget, action["shares"] * price)
-                elif "amount" in action:
-                    budget = min(max_budget, action["amount"])
-                else:
-                    budget = max_budget
-                if budget < 1:
-                    continue
-
-                override_tag = " [reserve spent]" if action.get("use_reserve") else ""
-                t = await _exec_buy(ticker, price, budget,
-                                    f"User chat:{override_tag} {reason}", **stamp)
-                if t:
-                    executed_trades.append(t)
-                    valuation = await valuate()
-                    total_equity = valuation["total_equity"]
-                    min_cash = total_equity * (settings.sim_min_cash_pct / 100)
-                    max_position_value = total_equity * (settings.sim_max_position_pct / 100)
-
-        if executed_trades:
-            post_val = await valuate()
-            await _write_snapshot(post_val, **stamp)
-        # Rule 7: freeze this turn's actions, exactly like sim_chat.
-        await _freeze_llm_decisions(
-            _ledger_chat_rows(actions, executed_trades, decided_at))
-        actions_executed = True
+        proposals.append(await _build_chat_proposal(actions, cfg_at_start, decided_at))
 
     yield {
         "type": "done",
         "text": display_text,
-        "trades": executed_trades,
-        "actions_executed": actions_executed,
+        "proposals": proposals,
         "raw": raw_content,
         "history": history,
         **({"error": error_msg} if error_msg else {}),

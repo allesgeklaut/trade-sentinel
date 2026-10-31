@@ -366,14 +366,31 @@ class TestChatActionLedger:
 
         result = await sim.sim_chat([{"role": "user", "content": "rebalance"}])
 
-        # The chat payload is unchanged by the ledger.
-        assert result["actions_executed"] is True
-        assert [(t["ticker"], t["side"]) for t in result["trades"]] == [
-            ("AAA", "SELL"), ("BBB", "BUY")]
-        assert result["trades"][0]["shares"] == pytest.approx(5.0)
-        assert result["trades"][1]["shares"] == pytest.approx(20.0)
+        # Slice 3D: the turn only PROPOSED — honest envelope, no ledger rows,
+        # no new trades; the unpriced ZZZ action is previewed infeasible.
+        assert "trades" not in result and "actions_executed" not in result
+        assert len(result["proposals"]) == 1
+        actions = result["proposals"][0]["actions"]
+        assert [a["ticker"] for a in actions] == ["AAA", "BBB", "ZZZ"]
+        assert actions[2]["preview"]["feasible"] is False
+        assert actions[2]["preview"]["issue"] == "no price"
+        assert await _rows(mem_db) == []
+        async with mem_db() as s:
+            assert len((await s.scalars(select(SimTrade))).all()) == 1  # the seed buy only
         assert "[[ACTION]]" not in result["text"]
         assert result["history"][-1]["role"] == "assistant"
+
+        # Confirming executes the two fillable actions and skips ZZZ with a
+        # machine-readable reason; the ledger rows are frozen at confirm time
+        # with the PROPOSAL's parse-time decided_at.
+        conf = await sim.confirm_chat_proposal(result["proposals"][0]["proposal_id"])
+        assert conf["ok"] is True
+        assert [(t["ticker"], t["side"]) for t in conf["trades"]] == [
+            ("AAA", "SELL"), ("BBB", "BUY")]
+        assert conf["trades"][0]["shares"] == pytest.approx(5.0)
+        assert conf["trades"][1]["shares"] == pytest.approx(20.0)
+        assert conf["skipped"] == [{"ticker": "ZZZ", "reason": "no price"}]
+        assert conf["snapshot_taken"] is True
 
         rows = await _rows(mem_db)
         assert [r["ticker"] for r in rows] == ["AAA", "BBB", "ZZZ"]
@@ -401,10 +418,13 @@ class TestChatActionLedger:
         assert unpriced["price"] is None
         assert unpriced["cash_after"] is None
 
-    async def test_stream_action_block_writes_a_ledger_row(self, mem_db, monkeypatch):
-        """``sim_chat_stream`` — the streaming twin of ``sim_chat`` — freezes
-        its ``[[ACTION]]`` block in the ledger exactly like the sync path, so
-        no LLM decision is lost by choosing the streamed endpoint."""
+    async def test_stream_action_block_writes_a_ledger_row_on_confirm(
+            self, mem_db, monkeypatch):
+        """``sim_chat_stream`` — the streaming twin of ``sim_chat`` — PROPOSES
+        its ``[[ACTION]]`` block in the done event; the ledger row is frozen
+        when the proposal is CONFIRMED, with ``decided_at`` still the stream's
+        parse time, so no LLM decision is lost by choosing the streamed
+        endpoint."""
         _freeze_first_call_clock(monkeypatch, _T0)
 
         async def mock_context():
@@ -431,8 +451,14 @@ class TestChatActionLedger:
         async for evt in sim.sim_chat_stream([{"role": "user", "content": "buy"}]):
             events.append(evt)
         done = next(e for e in events if e["type"] == "done")
-        assert done["actions_executed"] is True
-        assert [(t["ticker"], t["side"]) for t in done["trades"]] == [("AAA", "BUY")]
+        # The streamed turn proposes, it does not execute.
+        assert "trades" not in done and "actions_executed" not in done
+        assert len(done["proposals"]) == 1
+        assert done["proposals"][0]["actions"][0]["preview"]["feasible"] is True
+        assert await _rows(mem_db) == []  # proposing alone writes no ledger row
+
+        conf = await sim.confirm_chat_proposal(done["proposals"][0]["proposal_id"])
+        assert [(t["ticker"], t["side"]) for t in conf["trades"]] == [("AAA", "BUY")]
 
         rows = await _rows(mem_db)
         assert len(rows) == 1
@@ -553,7 +579,7 @@ class _AddAllBoomFactory:
 
 
 class TestLedgerFailureIsNonFatal:
-    async def test_raising_writer_never_fails_the_chat_turn(
+    async def test_raising_writer_never_fails_the_confirm(
             self, mem_db, monkeypatch, llm_backend, caplog):
         async def boom(rows):
             raise RuntimeError("ledger writer exploded")
@@ -572,11 +598,17 @@ class TestLedgerFailureIsNonFatal:
             '{"actions": [{"ticker": "AAA", "action": "BUY", "amount": 500.0,'
             ' "reason": "go"}]}\n[[/ACTION]]'))
 
-        with caplog.at_level(logging.ERROR, logger="trade_sentinel.sim"):
-            result = await sim.sim_chat([{"role": "user", "content": "buy AAA"}])
+        # The chat turn only proposes — the ledger failure can only surface at
+        # confirm, when the confirmed trades are already committed real state.
+        result = await sim.sim_chat([{"role": "user", "content": "buy AAA"}])
+        assert len(result["proposals"]) == 1
+        assert await _rows(mem_db) == []
 
-        assert result["actions_executed"] is True
-        assert [t["ticker"] for t in result["trades"]] == ["AAA"]
+        with caplog.at_level(logging.ERROR, logger="trade_sentinel.sim"):
+            conf = await sim.confirm_chat_proposal(result["proposals"][0]["proposal_id"])
+
+        assert conf["ok"] is True
+        assert [t["ticker"] for t in conf["trades"]] == ["AAA"]
         async with mem_db() as s:
             positions = (await s.scalars(select(SimPosition))).all()
         assert [p.ticker for p in positions] == ["AAA"]  # the trade is real state
@@ -602,11 +634,14 @@ class TestLedgerFailureIsNonFatal:
             '{"actions": [{"ticker": "AAA", "action": "BUY", "amount": 500.0,'
             ' "reason": "go"}]}\n[[/ACTION]]'))
 
-        with caplog.at_level(logging.ERROR, logger="trade_sentinel.sim"):
-            result = await sim.sim_chat([{"role": "user", "content": "buy AAA"}])
+        result = await sim.sim_chat([{"role": "user", "content": "buy AAA"}])
+        assert len(result["proposals"]) == 1
 
-        assert result["actions_executed"] is True
-        assert [t["ticker"] for t in result["trades"]] == ["AAA"]
+        with caplog.at_level(logging.ERROR, logger="trade_sentinel.sim"):
+            conf = await sim.confirm_chat_proposal(result["proposals"][0]["proposal_id"])
+
+        assert conf["ok"] is True
+        assert [t["ticker"] for t in conf["trades"]] == ["AAA"]
         assert any(r.levelno >= logging.ERROR and "ledger write" in r.getMessage().lower()
                    for r in caplog.records)
         # The trades themselves were committed before the failed ledger write.
