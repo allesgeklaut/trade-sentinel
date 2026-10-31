@@ -278,11 +278,15 @@ temperature 0; refusals/malformed outputs count as CONFIRM (fail-safe to
 the existing rule).
 
 **Authorized model.** **`deepseek-v4.1-flash-mistral`** (exact id, as it
-appears in the live hosting's model dropdown) on the owner's **Mistral**
-serving. The repo's LLM layer (`app/llm.py`) selects backends via the
-`LLM_BACKENDS` JSON (OpenAI-compatible type); the backend entry wiring is
-verified against the live server config when implementation starts (the
-server `.env` is not part of the snapshot, but the model id is pinned).
+appears in the live hosting's model dropdown), served by the owner's
+**Mistral** serving behind the LAN LiteLLM proxy at
+`http://192.168.0.46:4000` (OpenAI-compatible; the repo's LLM layer selects
+backends via the `LLM_BACKENDS` JSON). Verified from the offline sandbox on
+2026-10-31: the proxy's health endpoint answers, the sandbox's key store
+(`/opt/secrets/litellm.key`) authenticates, the model id is present in the
+proxy's `/v1/models` list, and a 1-token smoke completion at temperature 0
+returned cleanly (`finish_reason: stop`). The live server's `.env` remains
+the authority for the production wiring at deploy time.
 
 **Contamination controls** (from the Profit Mirage / Alpha Illusion /
 in-repo findings): evaluation on post-cutoff data only (and declared as
