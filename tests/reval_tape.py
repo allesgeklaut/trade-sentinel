@@ -21,7 +21,11 @@ The tape contains:
   index so the qv-mom ranking is stable yet distinct per name), in the exact
   schema ``fundamentals.load_fundamentals`` reads from the ``fundamentals``
   table;
-* a synthetic universe file (``UNIVERSE_NAME``) listing the equity tickers.
+* a synthetic universe file (``UNIVERSE_NAME``) listing the equity tickers;
+* a deliberate ONE-SESSION GAP: ``GAP_TICKER`` (T07) is missing the candle on
+  the session nearest ``GAP_ANCHOR`` (2025-10-15) that every other member
+  has — the slice-4B addendum's alignment-robustness regression trigger
+  (``tape["gap"]`` records it).
 """
 
 from __future__ import annotations
@@ -40,6 +44,15 @@ FX_PAIRS = ["GBPUSD=X", "EURUSD=X"]
 UNIVERSE_NAME = "reval-tape"
 TAPE_START = "2024-01-02"
 TAPE_END = "2026-10-02"
+
+# Slice-4B addendum: one member is deliberately MISSING one candle on a date
+# that every other member HAS (mid-window). pandas aligns the per-ticker
+# Series in ``reval._load_inputs``'s raw_close on the UNION of date indexes, so
+# this gap produces a NaN cell for GAP_TICKER on GAP_DATE — the sim arm's
+# weight reconstruction must carry the last KNOWN finite close there instead
+# of poisoning the weights (regression test in tests/test_reval_controls.py).
+GAP_TICKER = "T07"
+GAP_ANCHOR = "2025-10-15"   # the tape session nearest to this date gets the gap
 
 # Per-ticker drift regimes: (ticker, start date, daily factor). Two names
 # surge / sink at fixed dates so month-end frames genuinely re-rank. T01 is a
@@ -159,9 +172,15 @@ def make_tape(seed: int = 11) -> dict:
         "# synthetic reval tape universe (tests only)\n"
         + "\n".join(TAPE_TICKERS) + "\n"
     )
+    # the deliberate one-session gap (deterministic: nearest tape session to
+    # GAP_ANCHOR that other members have)
+    gap_ts = min(idx, key=lambda d: abs((d - pd.Timestamp(GAP_ANCHOR)).days))
+    gap_date = gap_ts.strftime("%Y-%m-%d")
+    candles[GAP_TICKER] = [r for r in candles[GAP_TICKER] if r["time"] != gap_date]
     return {"sessions": idx, "candles": candles,
             "fundamentals": fundamentals, "universe_text": universe_text,
-            "tickers": list(TAPE_TICKERS), "bench": BENCH, "fx_pairs": list(FX_PAIRS)}
+            "tickers": list(TAPE_TICKERS), "bench": BENCH, "fx_pairs": list(FX_PAIRS),
+            "gap": {"ticker": GAP_TICKER, "date": gap_date}}
 
 
 def universe_file(directory: str | Path, tape: dict) -> Path:

@@ -2570,6 +2570,7 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
                             close_preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
                             fund_preloaded: dict[str, dict[str, list[dict]]] | None = None,
                             open_preloaded: pd.DataFrame | None = None,
+                            fixed_capital: float = 0.0,
                             ) -> BacktestSummary | None:
     """DCA backtest of the monthly qv-mom-v1 strategy on stored candles.
 
@@ -2598,6 +2599,14 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
       * one equal-weight basket rebalance per fill, with the one-way cost on
         swapped notional (``settings.sim_monthly_cost_oneway``) — the same
         research-only cost model as the daily-core backtest.
+
+    ``fixed_capital`` (default ``0.0`` — bit-identical to the old behaviour)
+    is the single-shot funding hook for fixed-capital studies (Phase 4 slice
+    4B): when > 0 the monthly contributions are suppressed and one lump sum
+    of ``fixed_capital`` is funded at the window's first session. The lump
+    sits in ``parked`` until the first live rebalance deploys it, exactly
+    like a contribution, and the money-weighted IRR degenerates to the
+    single-flow annualized return over the window's calendar months.
     """
     from . import monthly as monthly_mod
     from . import fundamentals as fundamentals_mod
@@ -2746,6 +2755,16 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
     parked = 0.0     # contributions received, not yet deployed (cash: 0%)
     booked: set[tuple[int, int]] = set()
     n_contrib = 0
+    fixed = float(fixed_capital or 0.0)
+    if fixed > 0:
+        # Single-shot funding (fixed-capital studies): suppress the monthly
+        # contributions and fund one lump sum at the window's first session.
+        # The lump sits in `parked` until the first live rebalance deploys
+        # it, exactly like a contribution. At fixed == 0 nothing below
+        # changes (bit-identical: contribution passes through unchanged).
+        contribution = 0.0
+        parked += fixed
+        contributed += fixed
 
     def _settle_arrived(mark: pd.Timestamp) -> None:
         """Book every calendar month whose contribution day has arrived by
@@ -2807,26 +2826,37 @@ async def _monthly_backtest(start: str | None, end: str | None, universe: str,
 
     value = invested + parked
 
-    # money-weighted IRR: contribution * sum((1+r)^k) = final value
-    n = n_contrib
-
-    def f(r: float) -> float:
-        return contribution * sum((1.0 + r) ** k for k in range(n)) - value
-
-    lo, hi = -0.90, 1.0
-    if f(lo) > 0:
-        irr = -1.0
+    if fixed > 0:
+        # Single-flow annualized return over the window's calendar months
+        # (the money-weighted formula below assumes n equal monthly flows,
+        # which a lump sum is not).
+        n_months = len({(d.year, d.month) for d in idx})
+        irr = ((value / fixed) ** (12.0 / max(n_months, 1)) - 1.0) if value > 0 else -1.0
     else:
-        for _ in range(200):
-            mid = (lo + hi) / 2.0
-            if f(mid) < 0:
-                lo = mid
-            else:
-                hi = mid
-        irr = (1.0 + (lo + hi) / 2.0) ** 12 - 1.0
+        # money-weighted IRR: contribution * sum((1+r)^k) = final value
+        n = n_contrib
+
+        def f(r: float) -> float:
+            return contribution * sum((1.0 + r) ** k for k in range(n)) - value
+
+        lo, hi = -0.90, 1.0
+        if f(lo) > 0:
+            irr = -1.0
+        else:
+            for _ in range(200):
+                mid = (lo + hi) / 2.0
+                if f(mid) < 0:
+                    lo = mid
+                else:
+                    hi = mid
+            irr = (1.0 + (lo + hi) / 2.0) ** 12 - 1.0
 
     print(f"\n=== Monthly qv-mom backtest [{universe}] {months[0].date()}..{months[-1].date()} ===")
-    print(f"  contributions: {n} x ${contribution:,.0f} = ${contributed:,.0f}")
+    if fixed > 0:
+        print(f"  fixed capital: one lump sum ${fixed:,.0f} at the window's first session "
+              f"(monthly contributions suppressed) = ${contributed:,.0f}")
+    else:
+        print(f"  contributions: {n_contrib} x ${contribution:,.0f} = ${contributed:,.0f}")
     print(f"  final value:   ${value:,.0f}  (multiple {value / max(contributed, 1e-9):.2f}x)")
     print(f"  money-weighted IRR: {irr:.2%}/yr   avg monthly turnover: {sum(churns) / len(churns):.1%}"
           if churns else f"  money-weighted IRR: {irr:.2%}/yr   avg monthly turnover: n/a")
@@ -3015,6 +3045,7 @@ async def _daily_core_backtest(
     basket_er_min: float | None = None,
     basket_good_times: bool | None = None,
     basket_arm_sma: int | None = None,
+    fixed_capital: float = 0.0,
 ) -> BacktestSummary | None:
     """Deterministic "daily-core" backtest: the monthly qv-mom portfolio as the
     FUNDAMENTAL core, with minor candle-driven daily adjustments on top.
@@ -3077,6 +3108,15 @@ async def _daily_core_backtest(
         live engine's policy: the live paper portfolios are fee-free, which is
         why tests/test_replay_fills.py runs this replay at
         ``cost_oneway=0.0`` to compare fills with ``daily_core.backfill``.
+
+    ``fixed_capital`` (default ``0.0`` — bit-identical to the old behaviour)
+    is the single-shot funding hook for fixed-capital studies (Phase 4 slice
+    4B): when > 0 the monthly contributions are suppressed and one lump sum
+    of ``fixed_capital`` is deposited at the window's first session (into
+    ``cash``, or ``pending_cash`` under dca="monthly"), the turnover
+    bookkeeping treats that first-month deployment as a fresh contribution
+    (not churn), and the money-weighted IRR degenerates to the single-flow
+    annualized return over the window's calendar months.
     """
     from . import monthly as monthly_mod
     from . import fundamentals as fundamentals_mod
@@ -3218,6 +3258,14 @@ async def _daily_core_backtest(
             else float(cost_oneway))
     target_n = settings.sim_monthly_target_n
     hold_band = settings.sim_monthly_hold_band
+    fixed = float(fixed_capital or 0.0)
+    if fixed > 0:
+        # Single-shot funding hook (fixed-capital studies): suppress the
+        # monthly contributions; one lump sum funds at the window's first
+        # session (booked in the day loop below). At fixed == 0 every branch
+        # below is bit-identical to the old behaviour (contribution passes
+        # through unchanged).
+        contribution = 0.0
 
     # --- Crash-pause regime series (breadth + median 5d run) ---
     # Daily-frame variant of the LLM context's regime heuristic: PULLBACK =
@@ -3277,6 +3325,7 @@ async def _daily_core_backtest(
     month_sells = 0.0
     equity_month_start = 0.0
     cur_month: int | None = None
+    first_month_closed = False  # fixed-capital lump excluded from the first month's churn
 
     # Valuation closes: each ticker valued at its last valid close <= day
     # (same rule as eligible_frame). A raw close.at[d, t] treats a ticker
@@ -3658,8 +3707,12 @@ async def _daily_core_backtest(
                 # slot swaps exclude it); buys beyond the contribution are.
                 # Buys can exceed the contribution within a month (sell
                 # proceeds recycled into rebalancing) — the excess is churn.
-                churns.append(((max(month_buys - contribution, 0.0)
+                # A fixed-capital lump deployed in the window's first month is
+                # a fresh contribution there, not churn (same exclusion rule).
+                excl = fixed if (fixed > 0 and not first_month_closed) else contribution
+                churns.append(((max(month_buys - excl, 0.0)
                                 + month_sells) / 2.0) / equity_month_start)
+                first_month_closed = True
             month_buys, month_sells = 0.0, 0.0
             cur_month = d.month
             equity_month_start = cash + pending_cash + sum(
@@ -3670,7 +3723,18 @@ async def _daily_core_backtest(
         # live engine and daily_core.backfill). "monthly" parks it in
         # pending_cash until the month-end rebuild; "daily"/"rank" leave it in
         # cash so the daily deployment puts it to work immediately.
-        if d in contrib_days:
+        if fixed > 0:
+            # Single-shot funding: one lump sum at the window's first session
+            # (dca="monthly" parks it until the first rebuild, like every
+            # other contribution); monthly contributions stay suppressed.
+            if d == days_all[0]:
+                contributed += fixed
+                n_contribs += 1
+                if dca == "monthly":
+                    pending_cash += fixed
+                else:
+                    cash += fixed
+        elif d in contrib_days:
             contributed += contribution
             n_contribs += 1
             if dca == "monthly":
@@ -3946,7 +4010,8 @@ async def _daily_core_backtest(
         equity_close = round(cash + pending_cash + sum(
             (shares.get(t, 0.0) or 0.0) * (eod_px_of(t, d) or 0.0)
             for t in sorted(shares)), 2)
-        contrib_today = contribution if d in contrib_days else 0.0
+        contrib_today = (fixed if (fixed > 0 and d == days_all[0])
+                         else (contribution if d in contrib_days else 0.0))
         _record_equity(d, equity_close, contrib_today)
 
         # Contract rule 1/4: F's close only advances the trailing-stop peaks
@@ -4034,7 +4099,13 @@ async def _daily_core_backtest(
                 hi = mid
         return (1.0 + (lo + hi) / 2.0) ** 12 - 1.0
 
-    irr = irr_of(value, n_contribs)
+    if fixed > 0:
+        # Single-flow annualized return over the window's calendar months
+        # (irr_of assumes n_contribs equal monthly flows, which a lump is not).
+        n_months = len(contrib_keys)
+        irr = ((value / fixed) ** (12.0 / max(n_months, 1)) - 1.0) if value > 0 else -1.0
+    else:
+        irr = irr_of(value, n_contribs)
     cfg = (f"dca={dca} entry-gate={entry_gate} exit-cadence={exit_cadence} "
            f"crash-pause={'on' if crash_pause else 'off'} "
            f"cost={cost * 1e4:.0f}bps-oneway(research-only)"
@@ -4069,7 +4140,11 @@ async def _daily_core_backtest(
     mdd = _max_drawdown(port_eq, port_invested) / 100.0
     print(f"\n=== Daily-core backtest [{universe}] {days_all[0].date()}..{last_day.date()} ===")
     print(f"  config: {cfg}")
-    print(f"  contributions: {n_contribs} x ${contribution:,.0f} = ${contributed:,.0f}")
+    if fixed > 0:
+        print(f"  fixed capital: one lump sum ${fixed:,.0f} at the window's first session "
+              f"(monthly contributions suppressed) = ${contributed:,.0f}")
+    else:
+        print(f"  contributions: {n_contribs} x ${contribution:,.0f} = ${contributed:,.0f}")
     print(f"  final value:   ${value:,.0f}  (multiple {value / max(contributed, 1e-9):.2f}x)")
     print(f"  money-weighted IRR: {irr:.2%}/yr   Sharpe (ann): {ann_sharpe:.2f}   "
           f"max DD: {mdd:.1%}   avg monthly turnover: "
@@ -4096,6 +4171,7 @@ async def _daily_core_backtest(
             frame_cache=frame_cache, close_preloaded=close_preloaded,
             fund_preloaded=fund_preloaded,
             open_preloaded=None if close_preloaded is None else open_preloaded,
+            fixed_capital=fixed,
         )
 
     return BacktestSummary(

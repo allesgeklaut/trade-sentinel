@@ -1398,6 +1398,95 @@ share the current-membership survivorship caveat, and no LLM was
 consulted anywhere (contexts are for prompt design and prospective
 windows only — no LLM calls on history).
 
+## Phase 4B controls, study driver, uncertainty — 2026-10-31
+
+**Slice 4B code-complete, independently verified, and committed.** The
+evidence layer Phase 4 was built for: control arms, the multi-window study
+driver, the uncertainty layer, and the sim-arm alignment bug the
+orchestrator's real-data probe caught mid-slice (fixed + regression-pinned).
+
+`app/reval.py` (+~1,120 lines): **control arms** — `random_n` (seeded,
+bit-reproducible: per month-end the draw is
+`random.Random(int(sha256(f"{seed}|{month_end}")[:16], 16)).sample(sorted(eligible),
+k)` — order- and process-hash-independent, so the engine pass and the
+series-replay pass see identical picks) and `equal_weight` (the full
+eligible set each month-end), both driven through the monthly engine
+ITSELF via a swapped `pick_portfolio` (identical eligibility frames, fill
+sessions, contribution settling and cost model by construction; the
+monkeypatch is restored in `finally`), with the degenerate top-ranked
+protocol pinned **bit-identically** to the zero-band monthly arm and every
+control pick asserted ⊆ that month-end's eligible set. Controls run via
+`run_reval_async(cfg, controls=True)` and the study; the plain `run` path
+keeps the declared `NotImplementedError` (pinned by the 4A tests, which
+were outside this slice's writable scope). **The study driver**
+(`reval-study/1`): predeclared windows (`full`/`yearly`/`halves` derived
+from the session axis, no arbitrary thresholds, identical spans merged),
+cases (`contribution`, `fixed` — one lump at the window's first session),
+the predeclared 7-variant OFAT grid (stock bps {5,20} with fx scaled
+proportionally, cash yield {0.00,0.05}, mom residual, target_n 20,
+hold_band 40; monthly/daily_core arms only), `configs_tried` COMPUTED per
+window×case (`1 + n_seeds + 7`) and in total, ONE `_load_inputs` over the
+full span (pinned by a counting test) and one frame cache per momentum
+variant, the DCA arm's realized TWR/vol recorded per window as regime
+CONTEXT (numbers, not labels), byte-identical determinism (wall-clock
+printed by the CLI, never stored). **The uncertainty layer**: random_n
+seed dispersion (mean/std/P5/P50/P95 per summary metric; each predeclared
+arm's percentile inside the random_n distribution) and circular block
+bootstrap 95% CIs (block 21 sessions, B replicates, deterministic seed;
+linear-interpolation percentiles) for annualized excess return, excess
+Sharpe and vol. **Fixed capital**: `RevalConfig.fixed_capital` +
+`opening_lump`; dca buys the benchmark once at the first session, sim
+takes `start_cash` with zero allowance, the factor engines take the new
+additive hook. **The addendum fix**: the sim arm's `last_known` mark
+update now accepts only finite values (the union-index alignment that
+leaked NaN marks is guarded at the source; `concentration_metrics` stays
+pure), the tape gained a deliberate one-session gap (`T07` missing the
+session nearest 2025-10-15), and the regression test asserts the NaN
+cell exists, that the sim really held the gapped ticker, and that every
+arm's weights stay finite across the gap — the test cannot pass vacuously.
+
+`app/optimize.py` (+97/−21, every "−" a re-indentation): the ONE additive
+`fixed_capital: float = 0.0` hook on `_monthly_backtest` and
+`_daily_core_backtest` (monthly contributions suppressed when > 0; the
+lump funds once at the window's first session — parked like any
+contribution; the money-weighted IRR degenerates to the single-flow
+annualized return; the first-month lump excluded from churn exactly as
+fresh contributions are). Default `0.0` proven bit-identical by the
+golden suites AND an explicit parity test (no-arg vs `fixed_capital=0.0`
+→ identical summaries including trade ledgers).
+
+Independent verification: the orchestrator's own runs — full offline
+regression **1612 passed** in the main tree (1596 + 16 new), golden
+parity suites green, ruff clean on all touched files; a REAL-DATA study
+smoke against the snapshot (2022-2024, `full,halves` × `contribution`,
+seeds 2, B=200: 6m22s wall-clock, `configs_tried` 9 computed) that
+(1) verified the NaN fix on the exact window that caught it (sim
+`mean_top_weight` 0.1095 / `mean_hhi` 0.0923, finite), (2) reproduced the
+Phase 4A single-run numbers to the decimal on the full window (the
+driver and the standalone harness agree), and (3) produced the first
+real control-arm evidence: random_n +13.0%/yr (Sharpe 0.65) between dca
++6.1% and monthly +26.0%, equal_weight +10.0%/yr with the lowest
+active-arm maxDD (12.8%) — the skill-vs-selection-bias sandwich working
+as designed; the snapshot's row counts re-verified unchanged after the
+run. Declared deviations (all verified justified): the plain-path
+`NotImplementedError` retained (pinned by 4A tests outside scope); the
+OFAT grid has the 7 enumerated variants; the degenerate parity anchor is
+`hold_band == target_n` (a zero-band monthly is pathological full churn);
+the per-month-end RNG derivation (required by the two-pass design); the
+per-seed study entries embed metrics only (JSON size at 100 seeds);
+wall-clock printed not stored (determinism); `--fixed-capital` default
+12000 (the brief did not fix an amount).
+
+Honesty limits for the 4C report: windows overlap by construction (they
+are views of the same data, not independent samples); the
+monthly-cadence arms incl. both controls are `marks_only` (step NAV —
+intra-month vol/drawdown understated, bootstrap CIs inherit that);
+equal_weight's between-rebalance drift flows through fill-to-fill period
+returns (rebalance cost on membership changes only); the fixed case
+changes the funding schedule (XIRR/TWR compare differently across cases
+than within one); survivorship caveat unchanged (absolute vs dca
+biased, cross-arm deltas robust).
+
 ## References
 
 - [SEC Apple companyfacts](https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json)
