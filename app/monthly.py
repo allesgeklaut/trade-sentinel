@@ -2055,6 +2055,26 @@ async def run_monthly_cycle(now: datetime | None = None) -> dict[str, Any]:
         except Exception as e:  # noqa: BLE001 — never break the rebuild
             logger.error("Monthly sell-layer type-C step failed: %s", e, exc_info=True)
             c_result = {"error": f"{type(e).__name__}: {e}"}
+    # --- Type D (app/newsagent.py): the SHADOW material-news scan, declared
+    # order AFTER the type-C step, EVERY trading night. One agent run per
+    # monthly-book name; the ledger rows (event_type "D", engine "monthly")
+    # fill NULL forever in the shadow phase — NO execution authority
+    # (docs/sell-news-agent-design-2026-11-01.md). NOT gated on
+    # sim_monthly_llm_sells (that knob owns A/B/C only): D's own knob is
+    # SEARXNG_MCP_URL via the knob-off convention inside run_news_scan
+    # (status "disabled" — zero rows, no error). Fail-safe: any failure is
+    # logged and never breaks the rebuild below.
+    try:
+        from . import newsagent
+        d_result = await newsagent.run_news_scan(
+            out_dir=settings.sim_news_out_dir, dry_run=False)
+        logger.info("Monthly type-D shadow news scan: status=%s as_of=%s "
+                    "contexts=%d rows=%d deduped=%d errors=%d",
+                    d_result.get("status"), d_result.get("as_of"),
+                    d_result.get("n_contexts", 0), d_result.get("n_ledger_rows", 0),
+                    d_result.get("n_deduped", 0), d_result.get("n_errors", 0))
+    except Exception as e:  # noqa: BLE001 — never break the rebuild
+        logger.error("Monthly type-D news scan failed: %s", e, exc_info=True)
     if not _rebalance_lock.locked():
         result = await run_rebalance(now=now)
     else:

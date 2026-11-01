@@ -1,6 +1,12 @@
 # Type-D: the material-news agent — design note v2 (2026-11-01)
 
-Status: DESIGN, pre-wiring. SUPERSEDES
+Status: WIRED 2026-11-01 (owner approval). Shadow-first: D accumulates as
+its own track beside A/B/C; fill columns NULL; the predeclared promotion
+rule unchanged. First-night acceptance checklist: tools/list re-pin (done
+2026-11-01, recorded above); observe from the first wired night's rows
+whether the Mistral route honors temperature 0.6; watch for hang-guard
+anomalies (firing is an anomaly to investigate, never normal operation).
+SUPERSEDES
 `docs/sell-news-exit-design-2026-10-31.md` (kept verbatim for provenance).
 Owner-driven (2026-10-31/11-01): "a real agent with native function calling
 … I want the model to decide what to fetch and so on — relying on the LLM

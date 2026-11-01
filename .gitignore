@@ -8,3 +8,4 @@ data/
 
 # Playwright agent artifacts (see AGENTS.md)
 .playwright-out/
+news-out/

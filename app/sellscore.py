@@ -51,6 +51,12 @@ stored candles/trades/rebalances, deterministic byte-identical modulo the
 declared wall-clock field (``generated_at``). It never raises on a single row's
 problems — the row is counted + skipped with a reason.
 
+Type-D rows (the shadow material-news scan, app/newsagent.py) appear in the
+decision history with status "shadow" but are NEVER scored, NEVER bucketed
+into A/B/C and NEVER counted in the per-type or overall stats (the D scorer
+does not exist in the shadow phase; ``n_d_shadow`` counts them); any other
+unknown event_type is skipped-with-reason the same way.
+
 Costs/cash conventions: ``reval.CostConfig()``'s declared rates (the same
 stock bps + cash yield the study used), imported from reval, not redefined.
 Cash yield accrues COMPOUNDED per session — ``(1 + cash_yield_annual) **
@@ -455,12 +461,9 @@ async def score_sell_decisions(db=None, *, now: datetime | None = None) -> dict:
                                       "skipped": [], "n_fail_safe": 0}
                                   for t in ("A", "B", "C")}
     decisions: list[dict] = []
+    n_d_shadow = 0
     for row in rows:
-        et = row.event_type if row.event_type in per_type else "A"
-        bucket = per_type[et]
-        bucket["rows"].append(row)
-        if row.fail_safe:
-            bucket["n_fail_safe"] += 1
+        et = row.event_type
         base = {
             "event_id": row.event_id, "session_date": row.session_date,
             "decided_at": row.decided_at.isoformat(), "account": row.engine,
@@ -469,6 +472,30 @@ async def score_sell_decisions(db=None, *, now: datetime | None = None) -> dict:
             "fail_safe": bool(row.fail_safe), "fail_reason": row.fail_reason,
             "rationale": (row.rationale or "")[:RATIONALE_LEN],
         }
+        if et not in per_type:
+            # Type-D shadow rows (and any OTHER unknown event_type) are
+            # visible and honest in the history but NEVER scored, NEVER
+            # bucketed into A/B/C, NEVER counted in the per-type or overall
+            # stats — the old silent else-"A" fallback let D rows pollute
+            # the A bucket.
+            if et == "D":
+                n_d_shadow += 1
+                decisions.append({**base, "status": "shadow", "delta": None,
+                                  "window": None, "branch": None,
+                                  "detail": None,
+                                  "skip_reason": "type-D shadow row — scoring "
+                                                 "pending the D scorer"})
+            else:
+                decisions.append({**base, "status": "skipped", "delta": None,
+                                  "window": None, "branch": None,
+                                  "detail": None,
+                                  "skip_reason": f"unknown event_type {et!r} — "
+                                                 "not scored"})
+            continue
+        bucket = per_type[et]
+        bucket["rows"].append(row)
+        if row.fail_safe:
+            bucket["n_fail_safe"] += 1
         try:
             if et == "A":
                 res = _score_a(row, candles, sells, costs)
@@ -535,6 +562,7 @@ async def score_sell_decisions(db=None, *, now: datetime | None = None) -> dict:
         "generated_at": generated_at,
         "data_as_of": data_as_of,
         "read_only": True,
+        "n_d_shadow": n_d_shadow,
         "costs": {
             "stock_oneway_bps": costs.stock_oneway_bps,
             "etf_oneway_bps": costs.etf_oneway_bps,

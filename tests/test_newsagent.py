@@ -15,7 +15,6 @@ from app import llm as llm_mod
 from app import newsagent
 from app.mcpclient import McpClient, McpError, _parse_response
 
-
 # ---------------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------------

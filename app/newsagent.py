@@ -22,7 +22,9 @@ Shadow-first: every run is recorded in the ``LlmSellDecision`` ledger
 (event_type "D", engine "monthly", the fill columns NULL forever in the
 shadow phase) with NO execution authority; the promotion rule lives in
 the design note. Nightly cadence: one run per monthly-book name, right
-after the type-C step (``python -m app.newsagent news``).
+after the type-C step (``monthly.run_monthly_cycle`` calls
+``run_news_scan``; the ``python -m app.newsagent news`` CLI is a thin
+wrapper over the same scan core).
 """
 
 from __future__ import annotations
@@ -35,12 +37,11 @@ import re
 import time
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
 
 from sqlalchemy import func, select, text
 
 from .config import settings
-from .db import Candle, Fundamental, MonthlyPosition, Session
+from .db import Candle, Fundamental, LlmSellDecision, MonthlyPosition, Session
 from .llm import chat as llm_chat
 from .mcpclient import McpClient, McpError
 from .selllayer import _record_decision as _record_ledger_row
@@ -285,7 +286,7 @@ async def run_agent(context: dict, *, event_id: str,
                         for c in calls],
                 })
                 outcomes = await _execute_calls(mcp, calls)
-                for call, outcome in zip(calls, outcomes):
+                for call, outcome in zip(calls, outcomes, strict=False):
                     tool_calls += 1
                     any_success = any_success or outcome["ok"]
                     any_mcp_error = any_mcp_error or outcome["kind"] == "mcp"
@@ -448,62 +449,167 @@ def _log(record: dict, path: Path) -> None:
                            separators=(",", ":")) + "\n")
 
 
-async def _cmd_news(args) -> int:
-    as_of = args.as_of or await _last_session_date()
+async def run_news_scan(*, as_of: str | None = None, limit: int | None = None,
+                        out_dir: str = "news-out", dry_run: bool = False,
+                        generated_at: str | None = None, transport=None,
+                        mcp=None) -> dict:
+    """The nightly type-D scan core (extracted from the ``news`` CLI command,
+    which stays a thin wrapper; wired into ``monthly.run_monthly_cycle``):
+    one agent run per monthly-book name for the session ``as_of`` (default:
+    the DB's last stored candle session), recorded as shadow ledger rows
+    (event_type "D", engine "monthly" — the fill columns stay NULL forever
+    in the shadow phase, NO execution authority).
+
+    Semantics (unchanged from the CLI driver):
+
+    * no stored sessions -> status "no-sessions", nothing written;
+    * knob off (``not dry_run and not settings.searxng_mcp_url``) ->
+      status "disabled": the knob-off convention — DISABLED, not broken,
+      zero DB writes, no error;
+    * scan-time dedupe (mirrors type C, selllayer.py): a CONSULTED row
+      (parsed AND NOT fail-safe) with event_id ``D:{ticker}:{as_of}``
+      silences the name for that night (counted in ``n_deduped``); a
+      fail-safe row never silences — a rerun after a fail-safe consults
+      again;
+    * per-name error isolation: each name's (run_agent + _log +
+      _record_ledger_row) runs in its own try/except — one name's failure
+      is logged and collected, the loop continues, the scan NEVER raises;
+    * the artifact writes (the JSONL consult log + the run artifact) are
+      best-effort: a failure warns and continues (the ledger row is the
+      source of truth).
+
+    ``transport`` / ``mcp`` are the same injection points ``run_agent``
+    already has, passed through per name, so DB-level tests reuse the
+    existing fakes. Returns the run summary: status ("ok" | "disabled" |
+    "no-sessions"), as_of, n_contexts, n_ledger_rows, n_deduped, n_errors,
+    errors, log_path, artifact_path (plus the CLI's contexts/runs payloads).
+    """
+    as_of = as_of or await _last_session_date()
+    base = {"as_of": as_of, "n_contexts": 0, "n_ledger_rows": 0,
+            "n_deduped": 0, "n_errors": 0, "errors": [],
+            "log_path": None, "artifact_path": None,
+            "contexts": [], "runs": []}
     if as_of is None:
+        return {"status": "no-sessions", **base}
+    if not dry_run and not settings.searxng_mcp_url:
+        # The knob-off convention: the step is DISABLED, not broken —
+        # zero ledger rows, no error.
+        logger.info("news scan: SEARXNG_MCP_URL is not set — the D step is "
+                    "disabled (the knob-off convention)")
+        return {"status": "disabled", **base}
+    contexts = await _book_contexts(as_of, limit)
+    generated_at = generated_at or datetime.now(UTC).isoformat()
+    out_dir = Path(out_dir)
+    log_path = out_dir / f"news-consult-{as_of}.jsonl"
+    artifact_path = out_dir / f"news-run-{as_of}.json"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:  # noqa: BLE001 — the artifacts are best-effort
+        logger.warning("news scan: cannot create out dir %s (%s: %s) — "
+                       "artifact writes skipped, the ledger rows stand",
+                       out_dir, type(e).__name__, e)
+    runs: list[dict] = []
+    errors: list[dict] = []
+    n_deduped = 0
+    for ctx in contexts:
+        if dry_run:
+            continue
+        ticker = ctx["ticker"]
+        event_id = f"D:{ticker}:{as_of}"
+        # Scan-time dedupe (mirrors type C): only a CONSULTED row silences
+        # the name — a transient fail-safe row never does.
+        async with Session() as s:
+            consulted = await s.scalar(
+                select(func.count()).select_from(LlmSellDecision)
+                .where(LlmSellDecision.event_id == event_id,
+                       LlmSellDecision.parsed.is_(True),
+                       LlmSellDecision.fail_safe.is_(False)))
+        if consulted:
+            n_deduped += 1
+            logger.info("news scan: %s already consulted for %s (%s) — "
+                        "skipped", ticker, as_of, event_id)
+            continue
+        try:
+            rec = await run_agent(ctx, event_id=event_id, mcp=mcp,
+                                  transport=transport)
+            rec["session_date"] = as_of
+            try:
+                _log(rec, log_path)
+            except Exception as e:  # noqa: BLE001 — best-effort artifact
+                logger.warning("news scan: JSONL log write failed for %s "
+                               "(%s: %s) — the ledger row stands",
+                               event_id, type(e).__name__, e)
+            # The ledger row — the shadow record with NO execution authority
+            # (the fill columns stay NULL by design; one writer, no drift:
+            # selllayer's append-only recorder).
+            await _record_ledger_row(
+                rec=rec, engine="monthly", session_date=as_of,
+                ticker=ticker,
+                context={"position": ctx, "citations": rec["citations"],
+                         "trace": rec["trace"], "temperature": rec["temperature"],
+                         "reasoning_effort": rec["reasoning_effort"],
+                         "tool_calls": rec["tool_calls"], "turns": rec["turns"],
+                         "news_source": rec["news_source"]},
+                engine_branch=ENGINE_BRANCH)
+            runs.append(rec)
+        except Exception as e:  # noqa: BLE001 — one name never breaks the scan
+            errors.append({"ticker": ticker, "event_id": event_id,
+                           "error": f"{type(e).__name__}: {e}"})
+            logger.error("news scan: %s (%s) failed (%s: %s) — continuing "
+                         "with the remaining names", ticker, event_id,
+                         type(e).__name__, e, exc_info=True)
+    artifact = {"schema": SCHEMA_RUN, "as_of": as_of,
+                "generated_at": generated_at, "dry_run": bool(dry_run),
+                "knob_searxng_mcp_url": bool(settings.searxng_mcp_url),
+                "runs": runs}
+    try:
+        artifact_path.write_text(
+            json.dumps(artifact, sort_keys=True, indent=2, allow_nan=False),
+            encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — best-effort artifact
+        logger.warning("news scan: run artifact write failed for %s (%s: %s) "
+                       "— the ledger rows stand", artifact_path,
+                       type(e).__name__, e)
+    return {"status": "ok", "as_of": as_of, "n_contexts": len(contexts),
+            "n_ledger_rows": len(runs), "n_deduped": n_deduped,
+            "n_errors": len(errors), "errors": errors,
+            "log_path": str(log_path), "artifact_path": str(artifact_path),
+            "contexts": contexts, "runs": runs}
+
+
+async def _cmd_news(args) -> int:
+    """The ``news`` CLI command — a thin wrapper over :func:`run_news_scan`
+    (the scan core the nightly cycle calls)."""
+    result = await run_news_scan(as_of=args.as_of, limit=args.limit,
+                                 out_dir=args.out, dry_run=args.dry_run,
+                                 generated_at=args.generated_at)
+    if result["status"] == "no-sessions":
         print("no stored sessions in the DB (candles empty) — nothing to "
               "scan; aborting")
         return 1
-    if not args.dry_run and not settings.searxng_mcp_url:
+    if result["status"] == "disabled":
         # The knob-off convention: the step is DISABLED, not broken —
         # exit 0 with an explicit message (no ledger rows).
         print("SEARXNG_MCP_URL is not set — the D step is disabled "
               "(the knob-off convention)")
         return 0
-    contexts = await _book_contexts(as_of, args.limit)
-    generated_at = args.generated_at or datetime.now(UTC).isoformat()
-    print(f"material-news scan: {len(contexts)} monthly-book name(s), "
+    as_of = result["as_of"]
+    print(f"material-news scan: {result['n_contexts']} monthly-book name(s), "
           f"as-of {as_of}, dry_run={args.dry_run}")
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    log_path = out_dir / f"news-consult-{as_of}.jsonl"
-    runs: list[dict] = []
-    for ctx in contexts:
-        if args.dry_run:
+    if args.dry_run:
+        for ctx in result["contexts"]:
             print(json.dumps(ctx, sort_keys=True, indent=2, allow_nan=False))
-            continue
-        event_id = f"D:{ctx['ticker']}:{as_of}"
-        rec = await run_agent(ctx, event_id=event_id)
-        rec["session_date"] = as_of
-        _log(rec, log_path)
-        # The ledger row — the shadow record with NO execution authority
-        # (the fill columns stay NULL by design; one writer, no drift:
-        # selllayer's append-only recorder).
-        await _record_ledger_row(
-            rec=rec, engine="monthly", session_date=as_of,
-            ticker=ctx["ticker"],
-            context={"position": ctx, "citations": rec["citations"],
-                     "trace": rec["trace"], "temperature": rec["temperature"],
-                     "reasoning_effort": rec["reasoning_effort"],
-                     "tool_calls": rec["tool_calls"], "turns": rec["turns"],
-                     "news_source": rec["news_source"]},
-            engine_branch=ENGINE_BRANCH)
-        runs.append(rec)
-        print(f"{ctx['ticker']}: {rec['decision']} parsed={rec['parsed']} "
-              f"fail_safe={rec['fail_safe']} tool_calls={rec['tool_calls']} "
-              f"turns={rec['turns']} latency={rec['latency_ms']:.0f}ms")
-    artifact = {"schema": SCHEMA_RUN, "as_of": as_of,
-                "generated_at": generated_at, "dry_run": bool(args.dry_run),
-                "knob_searxng_mcp_url": bool(settings.searxng_mcp_url),
-                "runs": runs}
-    artifact_path = out_dir / f"news-run-{as_of}.json"
-    artifact_path.write_text(
-        json.dumps(artifact, sort_keys=True, indent=2, allow_nan=False),
-        encoding="utf-8")
-    print(f"artifact: {artifact_path}")
-    if not args.dry_run and runs:
-        print(f"ledger rows appended: {len(runs)} (event_type D, engine "
-              f"monthly, shadow — fills NULL); log: {log_path}")
+    else:
+        for rec in result["runs"]:
+            ticker = rec["event_id"].split(":")[1]
+            print(f"{ticker}: {rec['decision']} parsed={rec['parsed']} "
+                  f"fail_safe={rec['fail_safe']} tool_calls={rec['tool_calls']} "
+                  f"turns={rec['turns']} latency={rec['latency_ms']:.0f}ms")
+    if result["artifact_path"]:
+        print(f"artifact: {result['artifact_path']}")
+    if not args.dry_run and result["runs"]:
+        print(f"ledger rows appended: {len(result['runs'])} (event_type D, engine "
+              f"monthly, shadow — fills NULL); log: {result['log_path']}")
     return 0
 
 

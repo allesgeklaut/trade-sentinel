@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     # the same convention as every integration.
     searxng_mcp_url: str = ""
     searxng_mcp_timeout_s: float = 30.0
+    # Where the nightly type-D shadow news scan (app/newsagent.py, wired
+    # into monthly.run_monthly_cycle) writes its artifacts — the JSONL
+    # consult log + the run artifact. The container is read-only except
+    # /data and /tmp, hence the /data default.
+    sim_news_out_dir: str = "/data/news-out"
 
     paper_trading: bool = True
 
