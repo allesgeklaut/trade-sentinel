@@ -1329,7 +1329,10 @@
                 grid-template-columns: 1fr
             }
 
-            #sim-view {
+            #sim-view,
+            #monthly-view,
+            #dailycore-view,
+            #savings-view {
                 padding: 10px
             }
 
@@ -1411,8 +1414,8 @@
 
             /* Positions/log values stay on one line so tickers, prices and
                percentages never wrap mid-value; headers may still stack at
-               word boundaries ("Avg" / "Cost") to save width. Only the Reason
-               cell may wrap. */
+               word boundaries ("Avg" / "Cost") to save width. Only the
+               Reason cell and the savings event Note may wrap. */
             #sim-positions td,
             #monthly-positions td,
             #dailycore-positions td,
@@ -1422,21 +1425,28 @@
             #monthly-rebalances th,
             #sim-trades td:not(:last-child),
             #monthly-trades td:not(:last-child),
-            #dailycore-trades td:not(:last-child) {
+            #dailycore-trades td:not(:last-child),
+            #savings-positions-table td,
+            #savings-mirror-positions td,
+            #savings-plans td,
+            #savings-events td:not(:last-child) {
                 white-space: nowrap
             }
 
-            /* The trade log scrolls vertically, so give Reason all leftover
-               width: it wraps to multiple lines while every other column
-               (Time is a compact "14:04") stays on one line. min-width keeps
-               it from collapsing when a reason is short; on very narrow
-               screens 90px still leaves room for the fixed columns. */
+            /* The trade log and the savings event ledger scroll vertically,
+               so give Reason (and the event Note) all leftover width: the
+               prose cell wraps to multiple lines while every other column
+               stays on one line. min-width keeps it from collapsing when the
+               text is short; on very narrow screens it still leaves room
+               for the fixed columns. */
             #sim-trades th:last-child,
             #sim-trades td:last-child,
             #monthly-trades th:last-child,
             #monthly-trades td:last-child,
             #dailycore-trades th:last-child,
-            #dailycore-trades td:last-child {
+            #dailycore-trades td:last-child,
+            #savings-events th:last-child,
+            #savings-events td:last-child {
                 width: 55%;
                 min-width: 80px;
                 white-space: normal;
