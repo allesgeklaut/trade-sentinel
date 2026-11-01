@@ -1,5 +1,14 @@
 # Type-D: the material-news sell consult — design note (2026-10-31)
 
+Status: SUPERSEDED (2026-11-01) — by `docs/sell-news-agent-design-2026-11-01.md`:
+the owner rethought the shape completely ("a real agent with native
+function calling … I want the model to decide what to fetch"), and the
+live design is the agent note. This note is kept verbatim for
+provenance; the news-source decision, the event type, the shadow-first
+discipline, and the promotion rule carry over to the successor, while
+the fixed-fetch gate, the bounded headline block, and the
+headline-changed guard do not.
+
 Status: DESIGN, pre-wiring. Owner-requested (2026-10-31, the quota-day
 session): "should the llm also consider current news? we do have
 searxng and also a search mcp in openwebui mcpo container" — then the

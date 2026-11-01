@@ -251,17 +251,22 @@ async def select_backend(name: str, model: str | None = None) -> dict[str, Any]:
 # Ollama seed/temperature, so pinning would be ignored anyway and only adds
 # false reproducibility expectations to backtests.
 
-async def chat(messages: list[dict[str, str]], *,
+async def chat(messages: list[dict[str, Any]], *,
                temperature: float | None = None,
-               timeout_s: float | None = None) -> dict[str, Any]:
+               timeout_s: float | None = None,
+               tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Send a chat request to the active backend.
 
     ``messages`` is a list of ``{"role": ..., "content": ...}`` dicts (system
     messages included). ``temperature`` is sent ONLY when set (None leaves
     the server's default) — the sell layer passes its frozen recorded
     temperature so the wire matches what every consult record declares.
-    ``timeout_s`` overrides the read bound per call. Returns ``{"text": ...,
-    "backend": ..., "model": ..., "reasoning": ...}``.
+    ``timeout_s`` overrides the read bound per call. ``tools`` is the
+    OpenAI function-calling surface (the type-D news agent's native
+    tools; a core OpenAI field, sent only when set). Returns
+    ``{"text": ..., "backend": ..., "model": ..., "reasoning": ...,
+    "tool_calls": [...]}`` — ``tool_calls`` is the normalized list
+    (``[]`` when the turn called no tools).
     """
     backend = await current_backend()
     if not backend:
@@ -270,15 +275,17 @@ async def chat(messages: list[dict[str, str]], *,
             "backend": "",
             "model": "",
             "reasoning": "",
+            "tool_calls": [],
         }
-    text, reasoning, model = await _post_chat(backend, messages,
-                                              temperature=temperature,
-                                              timeout_s=timeout_s)
+    text, reasoning, model, tool_calls = await _post_chat(
+        backend, messages, temperature=temperature, timeout_s=timeout_s,
+        tools=tools)
     return {
         "text": text,
         "backend": backend["name"],
         "model": model,
         "reasoning": reasoning,
+        "tool_calls": tool_calls,
     }
 
 
@@ -447,10 +454,12 @@ async def chat_stream(messages: list[dict[str, str]]):
 
 
 async def _post_chat(
-    backend: dict[str, Any], messages: list[dict[str, str]],
-    *, temperature: float | None = None, timeout_s: float | None = None
-) -> tuple[str, str, str]:
-    """Raw POST for one backend; returns (text, reasoning, model_id)."""
+    backend: dict[str, Any], messages: list[dict[str, Any]],
+    *, temperature: float | None = None, timeout_s: float | None = None,
+    tools: list[dict[str, Any]] | None = None
+) -> tuple[str, str, str, list[dict[str, Any]]]:
+    """Raw POST for one backend; returns (text, reasoning, model_id,
+    tool_calls)."""
     timeout = httpx.Timeout(
         connect=10.0,
         read=(timeout_s if timeout_s is not None
@@ -474,6 +483,10 @@ async def _post_chat(
             }
             if temperature is not None:
                 payload["temperature"] = temperature
+            if tools:
+                # A core OpenAI field (unlike the opt-in chat_template_kwargs
+                # above): sent only when the caller passes a tool surface.
+                payload["tools"] = tools
             # The vLLM-native kwargs ride ONLY when the backend declared
             # them: strict OpenAI-schema servers (LiteLLM routing to
             # Mistral/OpenAI/...) reject the field with 422
@@ -516,18 +529,52 @@ async def _post_chat(
     return _extract_content(data, backend)
 
 
-def _extract_content(data: Any, backend: dict[str, Any]) -> tuple[str, str, str]:
-    """Pull (text, reasoning, model) from either an OpenAI-compatible or an
-    Ollama chat response shape, whichever is present."""
+def _parse_tool_calls(raw: Any) -> list[dict[str, Any]]:
+    """Normalize OpenAI-style ``tool_calls`` (from chat completions) into the
+    app's shape: ``[{"id", "name", "arguments" (a dict when the JSON string
+    parses to one, else the raw string), "arguments_raw"}]``. Malformed
+    entries are skipped — an empty list simply means "no tool calls this
+    turn" (the caller decides what that means)."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for tc in raw:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function")
+        if not isinstance(fn, dict) or not fn.get("name"):
+            continue
+        args_raw = fn.get("arguments")
+        if not isinstance(args_raw, str):
+            args_raw = json.dumps(args_raw) if args_raw is not None else "{}"
+        try:
+            args: Any = json.loads(args_raw)
+        except (json.JSONDecodeError, ValueError):
+            args = args_raw  # unparsable: kept raw — the caller surfaces it
+        out.append({"id": str(tc.get("id") or ""),
+                    "name": str(fn["name"]),
+                    "arguments": args,
+                    "arguments_raw": args_raw})
+    return out
+
+
+def _extract_content(data: Any,
+                     backend: dict[str, Any]) -> tuple[str, str, str, list]:
+    """Pull (text, reasoning, model, tool_calls) from either an
+    OpenAI-compatible or an Ollama chat response shape, whichever is
+    present. A tool-call turn with no text still returns its tool_calls
+    (the agent loop's signal to continue)."""
     if isinstance(data, dict):
         choice = (data.get("choices") or [{}])[0]
         msg = choice.get("message") if isinstance(choice, dict) else None
         content = (msg or {}).get("content") or ""
         reasoning = (msg or {}).get("reasoning_content") or (msg or {}).get("reasoning") or ""
         model = data.get("model") or ""
-        if content:
-            return content, reasoning, model
+        tool_calls = _parse_tool_calls((msg or {}).get("tool_calls"))
+        if content or tool_calls:
+            return content, reasoning, model, tool_calls
     msg = data.get("message") if isinstance(data, dict) else None
     content = (msg or {}).get("content") or (data.get("response") if isinstance(data, dict) else "") or ""
     reasoning = (msg or {}).get("reasoning") or ""
-    return content, reasoning, backend["model"]
+    return (content, reasoning, backend["model"],
+            _parse_tool_calls((msg or {}).get("tool_calls")))

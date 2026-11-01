@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     # --- SearXNG news search (optional) -------------------------------
     searxng_url: str = ""  # e.g. "http://your-server-ip:8081"; empty = disabled
     searxng_timeout: float = 10.0
+    # --- The shared searxng MCP tool server (the type-D material-news
+    # agent, app/newsagent.py; docs/sell-news-agent-design-2026-11-01.md).
+    # Base URL of the MCP (Streamable HTTP), e.g. "http://searxng-mcp:8808/mcp"
+    # on the stacks-shared docker network. Empty = the D step is disabled —
+    # the same convention as every integration.
+    searxng_mcp_url: str = ""
+    searxng_mcp_timeout_s: float = 30.0
 
     paper_trading: bool = True
 
