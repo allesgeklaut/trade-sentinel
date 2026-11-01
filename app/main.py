@@ -8,8 +8,8 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
 from pydantic import BaseModel
 from .config import settings
-from .db import (Watchlist, Session, init_db, current_db, use_db, dev_enabled,
-                 dev_db_exists, prod_db_exists, clone_prod_to_dev)
+from .db import (Watchlist, Session, LlmSellDecision, init_db, current_db, use_db,
+                 dev_enabled, dev_db_exists, prod_db_exists, clone_prod_to_dev)
 from .market import refresh, refresh_many, refresh_yfinance, candles, search, info, provider, PERIOD_COUNTS
 from .analysis import compute, persist, history, MIN_CANDLES
 from .screener import universe_names, run, results, refresh_incremental, load_deep_history, get_screener_progress, ScreenerBusy
@@ -683,10 +683,12 @@ async def sim_run_status():
 async def sim_backfill(start: str | None = Query(default=None)):
     """Backfill the daily sim with a DETERMINISTIC synthetic history.
 
-    Replays the engine's own rules (no LLM calls — the hybrid live strategy's
-    LLM overlay cannot be replayed) over stored candles/fundamentals and
-    REPLACES the portfolio state with the replay's end state. An
-    approximation by design; the response carries approximation: true.
+    Replays the engine's own DETERMINISTIC rules (no LLM calls — the hybrid
+    live strategy is retired: a stale llm/hybrid strategy value degrades to
+    the deterministic engine with a warning, it is never replayed) over
+    stored candles/fundamentals and REPLACES the portfolio state with the
+    replay's end state. An approximation by design; the response carries
+    approximation: true.
     """
     from . import sim
     r = await sim.backfill(_validated_start(start))
@@ -895,6 +897,109 @@ async def sellscore():
     no cache state. Spans both paper accounts (sim type A + monthly B/C)."""
     from . import sellscore as sellscore_mod
     return await sellscore_mod.score_sell_decisions()
+
+
+# =====================================================================
+# Type-D material-news agent: the MANUAL consult (UI/CLI trigger)
+# =====================================================================
+
+class NewsConsultRequest(BaseModel):
+    ticker: str
+    as_of: str | None = None
+
+
+@app.post('/api/news/consult', dependencies=[Depends(_refuse_during_clone)])
+async def news_consult(req: NewsConsultRequest):
+    """Run ONE manual material-news consult for one monthly-book name
+    (``app.newsagent.run_manual_consult`` — the ``--fresh`` semantics: the
+    4-part ``D:{ticker}:{as_of}:m`` event id, never deduped).
+
+    LONG-RUNNING BY DESIGN: one real agent run — the model plans the
+    research, so this is real LLM wire + searxng-MCP search/read calls,
+    typically ~40-90s at the deployed low reasoning effort — and the
+    request blocks until the verdict is recorded (no timeout changes; the
+    UI's confirm() says so before firing).
+
+    The verdict is SHADOW-only (the fill columns stay NULL; no execution
+    authority — the promotion rule lives in
+    docs/sell-news-agent-design-2026-11-01.md). Response: ok, decision,
+    rationale, citations, turns, tool_calls, latency_ms, fail_safe,
+    fail_reason, event_id, model, backend. A fail-safe record IS a valid
+    response — this route NEVER 500s on an agent failure. Knob off
+    (SEARXNG_MCP_URL unset) or an unknown ticker answer honestly with
+    ok:false + reason (HTTP 200, not an error status).
+    """
+    from . import newsagent
+    ticker = (req.ticker or "").strip().upper()
+    if not ticker:
+        raise HTTPException(422, "ticker must not be empty")
+    as_of = req.as_of
+    if as_of is not None:
+        try:
+            date.fromisoformat(as_of)
+        except ValueError as e:
+            raise HTTPException(
+                422, f"invalid as_of: {as_of!r} (use YYYY-MM-DD)") from e
+    result = await newsagent.run_manual_consult(ticker, as_of=as_of)
+    if not result.get("ok"):
+        return {"ok": False,
+                "reason": result.get("reason") or "consult failed"}
+    rec = result["record"]
+    return {
+        "ok": True,
+        "decision": rec["decision"],
+        "rationale": rec["rationale"],
+        "citations": rec["citations"],
+        "turns": rec["turns"],
+        "tool_calls": rec["tool_calls"],
+        "latency_ms": rec["latency_ms"],
+        "fail_safe": rec["fail_safe"],
+        "fail_reason": rec["fail_reason"],
+        "event_id": rec["event_id"],
+        "model": rec["model"],
+        "backend": rec["backend"],
+    }
+
+
+@app.get('/api/news/decisions/{event_id}')
+async def news_decision(event_id: str):
+    """The stored type-D row for one event_id — the news-agent view (NOT the
+    A/B/C ledger): only event_type "D" rows answer, anything else (unknown id
+    or a non-D event_id) gets an honest 404. Returns the full record with the
+    context JSON parsed (position, citations, trace) plus
+    decision/rationale/parsed/fail_safe/decided_at."""
+    async with Session() as s:
+        row = await s.scalar(
+            select(LlmSellDecision).where(LlmSellDecision.event_id == event_id))
+    if row is None or row.event_type != "D":
+        raise HTTPException(404, f"no type-D decision for event_id {event_id!r}")
+    try:
+        context = json.loads(row.context) if row.context else {}
+    except (json.JSONDecodeError, ValueError):
+        context = {"_raw": row.context}
+    try:
+        engine_branch = json.loads(row.engine_branch) if row.engine_branch else {}
+    except (json.JSONDecodeError, ValueError):
+        engine_branch = {"_raw": row.engine_branch}
+    return {
+        "event_id": row.event_id,
+        "event_type": row.event_type,
+        "engine": row.engine,
+        "ticker": row.ticker,
+        "session_date": row.session_date,
+        "decision": row.decision,
+        "rationale": row.rationale,
+        "parsed": row.parsed,
+        "fail_safe": row.fail_safe,
+        "fail_reason": row.fail_reason,
+        "prompt_version": row.prompt_version,
+        "context": context,
+        "engine_branch": engine_branch,
+        "backend": row.backend,
+        "model": row.model,
+        "latency_ms": row.latency_ms,
+        "decided_at": row.decided_at.isoformat() if row.decided_at else None,
+    }
 
 
 @app.get('/api/dailycore/status')

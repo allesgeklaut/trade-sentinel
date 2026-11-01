@@ -1755,6 +1755,24 @@
                     refreshes data without a rebalance. Backfill/replay controls moved to <b>Lab › Maintenance</b>.</div>
             </details>
         </div>
+        <div class="sim-section" id="news-consult-section">
+            <div class="bench-label">MATERIAL-NEWS CONSULT // TYPE-D AGENT (SHADOW)</div>
+            <div class="sim-actions">
+                <select id="news-consult-ticker"
+                        title="One of the Monthly book's current positions — the news agent judges recent news against that position's stated thesis"></select>
+                <button id="news-consult-btn" onclick="consultNews()">Consult now</button>
+            </div>
+            <div id="news-consult-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
+            <div id="news-consult-result"></div>
+            <details class="info-fold">
+                <summary>Scope &amp; safety</summary>
+                <div class="toolbar-scope">Scope: ONE Monthly paper-book name per click. Each consult runs ONE real
+                    agent run (real LLM + live searxng news search/read calls, ~1 minute at the deployed low effort)
+                    and is recorded as a SHADOW row (event <b>D:{ticker}:{as_of}:m</b>) in the LLM sell ledger — the
+                    verdict never places a trade (the fill columns stay NULL until the predeclared promotion rule).
+                    Nightly scans use the 3-part <b>D:{ticker}:{as_of}</b> ids and are unaffected.</div>
+            </details>
+        </div>
     </section>
     <section id="dailycore-view" style="display:none">
         <div class="sim-section">
@@ -5981,6 +5999,16 @@
                     window.PaperPortfolioUI.renderPositionsHtml(pos, {
                         emptyText: 'No open positions — waiting for first rebalance.',
                     });
+                // The material-news consult picker offers exactly the monthly
+                // book's positions (the same source as the positions table).
+                const newsSel = document.getElementById('news-consult-ticker');
+                if (newsSel) {
+                    const keep = newsSel.value;
+                    newsSel.innerHTML = pos.length
+                        ? pos.map(p => `<option value="${escapeHtml(p.ticker)}">${escapeHtml(p.ticker)}</option>`).join('')
+                        : '<option value="" disabled>(no positions)</option>';
+                    if (pos.some(p => p.ticker === keep)) newsSel.value = keep;
+                }
             } catch (e) { document.getElementById('monthly-summary').innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
 
@@ -6049,6 +6077,83 @@
                     loadMonthlyAll();
                 }
             } catch (e) { status.textContent = 'Error: ' + e.message; }
+            btn.disabled = false;
+        }
+
+        // --- Type-D material-news consult (one real agent run per click) ---
+        // Renders the POST /api/news/consult response: the verdict chip
+        // (EXIT in the house .sell red, HOLD in .hold amber), the rationale,
+        // the citations as clickable links, and the meta line. Honest
+        // disabled/error states come back as ok:false + reason.
+        function renderNewsConsult(r) {
+            const out = document.getElementById('news-consult-result');
+            if (!out) return;
+            if (!r || !r.ok) {
+                out.innerHTML = '<div class="sim-empty" style="padding:8px 0;text-align:left">'
+                    + escapeHtml((r && r.reason) || 'consult did not run') + '</div>';
+                return;
+            }
+            const dec = String(r.decision || '').toUpperCase();
+            const cls = dec === 'EXIT' ? 'sell' : 'hold';   // house decision chips
+            const cites = (Array.isArray(r.citations) ? r.citations : []).map(c => {
+                const title = escapeHtml(c && c.title ? c.title
+                    : (c && c.source ? c.source : 'citation'));
+                const rawUrl = c && typeof c.url === 'string' ? c.url : '';
+                // Only absolute http(s) URLs become links (never javascript: etc.)
+                if (/^https?:\/\//i.test(rawUrl)) {
+                    return '<li><a href="' + escapeHtml(rawUrl) + '" target="_blank" rel="noopener noreferrer">'
+                        + title + '</a></li>';
+                }
+                return '<li>' + title + '</li>';
+            }).join('');
+            const lat = r.latency_ms != null ? (r.latency_ms / 1000).toFixed(1) + 's' : '—';
+            out.innerHTML = '<div style="margin-top:8px;font-size:13px">'
+                + '<span class="' + cls + '" style="font-weight:bold">' + escapeHtml(dec) + '</span>'
+                + (r.fail_safe ? ' <span class="hold">(fail-safe)</span>' : '')
+                + '<div style="margin-top:4px;white-space:pre-wrap">' + escapeHtml(r.rationale || '') + '</div>'
+                + (cites ? '<div class="bench-label" style="margin-top:6px">CITATIONS</div>'
+                    + '<ul style="margin:4px 0 0 18px;font-size:12px">' + cites + '</ul>' : '')
+                + '<div style="margin-top:6px;font-size:11px;color:#7aaa81">'
+                + 'turns ' + (r.turns != null ? r.turns : '—')
+                + ' · tool calls ' + (r.tool_calls != null ? r.tool_calls : '—')
+                + ' · ' + lat
+                + ' · model ' + escapeHtml(r.model || '—') + ' (' + escapeHtml(r.backend || '—') + ')'
+                + ' · event ' + escapeHtml(r.event_id || '—')
+                + (r.fail_reason ? ' · fail-safe: ' + escapeHtml(r.fail_reason) : '')
+                + '</div></div>';
+        }
+
+        async function consultNews() {
+            const btn = document.getElementById('news-consult-btn');
+            const status = document.getElementById('news-consult-status');
+            const out = document.getElementById('news-consult-result');
+            const sel = document.getElementById('news-consult-ticker');
+            const ticker = sel && sel.value ? sel.value : '';
+            if (!ticker) {
+                status.textContent = 'No Monthly-book position to consult — the book is empty.';
+                return;
+            }
+            if (!confirm('Run ONE real material-news consult for ' + ticker + '?\n\n'
+                + 'This fires ONE real agent run — real LLM calls plus live searxng news search/read calls — '
+                + 'and typically takes about a minute. The verdict is a SHADOW consult only: it never places a trade.')) return;
+            btn.disabled = true;
+            status.textContent = 'Consulting ' + ticker + '… (one real agent run — LLM + news search calls, ~1 minute)';
+            if (out) out.innerHTML = '';
+            try {
+                const r = await api('news/consult', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ticker: ticker, as_of: null }),
+                });
+                renderNewsConsult(r);
+                status.textContent = r.ok
+                    ? 'Consult recorded: ' + r.event_id
+                    : 'Not run: ' + (r.reason || 'unknown reason');
+            } catch (e) {
+                status.textContent = 'Error: ' + e.message;
+                if (out) out.innerHTML = '<div class="sim-empty" style="padding:8px 0;text-align:left">Error: '
+                    + escapeHtml(e.message) + '</div>';
+            }
             btn.disabled = false;
         }
 
@@ -6486,9 +6591,10 @@
 
         async function backfillSim() {
             // Destructive: replaces the sim's state with a DETERMINISTIC
-            // replay (no LLM calls — the live hybrid overlay can't be
-            // replayed). Same confirm() pattern as resetSim.
-            if (!confirm('Backfill REPLACES the Daily Sim state with a deterministic replay of the engine rules (no LLM calls — an approximation of the live hybrid strategy). The current epoch\'s recorded rows are preserved for audit but stop feeding the chart. Continue?'))
+            // replay (no LLM calls — the hybrid live strategy is retired; a
+            // stale llm/hybrid value degrades to the deterministic engine
+            // with a warning). Same confirm() pattern as resetSim.
+            if (!confirm('Backfill REPLACES the Daily Sim state with a deterministic replay of the engine rules (no LLM calls — the hybrid live strategy is retired; a stale hybrid value degrades to deterministic with a warning). The current epoch\'s recorded rows are preserved for audit but stop feeding the chart. Continue?'))
                 return;
             const btn = document.getElementById('sim-backfill-btn');
             const status = document.getElementById('sim-run-status');

@@ -25,6 +25,14 @@ the design note. Nightly cadence: one run per monthly-book name, right
 after the type-C step (``monthly.run_monthly_cycle`` calls
 ``run_news_scan``; the ``python -m app.newsagent news`` CLI is a thin
 wrapper over the same scan core).
+
+Beside the nightly scan there is the MANUAL consult — ``run_manual_consult``
+(one name, the UI/API trigger) and the CLI's ``--fresh`` mode. Manual looks
+carry the 4-part event_id ``D:{ticker}:{as_of}:m`` (the ``:m`` marker): they
+are NEVER deduped (against nightly rows or against themselves — every manual
+run consults again) and the 4-part form keeps them OUT of the nightly
+≥6-month sample, which counts only the exact 3-part ``D:{ticker}:{as_of}``
+rows the nightly scan writes.
 """
 
 from __future__ import annotations
@@ -54,6 +62,19 @@ SCHEMA_RECORD = "newsagent-consult/1"
 SCHEMA_RUN = "newsagent-run/1"
 NEWS_SOURCE = "searxng-mcp"
 ERROR_TEXT_MAX = 200
+# The MANUAL-look marker: manual consults (run_manual_consult / the CLI's
+# --fresh) use the 4-part event_id ``D:{ticker}:{as_of}:m`` — never deduped
+# (every manual run consults again) and kept out of the nightly ≥6-month
+# sample, which counts only the exact 3-part ``D:{ticker}:{as_of}`` rows.
+MANUAL_EVENT_SUFFIX = "m"
+
+
+def _event_id(ticker: str, as_of: str, *, fresh: bool = False) -> str:
+    """The event_id for one consult: the nightly 3-part
+    ``D:{ticker}:{as_of}`` (deduped per night) or the manual 4-part
+    ``D:{ticker}:{as_of}:m`` (never deduped, never in the nightly sample)."""
+    base = f"D:{ticker}:{as_of}"
+    return f"{base}:{MANUAL_EVENT_SUFFIX}" if fresh else base
 # The DeepSeek family's documented recommendation ("Set the temperature
 # within the range of 0.5-0.7 (0.6 is recommended) to prevent endless
 # repetitions or incoherent outputs" — the R1-series usage guidance; their
@@ -452,7 +473,7 @@ def _log(record: dict, path: Path) -> None:
 async def run_news_scan(*, as_of: str | None = None, limit: int | None = None,
                         out_dir: str = "news-out", dry_run: bool = False,
                         generated_at: str | None = None, transport=None,
-                        mcp=None) -> dict:
+                        mcp=None, fresh: bool = False) -> dict:
     """The nightly type-D scan core (extracted from the ``news`` CLI command,
     which stays a thin wrapper; wired into ``monthly.run_monthly_cycle``):
     one agent run per monthly-book name for the session ``as_of`` (default:
@@ -471,6 +492,14 @@ async def run_news_scan(*, as_of: str | None = None, limit: int | None = None,
       silences the name for that night (counted in ``n_deduped``); a
       fail-safe row never silences — a rerun after a fail-safe consults
       again;
+    * ``fresh=True`` (the CLI's ``--fresh``, the MANUAL mode): the event_id
+      becomes the 4-part ``D:{ticker}:{as_of}:m`` and the dedupe check is
+      SKIPPED — a manual look is never deduped against nightly rows or
+      against itself (every ``--fresh`` run consults again), and the
+      4-part form keeps manual looks out of the nightly ≥6-month sample,
+      which counts only the exact 3-part nightly ids. The nightly path
+      (``fresh=False``, as called by ``monthly.run_monthly_cycle``) is
+      UNCHANGED;
     * per-name error isolation: each name's (run_agent + _log +
       _record_ledger_row) runs in its own try/except — one name's failure
       is logged and collected, the loop continues, the scan NEVER raises;
@@ -515,20 +544,22 @@ async def run_news_scan(*, as_of: str | None = None, limit: int | None = None,
         if dry_run:
             continue
         ticker = ctx["ticker"]
-        event_id = f"D:{ticker}:{as_of}"
+        event_id = _event_id(ticker, as_of, fresh=fresh)
         # Scan-time dedupe (mirrors type C): only a CONSULTED row silences
-        # the name — a transient fail-safe row never does.
-        async with Session() as s:
-            consulted = await s.scalar(
-                select(func.count()).select_from(LlmSellDecision)
-                .where(LlmSellDecision.event_id == event_id,
-                       LlmSellDecision.parsed.is_(True),
-                       LlmSellDecision.fail_safe.is_(False)))
-        if consulted:
-            n_deduped += 1
-            logger.info("news scan: %s already consulted for %s (%s) — "
-                        "skipped", ticker, as_of, event_id)
-            continue
+        # the name — a transient fail-safe row never does. MANUAL (--fresh)
+        # looks are NEVER deduped: every --fresh run consults again.
+        if not fresh:
+            async with Session() as s:
+                consulted = await s.scalar(
+                    select(func.count()).select_from(LlmSellDecision)
+                    .where(LlmSellDecision.event_id == event_id,
+                           LlmSellDecision.parsed.is_(True),
+                           LlmSellDecision.fail_safe.is_(False)))
+            if consulted:
+                n_deduped += 1
+                logger.info("news scan: %s already consulted for %s (%s) — "
+                            "skipped", ticker, as_of, event_id)
+                continue
         try:
             rec = await run_agent(ctx, event_id=event_id, mcp=mcp,
                                   transport=transport)
@@ -577,12 +608,88 @@ async def run_news_scan(*, as_of: str | None = None, limit: int | None = None,
             "contexts": contexts, "runs": runs}
 
 
+async def run_manual_consult(ticker: str, *, as_of: str | None = None,
+                             out_dir: str | None = None, transport=None,
+                             mcp=None) -> dict:
+    """ONE manual material-news consult for ONE monthly-book name — the
+    UI/API trigger (``POST /api/news/consult``) and the heart of the CLI's
+    ``--fresh`` mode.
+
+    Fresh semantics: the event_id is the 4-part ``D:{ticker}:{as_of}:m``
+    (the ``:m`` manual marker) and there is NO dedupe — every call consults
+    again (never against nightly rows, never against itself), and the
+    4-part form stays out of the nightly ≥6-month sample.
+
+    The context is the same ``_book_contexts`` block the nightly scan uses,
+    filtered to the ticker (an honest error dict when the name is not in the
+    monthly book); ``as_of`` defaults to ``_last_session_date()``. The run
+    goes through the same ``run_agent``, the ledger row is appended via the
+    same recorder (``selllayer._record_decision`` — shadow: the fill columns
+    stay NULL), and the artifacts (the JSONL log line) are best-effort.
+    NEVER raises. Returns ``{"ok": bool, "reason"?, "record"?}`` where
+    ``record`` is the ``run_agent`` record (which carries the ledger
+    event_id); a fail-safe record is a valid ``ok: True`` result.
+    """
+    try:
+        ticker = str(ticker or "").strip().upper()
+        if not ticker:
+            return {"ok": False, "reason": "ticker must not be empty"}
+        as_of = as_of or await _last_session_date()
+        if as_of is None:
+            return {"ok": False,
+                    "reason": "no stored sessions in the DB (candles empty) — "
+                              "nothing to consult"}
+        if not settings.searxng_mcp_url:
+            # The knob-off convention: DISABLED, not broken — zero rows.
+            logger.info("manual news consult: SEARXNG_MCP_URL is not set — "
+                        "the D step is disabled (the knob-off convention)")
+            return {"ok": False,
+                    "reason": "the D step is disabled — SEARXNG_MCP_URL is "
+                              "not set"}
+        contexts = await _book_contexts(as_of)
+        ctx = next((c for c in contexts if c["ticker"] == ticker), None)
+        if ctx is None:
+            return {"ok": False,
+                    "reason": f"{ticker} is not in the monthly book "
+                              f"(as of {as_of})"}
+        event_id = _event_id(ticker, as_of, fresh=True)
+        rec = await run_agent(ctx, event_id=event_id, mcp=mcp,
+                              transport=transport)
+        rec["session_date"] = as_of
+        # Best-effort artifact: the same JSONL consult log the scan writes.
+        out = Path(out_dir) if out_dir else Path(settings.sim_news_out_dir)
+        try:
+            _log(rec, out / f"news-consult-{as_of}.jsonl")
+        except Exception as e:  # noqa: BLE001 — best-effort artifact
+            logger.warning("manual news consult: JSONL log write failed for "
+                           "%s (%s: %s) — the ledger row stands",
+                           event_id, type(e).__name__, e)
+        # The ledger row — the shadow record with NO execution authority
+        # (the fill columns stay NULL by design; one writer, no drift:
+        # selllayer's append-only recorder).
+        await _record_ledger_row(
+            rec=rec, engine="monthly", session_date=as_of,
+            ticker=ticker,
+            context={"position": ctx, "citations": rec["citations"],
+                     "trace": rec["trace"], "temperature": rec["temperature"],
+                     "reasoning_effort": rec["reasoning_effort"],
+                     "tool_calls": rec["tool_calls"], "turns": rec["turns"],
+                     "news_source": rec["news_source"]},
+            engine_branch=ENGINE_BRANCH)
+        return {"ok": True, "record": rec}
+    except Exception as e:  # noqa: BLE001 — a manual consult never raises
+        logger.warning("manual news consult %s failed (%s: %s)",
+                       ticker, type(e).__name__, e)
+        return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+
+
 async def _cmd_news(args) -> int:
     """The ``news`` CLI command — a thin wrapper over :func:`run_news_scan`
     (the scan core the nightly cycle calls)."""
     result = await run_news_scan(as_of=args.as_of, limit=args.limit,
                                  out_dir=args.out, dry_run=args.dry_run,
-                                 generated_at=args.generated_at)
+                                 generated_at=args.generated_at,
+                                 fresh=args.fresh)
     if result["status"] == "no-sessions":
         print("no stored sessions in the DB (candles empty) — nothing to "
               "scan; aborting")
@@ -594,8 +701,10 @@ async def _cmd_news(args) -> int:
               "(the knob-off convention)")
         return 0
     as_of = result["as_of"]
-    print(f"material-news scan: {result['n_contexts']} monthly-book name(s), "
-          f"as-of {as_of}, dry_run={args.dry_run}")
+    mode = ("fresh MANUAL scan — event_id marker :m, NO dedupe (every "
+            "--fresh run consults again)" if args.fresh else "nightly scan")
+    print(f"material-news scan [{mode}]: {result['n_contexts']} monthly-book "
+          f"name(s), as-of {as_of}, dry_run={args.dry_run}")
     if args.dry_run:
         for ctx in result["contexts"]:
             print(json.dumps(ctx, sort_keys=True, indent=2, allow_nan=False))
@@ -605,6 +714,18 @@ async def _cmd_news(args) -> int:
             print(f"{ticker}: {rec['decision']} parsed={rec['parsed']} "
                   f"fail_safe={rec['fail_safe']} tool_calls={rec['tool_calls']} "
                   f"turns={rec['turns']} latency={rec['latency_ms']:.0f}ms")
+            # The response itself, so a terminal run is readable end-to-end:
+            # the verdict's rationale and each citation (title + URL).
+            if rec.get("rationale"):
+                print(f"  rationale: {rec['rationale']}")
+            for c in rec.get("citations") or []:
+                if isinstance(c, dict):
+                    title = str(c.get("title") or c.get("source") or "citation")
+                    url = str(c.get("url") or "")
+                else:
+                    title, url = str(c), ""
+                print(f"  citation: {title} — {url}" if url
+                      else f"  citation: {title}")
     if result["artifact_path"]:
         print(f"artifact: {result['artifact_path']}")
     if not args.dry_run and result["runs"]:
@@ -622,9 +743,11 @@ def _build_parser() -> argparse.ArgumentParser:
                     "the nightly shadow scan — NO execution authority.")
     sub = p.add_subparsers(dest="command", required=True)
     news = sub.add_parser(
-        "news", help="the nightly material-news scan: one agent run per "
-                     "monthly-book name (shadow; the ledger rows carry the "
-                     "hold-to-rebuild counterfactual)")
+        "news", help="the material-news scan: one agent run per monthly-book "
+                     "name (shadow; the ledger rows carry the hold-to-rebuild "
+                     "counterfactual). Default = the nightly 3-part event_id "
+                     "D:{ticker}:{as_of} (deduped per night); --fresh = manual "
+                     "consults with the 4-part :m marker, never deduped")
     news.add_argument("--as-of", default=None,
                       help="decision session YYYY-MM-DD (default: the DB's "
                            "last stored session)")
@@ -641,6 +764,14 @@ def _build_parser() -> argparse.ArgumentParser:
     news.add_argument("--generated-at", default=None,
                       help="caller-supplied ISO timestamp recorded in the "
                            "artifact (default: wall-clock UTC)")
+    news.add_argument("--fresh", action="store_true",
+                      help="MANUAL consult mode: each name's event_id becomes "
+                           "'D:{ticker}:{as_of}:m' (the :m manual marker) — "
+                           "never deduped against nightly rows or itself "
+                           "(every --fresh run consults again), and the "
+                           "4-part form keeps manual looks OUT of the nightly "
+                           "≥6-month sample, which counts only the exact "
+                           "3-part 'D:{ticker}:{as_of}' rows")
     return p
 
 

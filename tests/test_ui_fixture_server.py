@@ -823,6 +823,7 @@ def test_db_guard_parity_leaves_unguarded_routes_alone():
         ("POST", "/api/screener/run/diversified-plus"),
         ("POST", "/api/chat/AAPL/stream"),
         ("POST", "/api/llm/select"),
+        ("POST", "/api/news/consult"),
         ("DELETE", "/api/sim/chat/history"),
         ("DELETE", "/api/watchlist/AAPL"),
         ("POST", "/api/refresh/AAPL"),
@@ -980,3 +981,113 @@ def test_ticker_chat_stream_envelope_drops_legacy_trades_key():
     sse = backend.dispatch("POST", "/api/chat/AAPL/stream", body=b"{}")
     text = sse.body.decode("utf-8")
     assert '"trades"' not in text and '"actions_executed"' not in text
+
+
+# ---------------------------------------------------------------------------
+# Type-D news-agent routes: fixture parity with app/main.py's /api/news/*
+# (POST /api/news/consult = fail-closed synthetic ack, NO real consult;
+#  GET /api/news/decisions/{event_id} = one synthetic D row)
+# ---------------------------------------------------------------------------
+
+# The live route's response shape (app/main.py news_consult) — the fixture
+# ack must carry exactly these keys (plus fixture_ack/applied).
+NEWS_CONSULT_RESPONSE_KEYS = {
+    "ok", "decision", "rationale", "citations", "turns", "tool_calls",
+    "latency_ms", "fail_safe", "fail_reason", "event_id", "model", "backend",
+}
+# The live decisions route's keys (app/main.py news_decision).
+NEWS_DECISION_RESPONSE_KEYS = {
+    "event_id", "event_type", "engine", "ticker", "session_date", "decision",
+    "rationale", "parsed", "fail_safe", "fail_reason", "prompt_version",
+    "context", "engine_branch", "backend", "model", "latency_ms", "decided_at",
+}
+NEWS_ROUTES = (
+    ("POST", "/api/news/consult"),
+    ("GET", "/api/news/decisions/{event_id}"),
+)
+
+
+def test_news_consult_route_is_a_fail_closed_synthetic_ack():
+    for mode in ("populated", "empty"):
+        backend = FixtureBackend(mode=mode)
+        as_of = json.loads(DEFAULT_FIXTURE.read_text(encoding="utf-8"))["as_of"][:10]
+        monthly = get_json(backend, "/api/monthly/status")
+        tickers = [p["ticker"] for p in monthly["positions"]]
+        for ticker in (tickers[:1] or ["MSFT"]):
+            response = backend.dispatch(
+                "POST", "/api/news/consult", body=json.dumps({"ticker": ticker}).encode())
+            assert response.status == 200, (mode, response.status)
+            assert response.kind == "post_ack"
+            payload = response.json()
+            assert payload["fixture_ack"] is True
+            assert payload["applied"] is False       # NO real consult ran
+            assert b"http://" not in response.body and b"https://" not in response.body
+            if mode == "populated" and ticker in tickers:
+                assert payload["ok"] is True
+                assert NEWS_CONSULT_RESPONSE_KEYS <= set(payload)
+                assert payload["event_id"] == f"D:{ticker}:{as_of}:m"
+                assert payload["decision"] in {"EXIT", "HOLD"}
+            else:
+                assert payload["ok"] is False
+                assert {"ok", "reason"} <= set(payload)
+        # unknown / empty ticker: honest ok:false, still an ack, still 200
+        for body in (b'{"ticker": "ZZZ"}', b'{"ticker": "  "}', b"{}"):
+            response = backend.dispatch("POST", "/api/news/consult", body=body)
+            assert response.status == 200, (mode, body, response.status)
+            payload = response.json()
+            assert payload["ok"] is False and payload["reason"]
+            assert payload["fixture_ack"] is True and payload["applied"] is False
+
+
+def test_news_decisions_route_serves_one_synthetic_d_row():
+    backend = FixtureBackend(mode="populated")
+    as_of = json.loads(DEFAULT_FIXTURE.read_text(encoding="utf-8"))["as_of"][:10]
+    ticker = get_json(backend, "/api/monthly/status")["positions"][0]["ticker"]
+    event_id = f"D:{ticker}:{as_of}:m"
+    response = backend.dispatch("GET", f"/api/news/decisions/{event_id}")
+    assert response.status == 200, response.status
+    assert response.kind == "fixture_api"
+    payload = response.json()
+    assert NEWS_DECISION_RESPONSE_KEYS <= set(payload)
+    assert payload["event_id"] == event_id and payload["event_type"] == "D"
+    assert payload["engine"] == "monthly" and payload["ticker"] == ticker
+    assert payload["session_date"] == as_of and payload["decided_at"]
+    ctx = payload["context"]
+    assert ctx["position"]["ticker"] == ticker
+    assert isinstance(ctx["citations"], list) and ctx["trace"]
+    assert ctx["news_source"] == "searxng-mcp"
+    # fail-closed: everything else 404s/501s like the live app
+    for path in (
+        f"/api/news/decisions/D:{ticker}:{as_of}",       # 3-part nightly id: not stored
+        "/api/news/decisions/A:AAA:2026-03-06",          # non-D event id
+        "/api/news/decisions/D:ZZZ:2026-10-30:m",        # ticker not in the book
+        "/api/news/decisions/D:MSFT:2026-10-30",         # no :m marker
+        "/api/news/decisions/nope",
+        "/api/news/other",
+        "/api/news",
+    ):
+        r = backend.dispatch("GET", path)
+        assert r.status in (404, 501), (path, r.status)
+    assert backend.dispatch("POST", f"/api/news/decisions/{event_id}", body=b"{}").status == 501
+    assert backend.dispatch("GET", "/api/news/consult").status == 501
+    # empty mode: nothing held -> the consult acks ok:false, decisions 404
+    empty = FixtureBackend(mode="empty")
+    r = empty.dispatch("POST", "/api/news/consult", body=b'{"ticker": "MSFT"}')
+    assert r.status == 200 and r.json()["ok"] is False
+    assert empty.dispatch("GET", f"/api/news/decisions/{event_id}").status == 404
+
+
+def test_news_routes_are_unguarded_like_the_live_app():
+    """app/main.py guards /api/news/consult only with _refuse_during_clone
+    (never dev-only/prod-only), so the fixture must answer 200 on BOTH
+    synthetic databases — parity with test_db_guard_parity_leaves_unguarded."""
+    backend = FixtureBackend(mode="populated")
+    as_of = json.loads(DEFAULT_FIXTURE.read_text(encoding="utf-8"))["as_of"][:10]
+    ticker = get_json(backend, "/api/monthly/status")["positions"][0]["ticker"]
+    event_id = f"D:{ticker}:{as_of}:m"
+    for headers in (None, PROD_DB, DEV_DB):
+        consult = backend.dispatch("POST", "/api/news/consult", headers=headers,
+                                   body=json.dumps({"ticker": ticker}).encode())
+        assert consult.status == 200, (headers, consult.status)
+        decision = backend.dispatch("GET", f"/api/news/decisions/{event_id}", headers)
+        assert decision.status == 200, (headers, decision.status)

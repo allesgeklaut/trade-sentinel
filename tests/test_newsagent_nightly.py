@@ -416,3 +416,223 @@ class TestNightlyWiring:
             now=datetime(2026, 3, 6, 23, 30, tzinfo=UTC))
         assert out == {"rebalanced": True}
         assert order == ["D", "rebalance"]          # C skipped, D still runs
+
+
+# ---------------------------------------------------------------------------
+# (h) the MANUAL consult — run_manual_consult + the scan/CLI --fresh mode
+# ---------------------------------------------------------------------------
+
+_EXIT_URL = ('{"decision": "EXIT", "citations": [{"title": "AAA fraud probe", '
+             '"source": "reuters", "date": "2026-10-31", '
+             '"url": "https://reuters.com/aaa-probe"}], '
+             '"rationale": "fraud accusation verified"}')
+
+
+def _cyclic_transport(verdict_text):
+    """A scripted transport that cycles search -> verdict -> search -> ...
+    so EVERY agent run gets its own two turns (repeated CLI invocations in
+    one test share the counter)."""
+    state = {"n": 0}
+
+    async def _t(messages, tools):
+        state["n"] += 1
+        if state["n"] % 2 == 1:
+            return _turn(calls=[_tool_call()])
+        return _turn(text=verdict_text)
+    return _t
+
+
+class TestManualConsult:
+    async def test_happy_path_records_m_row(self, mem_db, armed, tmp_path):
+        await _seed_book(mem_db)
+        res = await newsagent.run_manual_consult(
+            "AAA", as_of=AS_OF, out_dir=str(tmp_path / "n"),
+            mcp=FakeMcp(), transport=_hold_transport())
+        assert res["ok"] is True
+        rec = res["record"]
+        assert rec["event_id"] == f"D:AAA:{AS_OF}:m"
+        assert rec["decision"] == "HOLD" and rec["parsed"] is True
+        assert rec["fail_safe"] is False
+        rows = await _ledger_rows(mem_db)
+        assert len(rows) == 1
+        r = rows[0]
+        assert r.event_type == "D" and r.engine == "monthly"
+        assert r.event_id == f"D:AAA:{AS_OF}:m" and r.ticker == "AAA"
+        assert r.session_date == AS_OF and r.decision == "HOLD"
+        # the flagship shadow property: EVERY fill column is NULL
+        assert r.filled_at is None and r.shares is None
+        assert r.price is None and r.cash_after is None
+        ctx = json.loads(r.context)
+        assert ctx["position"]["ticker"] == "AAA"
+        assert ctx["news_source"] == "searxng-mcp"
+        assert len(ctx["trace"]) == 1
+        # the best-effort artifact landed
+        assert (tmp_path / "n" / f"news-consult-{AS_OF}.jsonl").exists()
+
+    async def test_as_of_defaults_to_last_session(self, mem_db, armed, tmp_path):
+        await _seed_book(mem_db)
+        res = await newsagent.run_manual_consult(
+            "AAA", out_dir=str(tmp_path / "n"), mcp=FakeMcp(),
+            transport=_hold_transport())
+        assert res["ok"] is True
+        assert res["record"]["event_id"] == f"D:AAA:{AS_OF}:m"
+
+    async def test_repeated_consults_never_dedupe(self, mem_db, armed, tmp_path):
+        """Fresh semantics: every manual consult runs again — no self-dedupe,
+        no dedupe against nightly rows."""
+        await _seed_book(mem_db)
+        out = str(tmp_path / "n")
+        r1 = await newsagent.run_manual_consult(
+            "AAA", as_of=AS_OF, out_dir=out, mcp=FakeMcp(),
+            transport=_hold_transport())
+        r2 = await newsagent.run_manual_consult(
+            "AAA", as_of=AS_OF, out_dir=out, mcp=FakeMcp(),
+            transport=_hold_transport())
+        assert r1["ok"] is True and r2["ok"] is True
+        rows = await _ledger_rows(mem_db)
+        assert len(rows) == 2                       # append-only: both stand
+        assert all(r.event_id == f"D:AAA:{AS_OF}:m" for r in rows)
+
+    async def test_unknown_ticker_is_honest_error(self, mem_db, armed, tmp_path):
+        await _seed_book(mem_db)
+        res = await newsagent.run_manual_consult(
+            "ZZZ", as_of=AS_OF, out_dir=str(tmp_path / "n"), mcp=FakeMcp(),
+            transport=_hold_transport())
+        assert res["ok"] is False and "record" not in res
+        assert "not in the monthly book" in res["reason"] and "ZZZ" in res["reason"]
+        assert await _ledger_rows(mem_db) == []    # zero DB writes
+
+    async def test_knob_off_is_disabled_not_broken(self, mem_db, monkeypatch,
+                                                    tmp_path):
+        monkeypatch.setattr(settings, "searxng_mcp_url", "")
+        await _seed_book(mem_db)
+        res = await newsagent.run_manual_consult(
+            "AAA", as_of=AS_OF, out_dir=str(tmp_path / "n"), mcp=FakeMcp(),
+            transport=_hold_transport())
+        assert res["ok"] is False
+        assert res["reason"] == \
+            "the D step is disabled — SEARXNG_MCP_URL is not set"
+        assert await _ledger_rows(mem_db) == []    # zero DB writes, no error
+
+    async def test_never_raises_on_recorder_failure(self, mem_db, armed,
+                                                    tmp_path, monkeypatch):
+        await _seed_book(mem_db)
+
+        async def boom(*, rec, **kwargs):
+            raise RuntimeError("ledger write boom")
+
+        monkeypatch.setattr(newsagent, "_record_ledger_row", boom)
+        res = await newsagent.run_manual_consult(
+            "AAA", as_of=AS_OF, out_dir=str(tmp_path / "n"), mcp=FakeMcp(),
+            transport=_hold_transport())
+        assert res["ok"] is False                   # collected, not raised
+        assert "ledger write boom" in res["reason"]
+
+    async def test_fail_safe_record_is_a_valid_result(self, mem_db, armed,
+                                                      tmp_path):
+        """An agent failure (transport down) is a fail-safe RECORD, not an
+        error: ok:True with the fail-safe record, and the row is appended."""
+        await _seed_book(mem_db)
+
+        async def boom(messages, tools):
+            raise RuntimeError("proxy down")
+
+        res = await newsagent.run_manual_consult(
+            "AAA", as_of=AS_OF, out_dir=str(tmp_path / "n"), mcp=FakeMcp(),
+            transport=boom)
+        assert res["ok"] is True
+        assert res["record"]["fail_safe"] is True
+        assert res["record"]["decision"] == "HOLD"
+        assert "proxy down" in res["record"]["fail_reason"]
+        rows = await _ledger_rows(mem_db)
+        assert len(rows) == 1 and rows[0].fail_safe is True
+        assert rows[0].event_id == f"D:AAA:{AS_OF}:m"
+
+
+class TestFreshScanAndCli:
+    async def test_scan_fresh_uses_m_marker_and_never_dedupes(
+            self, mem_db, armed, tmp_path):
+        """--fresh: 4-part :m event ids, no dedupe at all (against nightly
+        rows or itself); without --fresh the nightly 3-part id and its
+        dedupe are unchanged."""
+        await _seed_book(mem_db)
+        out = str(tmp_path / "n")
+        r1 = await newsagent.run_news_scan(as_of=AS_OF, out_dir=out, fresh=True,
+                                           mcp=FakeMcp(),
+                                           transport=_hold_transport())
+        r2 = await newsagent.run_news_scan(as_of=AS_OF, out_dir=out, fresh=True,
+                                           mcp=FakeMcp(),
+                                           transport=_hold_transport())
+        assert r1["n_ledger_rows"] == 1 and r2["n_ledger_rows"] == 1
+        assert r1["n_deduped"] == 0 and r2["n_deduped"] == 0
+        rows = await _ledger_rows(mem_db)
+        assert [r.event_id for r in rows] == [f"D:AAA:{AS_OF}:m"] * 2
+        # the nightly 3-part path is unchanged: consults, then dedupes
+        r3 = await newsagent.run_news_scan(as_of=AS_OF, out_dir=out,
+                                           mcp=FakeMcp(),
+                                           transport=_hold_transport())
+        r4 = await newsagent.run_news_scan(as_of=AS_OF, out_dir=out,
+                                           mcp=FakeMcp(),
+                                           transport=_hold_transport())
+        assert r3["n_ledger_rows"] == 1 and r4["n_deduped"] == 1
+        assert r4["n_ledger_rows"] == 0
+        rows = await _ledger_rows(mem_db)
+        assert len(rows) == 3
+        assert rows[-1].event_id == f"D:AAA:{AS_OF}"    # exact 3-part form
+
+    async def test_cli_fresh_prints_the_response(self, mem_db, armed,
+                                                 monkeypatch, tmp_path, capsys):
+        """The --fresh CLI run: :m event ids, repeated runs consult again,
+        and the printed output carries the decision, the rationale and each
+        citation (title + URL) after the summary line."""
+        await _seed_book(mem_db)
+        monkeypatch.setattr(newsagent, "McpClient", lambda url: FakeMcp())
+        monkeypatch.setattr(newsagent, "_default_transport",
+                            _cyclic_transport(_EXIT_URL))
+        base = ["news", "--no-dry-run", "--fresh", "--as-of", AS_OF,
+                "--out", str(tmp_path / "n")]
+        assert await newsagent._cmd_news(
+            newsagent._build_parser().parse_args(base)) == 0
+        out = capsys.readouterr().out
+        rows = await _ledger_rows(mem_db)
+        assert len(rows) == 1 and rows[0].event_id == f"D:AAA:{AS_OF}:m"
+        assert rows[0].decision == "EXIT"
+        assert "EXIT" in out
+        assert "rationale: fraud accusation verified" in out
+        assert "AAA fraud probe" in out
+        assert "https://reuters.com/aaa-probe" in out
+        # a second --fresh run consults AGAIN (no self-dedupe)
+        assert await newsagent._cmd_news(
+            newsagent._build_parser().parse_args(base)) == 0
+        capsys.readouterr()
+        rows = await _ledger_rows(mem_db)
+        assert len(rows) == 2
+        assert all(r.event_id == f"D:AAA:{AS_OF}:m" for r in rows)
+
+    async def test_cli_without_fresh_keeps_nightly_3_part(
+            self, mem_db, armed, monkeypatch, tmp_path, capsys):
+        await _seed_book(mem_db)
+        monkeypatch.setattr(newsagent, "McpClient", lambda url: FakeMcp())
+        monkeypatch.setattr(newsagent, "_default_transport",
+                            _cyclic_transport(_HOLD))
+        base = ["news", "--no-dry-run", "--as-of", AS_OF,
+                "--out", str(tmp_path / "n")]
+        assert await newsagent._cmd_news(
+            newsagent._build_parser().parse_args(base)) == 0
+        assert await newsagent._cmd_news(        # deduped: consults once
+            newsagent._build_parser().parse_args(base)) == 0
+        out = capsys.readouterr().out
+        rows = await _ledger_rows(mem_db)
+        assert len(rows) == 1
+        assert rows[0].event_id == f"D:AAA:{AS_OF}"      # exact 3-part form
+        assert "rationale: nothing material" in out     # response still printed
+
+    def test_parser_fresh_flag_and_help_documents_marker(self, capsys):
+        p = newsagent._build_parser()
+        assert p.parse_args(["news"]).fresh is False
+        assert p.parse_args(["news", "--fresh"]).fresh is True
+        with pytest.raises(SystemExit):
+            p.parse_args(["news", "--help"])
+        help_out = capsys.readouterr().out
+        assert "D:{ticker}:{as_of}:m" in help_out
+        assert ":m" in help_out and "deduped" in help_out

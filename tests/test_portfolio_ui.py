@@ -71,6 +71,20 @@ FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 #   - 2026-10-31 (dead-code pass, part 2): the withLiveToday guard entry was
 #     removed together with the function (see the entry above); mddOf and
 #     Savings digests unchanged.
+#   - 2026-11-01 (type-D manual news-consult panel in the Monthly sub-view:
+#     new #news-consult-section HTML in #monthly-view, the
+#     news-consult-ticker select population in loadMonthlyStatus, and
+#     consultNews/renderNewsConsult beside runMonthly; plus the retired-
+#     hybrid wording in backfillSim's confirm()). NO guarded block spans
+#     those edits, so NO digest moved — re-pin verified, not needed:
+#     mddOf sha256 237c6ebde46f9af4c6078aec5511afa57805396a78dbcf462d2ba94c9e0641dd
+#     and savings_block_all_functions_and_math sha256
+#     77f1c31f0cfcaf6e6e13f386f27a56f2bfebecdb8f2ab3bbea76f9858b71b048 are
+#     UNCHANGED (byte-identical, recomputed after the edit). Intactness
+#     evidence: `node --check` passes on both extracted inline scripts of
+#     static/index.html, the golden overlay pins in test_legacy_golden_*
+#     still pass (comparison math behavior), and portfolio.js's withLiveToday
+#     is untouched (index.html's retired copy was already gone at 3A+).
 # ---------------------------------------------------------------------------
 
 RESULT_PREFIX = "__PORTFOLIO_UI_RESULT__"

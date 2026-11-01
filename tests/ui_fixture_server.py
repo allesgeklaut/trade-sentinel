@@ -30,6 +30,13 @@ GUARANTEES
   Guard parity mirrors the real app: dev-only destructive POSTs answer 403
   unless the active database is dev, and prod-only savings writes (18 POSTs
   plus the two savings DELETEs) answer 403 while the active database is dev.
+ * The type-D news-agent routes mirror app/main.py's ``/api/news/*``:
+  ``POST /api/news/consult`` is a FAIL-CLOSED synthetic ack (no real agent
+  consult, no LLM, no search call — the payload mirrors the live response
+  shape with ``fixture_ack``/``applied: false``), and
+  ``GET /api/news/decisions/{event_id}`` serves one synthetic D row for the
+  manual 4-part ``D:{ticker}:{date}:m`` ids of the monthly book's held
+  tickers; every other news path fails closed (404/501).
 * Every response carries ``X-Trade-Sentinel-Fixture: testing-only`` plus
   ``X-Fixture-Mode`` / ``X-Fixture-Label`` headers and a content-security
   policy that keeps all traffic same-origin. External CDN script tags in
@@ -590,6 +597,8 @@ class FixtureBackend:
             return self._json(200, _as_list(results.get(universe, []), f"screener.results.{universe}"), mode, "fixture_api")
         if api == ["llm", "status"]:
             return self._json(200, _as_dict(data.get("llm"), "llm"), mode, "fixture_api")
+        if api and api[0] == "news":
+            return self._news_get(api, mode)
         if api == ["run-config"]:
             # Live CURRENT (next-run) configuration of every engine — canned
             # from the fixture document (sim/monthly/daily_core, each with
@@ -650,6 +659,79 @@ class FixtureBackend:
             rebalances = _as_list(portfolio.get("rebalances"), "monthly.rebalances")
             return self._json(200, copy.deepcopy(rebalances[:limit]), mode, "fixture_api")
         raise FixtureError(501, "unknown fixture API route", "unknown_api")
+
+    def _news_get(self, api: list[str], mode: str) -> FixtureResponse:
+        """GET /api/news/decisions/{event_id} — the synthetic D row.
+
+        Mirrors app/main.py's news-agent view: only the manual 4-part
+        ``D:{ticker}:{date}:m`` event ids of the monthly book's held tickers
+        answer 200 (one hard-coded synthetic record, built here — NOT in the
+        pinned ui_phase3.json document); every other news path fails closed
+        exactly like the live app's honest 404 / unknown-route 501.
+        """
+        if len(api) == 3 and api[1] == "decisions":
+            event_id = api[2]
+            parts = event_id.split(":")
+            held = self._held_tickers(mode, "monthly")
+            if (len(parts) == 4 and parts[0] == "D" and parts[3] == "m"
+                    and parts[1] in held):
+                return self._json(200, self._synthetic_d_row(mode, event_id),
+                                  mode, "fixture_api")
+            raise FixtureError(
+                404, f"no type-D decision for event_id {event_id!r}", "not_found")
+        raise FixtureError(501, "unknown fixture API route", "unknown_api")
+
+    def _synthetic_d_row(self, mode: str, event_id: str) -> dict:
+        """The canned type-D record (built in the harness, not in the pinned
+        fixture document): a HOLD with one citation and one search trace."""
+        as_of = str(self.fixture.get("as_of", "2026-10-30"))[:10]
+        parts = event_id.split(":")
+        ticker = parts[1] if len(parts) > 1 else ""
+        session = parts[2] if len(parts) > 2 else as_of
+        return {
+            "event_id": event_id,
+            "event_type": "D",
+            "engine": "monthly",
+            "ticker": ticker,
+            "session_date": session,
+            "decision": "HOLD",
+            "rationale": "Synthetic fixture row — no real agent consult ran (testing only).",
+            "parsed": True,
+            "fail_safe": False,
+            "fail_reason": None,
+            "prompt_version": "sellshadow/1-d",
+            "context": {
+                "position": {
+                    "ticker": ticker,
+                    "shares_held": 8.0,
+                    "entry": {"date": "2026-07-31", "price": 401.2},
+                    "current": {"date": as_of, "close": 438.75},
+                    "pnl_pct": 9.36,
+                    "months_held": 3.0,
+                    "stated_thesis_condition": "ROE > 0 and operating cash flow positive",
+                    "latest_fundamentals": {},
+                },
+                "citations": [{"title": f"Fixture headline — {ticker}",
+                               "source": "fixture-news", "date": as_of}],
+                "trace": [{"name": "searxng_web_search",
+                           "arguments": {"query": f"{ticker} news"},
+                           "ok": True, "kind": "ok", "result_chars": 42,
+                           "result_head": "synthetic fixture search result"}],
+                "temperature": 0.6,
+                "reasoning_effort": "",
+                "tool_calls": 1,
+                "turns": 2,
+                "news_source": "searxng-mcp",
+            },
+            "engine_branch": {
+                "rule": "hold to next month-end rebuild",
+                "note": "shadow: no execution authority; the fill columns stay NULL",
+            },
+            "backend": "fixture-offline",
+            "model": "fixture-news-model",
+            "latency_ms": 0.0,
+            "decided_at": f"{as_of}T12:00:00+00:00",
+        }
 
     def _savings_get(self, api: list[str], query: dict[str, list[str]], mode: str) -> FixtureResponse:
         savings = _as_dict(self.modes[mode].get("savings"), "savings")
@@ -854,6 +936,39 @@ class FixtureBackend:
             return self._ack(mode, {
                 "backend": payload.get("backend", ""),
                 "model": payload.get("model", ""),
+            })
+
+        if api == ["news", "consult"]:
+            # Fail-closed synthetic ack mirroring POST /api/news/consult in
+            # app/main.py: NO real consult runs here (no LLM, no search MCP).
+            # The payload carries the live response's shape so the UI panel
+            # renders identically, plus fixture_ack/applied: false.
+            payload = self._body_json(body)
+            ticker = str(payload.get("ticker", "")).strip().upper()
+            held = self._held_tickers(mode, "monthly")
+            if not ticker:
+                return self._ack(mode, {"ok": False,
+                                        "reason": "ticker must not be empty"})
+            if ticker not in held:
+                return self._ack(mode, {
+                    "ok": False,
+                    "reason": f"{ticker} is not in the monthly book (fixture)",
+                })
+            as_of = str(self.fixture.get("as_of", "2026-10-30"))[:10]
+            row = self._synthetic_d_row(mode, f"D:{ticker}:{as_of}:m")
+            return self._ack(mode, {
+                "ok": True,
+                "decision": row["decision"],
+                "rationale": row["rationale"],
+                "citations": row["context"]["citations"],
+                "turns": row["context"]["turns"],
+                "tool_calls": row["context"]["tool_calls"],
+                "latency_ms": 0.0,
+                "fail_safe": False,
+                "fail_reason": None,
+                "event_id": row["event_id"],
+                "model": row["model"],
+                "backend": row["backend"],
             })
 
         if api and api[0] == "savings":
