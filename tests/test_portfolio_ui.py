@@ -85,6 +85,25 @@ FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 #     static/index.html, the golden overlay pins in test_legacy_golden_*
 #     still pass (comparison math behavior), and portfolio.js's withLiveToday
 #     is untouched (index.html's retired copy was already gone at 3A+).
+#   - 2026-11-01 (review-fix slice): the news-consult JS block is pinned as a
+#     THIRD source_guards entry, news_consult_block_renderNewsConsult_and_
+#     consultNews — boundaries: from the "// --- Type-D material-news consult
+#     (one real agent run per click) ---" comment through the end of
+#     consultNews (end marker "        async function backfillMonthly() {",
+#     the same start-of-next-section extraction style as the Savings block),
+#     sha256 177089c9dc256776fd1519f6f078aced6e5a6ed2578a7ef4ef6a9bf5131ee831.
+#     The pinned block carries the review fixes: consultNews's catch now
+#     renders an honest bounded error state (truncated 200-char technical
+#     detail, dim) instead of the raw assertion, renderNewsConsult uses a
+#     string citation's own words as its title, and the turns/tool_calls/lat
+#     meta interpolations are escapeHtml-wrapped. Intactness evidence for
+#     this re-pin: the two EXISTING pins are byte-identical — mddOf sha256
+#     237c6ebde46f9af4c6078aec5511afa57805396a78dbcf462d2ba94c9e0641dd and
+#     savings_block_all_functions_and_math sha256
+#     77f1c31f0cfcaf6e6e13f386f27a56f2bfebecdb8f2ab3bbea76f9858b71b048
+#     recomputed UNCHANGED after the edit; `node --check` passes on both
+#     extracted inline scripts of static/index.html; the golden overlay pins
+#     in test_legacy_golden_* still pass.
 # ---------------------------------------------------------------------------
 
 RESULT_PREFIX = "__PORTFOLIO_UI_RESULT__"

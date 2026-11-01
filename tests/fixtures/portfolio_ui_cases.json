@@ -2196,6 +2196,12 @@
         "start_marker": "        // ===================== Savings tracker (real money, EUR) =====================",
         "end_marker": "        // ===================== Monthly qv-mom portfolio =====================",
         "sha256": "77f1c31f0cfcaf6e6e13f386f27a56f2bfebecdb8f2ab3bbea76f9858b71b048"
+      },
+      {
+        "name": "news_consult_block_renderNewsConsult_and_consultNews",
+        "start_marker": "        // --- Type-D material-news consult (one real agent run per click) ---",
+        "end_marker": "        async function backfillMonthly() {",
+        "sha256": "177089c9dc256776fd1519f6f078aced6e5a6ed2578a7ef4ef6a9bf5131ee831"
       }
     ]
   },

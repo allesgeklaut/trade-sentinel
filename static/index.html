@@ -6096,8 +6096,9 @@
             const dec = String(r.decision || '').toUpperCase();
             const cls = dec === 'EXIT' ? 'sell' : 'hold';   // house decision chips
             const cites = (Array.isArray(r.citations) ? r.citations : []).map(c => {
-                const title = escapeHtml(c && c.title ? c.title
-                    : (c && c.source ? c.source : 'citation'));
+                const title = escapeHtml(typeof c === 'string' ? c
+                    : (c && c.title ? c.title
+                        : (c && c.source ? c.source : 'citation')));
                 const rawUrl = c && typeof c.url === 'string' ? c.url : '';
                 // Only absolute http(s) URLs become links (never javascript: etc.)
                 if (/^https?:\/\//i.test(rawUrl)) {
@@ -6114,9 +6115,9 @@
                 + (cites ? '<div class="bench-label" style="margin-top:6px">CITATIONS</div>'
                     + '<ul style="margin:4px 0 0 18px;font-size:12px">' + cites + '</ul>' : '')
                 + '<div style="margin-top:6px;font-size:11px;color:#7aaa81">'
-                + 'turns ' + (r.turns != null ? r.turns : '—')
-                + ' · tool calls ' + (r.tool_calls != null ? r.tool_calls : '—')
-                + ' · ' + lat
+                + 'turns ' + escapeHtml(r.turns != null ? r.turns : '—')
+                + ' · tool calls ' + escapeHtml(r.tool_calls != null ? r.tool_calls : '—')
+                + ' · ' + escapeHtml(lat)
                 + ' · model ' + escapeHtml(r.model || '—') + ' (' + escapeHtml(r.backend || '—') + ')'
                 + ' · event ' + escapeHtml(r.event_id || '—')
                 + (r.fail_reason ? ' · fail-safe: ' + escapeHtml(r.fail_reason) : '')
@@ -6150,9 +6151,24 @@
                     ? 'Consult recorded: ' + r.event_id
                     : 'Not run: ' + (r.reason || 'unknown reason');
             } catch (e) {
-                status.textContent = 'Error: ' + e.message;
-                if (out) out.innerHTML = '<div class="sim-empty" style="padding:8px 0;text-align:left">Error: '
-                    + escapeHtml(e.message) + '</div>';
+                // The request failed or timed out (e.g. a tunnel 524's HTML
+                // error page arrives as the raw body): the consult may STILL
+                // be running server-side and may still record its shadow row,
+                // so do not blindly re-click — that fires a SECOND real agent
+                // consult. Show an honest sentence; the technical detail is
+                // truncated and rendered dim below it.
+                const full = String(e && e.message ? e.message : e);
+                const detail = full.length > 200 ? full.slice(0, 200) + '…' : full;
+                const honest = 'The request failed or timed out — the consult may still be '
+                    + 'running server-side and may still record its shadow row (visible in '
+                    + "the LLM sell scorecard's shadow rows). Check there before retrying; "
+                    + 'a retry fires another real agent consult.';
+                status.textContent = honest;
+                if (out) out.innerHTML = '<div class="sim-empty" style="padding:8px 0;text-align:left">'
+                    + escapeHtml(honest)
+                    + '<div style="margin-top:4px;font-size:11px;color:#7aaa81;opacity:0.7;'
+                    + 'white-space:pre-wrap;word-break:break-word">' + escapeHtml(detail) + '</div>'
+                    + '</div>';
             }
             btn.disabled = false;
         }

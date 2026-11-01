@@ -823,14 +823,18 @@ def test_db_guard_parity_leaves_unguarded_routes_alone():
         ("POST", "/api/screener/run/diversified-plus"),
         ("POST", "/api/chat/AAPL/stream"),
         ("POST", "/api/llm/select"),
-        ("POST", "/api/news/consult"),
+        # A non-empty ticker: an empty one is a 422 now (live parity), so the
+        # unguarded-ness probe uses an unknown-but-valid ticker (200 ok:false).
+        ("POST", "/api/news/consult", b'{"ticker": "ZZZ"}'),
         ("DELETE", "/api/sim/chat/history"),
         ("DELETE", "/api/watchlist/AAPL"),
         ("POST", "/api/refresh/AAPL"),
     )
-    for method, path in unguarded:
+    for entry in unguarded:
+        method, path = entry[0], entry[1]
+        body = entry[2] if len(entry) > 2 else b"{}"
         for headers in (None, DEV_DB, PROD_DB):
-            response = backend.dispatch(method, path, headers=headers, body=b"{}")
+            response = backend.dispatch(method, path, headers=headers, body=body)
             assert response.status == 200, (method, path, headers, response.status)
     # Savings GETs (incl. GET savings/plans) stay unguarded on dev.
     assert get_json(backend, "/api/savings/plans", DEV_DB) is not None
@@ -1030,13 +1034,18 @@ def test_news_consult_route_is_a_fail_closed_synthetic_ack():
             else:
                 assert payload["ok"] is False
                 assert {"ok", "reason"} <= set(payload)
-        # unknown / empty ticker: honest ok:false, still an ack, still 200
-        for body in (b'{"ticker": "ZZZ"}', b'{"ticker": "  "}', b"{}"):
+        # unknown ticker: honest ok:false, still an ack, still 200 (live parity)
+        response = backend.dispatch("POST", "/api/news/consult", body=b'{"ticker": "ZZZ"}')
+        assert response.status == 200, (mode, response.status)
+        payload = response.json()
+        assert payload["ok"] is False and payload["reason"]
+        assert payload["fixture_ack"] is True and payload["applied"] is False
+        # empty ticker: 422 with the live detail string (app/main.py:935)
+        for body in (b'{"ticker": "  "}', b"{}"):
             response = backend.dispatch("POST", "/api/news/consult", body=body)
-            assert response.status == 200, (mode, body, response.status)
-            payload = response.json()
-            assert payload["ok"] is False and payload["reason"]
-            assert payload["fixture_ack"] is True and payload["applied"] is False
+            assert response.status == 422, (mode, body, response.status)
+            assert response.json()["detail"] == "ticker must not be empty"
+            assert b"http://" not in response.body and b"https://" not in response.body
 
 
 def test_news_decisions_route_serves_one_synthetic_d_row():

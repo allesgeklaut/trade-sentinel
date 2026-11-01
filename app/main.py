@@ -908,6 +908,15 @@ class NewsConsultRequest(BaseModel):
     as_of: str | None = None
 
 
+# In-flight manual consults, keyed by ticker — a ROUTE-level operational guard
+# like _refuse_during_clone: the UI disables its button while a consult runs,
+# but a second caller (another tab, or a re-click after a tunnel timeout that
+# made the first request look failed) would double-spend a real agent run.
+# The CLI/nightly paths call run_manual_consult / run_news_scan directly and
+# are unaffected; the agent loop's no-budgets doctrine is untouched.
+_NEWS_CONSULT_IN_FLIGHT: set[str] = set()
+
+
 @app.post('/api/news/consult', dependencies=[Depends(_refuse_during_clone)])
 async def news_consult(req: NewsConsultRequest):
     """Run ONE manual material-news consult for one monthly-book name
@@ -927,7 +936,10 @@ async def news_consult(req: NewsConsultRequest):
     fail_reason, event_id, model, backend. A fail-safe record IS a valid
     response — this route NEVER 500s on an agent failure. Knob off
     (SEARXNG_MCP_URL unset) or an unknown ticker answer honestly with
-    ok:false + reason (HTTP 200, not an error status).
+    ok:false + reason (HTTP 200, not an error status). A consult already in
+    flight for the same ticker is refused the same way (200 ok:false) — the
+    client-side disable-during-run is not enough against a second tab or a
+    re-click after a tunnel timeout.
     """
     from . import newsagent
     ticker = (req.ticker or "").strip().upper()
@@ -940,7 +952,21 @@ async def news_consult(req: NewsConsultRequest):
         except ValueError as e:
             raise HTTPException(
                 422, f"invalid as_of: {as_of!r} (use YYYY-MM-DD)") from e
-    result = await newsagent.run_manual_consult(ticker, as_of=as_of)
+    if ticker in _NEWS_CONSULT_IN_FLIGHT:
+        # Honest refusal (200 ok:false, this route's convention), not an
+        # error status: the in-flight consult may still complete server-side
+        # and record its shadow row (the sell scorecard) — retry after it.
+        return {"ok": False,
+                "reason": f"a consult for {ticker} is already running — its shadow "
+                          f"row will appear in the sell scorecard; retry after it "
+                          f"completes"}
+    _NEWS_CONSULT_IN_FLIGHT.add(ticker)
+    try:
+        result = await newsagent.run_manual_consult(ticker, as_of=as_of)
+    except Exception as e:  # noqa: BLE001 — the route never 500s
+        return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+    finally:
+        _NEWS_CONSULT_IN_FLIGHT.discard(ticker)
     if not result.get("ok"):
         return {"ok": False,
                 "reason": result.get("reason") or "consult failed"}

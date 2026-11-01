@@ -21,10 +21,16 @@ Covered:
       (position/citations/trace) plus decision/rationale/parsed/fail_safe/
       decided_at; an honest 404 for unknown ids AND for non-D event_ids
       (this is the news-agent view, not the A/B/C ledger).
+  (e) the route-level in-flight lock: two CONCURRENT consults for one
+      ticker — the first completes, the second gets 200 ok:false with the
+      already-running reason and NO second ledger row; the lock releases
+      after completion AND after an internal failure (run_manual_consult
+      raising once still never 500s the route), so the next consult succeeds.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 
@@ -232,6 +238,87 @@ class TestNewsConsultRoute:
         r = await client.post("/api/news/consult", json={"ticker": "   "})
         assert r.status_code == 422
         assert await _ledger_rows(mem_db) == []
+
+    async def test_concurrent_consult_for_same_ticker_is_refused(
+            self, mem_db, armed, fake_agent, monkeypatch, client):
+        """Two CONCURRENT consults for one ticker: the first completes, the
+        second is refused with the already-running reason and NO second
+        ledger row (the route-level in-flight lock — the client-side
+        disable-during-run alone cannot stop another tab or a re-click)."""
+        await _seed_book(mem_db)
+        real = newsagent.run_manual_consult
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = {"n": 0}
+
+        async def slow(ticker, **kwargs):
+            calls["n"] += 1
+            started.set()
+            await release.wait()          # hold the lock while request 2 lands
+            return await real(ticker, **kwargs)
+
+        monkeypatch.setattr(newsagent, "run_manual_consult", slow)
+        first = asyncio.create_task(client.post(
+            "/api/news/consult", json={"ticker": "AAA", "as_of": AS_OF}))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        second = await client.post("/api/news/consult",
+                                   json={"ticker": "AAA", "as_of": AS_OF})
+        assert second.status_code == 200            # honest refusal, not an error
+        body = second.json()
+        assert body["ok"] is False
+        assert "already running" in body["reason"] and "AAA" in body["reason"]
+        release.set()
+        r1 = await asyncio.wait_for(first, timeout=30)
+        assert r1.status_code == 200 and r1.json()["ok"] is True
+        assert calls["n"] == 1                      # only ONE real consult ran
+        rows = await _ledger_rows(mem_db)
+        assert len(rows) == 1                       # NO second ledger row
+        assert rows[0].event_id == f"D:AAA:{AS_OF}:m"
+        assert main._NEWS_CONSULT_IN_FLIGHT == set()
+
+    async def test_lock_releases_after_completion(self, mem_db, armed,
+                                                  fake_agent, client):
+        """After a consult completes, the same ticker consults again fine
+        (the lock is released in a finally, not held forever)."""
+        await _seed_book(mem_db)
+        for _ in range(2):
+            r = await client.post("/api/news/consult",
+                                  json={"ticker": "AAA", "as_of": AS_OF})
+            assert r.status_code == 200 and r.json()["ok"] is True
+        rows = await _ledger_rows(mem_db)
+        assert len(rows) == 2
+        assert main._NEWS_CONSULT_IN_FLIGHT == set()
+
+    async def test_lock_releases_after_internal_failure(self, mem_db, armed,
+                                                        fake_agent, monkeypatch,
+                                                        client):
+        """run_manual_consult raising once must NOT 500 the route (the
+        never-500s contract holds) and must NOT wedge the lock: the next
+        consult for the same ticker succeeds."""
+        await _seed_book(mem_db)
+        real = newsagent.run_manual_consult
+        calls = {"n": 0}
+
+        async def flaky(ticker, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("boom")
+            return await real(ticker, **kwargs)
+
+        monkeypatch.setattr(newsagent, "run_manual_consult", flaky)
+        r1 = await client.post("/api/news/consult",
+                               json={"ticker": "AAA", "as_of": AS_OF})
+        assert r1.status_code == 200               # the route never 500s
+        assert r1.json()["ok"] is False
+        assert "boom" in r1.json()["reason"]
+        assert await _ledger_rows(mem_db) == []
+        assert main._NEWS_CONSULT_IN_FLIGHT == set()
+        r2 = await client.post("/api/news/consult",
+                               json={"ticker": "AAA", "as_of": AS_OF})
+        assert r2.status_code == 200 and r2.json()["ok"] is True
+        rows = await _ledger_rows(mem_db)
+        assert len(rows) == 1
+        assert main._NEWS_CONSULT_IN_FLIGHT == set()
 
 
 # ---------------------------------------------------------------------------

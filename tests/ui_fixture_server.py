@@ -947,8 +947,8 @@ class FixtureBackend:
             ticker = str(payload.get("ticker", "")).strip().upper()
             held = self._held_tickers(mode, "monthly")
             if not ticker:
-                return self._ack(mode, {"ok": False,
-                                        "reason": "ticker must not be empty"})
+                # Mirrors live exactly: app/main.py raises HTTPException(422, "ticker must not be empty")
+                raise FixtureError(422, "ticker must not be empty", "rejected")
             if ticker not in held:
                 return self._ack(mode, {
                     "ok": False,
