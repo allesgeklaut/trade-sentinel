@@ -104,6 +104,23 @@ FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 #     recomputed UNCHANGED after the edit; `node --check` passes on both
 #     extracted inline scripts of static/index.html; the golden overlay pins
 #     in test_legacy_golden_* still pass.
+#   - 2026-11-01 (entry #2, type-D scope extension + run-all slice): the
+#     news-consult JS block moved again — runNewsScan/renderNewsScan (the
+#     "Run all (N)" background scan: POST news/scan, poll news/scan/status
+#     every ~3s, verdict-chip summary) were added inside the pinned block,
+#     and loadMonthlyStatus's picker population (OUTSIDE the pinned block)
+#     now merges /api/monthly/status + /api/dailycore/status into the union
+#     with book tags (M / DC / M+DC) and labels the scan button "Run all (N)".
+#     The pinned block was re-pinned ONLY: sha256
+#     0a9372ad0b18c1b669c611fd2e598474225d375d7607c5a0684a783d34eb1844 (was
+#     177089c9dc256776fd1519f6f078aced6e5a6ed2578a7ef4ef6a9bf5131ee831).
+#     Intactness evidence: the mddOf sha256
+#     237c6ebde46f9af4c6078aec5511afa57805396a78dbcf462d2ba94c9e0641dd and the
+#     savings_block_all_functions_and_math sha256
+#     77f1c31f0cfcaf6e6e13f386f27a56f2bfebecdb8f2ab3bbea76f9858b71b048 are
+#     UNCHANGED (byte-identical, recomputed after the edit); `node --check`
+#     passes on both extracted inline scripts of static/index.html; the
+#     golden overlay pins in test_legacy_golden_* still pass.
 # ---------------------------------------------------------------------------
 
 RESULT_PREFIX = "__PORTFOLIO_UI_RESULT__"

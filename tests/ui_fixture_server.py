@@ -33,7 +33,11 @@ GUARANTEES
  * The type-D news-agent routes mirror app/main.py's ``/api/news/*``:
   ``POST /api/news/consult`` is a FAIL-CLOSED synthetic ack (no real agent
   consult, no LLM, no search call — the payload mirrors the live response
-  shape with ``fixture_ack``/``applied: false``), and
+  shape with ``fixture_ack``/``applied: false``), ``POST /api/news/scan``
+  is a fail-closed synthetic ack of the background full scan
+  (``{ok, started, total}`` over the UNION of both paper books' held
+  tickers — no scan is ever started here), ``GET /api/news/scan/status``
+  serves one synthetic COMPLETED scan state with two results, and
   ``GET /api/news/decisions/{event_id}`` serves one synthetic D row for the
   manual 4-part ``D:{ticker}:{date}:m`` ids of the monthly book's held
   tickers; every other news path fails closed (404/501).
@@ -660,15 +664,28 @@ class FixtureBackend:
             return self._json(200, copy.deepcopy(rebalances[:limit]), mode, "fixture_api")
         raise FixtureError(501, "unknown fixture API route", "unknown_api")
 
-    def _news_get(self, api: list[str], mode: str) -> FixtureResponse:
-        """GET /api/news/decisions/{event_id} — the synthetic D row.
+    def _news_union_tickers(self, mode: str) -> list[str]:
+        """The UNION of both paper books' held tickers, sorted — the full
+        scan's synthetic scope (monthly + daily-core status positions)."""
+        monthly = self._held_tickers(mode, "monthly")
+        daily = self._held_tickers(mode, "daily_core")
+        return sorted(set(monthly) | set(daily))
 
-        Mirrors app/main.py's news-agent view: only the manual 4-part
-        ``D:{ticker}:{date}:m`` event ids of the monthly book's held tickers
-        answer 200 (one hard-coded synthetic record, built here — NOT in the
-        pinned ui_phase3.json document); every other news path fails closed
+    def _news_get(self, api: list[str], mode: str) -> FixtureResponse:
+        """GET /api/news/* — the synthetic news-agent views.
+
+        ``GET /api/news/scan/status`` mirrors app/main.py's scan-state
+        endpoint: one synthetic COMPLETED state (running false, two
+        results, empty errors) built here — NOT in the pinned fixture
+        document. ``GET /api/news/decisions/{event_id}`` mirrors the live
+        news-agent view: only the manual 4-part ``D:{ticker}:{date}:m``
+        event ids of the monthly book's held tickers answer 200 (one
+        hard-coded synthetic record); every other news path fails closed
         exactly like the live app's honest 404 / unknown-route 501.
         """
+        if api == ["news", "scan", "status"]:
+            return self._json(200, self._synthetic_scan_status(mode),
+                              mode, "fixture_api")
         if len(api) == 3 and api[1] == "decisions":
             event_id = api[2]
             parts = event_id.split(":")
@@ -680,6 +697,34 @@ class FixtureBackend:
             raise FixtureError(
                 404, f"no type-D decision for event_id {event_id!r}", "not_found")
         raise FixtureError(501, "unknown fixture API route", "unknown_api")
+
+    def _synthetic_scan_status(self, mode: str) -> dict:
+        """The canned COMPLETED full-scan state for GET /api/news/scan/status
+        (built in the harness, not in the pinned fixture document): running
+        false, the union's size as total/done, and TWO synthetic results
+        (one HOLD, one EXIT) with 4-part :m event ids. No real scan ran."""
+        as_of = str(self.fixture.get("as_of", "2026-10-30"))[:10]
+        union = self._news_union_tickers(mode)
+        results = []
+        for i, ticker in enumerate(union[:2]):
+            decision = "HOLD" if i == 0 else "EXIT"
+            results.append({
+                "ticker": ticker,
+                "decision": decision,
+                "fail_safe": False,
+                "event_id": f"D:{ticker}:{as_of}:m",
+            })
+        return {
+            "running": False,
+            "started_at": f"{as_of}T11:00:00+00:00",
+            "finished_at": f"{as_of}T11:05:00+00:00",
+            "as_of": as_of,
+            "total": len(union),
+            "done": len(union),
+            "current": None,
+            "results": results,
+            "errors": [],
+        }
 
     def _synthetic_d_row(self, mode: str, event_id: str) -> dict:
         """The canned type-D record (built in the harness, not in the pinned
@@ -936,6 +981,18 @@ class FixtureBackend:
             return self._ack(mode, {
                 "backend": payload.get("backend", ""),
                 "model": payload.get("model", ""),
+            })
+
+        if api == ["news", "scan"]:
+            # Fail-closed synthetic ack mirroring POST /api/news/scan in
+            # app/main.py: NO scan is started here (no agent, no LLM, no
+            # search MCP) — the ack carries the live response's shape
+            # ({ok, started, total}) with total = the UNION of both paper
+            # books' held tickers, plus fixture_ack/applied: false.
+            return self._ack(mode, {
+                "ok": True,
+                "started": True,
+                "total": len(self._news_union_tickers(mode)),
             })
 
         if api == ["news", "consult"]:

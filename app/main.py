@@ -916,12 +916,88 @@ class NewsConsultRequest(BaseModel):
 # are unaffected; the agent loop's no-budgets doctrine is untouched.
 _NEWS_CONSULT_IN_FLIGHT: set[str] = set()
 
+# Module-level state of the background FULL news scan (POST /api/news/scan).
+# A synchronous multi-minute request would die at the proxy's ~100s cutoff,
+# so the route starts the scan as an asyncio task and returns immediately;
+# GET /api/news/scan/status serves this state. A fresh process reports
+# running False, total 0. results: [{ticker, decision, fail_safe, event_id}];
+# errors: [{ticker, error}].
+_NEWS_SCAN_STATE: dict = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "as_of": None,
+    "total": 0,
+    "done": 0,
+    "current": None,
+    "results": [],
+    "errors": [],
+}
+_NEWS_SCAN_TASK: asyncio.Task | None = None
+
+
+async def _news_union_tickers() -> list[str]:
+    """The UNION of both paper books' held tickers (monthly + daily-core),
+    sorted — the full scan's scope and its count."""
+    from .db import DailyCorePosition, MonthlyPosition
+    async with Session() as s:
+        monthly = (await s.scalars(
+            select(MonthlyPosition.ticker).order_by(MonthlyPosition.ticker))).all()
+        daily = (await s.scalars(
+            select(DailyCorePosition.ticker).order_by(DailyCorePosition.ticker))).all()
+    return sorted(set(monthly) | set(daily))
+
+
+def _news_scan_progress(p: dict) -> None:
+    """The background scan's on_progress sink: updates _NEWS_SCAN_STATE after
+    each name — consulted names land in results[], failed ones in errors[]."""
+    st = _NEWS_SCAN_STATE
+    st["done"] = p.get("n_done", st["done"])
+    st["current"] = p.get("ticker")
+    if p.get("error"):
+        st["errors"].append({"ticker": p.get("ticker"),
+                             "error": str(p["error"])[:500]})
+    elif p.get("decision") is not None:
+        st["results"].append({"ticker": p.get("ticker"),
+                              "decision": p.get("decision"),
+                              "fail_safe": bool(p.get("fail_safe")),
+                              "event_id": p.get("event_id")})
+
+
+async def _run_news_scan_background(as_of: str) -> None:
+    """The background full-scan task: ``run_news_scan`` with ``fresh=True``
+    (manual semantics — 4-part :m event ids, never deduped, out of the
+    nightly sample) over the union of both paper books, feeding
+    _NEWS_SCAN_STATE via on_progress. NEVER raises; the finally always
+    clears running so the state cannot wedge."""
+    from . import newsagent
+    try:
+        result = await newsagent.run_news_scan(
+            as_of=as_of, out_dir=settings.sim_news_out_dir, dry_run=False,
+            fresh=True, on_progress=_news_scan_progress)
+        logger.info("News full scan finished: status=%s as_of=%s rows=%d "
+                    "deduped=%d errors=%d", result.get("status"),
+                    result.get("as_of"), result.get("n_ledger_rows", 0),
+                    result.get("n_deduped", 0), result.get("n_errors", 0))
+        if result.get("status") != "ok":
+            _NEWS_SCAN_STATE["errors"].append({
+                "ticker": None, "error": f"scan status {result.get('status')}"})
+    except Exception as e:  # noqa: BLE001 — the task never wedges the state
+        logger.error("News full scan crashed: %s", e, exc_info=True)
+        _NEWS_SCAN_STATE["errors"].append(
+            {"ticker": None, "error": f"{type(e).__name__}: {e}"})
+    finally:
+        _NEWS_SCAN_STATE["running"] = False
+        _NEWS_SCAN_STATE["finished_at"] = datetime.now(UTC).isoformat()
+        _NEWS_SCAN_STATE["current"] = None
+
 
 @app.post('/api/news/consult', dependencies=[Depends(_refuse_during_clone)])
 async def news_consult(req: NewsConsultRequest):
-    """Run ONE manual material-news consult for one monthly-book name
-    (``app.newsagent.run_manual_consult`` — the ``--fresh`` semantics: the
-    4-part ``D:{ticker}:{as_of}:m`` event id, never deduped).
+    """Run ONE manual material-news consult for one name of the paper books
+    (monthly + daily-core union — ``app.newsagent.run_manual_consult``,
+    the ``--fresh`` semantics: the 4-part ``D:{ticker}:{as_of}:m`` event id,
+    never deduped).
 
     LONG-RUNNING BY DESIGN: one real agent run — the model plans the
     research, so this is real LLM wire + searxng-MCP search/read calls,
@@ -939,7 +1015,10 @@ async def news_consult(req: NewsConsultRequest):
     ok:false + reason (HTTP 200, not an error status). A consult already in
     flight for the same ticker is refused the same way (200 ok:false) — the
     client-side disable-during-run is not enough against a second tab or a
-    re-click after a tunnel timeout.
+    re-click after a tunnel timeout. While a FULL scan (POST
+    /api/news/scan) is running, this route refuses the same way — mutual
+    exclusion both ways, so a single-name consult never double-spends a
+    real agent run against the background scan.
     """
     from . import newsagent
     ticker = (req.ticker or "").strip().upper()
@@ -952,6 +1031,13 @@ async def news_consult(req: NewsConsultRequest):
         except ValueError as e:
             raise HTTPException(
                 422, f"invalid as_of: {as_of!r} (use YYYY-MM-DD)") from e
+    if _NEWS_SCAN_STATE["running"]:
+        # Mutual exclusion, other direction: while a full scan runs, a
+        # single-name consult would double-spend a real agent run against
+        # it — honest refusal (200 ok:false, this route's convention).
+        return {"ok": False,
+                "reason": "a full scan is running — its results will appear in "
+                          "the scorecard"}
     if ticker in _NEWS_CONSULT_IN_FLIGHT:
         # Honest refusal (200 ok:false, this route's convention), not an
         # error status: the in-flight consult may still complete server-side
@@ -985,6 +1071,89 @@ async def news_consult(req: NewsConsultRequest):
         "model": rec["model"],
         "backend": rec["backend"],
     }
+
+
+@app.post('/api/news/scan', dependencies=[Depends(_refuse_during_clone)])
+async def news_scan():
+    """Start the FULL material-news scan over the UNION of both paper books
+    (monthly + daily-core, ONE consult per NAME — never twice) as a
+    BACKGROUND asyncio task, and return immediately.
+
+    LONG-RUNNING BY DESIGN, BACKGROUND: one real agent consult per name
+    (real LLM + searxng-MCP search/read calls, ~1 min per name) means a
+    synchronous request over all names would run for many minutes and die
+    at the proxy's ~100s cutoff — so this route only STARTS the scan
+    (``fresh=True``: manual semantics — 4-part ``D:{ticker}:{as_of}:m``
+    ids, never deduped, out of the nightly sample) and returns
+    ``{"ok": true, "started": true, "total": N}`` where N is the union's
+    size (the two books' ticker lists are loaded for the count). Progress
+    is polled at ``GET /api/news/scan/status``. No timeout changes; the
+    task survives browser disconnects because it is not tied to the
+    request.
+
+    Honest refusals (200 ok:false, this route's convention — nothing is
+    started): knob off (SEARXNG_MCP_URL unset — the same disabled reason
+    the consult route uses), a full scan already running, any per-ticker
+    consult in flight, or an empty union / no stored sessions. The scan
+    NEVER 500s: a per-name failure lands in the status state's errors[].
+    """
+    global _NEWS_SCAN_TASK
+    from . import newsagent
+    if not settings.searxng_mcp_url:
+        # The knob-off convention, same reason string as the consult route.
+        return {"ok": False,
+                "reason": "the D step is disabled — SEARXNG_MCP_URL is not set"}
+    if _NEWS_SCAN_STATE["running"]:
+        return {"ok": False, "reason": "a full scan is already running"}
+    if _NEWS_CONSULT_IN_FLIGHT:
+        return {"ok": False,
+                "reason": "a consult is in flight — wait for it to finish"}
+    # Reserve the slot synchronously (no await between the check and the
+    # set) so two concurrent POSTs cannot both start a scan.
+    _NEWS_SCAN_STATE["running"] = True
+    try:
+        tickers = await _news_union_tickers()
+        as_of = await newsagent._last_session_date()
+        if as_of is None:
+            _NEWS_SCAN_STATE["running"] = False
+            return {"ok": False,
+                    "reason": "no stored sessions in the DB (candles empty) — "
+                              "nothing to scan"}
+        if not tickers:
+            _NEWS_SCAN_STATE["running"] = False
+            return {"ok": False,
+                    "reason": "both paper books are empty — nothing to scan"}
+        _NEWS_SCAN_STATE.update({
+            "running": True,
+            "started_at": datetime.now(UTC).isoformat(),
+            "finished_at": None,
+            "as_of": as_of,
+            "total": len(tickers),
+            "done": 0,
+            "current": None,
+            "results": [],
+            "errors": [],
+        })
+    except Exception as e:  # noqa: BLE001 — the route never 500s
+        _NEWS_SCAN_STATE["running"] = False
+        logger.error("news scan start failed: %s", e, exc_info=True)
+        return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+    _NEWS_SCAN_TASK = asyncio.create_task(_run_news_scan_background(as_of))
+    return {"ok": True, "started": True, "total": len(tickers)}
+
+
+@app.get('/api/news/scan/status')
+async def news_scan_status():
+    """The background full scan's state (started by POST /api/news/scan):
+    {running, started_at, finished_at, as_of, total, done, current,
+    results: [{ticker, decision, fail_safe, event_id}],
+    errors: [{ticker, error}]}. running false + the last results after
+    completion; a fresh process reports running false, total 0. Read-only;
+    polled by the UI every ~3s while a scan runs."""
+    st = _NEWS_SCAN_STATE
+    return {**st,
+            "results": [dict(r) for r in st["results"]],
+            "errors": [dict(e) for e in st["errors"]]}
 
 
 @app.get('/api/news/decisions/{event_id}')

@@ -1,5 +1,6 @@
-"""Offline API tests for the type-D manual news-consult routes in app/main.py:
-``POST /api/news/consult`` and ``GET /api/news/decisions/{event_id}``.
+"""Offline API tests for the type-D news-agent routes in app/main.py:
+``POST /api/news/consult``, ``GET /api/news/decisions/{event_id}``, and the
+background full scan ``POST /api/news/scan`` + ``GET /api/news/scan/status``.
 
 Zero network: the agent's MCP client and LLM turn are the fakes from
 tests/test_newsagent.py, injected through the same seam the CLI tests use
@@ -26,12 +27,23 @@ Covered:
       already-running reason and NO second ledger row; the lock releases
       after completion AND after an internal failure (run_manual_consult
       raising once still never 500s the route), so the next consult succeeds.
+  (f) POST /api/news/scan starts the background full scan over the UNION of
+      both paper books (fresh=True :m semantics): {ok, started, total} with
+      total = the union size; GET /api/news/scan/status then shows running
+      with progress and finally the completed results (one per name, the
+      shared name ONCE); a second start while running is refused honestly;
+      the scan refuses while a consult is in flight; the consult route
+      refuses while a scan runs (mutual exclusion both ways); knob-off
+      answers the same disabled reason and starts nothing; a fresh process
+      reports running false / total 0; a per-name failure lands in errors[]
+      and the route never 500s.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import UTC, datetime
 
 import httpx
@@ -44,6 +56,7 @@ from app.config import settings
 from app.db import (
     Base,
     Candle,
+    DailyCorePosition,
     LlmSellDecision,
     MonthlyAccount,
     MonthlyPosition,
@@ -127,6 +140,71 @@ async def _seed_book(mem_db, tickers=("AAA",)):
         await s.commit()
 
 
+async def _seed_books(mem_db, monthly=("AAA",), daily=("AAA", "BBB")):
+    """The UNION seed (same as test_newsagent_nightly): monthly positions
+    for ``monthly``, daily-core positions for ``daily`` + one candle each."""
+    async with mem_db() as s:
+        for t in monthly:
+            s.add(MonthlyPosition(ticker=t, shares=100.0, avg_cost=100.0,
+                                  opened_at=datetime(2026, 1, 5)))
+        for t in daily:
+            s.add(DailyCorePosition(ticker=t, shares=50.0, avg_cost=200.0,
+                                    opened_at=datetime(2026, 2, 10)))
+        for t in sorted(set(monthly) | set(daily)):
+            s.add(Candle(ticker=t, timestamp=datetime(2026, 3, 6), open=100.0,
+                         high=101.0, low=99.0, close=100.5, volume=1e6))
+        await s.commit()
+
+
+_SCAN_STATE_RESET = {
+    "running": False, "started_at": None, "finished_at": None,
+    "as_of": None, "total": 0, "done": 0, "current": None,
+    "results": [], "errors": [],
+}
+
+
+@pytest.fixture
+def scan_env(monkeypatch, tmp_path):
+    """Hermetic scan-route environment: the news artifact dir goes to tmp,
+    and the module-level scan state + in-flight set are reset before and
+    after each test (a fresh process reports running false / total 0)."""
+    monkeypatch.setattr(settings, "sim_news_out_dir", str(tmp_path / "news-out"))
+    main._NEWS_CONSULT_IN_FLIGHT.clear()
+    main._NEWS_SCAN_STATE.update(_SCAN_STATE_RESET)
+    yield tmp_path
+    task = main._NEWS_SCAN_TASK
+    if task is not None and not task.done():
+        task.cancel()
+    main._NEWS_CONSULT_IN_FLIGHT.clear()
+    main._NEWS_SCAN_STATE.update(_SCAN_STATE_RESET)
+
+
+async def _wait_scan(client, timeout=30) -> dict:
+    """Poll GET /api/news/scan/status until the background scan finishes."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        st = (await client.get("/api/news/scan/status")).json()
+        if not st["running"]:
+            return st
+        await asyncio.sleep(0.05)
+    raise AssertionError("the background scan did not finish in time")
+
+
+def _blocking_transport(release: asyncio.Event):
+    """A cyclic search->HOLD transport whose FIRST turn blocks until
+    ``release`` is set — holds the background scan mid-run."""
+    state = {"n": 0}
+
+    async def _t(messages, tools):
+        state["n"] += 1
+        if state["n"] == 1:
+            await release.wait()
+        if state["n"] % 2 == 1:
+            return _turn(calls=[_tool_call()])
+        return _turn(text=_HOLD)
+    return _t
+
+
 async def _ledger_rows(mem_db) -> list:
     async with mem_db() as s:
         return (await s.scalars(
@@ -201,7 +279,7 @@ class TestNewsConsultRoute:
         assert r.status_code == 200
         body = r.json()
         assert body["ok"] is False
-        assert "not in the monthly book" in body["reason"]
+        assert "not held in either paper book" in body["reason"]
         assert "ZZZ" in body["reason"]
         assert await _ledger_rows(mem_db) == []
 
@@ -402,3 +480,169 @@ class TestNewsDecisionRoute:
         assert body["event_id"] == f"D:AAA:{AS_OF}"
         assert body["context"]["position"]["ticker"] == "AAA"
         assert body["rationale"] == "nightly row"
+
+
+# ---------------------------------------------------------------------------
+# (f) POST /api/news/scan + GET /api/news/scan/status — the background scan
+# ---------------------------------------------------------------------------
+
+class TestNewsScanRoute:
+    async def test_start_then_status_completes_with_union_results(
+            self, mem_db, armed, fake_agent, client, scan_env):
+        await _seed_books(mem_db, monthly=("AAA",), daily=("AAA", "BBB"))
+        r = await client.post("/api/news/scan")
+        assert r.status_code == 200
+        assert r.json() == {"ok": True, "started": True, "total": 2}
+        st = await _wait_scan(client)
+        assert st["running"] is False
+        assert st["as_of"] == AS_OF
+        assert st["total"] == 2 and st["done"] == 2 and st["current"] is None
+        assert st["started_at"] and st["finished_at"]
+        assert st["errors"] == []
+        assert sorted(x["ticker"] for x in st["results"]) == ["AAA", "BBB"]
+        assert all(x["decision"] == "HOLD" and x["fail_safe"] is False
+                   for x in st["results"])
+        # fresh=True manual semantics: 4-part :m ids, never deduped
+        assert all(x["event_id"].endswith(f":{AS_OF}:m") for x in st["results"])
+        # one ledger row per UNION name — the shared AAA consulted ONCE
+        rows = await _ledger_rows(mem_db)
+        assert sorted(row.ticker for row in rows) == ["AAA", "BBB"]
+        aaa = [row for row in rows if row.ticker == "AAA"]
+        assert len(aaa) == 1 and aaa[0].event_id == f"D:AAA:{AS_OF}:m"
+        assert aaa[0].engine == "monthly" and aaa[0].event_type == "D"
+        assert aaa[0].filled_at is None and aaa[0].shares is None
+        assert aaa[0].price is None and aaa[0].cash_after is None
+
+    async def test_status_running_with_progress_then_refuses_second_start(
+            self, mem_db, armed, client, scan_env, monkeypatch):
+        await _seed_books(mem_db, monthly=("AAA",), daily=("BBB",))
+        release = asyncio.Event()
+        monkeypatch.setattr(newsagent, "McpClient", lambda url: FakeMcp())
+        monkeypatch.setattr(newsagent, "_default_transport",
+                            _blocking_transport(release))
+        r1 = await client.post("/api/news/scan")
+        assert r1.status_code == 200
+        assert r1.json() == {"ok": True, "started": True, "total": 2}
+        # while the scan runs: the status shows it, a second start refuses
+        st = (await client.get("/api/news/scan/status")).json()
+        assert st["running"] is True and st["total"] == 2
+        assert st["as_of"] == AS_OF and st["started_at"] and st["results"] == []
+        r2 = await client.post("/api/news/scan")
+        assert r2.status_code == 200                  # honest, not an error
+        assert r2.json() == {"ok": False,
+                             "reason": "a full scan is already running"}
+        release.set()
+        st = await _wait_scan(client)
+        assert st["running"] is False and st["done"] == 2
+        assert len(st["results"]) == 2 and st["errors"] == []
+
+    async def test_scan_refuses_while_a_consult_is_in_flight(
+            self, mem_db, armed, fake_agent, client, scan_env, monkeypatch):
+        await _seed_books(mem_db, monthly=("AAA",), daily=("BBB",))
+        real = newsagent.run_manual_consult
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow(ticker, **kwargs):
+            started.set()
+            await release.wait()          # hold the in-flight lock
+            return await real(ticker, **kwargs)
+
+        monkeypatch.setattr(newsagent, "run_manual_consult", slow)
+        first = asyncio.create_task(client.post(
+            "/api/news/consult", json={"ticker": "AAA", "as_of": AS_OF}))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        r = await client.post("/api/news/scan")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is False
+        assert body["reason"] == "a consult is in flight — wait for it to finish"
+        assert await _ledger_rows(mem_db) == []    # nothing was started
+        release.set()
+        r1 = await asyncio.wait_for(first, timeout=30)
+        assert r1.status_code == 200 and r1.json()["ok"] is True
+        # once the consult finished, the scan starts fine
+        r2 = await client.post("/api/news/scan")
+        assert r2.json() == {"ok": True, "started": True, "total": 2}
+        st = await _wait_scan(client)
+        assert st["running"] is False and len(st["results"]) == 2
+
+    async def test_consult_refused_while_scan_runs(
+            self, mem_db, armed, client, scan_env, monkeypatch):
+        await _seed_books(mem_db, monthly=("AAA",), daily=("BBB",))
+        release = asyncio.Event()
+        monkeypatch.setattr(newsagent, "McpClient", lambda url: FakeMcp())
+        monkeypatch.setattr(newsagent, "_default_transport",
+                            _blocking_transport(release))
+        r = await client.post("/api/news/scan")
+        assert r.json()["started"] is True
+        c = await client.post("/api/news/consult",
+                              json={"ticker": "AAA", "as_of": AS_OF})
+        assert c.status_code == 200                   # honest refusal, not 500
+        body = c.json()
+        assert body["ok"] is False
+        assert "a full scan is running" in body["reason"]
+        assert "scorecard" in body["reason"]
+        assert await _ledger_rows(mem_db) == []       # no consult ran
+        release.set()
+        st = await _wait_scan(client)
+        assert st["running"] is False and st["done"] == 2
+        # mutual exclusion released: the consult works again after the scan
+        state = {"n": 100}
+
+        async def cyclic(messages, tools):
+            state["n"] += 1
+            if state["n"] % 2 == 1:
+                return _turn(calls=[_tool_call()])
+            return _turn(text=_HOLD)
+
+        monkeypatch.setattr(newsagent, "_default_transport", cyclic)
+        c2 = await client.post("/api/news/consult",
+                               json={"ticker": "AAA", "as_of": AS_OF})
+        assert c2.status_code == 200 and c2.json()["ok"] is True
+        assert c2.json()["event_id"] == f"D:AAA:{AS_OF}:m"
+
+    async def test_knob_off_honest_refusal_starts_nothing(
+            self, mem_db, monkeypatch, client, scan_env):
+        monkeypatch.setattr(settings, "searxng_mcp_url", "")
+        await _seed_books(mem_db)
+        r = await client.post("/api/news/scan")
+        assert r.status_code == 200
+        assert r.json() == {
+            "ok": False,
+            "reason": "the D step is disabled — SEARXNG_MCP_URL is not set",
+        }
+        st = (await client.get("/api/news/scan/status")).json()
+        assert st["running"] is False and st["total"] == 0
+        assert st["results"] == [] and st["errors"] == []
+        assert await _ledger_rows(mem_db) == []       # zero DB writes
+
+    async def test_fresh_process_status_is_not_running_total_zero(
+            self, mem_db, client, scan_env):
+        st = (await client.get("/api/news/scan/status")).json()
+        assert st["running"] is False and st["total"] == 0
+        assert st["done"] == 0 and st["current"] is None
+        assert st["results"] == [] and st["errors"] == []
+        assert st["started_at"] is None and st["finished_at"] is None
+
+    async def test_per_name_error_lands_in_errors_never_500s(
+            self, mem_db, armed, fake_agent, client, scan_env, monkeypatch):
+        await _seed_books(mem_db, monthly=("AAA",), daily=("BBB",))
+        real_record = newsagent._record_ledger_row
+
+        async def flaky(*, rec, **kwargs):
+            if kwargs.get("ticker") == "BBB":
+                raise RuntimeError("ledger write boom")
+            return await real_record(rec=rec, **kwargs)
+
+        monkeypatch.setattr(newsagent, "_record_ledger_row", flaky)
+        r = await client.post("/api/news/scan")
+        assert r.status_code == 200 and r.json()["started"] is True
+        st = await _wait_scan(client)
+        assert st["running"] is False
+        assert len(st["results"]) == 1 and st["results"][0]["ticker"] == "AAA"
+        assert len(st["errors"]) == 1
+        assert st["errors"][0]["ticker"] == "BBB"
+        assert "ledger write boom" in st["errors"][0]["error"]
+        rows = await _ledger_rows(mem_db)
+        assert len(rows) == 1 and rows[0].ticker == "AAA"

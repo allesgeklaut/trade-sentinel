@@ -30,6 +30,13 @@ Covered:
       step (declared order C-then-D), a raising D step does not break the
       cycle (the rebuild still runs), and D is NOT gated on
       sim_monthly_llm_sells.
+  (h) the UNION scope (2026-11-01): _book_contexts reads MonthlyPosition +
+      DailyCorePosition and returns ONE context per NAME with per-book
+      attribution ("books"/"positions") and byte-compatible flat fields
+      from the primary (monthly-first) position; the nightly scan covers
+      the union (a shared name consulted ONCE, name-level dedupe); the
+      manual consult accepts daily-core-only names; run_news_scan's new
+      on_progress callback fires per name and never breaks the scan.
 """
 
 from __future__ import annotations
@@ -47,6 +54,7 @@ from app.config import settings
 from app.db import (
     Base,
     Candle,
+    DailyCorePosition,
     LlmSellDecision,
     MonthlyAccount,
     MonthlyPosition,
@@ -110,6 +118,23 @@ async def _seed_book(mem_db, tickers=("AAA",)):
         for t in tickers:
             s.add(MonthlyPosition(ticker=t, shares=100.0, avg_cost=100.0,
                                   opened_at=datetime(2026, 1, 5)))
+            s.add(Candle(ticker=t, timestamp=datetime(2026, 3, 6), open=100.0,
+                         high=101.0, low=99.0, close=100.5, volume=1e6))
+        await s.commit()
+
+
+async def _seed_books(mem_db, monthly=("AAA",), daily=("AAA", "BBB")):
+    """The UNION seed: monthly-book positions for ``monthly``, daily-core
+    positions for ``daily`` (different lot sizes/costs/dates so per-book
+    detail is distinguishable) + one stored candle session per union name."""
+    async with mem_db() as s:
+        for t in monthly:
+            s.add(MonthlyPosition(ticker=t, shares=100.0, avg_cost=100.0,
+                                  opened_at=datetime(2026, 1, 5)))
+        for t in daily:
+            s.add(DailyCorePosition(ticker=t, shares=50.0, avg_cost=200.0,
+                                    opened_at=datetime(2026, 2, 10)))
+        for t in sorted(set(monthly) | set(daily)):
             s.add(Candle(ticker=t, timestamp=datetime(2026, 3, 6), open=100.0,
                          high=101.0, low=99.0, close=100.5, volume=1e6))
         await s.commit()
@@ -499,7 +524,7 @@ class TestManualConsult:
             "ZZZ", as_of=AS_OF, out_dir=str(tmp_path / "n"), mcp=FakeMcp(),
             transport=_hold_transport())
         assert res["ok"] is False and "record" not in res
-        assert "not in the monthly book" in res["reason"] and "ZZZ" in res["reason"]
+        assert "not held in either paper book" in res["reason"] and "ZZZ" in res["reason"]
         assert await _ledger_rows(mem_db) == []    # zero DB writes
 
     async def test_knob_off_is_disabled_not_broken(self, mem_db, monkeypatch,
@@ -636,3 +661,196 @@ class TestFreshScanAndCli:
         help_out = capsys.readouterr().out
         assert "D:{ticker}:{as_of}:m" in help_out
         assert ":m" in help_out and "deduped" in help_out
+
+
+# ---------------------------------------------------------------------------
+# (h) the UNION scope — one context per NAME across both paper books
+# ---------------------------------------------------------------------------
+
+class TestUnionContexts:
+    async def test_name_in_both_books_one_context_with_per_book_detail(
+            self, mem_db):
+        await _seed_books(mem_db, monthly=("AAA",), daily=("AAA", "BBB"))
+        ctxs = await newsagent._book_contexts(AS_OF)
+        assert [c["ticker"] for c in ctxs] == ["AAA", "BBB"]   # union, sorted
+        aaa = ctxs[0]
+        assert aaa["books"] == ["daily_core", "monthly"]        # sorted
+        assert set(aaa["positions"]) == {"daily_core", "monthly"}
+        # per-book detail: same computations as the flat fields, per position
+        assert aaa["positions"]["monthly"] == {
+            "shares_held": 100.0,
+            "entry": {"date": "2026-01-05", "price": 100.0},
+            "pnl_pct": 0.5,          # 100.5 / 100.0 - 1
+            "months_held": aaa["positions"]["monthly"]["months_held"],
+        }
+        assert aaa["positions"]["daily_core"]["shares_held"] == 50.0
+        assert aaa["positions"]["daily_core"]["entry"] == \
+            {"date": "2026-02-10", "price": 200.0}
+        assert aaa["positions"]["daily_core"]["pnl_pct"] == \
+            round((100.5 / 200.0 - 1.0) * 100.0, 2)   # that book's avg_cost
+        # flat legacy fields byte-compatible, from the PRIMARY (monthly first)
+        assert aaa["shares_held"] == 100.0
+        assert aaa["entry"] == {"date": "2026-01-05", "price": 100.0}
+        assert aaa["current"] == {"date": AS_OF, "close": 100.5}
+        assert aaa["pnl_pct"] == 0.5
+        assert aaa["months_held"] == aaa["positions"]["monthly"]["months_held"]
+        assert aaa["stated_thesis_condition"] == newsagent._THESIS_BREAK_CONDITION
+        assert set(aaa["latest_fundamentals"]) == set(newsagent._FUNDAMENTAL_TAGS)
+        # daily-core-only name: books lists only daily_core, flat = daily_core
+        bbb = ctxs[1]
+        assert bbb["books"] == ["daily_core"]
+        assert set(bbb["positions"]) == {"daily_core"}
+        assert bbb["shares_held"] == 50.0
+        assert bbb["entry"] == {"date": "2026-02-10", "price": 200.0}
+        assert bbb["pnl_pct"] == bbb["positions"]["daily_core"]["pnl_pct"]
+
+    async def test_monthly_only_name_books_list(self, mem_db):
+        await _seed_books(mem_db, monthly=("AAA",), daily=())
+        ctxs = await newsagent._book_contexts(AS_OF)
+        assert len(ctxs) == 1
+        assert ctxs[0]["books"] == ["monthly"]
+        assert set(ctxs[0]["positions"]) == {"monthly"}
+
+    async def test_limit_caps_the_union_ordered_by_ticker(self, mem_db):
+        await _seed_books(mem_db, monthly=("BBB", "DDD"), daily=("AAA", "CCC"))
+        ctxs = await newsagent._book_contexts(AS_OF, limit=2)
+        assert [c["ticker"] for c in ctxs] == ["AAA", "BBB"]
+        assert len(await newsagent._book_contexts(AS_OF)) == 4
+
+
+class TestUnionScan:
+    async def test_scan_covers_union_shared_name_consulted_once(
+            self, mem_db, armed, tmp_path):
+        await _seed_books(mem_db, monthly=("AAA",), daily=("AAA", "BBB"))
+        out = str(tmp_path / "n")
+        res = await newsagent.run_news_scan(as_of=AS_OF, out_dir=out,
+                                            mcp=FakeMcp(),
+                                            transport=_cyclic_transport(_HOLD))
+        assert res["status"] == "ok"
+        assert res["n_contexts"] == 2              # the UNION's size
+        assert res["n_ledger_rows"] == 2 and res["n_errors"] == 0
+        rows = await _ledger_rows(mem_db)
+        assert sorted(r.ticker for r in rows) == ["AAA", "BBB"]
+        # the shared name AAA was consulted ONCE — one row, the name-level
+        # 3-part id (that IS the not-twice guarantee)
+        aaa_rows = [r for r in rows if r.ticker == "AAA"]
+        assert len(aaa_rows) == 1
+        assert aaa_rows[0].event_id == f"D:AAA:{AS_OF}"
+        assert aaa_rows[0].engine == "monthly"     # engine field unchanged
+        ctx = json.loads(aaa_rows[0].context)
+        assert ctx["position"]["books"] == ["daily_core", "monthly"]
+        # a rerun dedupes name-level over the whole union
+        res2 = await newsagent.run_news_scan(as_of=AS_OF, out_dir=out,
+                                             mcp=FakeMcp(),
+                                             transport=_cyclic_transport(_HOLD))
+        assert res2["n_deduped"] == 2 and res2["n_ledger_rows"] == 0
+        assert len(await _ledger_rows(mem_db)) == 2
+
+
+class TestUnionManualConsult:
+    async def test_daily_core_only_ticker_is_consultable(self, mem_db, armed,
+                                                         tmp_path):
+        await _seed_books(mem_db, monthly=("AAA",), daily=("AAA", "BBB"))
+        res = await newsagent.run_manual_consult(
+            "BBB", as_of=AS_OF, out_dir=str(tmp_path / "n"),
+            mcp=FakeMcp(), transport=_hold_transport())
+        assert res["ok"] is True
+        assert res["record"]["event_id"] == f"D:BBB:{AS_OF}:m"
+        rows = await _ledger_rows(mem_db)
+        assert len(rows) == 1 and rows[0].ticker == "BBB"
+        assert rows[0].event_id == f"D:BBB:{AS_OF}:m"
+        ctx = json.loads(rows[0].context)
+        assert ctx["position"]["books"] == ["daily_core"]
+        assert ctx["position"]["shares_held"] == 50.0
+
+    async def test_shared_ticker_consults_with_both_books_in_context(
+            self, mem_db, armed, tmp_path):
+        await _seed_books(mem_db, monthly=("AAA",), daily=("AAA", "BBB"))
+        res = await newsagent.run_manual_consult(
+            "AAA", as_of=AS_OF, out_dir=str(tmp_path / "n"),
+            mcp=FakeMcp(), transport=_hold_transport())
+        assert res["ok"] is True
+        assert res["record"]["event_id"] == f"D:AAA:{AS_OF}:m"
+        rows = await _ledger_rows(mem_db)
+        assert len(rows) == 1
+        ctx = json.loads(rows[0].context)
+        assert ctx["position"]["books"] == ["daily_core", "monthly"]
+        assert set(ctx["position"]["positions"]) == {"daily_core", "monthly"}
+        # flat fields still primary (monthly-first)
+        assert ctx["position"]["shares_held"] == 100.0
+
+
+class TestScanProgress:
+    async def test_progress_called_after_each_name(self, mem_db, armed,
+                                                   tmp_path):
+        await _seed_books(mem_db, monthly=("AAA",), daily=("BBB",))
+        events = []
+        res = await newsagent.run_news_scan(
+            as_of=AS_OF, out_dir=str(tmp_path / "n"), mcp=FakeMcp(),
+            transport=_cyclic_transport(_HOLD),
+            on_progress=lambda p: events.append(dict(p)))
+        assert res["status"] == "ok" and res["n_ledger_rows"] == 2
+        assert [e["ticker"] for e in events] == ["AAA", "BBB"]
+        assert [e["n_done"] for e in events] == [1, 2]
+        assert all(e["n_total"] == 2 for e in events)
+        assert all(e["decision"] == "HOLD" and e["fail_safe"] is False
+                   for e in events)
+        assert events[0]["event_id"] == f"D:AAA:{AS_OF}"
+        assert events[1]["event_id"] == f"D:BBB:{AS_OF}"
+
+    async def test_progress_callback_exception_never_breaks_the_scan(
+            self, mem_db, armed, tmp_path):
+        await _seed_books(mem_db)
+
+        def boom(p):
+            raise RuntimeError("progress boom")
+
+        res = await newsagent.run_news_scan(
+            as_of=AS_OF, out_dir=str(tmp_path / "n"), mcp=FakeMcp(),
+            transport=_cyclic_transport(_HOLD), on_progress=boom)
+        assert res["status"] == "ok" and res["n_ledger_rows"] == 2
+        assert res["n_errors"] == 0
+        assert len(await _ledger_rows(mem_db)) == 2
+
+    async def test_progress_none_keeps_results_byte_identical(
+            self, mem_db, armed, tmp_path):
+        await _seed_books(mem_db, monthly=("AAA",), daily=("BBB",))
+        # fresh=True for both: no scan-time dedupe, so both runs consult
+        r1 = await newsagent.run_news_scan(
+            as_of=AS_OF, out_dir=str(tmp_path / "a"), mcp=FakeMcp(),
+            transport=_cyclic_transport(_HOLD), fresh=True)
+        r2 = await newsagent.run_news_scan(
+            as_of=AS_OF, out_dir=str(tmp_path / "b"), mcp=FakeMcp(),
+            transport=_cyclic_transport(_HOLD), fresh=True,
+            on_progress=lambda p: None)
+        for key in ("status", "as_of", "n_contexts", "n_ledger_rows",
+                    "n_deduped", "n_errors", "errors", "contexts"):
+            assert r1[key] == r2[key]
+        assert [r["event_id"] for r in r1["runs"]] == \
+            [r["event_id"] for r in r2["runs"]]
+        assert [r["decision"] for r in r1["runs"]] == \
+            [r["decision"] for r in r2["runs"]]
+
+    async def test_progress_reports_a_failed_name_as_error(
+            self, mem_db, armed, tmp_path, monkeypatch):
+        await _seed_books(mem_db, monthly=("AAA",), daily=("BBB",))
+        real_record = newsagent._record_ledger_row
+
+        async def flaky(*, rec, **kwargs):
+            if kwargs.get("ticker") == "BBB":
+                raise RuntimeError("ledger write boom")
+            return await real_record(rec=rec, **kwargs)
+
+        monkeypatch.setattr(newsagent, "_record_ledger_row", flaky)
+        events = []
+        res = await newsagent.run_news_scan(
+            as_of=AS_OF, out_dir=str(tmp_path / "n"), mcp=FakeMcp(),
+            transport=_cyclic_transport(_HOLD),
+            on_progress=lambda p: events.append(dict(p)))
+        assert res["status"] == "ok" and res["n_errors"] == 1
+        err_ev = next(e for e in events if e["ticker"] == "BBB")
+        assert err_ev["decision"] is None and err_ev["fail_safe"] is None
+        assert "ledger write boom" in err_ev["error"]
+        assert err_ev["n_done"] == 2 and err_ev["n_total"] == 2
+        ok_ev = next(e for e in events if e["ticker"] == "AAA")
+        assert ok_ev["decision"] == "HOLD" and ok_ev["n_done"] == 1

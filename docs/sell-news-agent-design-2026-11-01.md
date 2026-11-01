@@ -79,10 +79,56 @@ thesis-discipline names, the same book the C step scans); the sim book's
 D is out of scope until the promotion review. Cadence: nightly,
 immediately after the type-C step, every trading night.
 
+**Scope extension (2026-11-01, below): the scan now covers the UNION of
+both paper books — monthly + daily-core — ONE consult per NAME per night
+(a name held in both books is consulted once, never twice).**
+
+## Scope extension 2026-11-01 — the union of both paper books, one consult per name
+
+The monthly book and the daily-core book hold overlapping names (both are
+fed from the same qv-mom universe), so scanning the monthly book alone
+left daily-core-only names unconsulted. From 2026-11-01 the D scope is
+the UNION of `MonthlyPosition` and `DailyCorePosition` (identical shape:
+ticker, shares, avg_cost, opened_at):
+
+- `_book_contexts` returns ONE context per NAME over the union (ordered
+  by ticker). The context carries the attribution: `books` (sorted, only
+  the books that hold the name — e.g. `["daily_core", "monthly"]`) and
+  `positions` (per-book `{shares_held, entry, pnl_pct, months_held}`,
+  the same computations as the flat fields, per position). The FLAT
+  legacy fields stay byte-compatible and are computed from the PRIMARY
+  position: monthly if held there, else daily_core.
+- WHY one consult per name: the judgment is NAME-level ("does this
+  name's stated thesis still hold?") and the thesis condition is
+  book-agnostic — two books holding the same name do not double the
+  question. The nightly dedupe stays exactly `D:{ticker}:{as_of}`
+  (name-level), which IS the not-twice guarantee: a name held in both
+  books yields one context, hence one agent run, hence one ledger row.
+- The frozen prompt `sellshadow/1-d` is UNCHANGED (no `-d/2`): its
+  "one holding of a paper-trading monthly book" phrasing is a documented
+  approximation — for daily-core-only names the context block (not the
+  prompt) carries the truth via `books`/`positions`; the position facts
+  and thesis condition the model judges against are identical in shape.
+- The ledger `engine` stays `"monthly"`: the scan is DRIVEN by the
+  monthly cycle (`run_monthly_cycle` calls `run_news_scan`), and the
+  context's `books` carries the attribution. Known coupling, recorded:
+  D lives inside `run_monthly_cycle`, so the whole D step is gated by
+  `sim_monthly_enabled` (its own knob remains `SEARXNG_MCP_URL` via the
+  knob-off convention inside the scan). Daily-core-only names are
+  therefore scanned only on nights the monthly cycle runs.
+- Cost delta: nightly spend rises from the monthly book's names to the
+  UNION's — the books overlap heavily, so the delta is the daily-core-
+  only names (typically a handful), not a doubling.
+- Manual consults (`run_manual_consult`, `POST /api/news/consult`) and
+  the UI's new background full scan (`POST /api/news/scan`,
+  `GET /api/news/scan/status` — fresh `:m` semantics, never deduped)
+  consult any union name, including daily-core-only tickers.
+
 ## Division of labor — the harness decides who and when; the MODEL decides everything else
 
-The scan TRIGGER stays deterministic: every name in the monthly book,
-every trading night — the model never decides *whether* a name gets
+The scan TRIGGER stays deterministic: every name in the UNION of both
+paper books (monthly + daily-core, one consult per name), every trading
+night — the model never decides *whether* a name gets
 looked at (a lazy agent that silently skips names is unauditable).
 Everything downstream of the trigger is the model's: what to search, how
 to reformulate, what to read, how deep, and WHEN IT HAS ENOUGH —
@@ -225,7 +271,8 @@ versioned, declared change.
 
 Typical investigative runs on a single name are expected in the 5–20
 tool-call range; at ~1.2–3s per MCP call plus reasoning turns, a nightly
-pass over the monthly book is minutes to tens of minutes of wall-clock.
+pass over the union of both books (2026-11-01 scope) is minutes to tens
+of minutes of wall-clock.
 There is no designed budget: the ceiling is the runaway guard, and if
 nightly cost ever needs governing, that is an owner decision made from
 the observed traces — not a mechanism inside the loop.
@@ -245,7 +292,9 @@ the observed traces — not a mechanism inside the loop.
    (pinned live 2026-11-01, recorded above).
 5. Whether the Mistral route honors temperature (observation for the
    acceptance note; the records declare what is sent either way).
-6. The sim-book D scan (revisit only at the promotion review).
+6. The sim-book (type-A daily sim) D scan (revisit only at the promotion
+   review; 2026-11-01 the scope was extended to the union of the MONTHLY
+   and DAILY-CORE books only — see the scope-extension section).
 
 ## Sequencing
 

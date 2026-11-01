@@ -1759,18 +1759,22 @@
             <div class="bench-label">MATERIAL-NEWS CONSULT // TYPE-D AGENT (SHADOW)</div>
             <div class="sim-actions">
                 <select id="news-consult-ticker"
-                        title="One of the Monthly book's current positions — the news agent judges recent news against that position's stated thesis"></select>
+                        title="One of the paper books' current positions (M = monthly, DC = daily-core) — the news agent judges recent news against that position's stated thesis"></select>
                 <button id="news-consult-btn" onclick="consultNews()">Consult now</button>
+                <button id="news-scan-btn" onclick="runNewsScan()">Run all (0)</button>
             </div>
             <div id="news-consult-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
             <div id="news-consult-result"></div>
             <details class="info-fold">
                 <summary>Scope &amp; safety</summary>
-                <div class="toolbar-scope">Scope: ONE Monthly paper-book name per click. Each consult runs ONE real
-                    agent run (real LLM + live searxng news search/read calls, ~1 minute at the deployed low effort)
-                    and is recorded as a SHADOW row (event <b>D:{ticker}:{as_of}:m</b>) in the LLM sell ledger — the
-                    verdict never places a trade (the fill columns stay NULL until the predeclared promotion rule).
-                    Nightly scans use the 3-part <b>D:{ticker}:{as_of}</b> ids and are unaffected.</div>
+                <div class="toolbar-scope">Scope: ONE name per consult — the picker offers the UNION of both paper
+                    books' positions (M = monthly, DC = daily-core; a name held in both is consulted once). Each
+                    consult runs ONE real agent run (real LLM + live searxng news search/read calls, ~1 minute at
+                    the deployed low effort) and is recorded as a SHADOW row (event <b>D:{ticker}:{as_of}:m</b>)
+                    in the LLM sell ledger — the verdict never places a trade (the fill columns stay NULL until
+                    the predeclared promotion rule). “Run all” scans every name in the union in the background
+                    (one real consult each, never deduped). Nightly scans use the 3-part
+                    <b>D:{ticker}:{as_of}</b> ids and are unaffected.</div>
             </details>
         </div>
     </section>
@@ -5999,15 +6003,28 @@
                     window.PaperPortfolioUI.renderPositionsHtml(pos, {
                         emptyText: 'No open positions — waiting for first rebalance.',
                     });
-                // The material-news consult picker offers exactly the monthly
-                // book's positions (the same source as the positions table).
+                // The material-news consult picker offers the UNION of both
+                // paper books' positions, tagged by book: "MSFT (M)",
+                // "AAPL (DC)", "JPM (M+DC)" — the monthly status (this s) and
+                // the daily-core status merged by ticker.
                 const newsSel = document.getElementById('news-consult-ticker');
                 if (newsSel) {
+                    const dcStatus = await api('dailycore/status').catch(() => null);
+                    const dcPos = (dcStatus && dcStatus.valuation
+                        && Array.isArray(dcStatus.valuation.positions))
+                        ? dcStatus.valuation.positions : [];
+                    const mTickers = new Set(pos.map(p => p.ticker));
+                    const dcTickers = new Set(dcPos.map(p => p && p.ticker).filter(Boolean));
+                    const union = Array.from(new Set([...mTickers, ...dcTickers])).sort();
+                    const tag = t => (mTickers.has(t) ? 'M' : '')
+                        + (dcTickers.has(t) ? (mTickers.has(t) ? '+DC' : 'DC') : '');
                     const keep = newsSel.value;
-                    newsSel.innerHTML = pos.length
-                        ? pos.map(p => `<option value="${escapeHtml(p.ticker)}">${escapeHtml(p.ticker)}</option>`).join('')
+                    newsSel.innerHTML = union.length
+                        ? union.map(t => `<option value="${escapeHtml(t)}">${escapeHtml(t + ' (' + tag(t) + ')')}</option>`).join('')
                         : '<option value="" disabled>(no positions)</option>';
-                    if (pos.some(p => p.ticker === keep)) newsSel.value = keep;
+                    if (union.some(t => t === keep)) newsSel.value = keep;
+                    const scanBtn = document.getElementById('news-scan-btn');
+                    if (scanBtn) scanBtn.textContent = 'Run all (' + union.length + ')';
                 }
             } catch (e) { document.getElementById('monthly-summary').innerHTML = 'Error: ' + escapeHtml(e.message); }
         }
@@ -6171,6 +6188,114 @@
                     + '</div>';
             }
             btn.disabled = false;
+        }
+
+        // --- Type-D FULL scan (all names of both books, background) ---
+        // Renders the GET /api/news/scan/status terminal state: the counts
+        // (consulted / errors) and one line per name with its verdict chip
+        // (EXIT red .sell / HOLD amber .hold, fail-safe marked).
+        function renderNewsScan(st) {
+            const out = document.getElementById('news-consult-result');
+            if (!out) return;
+            const results = Array.isArray(st.results) ? st.results : [];
+            const errors = Array.isArray(st.errors) ? st.errors : [];
+            const trunc = s => { s = String(s == null ? '' : s); return s.length > 200 ? s.slice(0, 200) + '…' : s; };
+            let html = '<div style="margin-top:8px;font-size:13px">'
+                + '<div>Full scan finished (as-of ' + escapeHtml(String(st.as_of || '—')) + '): '
+                + '<b>' + results.length + '</b> consulted, <b>' + errors.length + '</b> error(s) — '
+                + 'shadow rows only (D:{ticker}:{as_of}:m), no trade is ever placed.</div>';
+            if (results.length) {
+                html += '<div style="margin-top:6px">';
+                results.forEach(r => {
+                    const dec = String(r.decision || '').toUpperCase();
+                    const cls = dec === 'EXIT' ? 'sell' : 'hold';   // house decision chips
+                    html += '<div style="font-size:12px;margin-top:2px">'
+                        + escapeHtml(String(r.ticker || '?'))
+                        + ' <span class="' + cls + '" style="font-weight:bold">' + escapeHtml(dec || '—') + '</span>'
+                        + (r.fail_safe ? ' <span class="hold">(fail-safe)</span>' : '')
+                        + ' <span style="color:#7aaa81">' + escapeHtml(String(r.event_id || '')) + '</span></div>';
+                });
+                html += '</div>';
+            }
+            if (errors.length) {
+                html += '<div class="bench-label" style="margin-top:6px">ERRORS</div>';
+                errors.forEach(e => {
+                    html += '<div style="font-size:11px;color:#ff7b72">'
+                        + escapeHtml(String(e.ticker || '?')) + ': ' + escapeHtml(trunc(e.error)) + '</div>';
+                });
+            }
+            html += '</div>';
+            out.innerHTML = html;
+        }
+
+        // The "Run all (N)" button: POST /api/news/scan starts the scan in
+        // the BACKGROUND (a synchronous multi-minute request would die at
+        // the proxy's ~100s cutoff), then polls /api/news/scan/status every
+        // ~3s. Both buttons stay disabled while the scan runs.
+        async function runNewsScan() {
+            const btn = document.getElementById('news-consult-btn');
+            const scanBtn = document.getElementById('news-scan-btn');
+            const status = document.getElementById('news-consult-status');
+            const out = document.getElementById('news-consult-result');
+            const sel = document.getElementById('news-consult-ticker');
+            const tickers = sel ? Array.from(sel.options).map(o => o.value).filter(v => !!v) : [];
+            const n = tickers.length;
+            if (!n) {
+                status.textContent = 'No names to scan — both paper books are empty.';
+                return;
+            }
+            if (!confirm('Run the material-news scan for ALL ' + n + ' name(s) across both paper books (monthly + daily-core)?\n\n'
+                + 'Each of the ' + n + ' names gets ONE real agent consult — real LLM calls plus live searxng '
+                + 'news search/read calls — about 1 minute per name, so expect roughly ' + n + ' minutes in total '
+                + '(a 7-20 name book runs ~7-20 minutes). The scan runs in the BACKGROUND; this page polls its progress.\n\n'
+                + 'Every verdict is a SHADOW consult only (it never places a trade), and every run consults again — '
+                + 'results are never deduped.')) return;
+            btn.disabled = true;
+            scanBtn.disabled = true;
+            status.textContent = 'Starting full scan of ' + n + ' name(s)…';
+            if (out) out.innerHTML = '';
+            try {
+                const r = await api('news/scan', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: '{}',
+                });
+                if (!r || !r.ok) {
+                    status.textContent = 'Not run: ' + ((r && r.reason) || 'unknown reason');
+                    return;
+                }
+                const total = r.total || n;
+                status.textContent = 'Full scan running: 0/' + total + '…';
+                let st = null;
+                for (;;) {
+                    await new Promise(res => setTimeout(res, 3000));
+                    st = await api('news/scan/status');
+                    if (!st.running) break;
+                    status.textContent = 'Full scan running: ' + (st.done || 0) + '/' + (st.total || total)
+                        + (st.current ? ' — ' + st.current + '…' : '…');
+                }
+                renderNewsScan(st);
+                const nErr = (st.errors || []).length;
+                status.textContent = 'Full scan finished: ' + (st.results || []).length + ' consulted, '
+                    + nErr + ' error(s) — shadow rows in the LLM sell scorecard.';
+            } catch (e) {
+                // Honest bounded error state (same style as consultNews):
+                // the scan may STILL be running server-side, so do not
+                // blindly re-click — that fires a SECOND full scan.
+                const full = String(e && e.message ? e.message : e);
+                const detail = full.length > 200 ? full.slice(0, 200) + '…' : full;
+                const honest = 'The scan request failed or timed out — the scan may still be running '
+                    + 'server-side. Poll its status before retrying; a retry fires another full scan.';
+                status.textContent = honest;
+                if (out) out.innerHTML = '<div class="sim-empty" style="padding:8px 0;text-align:left">'
+                    + escapeHtml(honest)
+                    + '<div style="margin-top:4px;font-size:11px;color:#7aaa81;opacity:0.7;'
+                    + 'white-space:pre-wrap;word-break:break-word">' + escapeHtml(detail) + '</div>'
+                    + '</div>';
+            } finally {
+                btn.disabled = false;
+                scanBtn.disabled = false;
+            }
         }
 
         async function backfillMonthly() {

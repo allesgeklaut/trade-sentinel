@@ -21,10 +21,12 @@ path for D (no direct-SearXNG client, the owner's call).
 Shadow-first: every run is recorded in the ``LlmSellDecision`` ledger
 (event_type "D", engine "monthly", the fill columns NULL forever in the
 shadow phase) with NO execution authority; the promotion rule lives in
-the design note. Nightly cadence: one run per monthly-book name, right
-after the type-C step (``monthly.run_monthly_cycle`` calls
-``run_news_scan``; the ``python -m app.newsagent news`` CLI is a thin
-wrapper over the same scan core).
+the design note. Nightly cadence: one run per NAME in the UNION of both
+paper books (monthly + daily-core — one context per name, so a name held
+in both books is consulted ONCE), right after the type-C step
+(``monthly.run_monthly_cycle`` calls ``run_news_scan``; the
+``python -m app.newsagent news`` CLI is a thin wrapper over the same
+scan core).
 
 Beside the nightly scan there is the MANUAL consult — ``run_manual_consult``
 (one name, the UI/API trigger) and the CLI's ``--fresh`` mode. Manual looks
@@ -39,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -49,7 +52,8 @@ from pathlib import Path
 from sqlalchemy import func, select, text
 
 from .config import settings
-from .db import Candle, Fundamental, LlmSellDecision, MonthlyPosition, Session
+from .db import (Candle, DailyCorePosition, Fundamental, LlmSellDecision,
+                 MonthlyPosition, Session)
 from .llm import chat as llm_chat
 from .mcpclient import McpClient, McpError
 from .selllayer import _record_decision as _record_ledger_row
@@ -392,8 +396,24 @@ def _build_record(context: dict, event_id: str, parsed: dict, *, trace: list,
 
 
 # ---------------------------------------------------------------------------
-# The nightly driver — one agent run per monthly-book name
+# The nightly driver — one agent run per name in the UNION of both books
 # ---------------------------------------------------------------------------
+
+
+async def _notify_progress(on_progress, payload: dict) -> None:
+    """Invoke the optional ``on_progress`` callback with one name's progress
+    payload. A callback exception NEVER breaks the scan — progress is
+    observation only (the default ``None`` keeps the scan byte-identical
+    to the pre-callback behavior)."""
+    if on_progress is None:
+        return
+    try:
+        result = on_progress(payload)
+        if inspect.isawaitable(result):
+            await result
+    except Exception as e:  # noqa: BLE001 — observation must never break the scan
+        logger.warning("news scan: on_progress callback failed (%s: %s) — ignored",
+                       type(e).__name__, e)
 
 async def _last_session_date() -> str | None:
     """The DB's last stored candle session (read-only SQL) — the as-of
@@ -422,40 +442,81 @@ async def _latest_fund(s, ticker: str, tag: str, as_of: str) -> dict | None:
 
 async def _book_contexts(as_of: str,
                          limit: int | None = None) -> list[dict]:
-    """The monthly book's live positions (read-only) + per-name context:
-    the position facts and the SAME predeclared thesis condition the C
-    step breaks on, anchored by the latest filed fundamentals. The news
-    itself is NOT pre-fetched — that is the agent's job."""
+    """The UNION of both paper books' live positions (read-only) +
+    per-name context: the position facts and the SAME predeclared thesis
+    condition the C step breaks on, anchored by the latest filed
+    fundamentals. The news itself is NOT pre-fetched — that is the
+    agent's job.
+
+    The union is MonthlyPosition + DailyCorePosition (identical shape:
+    ticker, shares, avg_cost, opened_at). ONE context per NAME: a name
+    held in BOTH books yields a single context (never two), so a name
+    held in both books is consulted ONCE per night — the judgment is
+    name-level and the stated thesis condition is book-agnostic. The
+    context carries the attribution: ``books`` lists the books holding
+    the name (sorted, only the books that hold it) and ``positions`` the
+    per-book detail (shares_held, entry, pnl_pct, months_held — the same
+    computations as the flat fields, per position). The FLAT legacy
+    fields (ticker, shares_held, entry, current, pnl_pct, months_held,
+    stated_thesis_condition, latest_fundamentals) stay byte-compatible
+    with the pre-union shape and are computed from the PRIMARY position:
+    monthly if the name is held there, else daily_core. ``limit`` caps
+    the union list ordered by ticker (a smoke-run convenience)."""
     out: list[dict] = []
     async with Session() as s:
-        positions = (await s.scalars(
+        monthly = (await s.scalars(
             select(MonthlyPosition).order_by(MonthlyPosition.ticker))).all()
-        if limit:
-            positions = positions[:limit]
-        for p in positions:
+        daily = (await s.scalars(
+            select(DailyCorePosition).order_by(DailyCorePosition.ticker))).all()
+        books_by_ticker: dict[str, dict[str, object]] = {}
+        for p in daily:
+            books_by_ticker.setdefault(p.ticker, {})["daily_core"] = p
+        for p in monthly:
+            books_by_ticker.setdefault(p.ticker, {})["monthly"] = p
+        for ticker in sorted(books_by_ticker):
+            if limit and len(out) >= limit:
+                break
+            books = books_by_ticker[ticker]
             close = await s.scalar(
                 select(Candle.close)
-                .where(Candle.ticker == p.ticker,
+                .where(Candle.ticker == ticker,
                        func.date(Candle.timestamp) <= as_of)
                 .order_by(Candle.timestamp.desc()).limit(1))
-            opened = (p.opened_at.date()
-                      if isinstance(p.opened_at, datetime)
-                      else date.fromisoformat(str(p.opened_at)[:10]))
-            days = (date.fromisoformat(as_of) - opened).days
+            positions: dict[str, dict] = {}
+            for book in sorted(books):
+                p = books[book]
+                opened = (p.opened_at.date()
+                          if isinstance(p.opened_at, datetime)
+                          else date.fromisoformat(str(p.opened_at)[:10]))
+                days = (date.fromisoformat(as_of) - opened).days
+                positions[book] = {
+                    "shares_held": float(p.shares),
+                    "entry": {"date": str(opened), "price": float(p.avg_cost)},
+                    "pnl_pct": (round((float(close) / float(p.avg_cost) - 1.0)
+                                      * 100.0, 2)
+                                if close is not None else None),
+                    "months_held": (round(days / 30.44, 1)
+                                    if days >= 0 else None),
+                }
+            # The PRIMARY position (monthly if held there, else daily_core)
+            # feeds the flat legacy fields — byte-compatible with the
+            # pre-union monthly-only shape.
+            primary = positions["monthly"] if "monthly" in positions \
+                else positions["daily_core"]
             out.append({
-                "ticker": p.ticker,
-                "shares_held": float(p.shares),
-                "entry": {"date": str(opened), "price": float(p.avg_cost)},
+                "ticker": ticker,
+                "books": sorted(books),
+                "positions": positions,
+                "shares_held": primary["shares_held"],
+                "entry": dict(primary["entry"]),
                 "current": {"date": as_of,
                             "close": (float(close) if close is not None
                                       else None)},
-                "pnl_pct": (round((float(close) / float(p.avg_cost) - 1.0)
-                                  * 100.0, 2)
-                            if close is not None else None),
-                "months_held": (round(days / 30.44, 1) if days >= 0 else None),
+                "pnl_pct": primary["pnl_pct"],
+                "months_held": primary["months_held"],
                 "stated_thesis_condition": _THESIS_BREAK_CONDITION,
                 "latest_fundamentals": {
-                    tag: await _latest_fund(s, p.ticker, tag, as_of)
+                    tag: await _latest_fund(s, ticker, tag, as_of)
                     for tag in _FUNDAMENTAL_TAGS},
             })
     return out
@@ -473,13 +534,20 @@ def _log(record: dict, path: Path) -> None:
 async def run_news_scan(*, as_of: str | None = None, limit: int | None = None,
                         out_dir: str = "news-out", dry_run: bool = False,
                         generated_at: str | None = None, transport=None,
-                        mcp=None, fresh: bool = False) -> dict:
+                        mcp=None, fresh: bool = False,
+                        on_progress=None) -> dict:
     """The nightly type-D scan core (extracted from the ``news`` CLI command,
     which stays a thin wrapper; wired into ``monthly.run_monthly_cycle``):
-    one agent run per monthly-book name for the session ``as_of`` (default:
-    the DB's last stored candle session), recorded as shadow ledger rows
-    (event_type "D", engine "monthly" — the fill columns stay NULL forever
-    in the shadow phase, NO execution authority).
+    one agent run per NAME in the UNION of both paper books (monthly +
+    daily-core — ``_book_contexts`` returns ONE context per name, so a name
+    held in both books is consulted ONCE; the dedupe below stays
+    name-level ``D:{ticker}:{as_of}``, which IS the not-twice guarantee)
+    for the session ``as_of`` (default: the DB's last stored candle
+    session), recorded as shadow ledger rows (event_type "D", engine
+    "monthly" — the fill columns stay NULL forever in the shadow phase,
+    NO execution authority). The scan covers the union of both books;
+    the ledger ``engine`` stays "monthly" (the scan is driven by the
+    monthly cycle; the context's ``books`` carries the attribution).
 
     Semantics (unchanged from the CLI driver):
 
@@ -505,7 +573,14 @@ async def run_news_scan(*, as_of: str | None = None, limit: int | None = None,
       is logged and collected, the loop continues, the scan NEVER raises;
     * the artifact writes (the JSONL consult log + the run artifact) are
       best-effort: a failure warns and continues (the ledger row is the
-      source of truth).
+      source of truth);
+    * ``on_progress`` (optional, default None = the pre-callback behavior,
+      byte-identical results): called after EACH name with
+      ``{"ticker", "n_done", "n_total", "decision", "fail_safe",
+      "event_id"}`` (plus ``"error"`` for a name whose pipeline failed;
+      ``decision``/``fail_safe`` are None for a deduped or failed name).
+      A callback exception NEVER breaks the scan (see _notify_progress) —
+      it feeds the background full-scan route's status state.
 
     ``transport`` / ``mcp`` are the same injection points ``run_agent``
     already has, passed through per name, so DB-level tests reuse the
@@ -540,14 +615,17 @@ async def run_news_scan(*, as_of: str | None = None, limit: int | None = None,
     runs: list[dict] = []
     errors: list[dict] = []
     n_deduped = 0
-    for ctx in contexts:
+    n_total = len(contexts)
+    for n_done, ctx in enumerate(contexts, start=1):
         if dry_run:
             continue
         ticker = ctx["ticker"]
         event_id = _event_id(ticker, as_of, fresh=fresh)
         # Scan-time dedupe (mirrors type C): only a CONSULTED row silences
         # the name — a transient fail-safe row never does. MANUAL (--fresh)
-        # looks are NEVER deduped: every --fresh run consults again.
+        # looks are NEVER deduped: every --fresh run consults again. The
+        # dedupe key is NAME-level (D:{ticker}:{as_of}) over the union — a
+        # name held in both books is consulted at most once per night.
         if not fresh:
             async with Session() as s:
                 consulted = await s.scalar(
@@ -559,6 +637,9 @@ async def run_news_scan(*, as_of: str | None = None, limit: int | None = None,
                 n_deduped += 1
                 logger.info("news scan: %s already consulted for %s (%s) — "
                             "skipped", ticker, as_of, event_id)
+                await _notify_progress(on_progress, {
+                    "ticker": ticker, "n_done": n_done, "n_total": n_total,
+                    "decision": None, "fail_safe": None, "event_id": event_id})
                 continue
         try:
             rec = await run_agent(ctx, event_id=event_id, mcp=mcp,
@@ -583,12 +664,20 @@ async def run_news_scan(*, as_of: str | None = None, limit: int | None = None,
                          "news_source": rec["news_source"]},
                 engine_branch=ENGINE_BRANCH)
             runs.append(rec)
+            await _notify_progress(on_progress, {
+                "ticker": ticker, "n_done": n_done, "n_total": n_total,
+                "decision": rec["decision"], "fail_safe": bool(rec["fail_safe"]),
+                "event_id": event_id})
         except Exception as e:  # noqa: BLE001 — one name never breaks the scan
             errors.append({"ticker": ticker, "event_id": event_id,
                            "error": f"{type(e).__name__}: {e}"})
             logger.error("news scan: %s (%s) failed (%s: %s) — continuing "
                          "with the remaining names", ticker, event_id,
                          type(e).__name__, e, exc_info=True)
+            await _notify_progress(on_progress, {
+                "ticker": ticker, "n_done": n_done, "n_total": n_total,
+                "decision": None, "fail_safe": None, "event_id": event_id,
+                "error": f"{type(e).__name__}: {e}"})
     artifact = {"schema": SCHEMA_RUN, "as_of": as_of,
                 "generated_at": generated_at, "dry_run": bool(dry_run),
                 "knob_searxng_mcp_url": bool(settings.searxng_mcp_url),
@@ -611,18 +700,20 @@ async def run_news_scan(*, as_of: str | None = None, limit: int | None = None,
 async def run_manual_consult(ticker: str, *, as_of: str | None = None,
                              out_dir: str | None = None, transport=None,
                              mcp=None) -> dict:
-    """ONE manual material-news consult for ONE monthly-book name — the
-    UI/API trigger (``POST /api/news/consult``) and the heart of the CLI's
-    ``--fresh`` mode.
+    """ONE manual material-news consult for ONE name of the paper books —
+    the UI/API trigger (``POST /api/news/consult``) and the heart of the
+    CLI's ``--fresh`` mode.
 
     Fresh semantics: the event_id is the 4-part ``D:{ticker}:{as_of}:m``
     (the ``:m`` manual marker) and there is NO dedupe — every call consults
     again (never against nightly rows, never against itself), and the
     4-part form stays out of the nightly ≥6-month sample.
 
-    The context is the same ``_book_contexts`` block the nightly scan uses,
-    filtered to the ticker (an honest error dict when the name is not in the
-    monthly book); ``as_of`` defaults to ``_last_session_date()``. The run
+    The context is the same ``_book_contexts`` block the nightly scan uses
+    (the UNION of both paper books, one context per name), filtered to the
+    ticker (an honest error dict when the name is held in neither book —
+    monthly nor daily-core); ``as_of`` defaults to
+    ``_last_session_date()``. The run
     goes through the same ``run_agent``, the ledger row is appended via the
     same recorder (``selllayer._record_decision`` — shadow: the fill columns
     stay NULL), and the artifacts (the JSONL log line) are best-effort.
@@ -650,8 +741,8 @@ async def run_manual_consult(ticker: str, *, as_of: str | None = None,
         ctx = next((c for c in contexts if c["ticker"] == ticker), None)
         if ctx is None:
             return {"ok": False,
-                    "reason": f"{ticker} is not in the monthly book "
-                              f"(as of {as_of})"}
+                    "reason": f"{ticker} is not held in either paper book "
+                              f"(monthly / daily-core, as of {as_of})"}
         event_id = _event_id(ticker, as_of, fresh=True)
         rec = await run_agent(ctx, event_id=event_id, mcp=mcp,
                               transport=transport)
@@ -703,8 +794,9 @@ async def _cmd_news(args) -> int:
     as_of = result["as_of"]
     mode = ("fresh MANUAL scan — event_id marker :m, NO dedupe (every "
             "--fresh run consults again)" if args.fresh else "nightly scan")
-    print(f"material-news scan [{mode}]: {result['n_contexts']} monthly-book "
-          f"name(s), as-of {as_of}, dry_run={args.dry_run}")
+    print(f"material-news scan [{mode}]: {result['n_contexts']} name(s) in the "
+          f"union of both paper books (monthly + daily-core, one consult per "
+          f"name), as-of {as_of}, dry_run={args.dry_run}")
     if args.dry_run:
         for ctx in result["contexts"]:
             print(json.dumps(ctx, sort_keys=True, indent=2, allow_nan=False))
@@ -743,11 +835,13 @@ def _build_parser() -> argparse.ArgumentParser:
                     "the nightly shadow scan — NO execution authority.")
     sub = p.add_subparsers(dest="command", required=True)
     news = sub.add_parser(
-        "news", help="the material-news scan: one agent run per monthly-book "
-                     "name (shadow; the ledger rows carry the hold-to-rebuild "
-                     "counterfactual). Default = the nightly 3-part event_id "
-                     "D:{ticker}:{as_of} (deduped per night); --fresh = manual "
-                     "consults with the 4-part :m marker, never deduped")
+        "news", help="the material-news scan: one agent run per name in the "
+                     "union of both paper books, monthly + daily-core (one "
+                     "consult per name, never twice; shadow — the ledger rows "
+                     "carry the hold-to-rebuild counterfactual). Default = the "
+                     "nightly 3-part event_id D:{ticker}:{as_of} (deduped per "
+                     "night); --fresh = manual consults with the 4-part :m "
+                     "marker, never deduped")
     news.add_argument("--as-of", default=None,
                       help="decision session YYYY-MM-DD (default: the DB's "
                            "last stored session)")

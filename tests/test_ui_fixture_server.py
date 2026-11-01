@@ -826,6 +826,8 @@ def test_db_guard_parity_leaves_unguarded_routes_alone():
         # A non-empty ticker: an empty one is a 422 now (live parity), so the
         # unguarded-ness probe uses an unknown-but-valid ticker (200 ok:false).
         ("POST", "/api/news/consult", b'{"ticker": "ZZZ"}'),
+        ("POST", "/api/news/scan", b"{}"),
+        ("GET", "/api/news/scan/status"),
         ("DELETE", "/api/sim/chat/history"),
         ("DELETE", "/api/watchlist/AAPL"),
         ("POST", "/api/refresh/AAPL"),
@@ -990,6 +992,8 @@ def test_ticker_chat_stream_envelope_drops_legacy_trades_key():
 # ---------------------------------------------------------------------------
 # Type-D news-agent routes: fixture parity with app/main.py's /api/news/*
 # (POST /api/news/consult = fail-closed synthetic ack, NO real consult;
+#  POST /api/news/scan = fail-closed ack of the background full scan;
+#  GET /api/news/scan/status = one synthetic COMPLETED scan state;
 #  GET /api/news/decisions/{event_id} = one synthetic D row)
 # ---------------------------------------------------------------------------
 
@@ -1005,8 +1009,18 @@ NEWS_DECISION_RESPONSE_KEYS = {
     "rationale", "parsed", "fail_safe", "fail_reason", "prompt_version",
     "context", "engine_branch", "backend", "model", "latency_ms", "decided_at",
 }
+# The live scan routes' shapes (app/main.py news_scan / news_scan_status):
+# the start ack and the scan-state keys.
+NEWS_SCAN_ACK_KEYS = {"ok", "started", "total"}
+NEWS_SCAN_STATE_KEYS = {
+    "running", "started_at", "finished_at", "as_of", "total", "done",
+    "current", "results", "errors",
+}
+NEWS_SCAN_RESULT_KEYS = {"ticker", "decision", "fail_safe", "event_id"}
 NEWS_ROUTES = (
     ("POST", "/api/news/consult"),
+    ("POST", "/api/news/scan"),
+    ("GET", "/api/news/scan/status"),
     ("GET", "/api/news/decisions/{event_id}"),
 )
 
@@ -1100,3 +1114,73 @@ def test_news_routes_are_unguarded_like_the_live_app():
         assert consult.status == 200, (headers, consult.status)
         decision = backend.dispatch("GET", f"/api/news/decisions/{event_id}", headers)
         assert decision.status == 200, (headers, decision.status)
+        scan = backend.dispatch("POST", "/api/news/scan", headers=headers, body=b"{}")
+        assert scan.status == 200, (headers, scan.status)
+        status = backend.dispatch("GET", "/api/news/scan/status", headers)
+        assert status.status == 200, (headers, status.status)
+
+
+def _union_size(backend: FixtureBackend, mode: str) -> int:
+    monthly = [p["ticker"] for p in get_json(backend, "/api/monthly/status")["positions"]]
+    dc_status = get_json(backend, "/api/dailycore/status")
+    daily = [p["ticker"] for p in dc_status["valuation"]["positions"]]
+    return len(set(monthly) | set(daily))
+
+
+def test_news_scan_route_is_a_fail_closed_synthetic_ack():
+    """POST /api/news/scan mirrors app/main.py's news_scan: a fail-closed
+    synthetic ack ({ok, started, total}) with total = the UNION of both paper
+    books' held tickers — NO scan is ever started (no agent/LLM/search)."""
+    for mode in ("populated", "empty"):
+        backend = FixtureBackend(mode=mode)
+        expected_total = _union_size(backend, mode)
+        response = backend.dispatch("POST", "/api/news/scan", body=b"{}")
+        assert response.status == 200, (mode, response.status)
+        assert response.kind == "post_ack"
+        payload = response.json()
+        assert payload["fixture_ack"] is True
+        assert payload["applied"] is False          # NO real scan ran
+        assert NEWS_SCAN_ACK_KEYS <= set(payload)
+        assert payload["ok"] is True and payload["started"] is True
+        assert payload["total"] == expected_total
+        assert b"http://" not in response.body and b"https://" not in response.body
+
+
+def test_news_scan_status_serves_one_synthetic_completed_state():
+    """GET /api/news/scan/status mirrors app/main.py's news_scan_status: one
+    synthetic COMPLETED state (running false) with 2 results on the
+    populated fixture; the no-http(s)-in-bodies guarantee holds."""
+    backend = FixtureBackend(mode="populated")
+    as_of = json.loads(DEFAULT_FIXTURE.read_text(encoding="utf-8"))["as_of"][:10]
+    response = backend.dispatch("GET", "/api/news/scan/status")
+    assert response.status == 200, response.status
+    assert response.kind == "fixture_api"
+    payload = response.json()
+    assert set(payload) == NEWS_SCAN_STATE_KEYS
+    assert payload["running"] is False
+    assert payload["as_of"] == as_of
+    assert payload["total"] == payload["done"] == _union_size(backend, "populated")
+    assert payload["current"] is None and payload["errors"] == []
+    assert len(payload["results"]) == 2
+    for result in payload["results"]:
+        assert NEWS_SCAN_RESULT_KEYS <= set(result)
+        assert result["decision"] in {"EXIT", "HOLD"}
+        assert result["fail_safe"] is False
+        assert result["event_id"] == f"D:{result['ticker']}:{as_of}:m"
+    assert b"http://" not in response.body and b"https://" not in response.body
+    # empty mode: no held names -> total 0, no results
+    empty = FixtureBackend(mode="empty")
+    payload = empty.dispatch("GET", "/api/news/scan/status").json()
+    assert payload["running"] is False and payload["total"] == 0
+    assert payload["results"] == []
+    # fail-closed: every other news-scan path 404s/501s like the live app
+    for method, path in (
+        ("GET", "/api/news/scan"),
+        ("POST", "/api/news/scan/status"),
+        ("DELETE", "/api/news/scan"),
+        ("GET", "/api/news/scan/extra"),
+        ("POST", "/api/news/scan/extra", ),
+    ):
+        r = backend.dispatch(method, path, body=b"{}" if method == "POST" else b"")
+        assert r.status in (404, 501), (method, path, r.status)
+        assert r.json()["testing_only"] is True
