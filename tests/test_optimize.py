@@ -7,7 +7,7 @@ parameter sweep) using synthetic candles — no DB, no network.
 from __future__ import annotations
 
 import random
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 import pytest
@@ -2146,3 +2146,101 @@ class TestDailyCoreProtection:
             with_baseline=False, basket_trend_days=10, basket_confirm_days=3,
             basket_good_times=True, basket_arm_sma=50)
         assert g50 is not None and g50.basket_events >= 1
+
+
+# ---------------------------------------------------------------------------
+# prune-candles: the one WRITING subcommand — 8-year fail-closed guard
+# ---------------------------------------------------------------------------
+
+
+class TestPruneCandles:
+    """prune-candles deletes Candle rows from the SHARED live DB — the one
+    maintenance exception to app.optimize's read-only rule. A --before
+    cutoff within 8 years of today must be REFUSED unless --allow-degrade is
+    passed, because the savings mirror reads 8 years of candle history back
+    (app/savings.py _eur_close_history)."""
+
+    @pytest.fixture
+    async def candle_db(self, monkeypatch):
+        from sqlalchemy import StaticPool, func, select
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        from app.db import Base, Candle
+
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        monkeypatch.setattr(optimize, "Session", session_factory)
+
+        async def _count() -> int:
+            async with session_factory() as s:
+                return (await s.scalar(select(func.count()).select_from(Candle))) or 0
+
+        async def _seed(ticker: str, day: str) -> None:
+            async with session_factory() as s:
+                s.add(Candle(ticker=ticker, timestamp=datetime.strptime(day, "%Y-%m-%d"),
+                             open=1.0, high=1.0, low=1.0, close=1.0, volume=1))
+                await s.commit()
+
+        yield _count, _seed
+        await engine.dispose()
+
+    def test_parser_has_allow_degrade_flag_defaulting_off(self):
+        p = optimize._build_parser()
+        args = p.parse_args(["prune-candles", "--before", "2020-01-01"])
+        assert args.command == "prune-candles" and args.allow_degrade is False
+        args = p.parse_args(["prune-candles", "--before", "2020-01-01", "--allow-degrade"])
+        assert args.allow_degrade is True
+
+    async def test_refuses_cutoff_within_8_years_without_flag(self, candle_db, capsys):
+        count, seed = candle_db
+        today = datetime.now(UTC).date()
+        recent = (today - timedelta(days=365 * 3)).strftime("%Y-%m-%d")  # 3y ago: inside 8y
+        old = (today - timedelta(days=365 * 10)).strftime("%Y-%m-%d")   # 10y ago: outside
+        await seed("AAA", recent)
+        await seed("AAA", old)
+        await optimize._prune_candles(recent, dry_run=False)
+        out = capsys.readouterr().out
+        assert "refused" in out and "8 years" in out and "savings" in out
+        assert "_eur_close_history" in out  # names the 8-year mirror reader
+        assert await count() == 2           # NOTHING deleted (fail closed)
+
+    async def test_dry_run_within_8_years_is_refused_too(self, candle_db, capsys):
+        count, seed = candle_db
+        recent = (datetime.now(UTC).date() - timedelta(days=30)).strftime("%Y-%m-%d")
+        await seed("AAA", recent)
+        await optimize._prune_candles(recent, dry_run=True)
+        assert "refused" in capsys.readouterr().out
+        assert await count() == 1
+
+    async def test_allow_degrade_deletes_within_8_years(self, candle_db, capsys):
+        count, seed = candle_db
+        today = datetime.now(UTC).date()
+        recent = (today - timedelta(days=365 * 3)).strftime("%Y-%m-%d")
+        old = (today - timedelta(days=365 * 10)).strftime("%Y-%m-%d")
+        await seed("AAA", recent)
+        await seed("AAA", old)
+        await optimize._prune_candles(recent, dry_run=False, allow_degrade=True)
+        assert "deleted 1 of 2" in capsys.readouterr().out
+        assert await count() == 1           # only the old row went
+
+    async def test_old_cutoff_allowed_without_flag(self, candle_db, capsys):
+        count, seed = candle_db
+        today = datetime.now(UTC).date()
+        cutoff = (today - timedelta(days=365 * 10)).strftime("%Y-%m-%d")  # outside the 8y window
+        older = (today - timedelta(days=365 * 11)).strftime("%Y-%m-%d")   # strictly before cutoff
+        keep = (today - timedelta(days=365 * 9)).strftime("%Y-%m-%d")
+        await seed("AAA", older)
+        await seed("AAA", keep)
+        await optimize._prune_candles(cutoff, dry_run=False)  # 10y ago: allowed, no flag
+        assert "deleted 1 of 2" in capsys.readouterr().out
+        assert await count() == 1  # only the strictly-before row went
+
+    def test_module_docstring_discloses_the_write_exception(self):
+        doc = optimize.__doc__
+        assert "prune-candles" in doc and "not read-only" in doc

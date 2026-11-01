@@ -5,6 +5,12 @@ account, positions, or trades. It replays the deterministic decision rules
 against stored historical candles and reports how well a given parameter set
 would have performed.
 
+ONE EXPLICIT EXCEPTION: the ``prune-candles`` subcommand is a maintenance
+command, not an analysis — it deletes ``Candle`` rows from the SHARED live
+database (the same candle cache every engine reads), so it is the one
+command here that is not read-only. Its 8-year guard below exists because
+the savings mirror reads 8 years of that same history back.
+
 Run inside the container (the DB lives in the Docker volume):
 
     docker compose exec trade-sentinel python -m app.optimize --help
@@ -30,7 +36,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 from collections.abc import Callable
 from typing import Any
 
@@ -2543,15 +2549,38 @@ def _print_walkforward_summary(results: list[_WindowResult]) -> None:
     print(f"\n  Positive-return windows: {pos_windows}/{n}")
 
 
-async def _prune_candles(before: str, dry_run: bool) -> None:
+# The savings mirror reads 8 years of candle history back (app/savings.py
+# ``_eur_close_history``, ``timedelta(days=365 * 8)``), so a prune cutoff
+# inside that window would silently truncate the mirror's history. Keep the
+# two windows in sync if either changes.
+_PRUNE_MIN_HISTORY_YEARS = 8
+
+
+async def _prune_candles(before: str, dry_run: bool, allow_degrade: bool = False) -> None:
     """Delete candle rows strictly before `before` (YYYY-MM-DD).
 
     Rationale: the monthly backtest cannot start earlier than the first month
     with eligible fundamentals (~2022 for the yfinance feed), and the daily
     engine only needs ~2y of history — old rows are dead weight. The FX
-    pseudo-tickers and every ticker keep everything after the cutoff."""
+    pseudo-tickers and every ticker keep everything after the cutoff.
+
+    FAIL-CLOSED GUARD: a cutoff WITHIN 8 years of today is refused unless
+    ``allow_degrade`` is passed — the savings mirror reads 8 years of candle
+    history back from the same shared DB (app/savings.py
+    ``_eur_close_history``), so pruning rows newer than that window would
+    degrade its mirror curve. The guard applies to ``--dry-run`` too: a dry
+    run reports exactly the deletion that would happen, so it is refused on
+    the same terms. Nothing is deleted on refusal."""
     from .db import Candle
     cutoff = datetime.fromisoformat(before).replace(tzinfo=UTC)
+    now = datetime.now(UTC)
+    oldest_safe_cutoff = now - timedelta(days=365 * _PRUNE_MIN_HISTORY_YEARS)
+    if cutoff > oldest_safe_cutoff and not allow_degrade:
+        print(f"refused: --before {cutoff.date()} is within {_PRUNE_MIN_HISTORY_YEARS} years "
+              f"of today ({now.date()}) — the savings mirror reads 8 years of candle history "
+              "back from the same DB (app/savings.py _eur_close_history), so pruning that "
+              "range would degrade its history; pass --allow-degrade to delete anyway")
+        return
     async with Session() as s:
         n = (await s.scalar(select(func.count()).select_from(Candle)
                             .where(Candle.timestamp < cutoff))) or 0
@@ -4282,7 +4311,7 @@ async def _daily_core_backtest(
 
 async def _main(args: argparse.Namespace) -> None:
     if args.command == "prune-candles":
-        await _prune_candles(args.before, args.dry_run)
+        await _prune_candles(args.before, args.dry_run, args.allow_degrade)
         return
 
     if args.command == "monthly-backtest":
@@ -5228,10 +5257,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pc = sub.add_parser("prune-candles",
                         help="Delete candle rows before a cutoff date (frees DB space, "
-                             "does not affect the daily engine which only needs ~2y)")
+                             "does not affect the daily engine which only needs ~2y). "
+                             "WARNING: this is the one subcommand that WRITES to the shared "
+                             "live candle DB, and a cutoff within 8 years of today is refused "
+                             "unless --allow-degrade (the savings mirror reads 8 years back)")
     pc.add_argument("--before", default="2016-01-01",
-                    help="YYYY-MM-DD: delete candles strictly before this date (default 2016-01-01)")
+                    help="YYYY-MM-DD: delete candles strictly before this date (default 2016-01-01; "
+                         "a cutoff within 8 years of today needs --allow-degrade)")
     pc.add_argument("--dry-run", action="store_true", help="Only report what would be deleted")
+    pc.add_argument("--allow-degrade", action="store_true",
+                    help="Allow a --before cutoff within 8 years of today, deleting candle rows "
+                         "the savings mirror's 8-year history reads (app/savings.py "
+                         "_eur_close_history)")
 
     return p
 

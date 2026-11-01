@@ -740,7 +740,23 @@ async def initialize(
 
     ``positions``: [{ticker, shares, avg_cost}] in EUR. The total invested
     amount is mirrored into the daily-core suggestion.
+
+    FINITE-INPUT GUARD: ``cash``, ``interest_rate`` and ``monthly_transfer``
+    must be finite numbers (NaN/inf pass every comparison and would be
+    stored, poisoning the ledger) — refused with ``{"ok": False, ...}``
+    BEFORE anything is read or written. Sign semantics are unchanged (cash
+    still clamps at 0; rate/transfer keep their sign).
     """
+    cash_val = _finite_number(cash)
+    rate_val = _finite_number(
+        interest_rate if interest_rate is not None else settings.savings_interest_rate
+    )
+    transfer_val = _finite_number(
+        monthly_transfer if monthly_transfer is not None else settings.savings_monthly_transfer
+    )
+    if cash_val is None or rate_val is None or transfer_val is None:
+        return {"ok": False,
+                "reason": "cash, interest_rate and monthly_transfer must be finite numbers"}
     positions = positions or []
     invested = 0.0
     async with Session() as s:
@@ -759,14 +775,10 @@ async def initialize(
             await s.execute(sa_delete(tbl))
         acc = SavingsAccount(id=1)
         s.add(acc)
-        acc.cash = max(0.0, float(cash))
+        acc.cash = max(0.0, cash_val)
         acc.accrued_interest = 0.0
-        acc.interest_rate = float(
-            interest_rate if interest_rate is not None else settings.savings_interest_rate
-        )
-        acc.monthly_transfer = float(
-            monthly_transfer if monthly_transfer is not None else settings.savings_monthly_transfer
-        )
+        acc.interest_rate = rate_val
+        acc.monthly_transfer = transfer_val
         month = _current_month()
         # Mark the current month as done for both monthly actions: the
         # operator seeded the balance manually, so the tracker must not
@@ -786,7 +798,10 @@ async def initialize(
                 avg_cost = float(p.get("avg_cost") or 0)
             except (TypeError, ValueError):
                 continue
-            if not ticker or shares <= 0 or avg_cost <= 0:
+            # Non-finite lots (inf shares/avg_cost pass `<= 0`) are skipped
+            # like any other unusable lot — never stored, never mirrored.
+            if (not ticker or not isfinite(shares) or shares <= 0
+                    or not isfinite(avg_cost) or avg_cost <= 0):
                 continue
             lot = lots.setdefault(ticker, [0.0, 0.0])
             lot[0] += shares
@@ -1215,8 +1230,14 @@ async def trueup(actual_total: float) -> dict:
     val = await valuate()
     if not val.get("initialized"):
         return {"ok": False, "reason": "not initialized"}
+    # Finite-input guard: NaN/inf pass BOTH `abs(delta) < 0.005` and
+    # `cash + delta < 0` comparisons and would land in cash, poisoning it
+    # inf→NaN permanently — refuse before any mutation.
+    actual = _finite_number(actual_total)
+    if actual is None:
+        return {"ok": False, "reason": "actual_total must be a finite number"}
     tracked_cash = val["cash"] + val["accrued_interest"]
-    delta = float(actual_total) - tracked_cash
+    delta = actual - tracked_cash
     async with Session() as s:
         acc = await _account(s)
         if acc is None:
@@ -1234,7 +1255,7 @@ async def trueup(actual_total: float) -> dict:
                     "reason": f"true-up would make cash negative "
                               f"({acc.cash:.2f} {delta:+.2f}) — check the entered total"}
         acc.cash += delta
-        await _log_event(s, "TRUEUP", delta, note=f"balance true-up to {actual_total:.2f} €")
+        await _log_event(s, "TRUEUP", delta, note=f"balance true-up to {actual:.2f} €")
         await s.commit()
     logger.info("Savings true-up: delta %.2f", delta)
     return {"ok": True, "delta": round(delta, 2), "cash": round(val["cash"] + delta, 2)}
@@ -1248,9 +1269,11 @@ async def add_deposit(amount: float) -> dict:
     nothing is mirrored until a Sparplan or manual buy invests it.
     Money moved OUT is ``withdraw`` (a dated WITHDRAWAL flow); a true-up
     remains the reconciliation tool for drift."""
-    amount = float(amount)
-    if amount <= 0:
-        return {"ok": False, "reason": "amount must be > 0"}
+    # _positive_amount = finite AND > 0: a bare `<= 0` lets inf through and
+    # one inf deposit poisons cash inf→NaN permanently.
+    amount = _positive_amount(amount)
+    if amount is None:
+        return {"ok": False, "reason": "amount must be a finite number > 0"}
     async with Session() as s:
         acc = await _account(s)
         if acc is None:
@@ -1299,6 +1322,23 @@ def _positive_amount(value) -> float | None:
     except (TypeError, ValueError):
         return None
     return amount if isfinite(amount) and amount > 0 else None
+
+
+def _finite_number(value) -> float | None:
+    """A finite float, or None when the value is unusable (NaN/inf/non-numeric).
+
+    Sign semantics stay with the caller (clamping etc.) — this guard only
+    rejects non-finites, which pass every `<=`/`>=` comparison and would
+    otherwise be STORED and poison later math (one inf deposit turns cash
+    inf→NaN permanently). Pydantic v2 lets JSON ``1e999``→inf and ``NaN``
+    through float request fields, so every entry point validates with this
+    before any mutation.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if isfinite(f) else None
 
 
 def _nonfuture_event_day(occurred_on: str | None) -> tuple[str | None, str | None]:
@@ -1996,10 +2036,10 @@ async def add_saveback(amount: float, ticker: str) -> dict:
     operator enters what TR actually invested). Buys the position from
     nothing — Saveback is a bonus, money TR gives you on top, NOT savings
     cash (a buy paid from your cash is manual_buy). Mirrors it."""
-    amount = float(amount)
+    amount = _positive_amount(amount)
     ticker = ticker.strip().upper()
-    if amount <= 0 or not ticker:
-        return {"ok": False, "reason": "amount must be > 0 and ticker required"}
+    if amount is None or not ticker:
+        return {"ok": False, "reason": "amount must be a finite number > 0 and ticker required"}
     prices = await _price_eur_map([ticker])
     price = prices.get(ticker)
     if price is None or price <= 0:
@@ -2035,10 +2075,10 @@ async def manual_buy(amount: float, ticker: str) -> dict:
     (e.g. ETF shares bought directly in TR, outside any Sparplan) — the
     manual counterpart to a Sparplan execution: cash is deducted, a
     MANUAL_BUY ledger event is booked, and the € is mirrored."""
-    amount = float(amount)
+    amount = _positive_amount(amount)
     ticker = ticker.strip().upper()
-    if amount <= 0 or not ticker:
-        return {"ok": False, "reason": "amount must be > 0 and ticker required"}
+    if amount is None or not ticker:
+        return {"ok": False, "reason": "amount must be a finite number > 0 and ticker required"}
     prices = await _price_eur_map([ticker])
     price = prices.get(ticker)
     if price is None or price <= 0:
@@ -2083,15 +2123,27 @@ async def set_config(
     monthly_transfer: float | None = None, interest_rate: float | None = None
 ) -> dict:
     """Update the persisted configuration (editable at runtime, unlike the
-    env seed values)."""
+    env seed values).
+
+    FINITE-INPUT GUARD: non-finite values (NaN/inf pass `max(0.0, ...)`)
+    are refused with ``{"ok": False, ...}`` before any mutation; the
+    existing sign semantics (clamp at 0) are unchanged.
+    """
     async with Session() as s:
         acc = await _account(s)
         if acc is None:
             return {"ok": False, "reason": "not initialized"}
-        if monthly_transfer is not None:
-            acc.monthly_transfer = max(0.0, float(monthly_transfer))
-        if interest_rate is not None:
-            acc.interest_rate = max(0.0, float(interest_rate))
+        updates: dict[str, float] = {}
+        for name, value in (("monthly_transfer", monthly_transfer),
+                            ("interest_rate", interest_rate)):
+            if value is None:
+                continue
+            v = _finite_number(value)
+            if v is None:
+                return {"ok": False, "reason": f"{name} must be a finite number"}
+            updates[name] = max(0.0, v)
+        for name, v in updates.items():
+            setattr(acc, name, v)
         await s.commit()
         return {
             "ok": True,
@@ -2101,10 +2153,18 @@ async def set_config(
 
 
 async def add_plan(ticker: str, amount: float, day_of_month: int) -> dict:
-    """Create (or reactivate) a Sparplan. One plan per (ticker, day)."""
+    """Create (or reactivate) a Sparplan. One plan per (ticker, day).
+
+    The amount must be finite AND > 0 (``_positive_amount``); a non-finite
+    day (inf/NaN raises OverflowError/ValueError on int()) is refused too —
+    before any mutation."""
     ticker = ticker.strip().upper()
-    amount, day_of_month = float(amount), int(day_of_month)
-    if not ticker or amount <= 0 or not 1 <= day_of_month <= 31:
+    amount = _positive_amount(amount)
+    try:
+        day_of_month = int(day_of_month)
+    except (TypeError, ValueError, OverflowError):
+        return {"ok": False, "reason": "invalid plan (ticker, amount>0, day 1..31)"}
+    if not ticker or amount is None or not 1 <= day_of_month <= 31:
         return {"ok": False, "reason": "invalid plan (ticker, amount>0, day 1..31)"}
     async with Session() as s:
         acc = await _account(s)

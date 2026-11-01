@@ -35,7 +35,11 @@ pre-measured reference bars (``sellreview.REFERENCE_BARS``).
     the strict exact-date opens of the governing sessions
     (``monthly._open_usd_map`` — the same convention as the rebuild's fills).
     Both legs of both branches are net of the one-way cost (the costs cancel
-    in the delta). CONFIRM = delta 0.
+    in the delta). CONFIRM = delta 0. A DEFER-retained name that the
+    rebuild's defensive capacity cap released anyway (``capacity_truncated``
+    in the rebuild's ``sell_layer`` JSON) is flagged ``capacity_released`` on
+    its history entry and counted in the top-level ``n_capacity_released`` —
+    attribution honesty only; the delta math is unchanged.
   * **Type C (engine "monthly")** — window = [the row's EXIT fill → the next
     month-end rebuild's fill session]. LLM branch (EXIT) = sold at the row's
     recorded fill, net of the one-way cost there, the proceeds at the declared
@@ -511,6 +515,18 @@ async def score_sell_decisions(db=None, *, now: datetime | None = None) -> dict:
                  "delta": res.get("delta"), "window": res.get("window"),
                  "branch": res.get("branch"), "detail": res.get("detail"),
                  "skip_reason": res.get("reason") or (res.get("window") or {}).get("reason")}
+        if et == "B":
+            # Attribution honesty (app/selllayer.py): when the defensive
+            # capacity cap released a DEFER-retained name anyway, the
+            # rebuild's sell_layer JSON lists it in "capacity_truncated" —
+            # the same join _score_b uses (_rebuild_for). Flag it on the
+            # history entry so the DEFER does not read as an ordinary LLM
+            # call; the scoring/delta math is UNCHANGED (the counterfactual
+            # stands — this is attribution only).
+            rb = _rebuild_for(row.session_date, rebalance_rows)
+            layer = _json(rb.sell_layer) if rb is not None else {}
+            truncated = {str(t) for t in (layer.get("capacity_truncated") or [])}
+            entry["capacity_released"] = row.ticker in truncated
         decisions.append(entry)
         if res["status"] == "scored":
             bucket["scored"].append(entry)
@@ -563,6 +579,9 @@ async def score_sell_decisions(db=None, *, now: datetime | None = None) -> dict:
         "data_as_of": data_as_of,
         "read_only": True,
         "n_d_shadow": n_d_shadow,
+        # B rows whose DEFER the rebuild's capacity cap released anyway
+        # (flagged "capacity_released" on their history entries above).
+        "n_capacity_released": sum(1 for d in decisions if d.get("capacity_released")),
         "costs": {
             "stock_oneway_bps": costs.stock_oneway_bps,
             "etf_oneway_bps": costs.etf_oneway_bps,

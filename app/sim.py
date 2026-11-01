@@ -255,8 +255,18 @@ async def _latest_close(ticker: str) -> float | None:
     """Return the most recent cached close price for *ticker*, or None.
 
     Delegates to market.latest_close (single-row query) — the old path loaded
-    the ticker's entire history via candles() just to read the last bar."""
-    return await latest_close(ticker)
+    the ticker's entire history via candles() just to read the last bar.
+
+    FAIL CLOSED on non-finite stored closes (SQLite stores inf as REAL, and
+    inf is storable end-to-end): a non-finite close is NO DATA, never a
+    price. Returning None routes every caller (valuate, the benchmark, the
+    chat preview) into its existing no-data path — valuation falls back to
+    avg cost, fills/deposits skip — the same isfinite convention the factor
+    books use."""
+    price = await latest_close(ticker)
+    if price is None or not math.isfinite(price):
+        return None
+    return price
 
 
 async def held_tickers() -> list[str]:
@@ -695,6 +705,11 @@ async def _write_snapshot(post: dict, *, mode: str | None = None,
     records too.
     """
     async with _state_write_lock:
+        if not all(math.isfinite(float(post[k]))
+                   for k in ("cash", "positions_value", "total_equity", "allowance_total")):
+            # Fail closed: a non-finite mark never lands in the equity curve.
+            logger.warning("Sim snapshot refused: non-finite valuation %r", post)
+            return
         stamp = await _resolve_paper_stamp(mode=mode, config_id=config_id, epoch=epoch)
         async with Session() as s:
             if not await _stamp_is_current(s, stamp):
@@ -728,7 +743,10 @@ async def _exec_buy(ticker: str, price: float, max_budget: float, reason: str,
     it to the blended average cost would), and the position-specific
     monotone ATR ratchet is the only mechanism that can tighten it.
     """
-    if price <= 0 or max_budget < 1:
+    if not math.isfinite(price) or price <= 0 or not math.isfinite(max_budget) or max_budget < 1:
+        # NaN passes `price <= 0` and floor()s to NaN shares, which would
+        # poison cash inf→NaN in _exec_buy_locked — refuse non-finites here
+        # (fail closed: no fill).
         return None
     # Fractional shares — floor (not round) so cost never exceeds the
     # budget; rounding up can push a high-priced ticker cents over the
@@ -806,9 +824,13 @@ async def _exec_sell_locked(ticker: str, price: float, shares: float | None,
         pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == ticker))
         if pos is None or pos.shares <= 0:
             return None
+        if not math.isfinite(price):
+            # Fail closed: a non-finite fill price is no fill — proceeds
+            # would poison cash inf→NaN (same convention as _exec_buy).
+            return None
 
         sell_shares = pos.shares if shares is None else min(shares, pos.shares)
-        if sell_shares <= 0:
+        if sell_shares <= 0 or not math.isfinite(sell_shares):
             return None
         proceeds = sell_shares * price
 
@@ -998,6 +1020,13 @@ async def _decision_inputs(tickers: list[str],
         dec_rows = [r for r in rows if r["time"] <= s_str]
         if not dec_rows or dec_rows[-1]["time"] != s_str:
             continue  # did not trade on S — no fresh decision view
+        last_close = float(dec_rows[-1]["close"])
+        if not math.isfinite(last_close):
+            # A non-finite S close is NO DATA (fail closed): the ticker gets
+            # no signal and no decision price this cycle — exactly like one
+            # that did not trade on S — and never an inf/NaN price that
+            # could reach a fill through the proposals.
+            continue
         if len(dec_rows) < MIN_CANDLES:
             continue
         try:
@@ -1005,7 +1034,7 @@ async def _decision_inputs(tickers: list[str],
         except Exception as e:
             logger.warning("No signal for %s: %s", t, e)
             continue
-        prices[t] = float(dec_rows[-1]["close"])
+        prices[t] = last_close
 
     ratchets = _atr_ratchets(frames, held_entries or {}, s_str)
     return _DecisionInputs(f_ts=f_ts, s_ts=s_ts, signals=signals,
@@ -2470,11 +2499,12 @@ async def backfill(start: str | None = None) -> dict[str, Any]:
     """Replay the DETERMINISTIC sim strategy over historical data and REPLACE
     the portfolio state with the replay's end state.
 
-    The live sim's deterministic cycle is the live decision path (the LLM
-    sell layer wires into it); ``llm``/``hybrid`` remain selectable
-    strategy modes, but the LLM cannot be replayed faithfully (tokens, and
-    its cloud behaviour isn't reproducible), so this backfill is a
-    DETERMINISTIC APPROXIMATION: the engine's own rules only — the same
+    The live sim's deterministic cycle is the only live decision path (the
+    LLM sell layer wires into it); the ``llm``/``hybrid`` whole-cycle modes
+    are RETIRED (a stale ``SIM_STRATEGY`` value degrades to deterministic
+    with a warning in run_cycle), and the LLM cannot be replayed faithfully
+    anyway (tokens, and its cloud behaviour isn't reproducible), so this
+    backfill is a DETERMINISTIC APPROXIMATION: the engine's own rules only — the same
     SELL/ATR-stop/BUY logic, the same risk config (max-positions, stops,
     run-up block, cash floor), zero LLM calls. The curve approximates the
     deterministic engine; treat it as context for comparison, not a track

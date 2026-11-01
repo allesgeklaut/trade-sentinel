@@ -13,8 +13,10 @@ from ``app/sellreview.py``):
     on the position (``SimPosition.stop_defer_level`` / ``stop_defer_set_at``)
     and capped at ``sell_layer_max_defers`` consecutive defers, counted from
     the decision ledger — at the cap the stop executes regardless ("defer
-    cap"). The hybrid/llm strategy modes keep their existing whole-cycle
-    review; NO second LLM pass is added there.
+    cap"). The hybrid/llm whole-cycle strategy modes are RETIRED (a stale
+    value degrades to deterministic with a warning in run_cycle), so there
+    is no whole-cycle LLM review left to duplicate; NO second LLM pass is
+    added anywhere.
   * **Type B (the monthly book)** — at the month-end rebuild a held name falls
     out of the hysteresis band. CONFIRM releases it as today; DEFER retains it
     one more month and the new name it displaced is not bought (capacity stays
@@ -43,9 +45,10 @@ means the ENGINE's own rule stands; the live book never breaks because of
 the LLM. With the knobs off the overlays are identity functions: bit-identical
 OFF parity.
 
-The owner's explicit caution is honoured: the sim's existing LLM layer
-(hybrid/pure-LLM whole-cycle review) never worked well — nothing here is
-modelled on it beyond ``SimLlmDecision``'s ledger conventions (append-only,
+The owner's explicit caution is honoured: the sim's retired LLM layer
+(hybrid/pure-LLM whole-cycle review — retired, degrades to deterministic)
+never worked well — nothing here is modelled on it beyond
+``SimLlmDecision``'s ledger conventions (append-only,
 ``decided_at`` frozen at parse, NULL-together fill columns, no pending-order
 persistence beyond the ledger rows — the session fill contract, rule 7).
 

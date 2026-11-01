@@ -554,3 +554,78 @@ def test_index_html_inline_scripts_parse():
             assert r.returncode == 0, r.stderr
         finally:
             Path(path).unlink()
+
+
+# ---------------------------------------------------------------------------
+# 2b. Type B attribution: capacity_truncated -> capacity_released flag
+# ---------------------------------------------------------------------------
+
+
+class TestTypeBCapacityReleased:
+    """When the rebuild's defensive capacity cap releases a DEFER-retained
+    name anyway, selllayer records it in the MonthlyRebalance sell_layer JSON
+    as ``capacity_truncated``. The scorecard must flag that DEFER on its
+    history entry (``capacity_released: true``) and count it top-level
+    (``n_capacity_released``) — attribution honesty only; the delta math is
+    unchanged (the counterfactual stands)."""
+
+    ME1, FILL1 = "2026-03-31", "2026-04-01"
+    ME2, FILL2 = "2026-04-30", "2026-05-01"
+
+    async def _seed_book(self):
+        sessions = await _seed_candles(["AAA", "BBB", "CCC", "DDD"])
+        # target_n effectively 2: the cap truncates the retained BBB out of
+        # executed_picks — exactly the selllayer capacity_truncated edge case.
+        await _add_rebalance("2026-03", self.ME1, "AAA,BBB", "AAA,CCC,DDD",
+                             {"engine_picks": ["AAA", "CCC", "DDD"],
+                              "executed_picks": ["AAA", "CCC"],
+                              "retained": ["BBB"], "consulted": 1,
+                              "capacity_truncated": ["BBB"]})
+        await _add_rebalance("2026-04", self.ME2, "AAA,CCC", "AAA,CCC,DDD",
+                             {"engine_picks": ["AAA", "CCC", "DDD"],
+                              "executed_picks": ["AAA", "CCC", "DDD"]})
+        return sessions
+
+    async def test_capacity_truncated_defer_is_flagged_and_counted(self, mem_db):
+        sessions = await self._seed_book()
+        await _add_ledger(event_type="B", engine="monthly", session_date=self.FILL1,
+                          ticker="BBB", decision="DEFER")
+        await _add_ledger(event_type="B", engine="monthly", session_date=self.FILL1,
+                          ticker="AAA", decision="CONFIRM", event_id="B:AAA:1")
+        rep = await _score()
+        # top-level count
+        assert rep["n_capacity_released"] == 1
+        # the history entries carry the flag
+        by_ticker = {d["ticker"]: d for d in rep["decisions"] if d["event_type"] == "B"}
+        assert by_ticker["BBB"]["capacity_released"] is True
+        assert by_ticker["AAA"]["capacity_released"] is False
+        # ... also on the scored per-type events
+        ev = next(e for e in rep["types"]["B"]["events"] if e["ticker"] == "BBB")
+        assert ev["capacity_released"] is True
+        # delta math UNCHANGED: still the exact displaced-add counterfactual
+        e_r = _open_of("BBB", self.FILL1, sessions)
+        x_r = _open_of("BBB", "2026-05-01", sessions)
+        e_d = _open_of("DDD", self.FILL1, sessions)
+        x_d = _open_of("DDD", "2026-05-01", sessions)
+        exp = (x_r / e_r - 1.0 - 2 * RATE) - (x_d / e_d - 1.0 - 2 * RATE)
+        assert ev["delta"] == pytest.approx(exp)
+        assert ev["detail"]["engine_branch"] == "displaced add DDD"
+        assert rep["types"]["B"]["n_divergent"] == 1
+
+    async def test_no_capacity_truncated_means_zero_released(self, mem_db):
+        """Ordinary DEFERs (no capacity_truncated in the rebuild's sell_layer)
+        are NOT flagged — the flag is attribution, not a blanket marker."""
+        await _seed_candles(["AAA", "BBB", "CCC", "DDD"])
+        await _add_rebalance("2026-03", self.ME1, "AAA,BBB", "AAA,CCC,DDD",
+                             {"engine_picks": ["AAA", "CCC", "DDD"],
+                              "executed_picks": ["AAA", "CCC", "BBB"],
+                              "retained": ["BBB"]})
+        await _add_rebalance("2026-04", self.ME2, "AAA,CCC", "AAA,CCC,DDD",
+                             {"engine_picks": ["AAA", "CCC", "DDD"],
+                              "executed_picks": ["AAA", "CCC", "DDD"]})
+        await _add_ledger(event_type="B", engine="monthly", session_date=self.FILL1,
+                          ticker="BBB", decision="DEFER")
+        rep = await _score()
+        assert rep["n_capacity_released"] == 0
+        ev = rep["types"]["B"]["events"][0]
+        assert ev["capacity_released"] is False

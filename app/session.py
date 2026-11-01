@@ -37,6 +37,10 @@ session (the run date); S is the previous *completed* session.
      — it can only tighten, never loosen. It is recomputed per cycle from
      the entry anchor (``SimPosition.opened_at`` = the actual first-buy
      session date) so it needs no persistence.
+  Addendum (2026-11-01, owner-signed): a type-A DEFER re-arms the standing
+  stop at the deferred level and persists ``stop_defer_level`` so a restart
+  does not silently re-tighten. This is the one sanctioned loosening; every
+  other rule-6 clause stands — no other path loosens a standing stop.
   7. No pending-order persistence: the deterministic decision is recomputed
      at F's cycle from frozen inputs and is bit-identical on a re-run; an
      unfilled proposal is simply dropped and re-taken next session. The
