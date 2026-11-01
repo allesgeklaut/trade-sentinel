@@ -1561,9 +1561,9 @@
         <header class="paper-header">
             <div class="paper-head-main">
                 <div class="paper-kicker">PAPER ACCOUNT / USD</div>
-                <h2 class="paper-title" id="paper-account-title">Daily Sim</h2>
-                <p class="paper-desc" id="paper-account-desc">Daily deterministic/hybrid paper bot in USD, funded by a
-                    monthly allowance.</p>
+                <h2 class="paper-title" id="paper-account-title">Daily-Core</h2>
+                <p class="paper-desc" id="paper-account-desc">qv-mom ranking with daily deployment of free cash toward
+                    equal weight.</p>
                 <p class="paper-strategy">Named strategy variant: <b id="paper-strategy">—</b></p>
             </div>
             <div class="paper-controls">
@@ -1571,7 +1571,7 @@
                     <select id="paper-account" onchange="selectPaperAccount(this.value)">
                         <option value="sim">Daily Sim — USD paper</option>
                         <option value="monthly">Monthly — USD paper</option>
-                        <option value="dailycore">Daily-Core — USD paper</option>
+                        <option value="dailycore" selected>Daily-Core — USD paper</option>
                     </select>
                 </label>
                 <button id="paper-refresh-btn" onclick="refreshPaperAccount(this)"
@@ -1755,28 +1755,6 @@
                     refreshes data without a rebalance. Backfill/replay controls moved to <b>Lab › Maintenance</b>.</div>
             </details>
         </div>
-        <div class="sim-section" id="news-consult-section">
-            <div class="bench-label">MATERIAL-NEWS CONSULT // TYPE-D AGENT (SHADOW)</div>
-            <div class="sim-actions">
-                <select id="news-consult-ticker"
-                        title="One of the paper books' current positions (M = monthly, DC = daily-core) — the news agent judges recent news against that position's stated thesis"></select>
-                <button id="news-consult-btn" onclick="consultNews()">Consult now</button>
-                <button id="news-scan-btn" onclick="runNewsScan()">Run all (0)</button>
-            </div>
-            <div id="news-consult-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
-            <div id="news-consult-result"></div>
-            <details class="info-fold">
-                <summary>Scope &amp; safety</summary>
-                <div class="toolbar-scope">Scope: ONE name per consult — the picker offers the UNION of both paper
-                    books' positions (M = monthly, DC = daily-core; a name held in both is consulted once). Each
-                    consult runs ONE real agent run (real LLM + live searxng news search/read calls, ~1 minute at
-                    the deployed low effort) and is recorded as a SHADOW row (event <b>D:{ticker}:{as_of}:m</b>)
-                    in the LLM sell ledger — the verdict never places a trade (the fill columns stay NULL until
-                    the predeclared promotion rule). “Run all” scans every name in the union in the background
-                    (one real consult each, never deduped). Nightly scans use the 3-part
-                    <b>D:{ticker}:{as_of}</b> ids and are unaffected.</div>
-            </details>
-        </div>
     </section>
     <section id="dailycore-view" style="display:none">
         <div class="sim-section">
@@ -1850,6 +1828,28 @@
                 backfill. They do not rewrite stored history.</div>
         </div>
     </section>
+        <div class="sim-section" id="news-consult-section">
+            <div class="bench-label">MATERIAL-NEWS CONSULT // TYPE-D AGENT (SHADOW)</div>
+            <div class="sim-actions">
+                <select id="news-consult-ticker"
+                        title="One of the paper books' current positions (M = monthly, DC = daily-core) — the news agent judges recent news against that position's stated thesis"></select>
+                <button id="news-consult-btn" onclick="consultNews()">Consult now</button>
+                <button id="news-scan-btn" onclick="runNewsScan()">Run all (0)</button>
+            </div>
+            <div id="news-consult-status" style="margin-top:8px;font-size:12px;color:#7aaa81;min-height:14px"></div>
+            <div id="news-consult-result"></div>
+            <details class="info-fold">
+                <summary>Scope &amp; safety</summary>
+                <div class="toolbar-scope">Scope: ONE name per consult — the picker offers the UNION of both paper
+                    books' positions (M = monthly, DC = daily-core; a name held in both is consulted once). Each
+                    consult runs ONE real agent run (real LLM + live searxng news search/read calls, ~1 minute at
+                    the deployed low effort) and is recorded as a SHADOW row (event <b>D:{ticker}:{as_of}:m</b>)
+                    in the LLM sell ledger — the verdict never places a trade (the fill columns stay NULL until
+                    the predeclared promotion rule). “Run all” scans every name in the union in the background
+                    (one real consult each, never deduped). Nightly scans use the 3-part
+                    <b>D:{ticker}:{as_of}</b> ids and are unaffected.</div>
+            </details>
+        </div>
         <!-- Slice 2: the shared LLM sell scorecard — spans BOTH paper accounts
              (sim type A + monthly B/C), so it lives at the workspace level. -->
         <section id="sellscore-section" class="sim-section" aria-labelledby="sellscore-title">
@@ -3996,6 +3996,10 @@
         // The shared LLM sell scorecard (spans both paper accounts) loads
         // lazily once per Paper visit, exactly like the account views.
         let sellscoreLoaded = false;
+        // The material-news picker is workspace-level too (the panel is
+        // visible under every paper sub-tab), so it fills on the first Paper
+        // visit even when the landing account is sim or daily-core.
+        let newsPickerLoaded = false;
         // A research ticker chart must not be created while the Research
         // workspace is hidden (clientWidth 0): defer the draw until visible.
         let pendingResearchDraw = null;
@@ -4039,7 +4043,10 @@
         };
         const navState = {
             workspace: 'research',
-            paperAccount: 'sim',
+            // Daily-Core is the default paper account: it is the live
+            // strategy (the monthly book is the faithful baseline, the sim
+            // book the legacy comparison).
+            paperAccount: 'dailycore',
             legacyView: 'dashboard',
             hash: '#/research',
         };
@@ -4111,7 +4118,7 @@
 
         function canonicalHash(workspace, account) {
             const accountKey = PAPER_ACCOUNTS.includes(account)
-                ? account : (navState.paperAccount || 'sim');
+                ? account : (navState.paperAccount || 'dailycore');
             if (workspace === 'paper') return '#/paper/' + accountKey;
             if (workspace === 'savings' || workspace === 'lab' || workspace === 'settings') {
                 return '#/' + workspace;
@@ -4223,7 +4230,7 @@
             opts = opts || {};
             const workspace = route.workspace;
             const account = PAPER_ACCOUNTS.includes(route.account)
-                ? route.account : (navState.paperAccount || 'sim');
+                ? route.account : (navState.paperAccount || 'dailycore');
             const legacyView = workspace === 'research' ? 'dashboard'
                 : workspace === 'paper' ? account : workspace;
             navState.workspace = workspace;
@@ -4286,6 +4293,15 @@
                 else if (account === 'dailycore' && !dailyCoreLoaded) { dailyCoreLoaded = true; loadDailyCoreAll(); }
                 // The scorecard spans BOTH accounts: one lazy load per Paper visit.
                 if (!sellscoreLoaded) { sellscoreLoaded = true; loadSellScore(); }
+                // The material-news picker is workspace-level as well: fill it
+                // on the first Paper visit. The Monthly loader also fills it
+                // (from the status it already holds), so skip it here when
+                // Monthly is the account that is loading.
+                if (!newsPickerLoaded && account !== 'monthly') {
+                    // The loader sets the flag itself, only after a successful
+                    // fill — a failed read retries on the next Paper visit.
+                    loadNewsPicker();
+                }
                 // Live CURRENT (next-run) configuration rides along with the
                 // account/status load — one read-only GET, cached per page.
                 loadRunConfig();
@@ -4338,7 +4354,7 @@
         }
 
         function selectPaperAccount(account) {
-            if (!PAPER_ACCOUNTS.includes(account)) account = 'sim';
+            if (!PAPER_ACCOUNTS.includes(account)) account = 'dailycore';
             navState.paperAccount = account;
             applyWorkspace({ workspace: 'paper', account }, { writeHash: 'push' });
         }
@@ -6003,30 +6019,53 @@
                     window.PaperPortfolioUI.renderPositionsHtml(pos, {
                         emptyText: 'No open positions — waiting for first rebalance.',
                     });
-                // The material-news consult picker offers the UNION of both
-                // paper books' positions, tagged by book: "MSFT (M)",
-                // "AAPL (DC)", "JPM (M+DC)" — the monthly status (this s) and
-                // the daily-core status merged by ticker.
-                const newsSel = document.getElementById('news-consult-ticker');
-                if (newsSel) {
-                    const dcStatus = await api('dailycore/status').catch(() => null);
-                    const dcPos = (dcStatus && dcStatus.valuation
-                        && Array.isArray(dcStatus.valuation.positions))
-                        ? dcStatus.valuation.positions : [];
-                    const mTickers = new Set(pos.map(p => p.ticker));
-                    const dcTickers = new Set(dcPos.map(p => p && p.ticker).filter(Boolean));
-                    const union = Array.from(new Set([...mTickers, ...dcTickers])).sort();
-                    const tag = t => (mTickers.has(t) ? 'M' : '')
-                        + (dcTickers.has(t) ? (mTickers.has(t) ? '+DC' : 'DC') : '');
-                    const keep = newsSel.value;
-                    newsSel.innerHTML = union.length
-                        ? union.map(t => `<option value="${escapeHtml(t)}">${escapeHtml(t + ' (' + tag(t) + ')')}</option>`).join('')
-                        : '<option value="" disabled>(no positions)</option>';
-                    if (union.some(t => t === keep)) newsSel.value = keep;
-                    const scanBtn = document.getElementById('news-scan-btn');
-                    if (scanBtn) scanBtn.textContent = 'Run all (' + union.length + ')';
-                }
+                // The material-news picker is workspace-level (visible under
+                // every paper sub-tab), so it is filled by its own loader —
+                // passing this status's positions avoids a duplicate
+                // monthly/status fetch.
+                await loadNewsPicker(pos);
             } catch (e) { document.getElementById('monthly-summary').innerHTML = 'Error: ' + escapeHtml(e.message); }
+        }
+
+        // Fills the workspace-level material-news picker: the UNION of both
+        // paper books' positions, tagged by book — "MSFT (M)", "AAPL (DC)",
+        // "JPM (M+DC)" — merged by ticker from the monthly and daily-core
+        // statuses. This lives OUTSIDE loadMonthlyStatus because the panel is
+        // visible under every paper sub-tab and the landing account is
+        // daily-core (or sim): the picker must fill without a Monthly visit.
+        // `monthlyPos` is
+        // optional — pass it when the caller already holds the monthly status.
+        async function loadNewsPicker(monthlyPos) {
+            const newsSel = document.getElementById('news-consult-ticker');
+            if (!newsSel) return;
+            try {
+                let mPos = monthlyPos;
+                if (!Array.isArray(mPos)) {
+                    const mStatus = await api('monthly/status').catch(() => null);
+                    mPos = (mStatus && Array.isArray(mStatus.positions)) ? mStatus.positions : [];
+                }
+                const dcStatus = await api('dailycore/status').catch(() => null);
+                const dcPos = (dcStatus && dcStatus.valuation
+                    && Array.isArray(dcStatus.valuation.positions))
+                    ? dcStatus.valuation.positions : [];
+                const mTickers = new Set(mPos.map(p => p && p.ticker).filter(Boolean));
+                const dcTickers = new Set(dcPos.map(p => p && p.ticker).filter(Boolean));
+                const union = Array.from(new Set([...mTickers, ...dcTickers])).sort();
+                const tag = t => (mTickers.has(t) ? 'M' : '')
+                    + (dcTickers.has(t) ? (mTickers.has(t) ? '+DC' : 'DC') : '');
+                const keep = newsSel.value;
+                newsSel.innerHTML = union.length
+                    ? union.map(t => `<option value="${escapeHtml(t)}">${escapeHtml(t + ' (' + tag(t) + ')')}</option>`).join('')
+                    : '<option value="" disabled>(no positions)</option>';
+                if (union.some(t => t === keep)) newsSel.value = keep;
+                const scanBtn = document.getElementById('news-scan-btn');
+                if (scanBtn) scanBtn.textContent = 'Run all (' + union.length + ')';
+            } catch (e) {
+                // Read-only population: keep the previous options rather than
+                // breaking the panel; the next Paper visit retries.
+                return;
+            }
+            newsPickerLoaded = true;
         }
 
         async function loadMonthlyTrades() {

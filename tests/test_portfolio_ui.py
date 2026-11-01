@@ -121,6 +121,20 @@ FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 #     UNCHANGED (byte-identical, recomputed after the edit); `node --check`
 #     passes on both extracted inline scripts of static/index.html; the
 #     golden overlay pins in test_legacy_golden_* still pass.
+#   - 2026-11-01 (entry #3, news-consult panel moved to paper-workspace
+#     level): the #news-consult-section HTML block moved out of
+#     #monthly-view to a sibling of #sellscore-section (pure HTML move, no
+#     JS/CSS change — all handlers address elements by id). NO digest
+#     moved — all three source_guards are byte-identical, recomputed after
+#     the move: mddOf sha256
+#     237c6ebde46f9af4c6078aec5511afa57805396a78dbcf462d2ba94c9e0641dd,
+#     savings_block_all_functions_and_math sha256
+#     77f1c31f0cfcaf6e6e13f386f27a56f2bfebecdb8f2ab3bbea76f9858b71b048,
+#     news_consult_block_renderNewsConsult_and_consultNews sha256
+#     0a9372ad0b18c1b669c611fd2e598474225d375d7607c5a0684a783d34eb1844.
+#     Intactness evidence: `node --check` passes on both extracted inline
+#     scripts of static/index.html; the golden overlay pins in
+#     test_legacy_golden_* still pass.
 # ---------------------------------------------------------------------------
 
 RESULT_PREFIX = "__PORTFOLIO_UI_RESULT__"

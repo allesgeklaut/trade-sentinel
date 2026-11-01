@@ -124,6 +124,16 @@ ticker, shares, avg_cost, opened_at):
   `GET /api/news/scan/status` — fresh `:m` semantics, never deduped)
   consult any union name, including daily-core-only tickers.
 
+UI placement (2026-11-01): the material-news consult panel now lives at
+paper-workspace level — visible under all three paper sub-tabs (sim,
+monthly, daily-core), beside the LLM sell scorecard — because its scope
+is the union of both books. Previously it was nested inside the Monthly
+sub-view, a leftover from when the agent was monthly-only. The picker is
+filled by its own `loadNewsPicker()` (lazy, once per Paper visit) rather
+than from `loadMonthlyStatus`, because the landing account is daily-core
+(or sim): without that, the panel would appear with an empty picker and a
+"Run all (0)" label until the Monthly tab happened to load.
+
 ## Division of labor — the harness decides who and when; the MODEL decides everything else
 
 The scan TRIGGER stays deterministic: every name in the UNION of both
