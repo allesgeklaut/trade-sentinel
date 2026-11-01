@@ -6109,8 +6109,6 @@
             drawPaperComparison();
         }
 
-        function fmtPct(v) { return v.toFixed(1) + '%'; }
-
         async function loadMonthlyRebalances() {
             try {
                 const r = await api('monthly/rebalances?limit=24');

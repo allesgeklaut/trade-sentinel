@@ -556,6 +556,43 @@ def test_index_html_inline_scripts_parse():
             Path(path).unlink()
 
 
+def test_index_html_has_no_duplicate_top_level_functions():
+    """A duplicate ``function name(...)`` declaration at the same nesting
+    level silently overrides the earlier one — declarations hoist and the
+    LAST one wins, with no error and no warning.
+
+    That is exactly how the scorecard died: a later
+    ``function fmtPct(v) { return v.toFixed(1) + '%'; }`` (introduced by the
+    monthly-alignment commit, long before the scorecard existed) shadowed
+    the null-safe ``fmtPct`` declared above it, so ``renderSellScore`` threw
+    "Cannot read properties of null (reading 'toFixed')" on every null
+    aggregate — an empty ledger, or any type with no completed windows — and
+    rendered nothing at all.
+
+    Guard the whole inline script against the class: no two declarations of
+    the same name at the same indentation level.
+    """
+    import collections
+    import re
+
+    src = (Path(__file__).resolve().parents[1] / "static" / "index.html").read_text(
+        encoding="utf-8")
+    blocks = re.findall(r"<script>(.*?)</script>", src, re.S)
+    assert blocks, "no inline scripts found"
+    for bi, block in enumerate(blocks):
+        seen = collections.Counter(
+            (m.group(1), m.group(2))
+            for m in re.finditer(
+                r"^([ \t]*)function\s+([A-Za-z_$][\w$]*)\s*\(", block, re.M)
+        )
+        dup = {f"{name} (indent {len(indent)})": n
+               for (indent, name), n in seen.items() if n > 1}
+        assert not dup, (
+            f"inline script block {bi} declares the same function more than once at "
+            f"the same nesting level: {dup} — hoisting makes the LAST declaration win "
+            f"silently, which is how the scorecard's null-safe fmtPct was shadowed")
+
+
 # ---------------------------------------------------------------------------
 # 2b. Type B attribution: capacity_truncated -> capacity_released flag
 # ---------------------------------------------------------------------------
