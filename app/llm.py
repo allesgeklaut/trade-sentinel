@@ -483,6 +483,18 @@ async def _post_chat(
             }
             if temperature is not None:
                 payload["temperature"] = temperature
+                if temperature == 0.0:
+                    # Greedy sampling needs the full nucleus on strict servers:
+                    # Mistral rejects a bare temperature 0 with HTTP 400 code
+                    # 3054, "top_p must be 1 when using greedy sampling"
+                    # (probe-verified live 2026-11-03 through the LAN proxy —
+                    # every A/B/C sell consult fail-safed on it on 2026-11-02;
+                    # temp 0.0 + top_p 1.0 answers 200). top_p 1.0 is the
+                    # no-op nucleus everywhere (the OpenAI default), so the
+                    # field rides ONLY with the greedy temperature — the
+                    # frozen 0.0 regime (sellshadow's constants) is unchanged,
+                    # now expressed in the form the server contract requires.
+                    payload["top_p"] = 1.0
             if tools:
                 # A core OpenAI field (unlike the opt-in chat_template_kwargs
                 # above): sent only when the caller passes a tool surface.
@@ -522,9 +534,17 @@ async def _post_chat(
                 json=payload, headers=_auth_headers(backend),
             )
         if getattr(resp, "status_code", 200) != 200:
-            raise RuntimeError(
-                f"LLM backend {backend['name']} returned HTTP {resp.status_code}"
-            )
+            # The body rides along (same contract as the streaming path above):
+            # a bare status code is undiagnosable — the 2026-10-30 type-A
+            # fail-safes recorded only "HTTP 400" and the reason (the route's
+            # rejection text, e.g. an unsupported-value listing) was lost with
+            # it. Snippet-bounded; response bodies carry no credentials.
+            msg = (f"LLM backend {backend['name']} returned HTTP "
+                   f"{resp.status_code}")
+            body = str(getattr(resp, "text", "") or "")[:200]
+            if body:
+                msg += f": {body}"
+            raise RuntimeError(msg)
         data = resp.json()
     return _extract_content(data, backend)
 

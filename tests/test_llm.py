@@ -21,12 +21,14 @@ def llm_state_tmp(monkeypatch, tmp_path):
     return state_file
 
 
-def _fake_async_client(monkeypatch, response_data=None, status_code=200, raise_error=None):
+def _fake_async_client(monkeypatch, response_data=None, status_code=200,
+                       raise_error=None, body_text=None):
     """Replace httpx.AsyncClient with a fake returning ``response_data``."""
     http_status = status_code
 
     class FakeResponse:
         status_code = http_status
+        text = body_text
 
         def json(self):
             return response_data if response_data is not None else {}
@@ -187,6 +189,20 @@ class TestChat:
         with pytest.raises(RuntimeError):
             self._chat(monkeypatch, llm_state_tmp, {}, status_code=500)
 
+    def test_http_error_message_carries_the_body(self, monkeypatch,
+                                                 llm_state_tmp):
+        """A non-200's message must include the server's body snippet: the
+        2026-10-30 type-A fail-safes recorded only "HTTP 400" and the route's
+        rejection text was lost — a bare code is undiagnosable from the
+        ledger alone. Same contract as the streaming path."""
+        with pytest.raises(RuntimeError) as exc:
+            self._chat(monkeypatch, llm_state_tmp, {}, status_code=400,
+                       body_text='{"error": {"message": "reasoning_effort '
+                                 '\'medium\' is not supported"}}')
+        msg = str(exc.value)
+        assert "HTTP 400" in msg
+        assert "reasoning_effort" in msg  # the body snippet rides along
+
 
 class TestChatTemplateKwargs:
     """The vLLM-native ``chat_template_kwargs`` are OPT-IN per backend.
@@ -311,6 +327,44 @@ class TestChatTemplateKwargs:
         ]), effort="max")
         assert body["reasoning_effort"] == "max"
         assert "chat_template_kwargs" not in body
+
+    def test_greedy_temperature_rides_top_p_one(self, monkeypatch,
+                                                llm_state_tmp):
+        """The 2026-11-02 live failure, pinned: the A/B/C sell consults send
+        the frozen greedy temperature 0.0, and Mistral rejects a bare
+        temperature 0 with HTTP 400 code 3054 "top_p must be 1 when using
+        greedy sampling" (probe-verified live 2026-11-03 — temp 0.0 + top_p
+        1.0 answers 200). The wire must encode greedy sampling in the form
+        the server contract requires; the frozen 0.0 regime itself is
+        unchanged."""
+        body = self._capture_body(monkeypatch, json.dumps([
+            {"name": "proxy", "type": "openai", "url": "http://a:1",
+             "model": "m"},
+        ]), temperature=0.0)
+        assert body["temperature"] == 0.0
+        assert body["top_p"] == 1.0
+
+    def test_non_greedy_temperature_sends_no_top_p(self, monkeypatch,
+                                                   llm_state_tmp):
+        """top_p 1.0 rides ONLY with the greedy temperature — the D agent's
+        0.6 (the anti-repetition dose from the design note) must not gain a
+        nucleus field (the OpenAI default is no top_p at all)."""
+        body = self._capture_body(monkeypatch, json.dumps([
+            {"name": "proxy", "type": "openai", "url": "http://a:1",
+             "model": "m"},
+        ]), temperature=0.6)
+        assert body["temperature"] == 0.6
+        assert "top_p" not in body
+
+    def test_no_temperature_sends_no_sampling_fields(self, monkeypatch,
+                                                      llm_state_tmp):
+        """No temperature (the plain chat path) sends neither field."""
+        body = self._capture_body(monkeypatch, json.dumps([
+            {"name": "proxy", "type": "openai", "url": "http://a:1",
+             "model": "m"},
+        ]))
+        assert "temperature" not in body
+        assert "top_p" not in body
 
     def test_no_effort_sends_no_reasoning_fields(self, monkeypatch, llm_state_tmp):
         body = self._capture_body(monkeypatch, json.dumps([
