@@ -135,6 +135,46 @@ FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 #     Intactness evidence: `node --check` passes on both extracted inline
 #     scripts of static/index.html; the golden overlay pins in
 #     test_legacy_golden_* still pass.
+#   - 2026-11-03 (Savings % scale): the Savings equity chart gained a Value
+#     scale toggle (EUR default / % of net contributed, 100 baseline) and now
+#     builds its series through the tested pure helper
+#     portfolio.js::buildSavingsSeries (the same % rule as the paper
+#     comparison; % points omitted where net contributed is zero or negative;
+#     the picks mirror normalized to its own allocated €). The change lives in
+#     renderSavingsChart + setSavingsMode inside the pinned block, so the
+#     Savings digest was re-pinned: sha256
+#     6438c993c37b72081c87e3b53880346dfab2672e66c36b8f76d704a4f983dd7a (was
+#     77f1c31f0cfcaf6e6e13f386f27a56f2bfebecdb8f2ab3bbea76f9858b71b048; five
+#     intermediate pins — 52307ddf..., b4a1f248..., 32c3a918..., 260d2504...
+#     and 93a10662... — covered earlier cuts while the change was being
+#     reviewed).
+#     The final cut makes % mode divide each line by ITS OWN basis (100 =
+#     break-even on that basis), per the owner's two 2026-11-03 corrections:
+#     (a) positions and the picks mirror use the mirror curve's ``allocated``
+#     (the € actually invested), NOT ``contributed`` — dividing by
+#     contributions counted idle cash and read a single-digit percentage for
+#     positions while the invested book sat near break-even; (b) the total line KEEPS its own
+#     basis, equity / net contributed, because equity includes idle cash and
+#     dividing it by the invested € would read over 1000% — the owner asked for
+#     the total percentage back after it was dropped; (c) the legend names
+#     each basis (total vs contributed €, positions/mirror vs invested €,
+#     flat 100 baseline) instead of hiding the total entry; (d) a day whose
+#     snapshot predates a same-day buy (positions 0 against a basis that
+#     already counts it) keeps its baseline but adds no
+#     positions point, so the axis is not dragged to 0-140; (e) renders
+#     "hard-refresh" copy instead of a silent blank panel when the cached
+#     portfolio.js predates buildSavingsSeries (the same-day phone report —
+#     see tests/test_static_cache.py).
+#     Intactness evidence: the mddOf sha256
+#     237c6ebde46f9af4c6078aec5511afa57805396a78dbcf462d2ba94c9e0641dd and the
+#     news_consult_block_renderNewsConsult_and_consultNews sha256
+#     0a9372ad0b18c1b669c611fd2e598474225d375d7607c5a0684a783d34eb1844 are
+#     UNCHANGED (byte-identical, recomputed after the edit); `node --check`
+#     passes on both extracted inline scripts of static/index.html; the golden
+#     overlay pins in test_legacy_golden_* still pass; and the new
+#     buildSavingsSeries math is covered by test_build_savings_series
+#     (hand-computed cases, including the zero/negative-contribution omission
+#     and the mirror's own-basis rule).
 # ---------------------------------------------------------------------------
 
 RESULT_PREFIX = "__PORTFOLIO_UI_RESULT__"
@@ -272,6 +312,7 @@ async function runOne(item) {
     const results = [];
     const golden = [];
     const positions = [];
+    const savings = [];
     if (!loadError) {
         for (const item of payload.cases) results.push(await runOne(item));
         for (const item of payload.golden_inputs) golden.push(await runOne(item));
@@ -293,6 +334,24 @@ async function runOne(item) {
             }
             positions.push(record);
         }
+        const savingsApi = (loaded && typeof loaded.buildSavingsSeries === "function")
+            ? loaded
+            : (globalThis.PaperPortfolioUI
+                && typeof globalThis.PaperPortfolioUI.buildSavingsSeries === "function"
+                ? globalThis.PaperPortfolioUI : null);
+        for (const item of (payload.savings_cases || [])) {
+            const record = { name: item.name, output: null, threw: null, input_unchanged: null };
+            const input = revive(item);
+            const before = snapshot(input);
+            try {
+                if (!savingsApi) throw new Error("buildSavingsSeries is not exported");
+                record.output = savingsApi.buildSavingsSeries(input);
+            } catch (error) {
+                record.threw = String((error && error.stack) || error);
+            }
+            record.input_unchanged = snapshot(input) === before;
+            savings.push(record);
+        }
     }
     process.stdout.write(RESULT_PREFIX + JSON.stringify({
         loaded: !loadError,
@@ -302,6 +361,7 @@ async function runOne(item) {
         results: results,
         golden: golden,
         positions: positions,
+        savings: savings,
     }) + "\n");
 })().catch((error) => {
     process.stderr.write(String((error && error.stack) || error) + "\n");
@@ -318,6 +378,7 @@ def _run_node(cases: dict, golden_inputs: list[dict], tmp_dir: Path) -> dict:
         "cases": cases,
         "golden_inputs": golden_inputs,
         "positions_cases": CASES.get("positions_cases", []),
+        "savings_cases": CASES.get("savings_cases", []),
     }
     completed = subprocess.run(
         ["node", str(runner), str(MODULE)],
@@ -711,6 +772,140 @@ def test_phase3a_helpers_and_savings_block_byte_identical() -> None:
             "to remain byte-identical (the retired index.html withLiveToday copy "
             "no longer has a guard entry; portfolio.js's copy is the live one)."
         )
+
+
+def _assert_series(actual: list[dict], expected: list[tuple[str, float]], label: str) -> None:
+    assert [point["time"] for point in actual] == [day for day, _ in expected], (
+        f"{label}: time axis changed: {[point['time'] for point in actual]!r}"
+    )
+    for point, (day, value) in zip(actual, expected, strict=True):
+        _assert_close(point["value"], value, f"{label}@{day}")
+
+
+def test_build_savings_series(module_payload: dict) -> None:
+    """The Savings tab's EUR/% normalization, hand-computed per case.
+
+    % mode divides each line by ITS OWN basis, 100 = break-even: the total by
+    net contributed capital (the whole account, cash included), the positions
+    and the picks mirror by the EUR actually invested (the mirror curve's
+    ``allocated``). Dividing positions by contributions instead counts idle
+    cash and read a single-digit percentage while the invested book sat near
+    break-even.
+    EUR mode is the tab's original view and must stay a pure passthrough.
+    """
+    _require_loaded(module_payload)
+    results = {entry["name"]: entry for entry in module_payload.get("savings", [])}
+    assert results, "Node runner returned no savings results"
+    for name, entry in results.items():
+        assert entry["threw"] is None, f"{name} threw:\n{entry['threw']}"
+        assert entry["input_unchanged"] is True, f"{name}: buildSavingsSeries mutated its input"
+
+    eur = results["eur_passthrough"]["output"]
+    assert eur["mode"] == "eur"
+    _assert_series(eur["total"], [("2026-10-01", 1005.0), ("2026-10-02", 1010.0)], "eur total")
+    _assert_series(eur["positions"], [("2026-10-01", 400.0), ("2026-10-02", 405.0)], "eur positions")
+    _assert_series(eur["contributed"], [("2026-10-01", 1000.0), ("2026-10-02", 1000.0)],
+                   "eur contributed")
+    _assert_series(eur["mirror"], [("2026-10-01", 402.0), ("2026-10-02", 408.0)], "eur mirror")
+    assert eur["asOf"] == "2026-10-02"
+    assert eur["omitted"] == 0
+
+    pct = results["pct_is_value_over_invested_not_contributed"]["output"]
+    assert pct["mode"] == "pct"
+    # The total keeps its own basis: equity / contributed.
+    _assert_series(pct["total"], [("2026-10-01", 100.5), ("2026-10-02", 105.0)],
+                   "pct total over contributed")
+    # Positions use the invested EUR: 400/400 = 100%, 450/400 = 112.5% — NOT
+    # 40% / 45% (which is what dividing by the 1000 contributed would give).
+    _assert_series(pct["positions"], [("2026-10-01", 100.0), ("2026-10-02", 112.5)],
+                   "pct positions over invested")
+    _assert_series(pct["contributed"], [("2026-10-01", 100.0), ("2026-10-02", 100.0)],
+                   "pct baseline")
+    _assert_series(pct["mirror"], [("2026-10-01", 100.5), ("2026-10-02", 102.0)], "pct mirror")
+    assert pct["omitted"] == 0
+
+    omitted = results["pct_omits_days_without_invested_basis"]["output"]
+    # Days without an invested basis drop out of the POSITIONS line only —
+    # the total still plots them against contributions, so nothing is lost
+    # from the chart and the omitted counter stays 0.
+    _assert_series(omitted["total"], [("2026-10-01", 100.0), ("2026-10-02", 100.0),
+                                      ("2026-10-03", 104.0)], "omitted-case total")
+    _assert_series(omitted["positions"], [("2026-10-03", 100.0)], "omitted positions")
+    _assert_series(omitted["contributed"], [("2026-10-01", 100.0), ("2026-10-02", 100.0),
+                                            ("2026-10-03", 100.0)], "omitted baseline")
+    _assert_series(omitted["mirror"], [("2026-10-03", 110.0)], "omitted mirror")
+    assert omitted["omitted"] == 0
+    assert omitted["asOf"] == "2026-10-03"
+
+    dedup = results["pct_omitted_counts_days_not_rows"]["output"]
+    # A day with no basis at all is counted ONCE even though a basis-less
+    # mirror row shares it (the pre-fix code counted such days twice — on live
+    # data 3 missing days reported as 6).
+    _assert_series(dedup["total"], [("2026-10-01", 100.0)], "dedup total")
+    _assert_series(dedup["positions"], [("2026-10-01", 100.0)], "dedup positions")
+    _assert_series(dedup["mirror"], [("2026-10-01", 103.0)], "dedup mirror")
+    assert dedup["omitted"] == 1
+    assert dedup["asOf"] == "2026-10-01"
+
+    asof_case = results["pct_asof_tracks_last_plotted_day"]["output"]
+    # The final day has no basis at all (contributed 0, no invested EUR), so
+    # it is not drawn and must not be claimed as the chart's as-of mark.
+    _assert_series(asof_case["total"], [("2026-10-01", 100.0)], "pct as-of total")
+    _assert_series(asof_case["positions"], [("2026-10-01", 100.0)], "pct as-of positions")
+    assert asof_case["omitted"] == 1
+    assert asof_case["asOf"] == "2026-10-01"
+
+    null_positions = results["pct_positions_null_keeps_baseline_and_mirror"]["output"]
+    # A missing positions value drops only that series' point — the total,
+    # the baseline and the mirror still plot against their own bases.
+    _assert_series(null_positions["total"], [("2026-10-01", 100.5)], "null-positions total")
+    assert null_positions["positions"] == []
+    _assert_series(null_positions["contributed"], [("2026-10-01", 100.0)],
+                   "null-positions baseline")
+    _assert_series(null_positions["mirror"], [("2026-10-01", 104.0)], "null-positions mirror")
+    assert null_positions["omitted"] == 0
+
+    zero_pos = results["pct_zero_positions_with_basis_is_not_zero_percent"]["output"]
+    # A snapshot taken before a same-day buy has positions 0 against a basis
+    # that already counts it: that day must NOT plot 0% (the same-day-buy
+    # artifact that dragged the axis to 0-140 in live data). The total and
+    # baseline still mark the day.
+    _assert_series(zero_pos["total"], [("2026-10-01", 100.0)], "zero-positions total")
+    assert zero_pos["positions"] == []
+    _assert_series(zero_pos["contributed"], [("2026-10-01", 100.0)], "zero-positions baseline")
+    _assert_series(zero_pos["mirror"], [("2026-10-01", 98.62)], "zero-positions mirror")
+    assert zero_pos["omitted"] == 0
+
+    dup_pct = results["pct_duplicate_days_last_row_wins"]["output"]
+    _assert_series(dup_pct["total"], [("2026-10-01", 100.5)], "pct duplicate-day total")
+    _assert_series(dup_pct["positions"], [("2026-10-01", 100.0)], "pct duplicate-day positions")
+
+    strings = results["numeric_strings_are_accepted_like_the_paper_module"]["output"]
+    # finiteNumber coerces numeric strings, exactly like the paper module.
+    _assert_series(strings["total"], [("2026-10-01", 100.5)], "numeric-string total")
+    _assert_series(strings["positions"], [("2026-10-01", 100.0)], "numeric-string positions")
+    _assert_series(strings["mirror"], [("2026-10-01", 100.5)], "numeric-string mirror")
+
+    last = results["last_row_per_day_wins"]["output"]
+    _assert_series(last["total"], [("2026-10-01", 1005.0)], "last total")
+    _assert_series(last["positions"], [("2026-10-01", 400.0)], "last positions")
+    assert last["mirror"] == []
+    assert last["asOf"] == "2026-10-01"
+
+    invalid = results["invalid_rows_skipped_never_zero_filled"]["output"]
+    # 2026-02-31 is not a calendar day; a null equity row is skipped; a null
+    # positions value drops only that series' point (never coerced to zero).
+    _assert_series(invalid["total"], [("2026-10-02", 100.0)], "invalid total")
+    assert invalid["positions"] == []
+    _assert_series(invalid["contributed"], [("2026-10-02", 100.0)], "invalid baseline")
+    # EUR mirror keeps the historical filter: a row is plotted when value > 0
+    # OR allocated > 0 (a 0-value row with allocated EUR is a real mark).
+    _assert_series(invalid["mirror"], [("2026-10-02", 0.0)], "invalid mirror")
+    assert invalid["asOf"] == "2026-10-02"
+
+    unknown = results["unknown_mode_falls_back_to_eur"]["output"]
+    assert unknown["mode"] == "eur"
+    _assert_series(unknown["total"], [("2026-10-01", 1005.0)], "unknown-mode total")
 
 
 def test_no_runtime_baseline_path_is_required() -> None:

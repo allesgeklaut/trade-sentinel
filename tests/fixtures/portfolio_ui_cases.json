@@ -2195,7 +2195,7 @@
         "name": "savings_block_all_functions_and_math",
         "start_marker": "        // ===================== Savings tracker (real money, EUR) =====================",
         "end_marker": "        // ===================== Monthly qv-mom portfolio =====================",
-        "sha256": "77f1c31f0cfcaf6e6e13f386f27a56f2bfebecdb8f2ab3bbea76f9858b71b048"
+        "sha256": "6438c993c37b72081c87e3b53880346dfab2672e66c36b8f76d704a4f983dd7a"
       },
       {
         "name": "news_consult_block_renderNewsConsult_and_consultNews",
@@ -2358,6 +2358,139 @@
       "expected_row_classes": [
         ""
       ]
+    }
+  ],
+  "savings_cases": [
+    {
+      "name": "eur_passthrough",
+      "mode": "eur",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 1005.0, "contributed": 1000.0, "positions_value": 400.0},
+        {"date": "2026-10-02", "total_equity": 1010.0, "contributed": 1000.0, "positions_value": 405.0}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": 400.0, "value": 402.0},
+        {"date": "2026-10-02", "allocated": 400.0, "value": 408.0}
+      ]}
+    },
+    {
+      "name": "pct_is_value_over_invested_not_contributed",
+      "mode": "pct",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 1005.0, "contributed": 1000.0, "positions_value": 400.0},
+        {"date": "2026-10-02", "total_equity": 1050.0, "contributed": 1000.0, "positions_value": 450.0}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": 400.0, "value": 402.0},
+        {"date": "2026-10-02", "allocated": 400.0, "value": 408.0}
+      ]}
+    },
+    {
+      "name": "pct_omits_days_without_invested_basis",
+      "mode": "pct",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 1000.0, "contributed": 1000.0, "positions_value": 0.0},
+        {"date": "2026-10-02", "total_equity": 1000.0, "contributed": 1000.0, "positions_value": 10.0},
+        {"date": "2026-10-03", "total_equity": 1040.0, "contributed": 1000.0, "positions_value": 40.0}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-02", "allocated": 0.0, "value": 0.0},
+        {"date": "2026-10-03", "allocated": 40.0, "value": 44.0}
+      ]}
+    },
+    {
+      "name": "pct_omitted_counts_days_not_rows",
+      "mode": "pct",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 1000.0, "contributed": 1000.0, "positions_value": 30.0},
+        {"date": "2026-10-02", "total_equity": 1000.0, "contributed": 0.0, "positions_value": 40.0}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": 30.0, "value": 30.9},
+        {"date": "2026-10-02", "allocated": 0.0, "value": 0.0}
+      ]}
+    },
+    {
+      "name": "pct_asof_tracks_last_plotted_day",
+      "mode": "pct",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 100.0, "contributed": 100.0, "positions_value": 40.0},
+        {"date": "2026-10-02", "total_equity": 0.0, "contributed": 0.0, "positions_value": 0.0}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": 40.0, "value": 40.0}
+      ]}
+    },
+    {
+      "name": "pct_positions_null_keeps_baseline_and_mirror",
+      "mode": "pct",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 1005.0, "contributed": 1000.0, "positions_value": null}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": 100.0, "value": 104.0}
+      ]}
+    },
+    {
+      "name": "pct_zero_positions_with_basis_is_not_zero_percent",
+      "mode": "pct",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 1000.0, "contributed": 1000.0, "positions_value": 0.0}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": 200.0, "value": 197.24}
+      ]}
+    },
+    {
+      "name": "pct_duplicate_days_last_row_wins",
+      "mode": "pct",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 900.0, "contributed": 1000.0, "positions_value": 300.0},
+        {"date": "2026-10-01", "total_equity": 1005.0, "contributed": 1000.0, "positions_value": 400.0}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": 400.0, "value": 402.0}
+      ]}
+    },
+    {
+      "name": "numeric_strings_are_accepted_like_the_paper_module",
+      "mode": "pct",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": "1005.0", "contributed": "1000.0", "positions_value": "400.0"}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": "400.0", "value": "402.0"}
+      ]}
+    },
+    {
+      "name": "last_row_per_day_wins",
+      "mode": "eur",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 900.0, "contributed": 1000.0, "positions_value": 300.0},
+        {"date": "2026-10-01", "total_equity": 1005.0, "contributed": 1000.0, "positions_value": 400.0}
+      ],
+      "mirror": null
+    },
+    {
+      "name": "invalid_rows_skipped_never_zero_filled",
+      "mode": "eur",
+      "snapshots": [
+        {"date": "2026-02-31", "total_equity": 100.0, "contributed": 100.0, "positions_value": 10.0},
+        {"date": "2026-10-01", "total_equity": null, "contributed": 100.0, "positions_value": 10.0},
+        {"date": "2026-10-02", "total_equity": 100.0, "contributed": 100.0, "positions_value": null}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": 0.0, "value": 0.0},
+        {"date": "2026-10-02", "allocated": 25.0, "value": 0.0}
+      ]}
+    },
+    {
+      "name": "unknown_mode_falls_back_to_eur",
+      "mode": "percent",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 1005.0, "contributed": 1000.0, "positions_value": 400.0}
+      ],
+      "mirror": null
     }
   ]
 }

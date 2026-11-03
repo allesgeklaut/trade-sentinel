@@ -49,6 +49,19 @@
  *     is required, never a fabricated live-only curve. Missing overlay data is
  *     omitted, never zero-filled, and does not make the primary empty.
  *
+ * buildSavingsSeries({ mode, snapshots, mirror }) is the Savings tab's
+ * equity curve. EUR mode is the tab's original view (actual values on one
+ * axis). % mode divides each line by its OWN basis, 100 = break-even: the
+ * total by net contributed capital (the whole account, idle cash included),
+ * the positions and the picks mirror by the € actually invested (the mirror
+ * curve's ``allocated``). Positions deliberately do NOT divide by
+ * ``contributed``: contributions include money still sitting in cash, which
+ * made the positions line read a single-digit percentage while the invested
+ * book sat near break-even. The total deliberately does NOT divide by the
+ * invested € (equity includes idle cash — a mostly-cash account would read
+ * over 1000%), which is why it keeps its own basis. See the function's own
+ * contract comment.
+ *
  * renderPositionsHtml(positions, options) is the shared positions table
  * renderer (unchanged columns/formulas/colours/empty copy per account):
  *   options = { emptyText, showRank, showWeight, rankMap, totalEquity }
@@ -305,6 +318,167 @@
         };
     }
 
+    /*
+     * CONTRACT — buildSavingsSeries({ mode, snapshots, mirror })
+     *
+     * The Savings tab's equity curve.
+     *
+     *   mode      : 'eur' | 'pct'   (anything else -> 'eur')
+     *   snapshots : savings equity rows
+     *               {date, total_equity, contributed, positions_value}
+     *   mirror    : the /savings/mirror payload ({curve: [{date, allocated,
+     *               value}]}) or null
+     *
+     * EUR mode — the tab's original view, actual values on one axis:
+     *   total       equity (€)
+     *   positions   positions value (€)
+     *   contributed net contributed capital (€) — the baseline
+     *   mirror      the equal-allocation picks mirror (€)
+     *
+     * % mode — each line against its OWN basis, 100 = break-even:
+     *   total       equity / net contributed × 100 — the whole account,
+     *               including money still in cash
+     *   positions   positions value / invested € × 100 — the Sparplan book
+     *   mirror      mirror value / invested € × 100 — the picks book
+     *   contributed a flat 100 break-even line
+     *
+     * The two bases are DIFFERENT ON PURPOSE and the legend says so: the
+     * total line answers "how is my account doing against what I paid in"
+     * (idle cash included), while the positions/mirror lines answer "how is
+     * the invested book doing against the € it received". Dividing positions
+     * by contributions instead counts money still sitting in cash: on
+     * a small fraction of all contributions while the invested book sat near
+     * break-even — the owner's correction. Dividing the total by the invested €
+     * would be meaningless (a mostly-cash account reads over 1000%), which is
+     * why it keeps its own basis.
+     *
+     * "Invested €" is the mirror curve's ``allocated`` for that day: the € the
+     * tracker actually put into the book (Sparplan buys, manual buys,
+     * Savebacks, less disposals). The positions and mirror lines share it, so
+     * they are directly comparable.
+     *
+     * RULES:
+     *   - One point per day, the LAST input row for that day wins (the
+     *     savings chart's long-standing convention).
+     *   - A % point is emitted only where the invested basis is a finite
+     *     positive number. Zero / missing bases are omitted — NEVER rendered
+     *     as 0% — and counted in ``omitted`` for the caption (one count per
+     *     DAY; the mirror row shares its day with the snapshot row).
+     *   - A day with a positive basis but a ZERO positions value is not a
+     *     return: that is a snapshot taken before a same-day buy (the mirror
+     *     allocation already counts it). Such a day keeps its baseline point
+     *     but adds no positions point.
+     *   - Invalid dates / non-finite values are skipped, never zero-filled.
+     *   - Inputs are never mutated.
+     *
+     * Returns { mode, total, positions, contributed, mirror, asOf, omitted };
+     * ``asOf`` is the last day actually drawn.
+     */
+    function buildSavingsSeries(options) {
+        const opts = options && typeof options === 'object' ? options : {};
+        const mode = opts.mode === 'pct' ? 'pct' : 'eur';
+        const curve = (opts.mirror && Array.isArray(opts.mirror.curve)) ? opts.mirror.curve : [];
+        // The invested € per day — the denominator of the % view.
+        const investedByDay = new Map();
+        for (const row of curve) {
+            if (!row || typeof row !== 'object') continue;
+            const day = utcDay(row.date);
+            const allocated = finiteNumber(row.allocated);
+            if (day && allocated !== null) investedByDay.set(day, allocated);
+        }
+        const byDay = new Map();
+        const rows = Array.isArray(opts.snapshots) ? opts.snapshots : [];
+        for (const row of rows) {
+            if (!row || typeof row !== 'object') continue;
+            const day = utcDay(row.date);
+            if (!day) continue;
+            const total = finiteNumber(row.total_equity);
+            if (total === null) continue;
+            byDay.set(day, {
+                time: day,
+                total,
+                positions: finiteNumber(row.positions_value),
+                contributed: finiteNumber(row.contributed),
+            });
+        }
+        const points = Array.from(byDay.values())
+            .sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+        const total = [];
+        const positions = [];
+        const contributed = [];
+        let omitted = 0;
+        for (const point of points) {
+            if (mode === 'pct') {
+                const basis = investedByDay.get(point.time);
+                const hasContributed = point.contributed !== null && point.contributed > 0;
+                const hasInvested = basis !== undefined && basis !== null && basis > 0;
+                // The total account line keeps its OWN basis — equity over the
+                // money paid in. That is a different question from the invested
+                // book (it includes idle cash), so the two are labelled
+                // separately; 100 is break-even on each line's own basis.
+                if (hasContributed) {
+                    total.push({ time: point.time, value: point.total / point.contributed * 100 });
+                }
+                // A % return needs a VALUED book: a snapshot taken before a
+                // same-day buy has positions 0 against a basis that already
+                // includes it — plotting 0% would be a
+                // timing artifact, not a return. The baseline still marks
+                // the day.
+                if (hasInvested && point.positions !== null && point.positions > 0) {
+                    positions.push({
+                        time: point.time,
+                        value: point.positions / basis * 100,
+                    });
+                }
+                if (hasContributed || hasInvested) {
+                    contributed.push({ time: point.time, value: 100 });
+                } else {
+                    omitted += 1;
+                }
+            } else {
+                total.push({ time: point.time, value: point.total });
+                if (point.positions !== null) {
+                    positions.push({ time: point.time, value: point.positions });
+                }
+                if (point.contributed !== null) {
+                    contributed.push({ time: point.time, value: point.contributed });
+                }
+            }
+        }
+        const mirror = [];
+        for (const row of curve) {
+            if (!row || typeof row !== 'object') continue;
+            const day = utcDay(row.date);
+            const value = finiteNumber(row.value);
+            const allocated = finiteNumber(row.allocated);
+            if (!day || value === null) continue;
+            if (mode === 'pct') {
+                if (allocated !== null && allocated > 0) {
+                    mirror.push({ time: day, value: value / allocated * 100 });
+                }
+                // A mirror row without a basis shares its day with the
+                // snapshot row above — counting it again would double-count
+                // the same missing day in the caption.
+            } else if (value > 0 || (allocated !== null && allocated > 0)) {
+                // Pre-allocation zero rows stay out of the EUR view (the
+                // chart's long-standing filter: nothing was ever invested).
+                mirror.push({ time: day, value });
+            }
+        }
+        const primary = total.length ? total : positions;
+        return {
+            mode,
+            total,
+            positions,
+            contributed,
+            mirror,
+            // The last day actually drawn (an omitted final day must not be
+            // claimed as the chart's as-of mark).
+            asOf: primary.length ? primary[primary.length - 1].time : null,
+            omitted,
+        };
+    }
+
     function escapeHtml(value) {
         return String(value === null || value === undefined ? '' : value)
             .replace(/&/g, '&amp;')
@@ -366,6 +540,7 @@
         CONTRIBUTED_COLOR,
         PERCENT_BASIS_NOTE,
         buildComparisonSeries,
+        buildSavingsSeries,
         renderPositionsHtml,
         // Exposed for parity checks (pure helpers; no DOM).
         normalizeSnapshots,

@@ -2444,4 +2444,29 @@ async def index() -> FileResponse:
     resp.headers["Cache-Control"] = "no-cache"
     return resp
 
-app.mount('/', StaticFiles(directory=str(_STATIC_DIR), html=True), name='static')
+
+class NoCacheStaticFiles(StaticFiles):
+    """Static files with ``Cache-Control: no-cache`` (revalidate each load).
+
+    The mount below serves the SPA's subresources: workspace.css,
+    portfolio.js, favicon, manifest. Starlette sets only ETag/Last-Modified,
+    so browsers apply HEURISTIC caching to them — and a phone that keeps an
+    old ``portfolio.js`` while the (no-cache) index.html revalidates runs the
+    NEW page against the OLD module. On 2026-11-03 that surfaced as a blank
+    Savings chart: the new page called
+    ``PaperPortfolioUI.buildSavingsSeries``, the cached module did not have
+    it, and the TypeError killed the chart while the rest of the page
+    rendered. ``no-cache`` still allows the cheap 304 revalidation path
+    (ETag/Last-Modified are unchanged), it only forbids reusing a response
+    without asking — which is what makes a deploy atomic for the whole page.
+    The index.html route above already does exactly this for the entry
+    document; this extends the same rule to everything the document loads.
+    """
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount('/', NoCacheStaticFiles(directory=str(_STATIC_DIR), html=True), name='static')
