@@ -2064,15 +2064,45 @@ async def run_monthly_cycle(now: datetime | None = None) -> dict[str, Any]:
     # SEARXNG_MCP_URL via the knob-off convention inside run_news_scan
     # (status "disabled" — zero rows, no error). Fail-safe: any failure is
     # logged and never breaks the rebuild below.
+    #
+    # Cadence gate (2026-11-03, the owner's Exa-spend decision — the design
+    # note's division of labor: the harness owns the WHEN, the model owns the
+    # research): SIM_NEWS_SCAN_WEEKDAY -1 (default) = every night, 0..4 =
+    # only that UTC weekday (0=Monday .. 4=Friday, the universe_sync_weekday
+    # numbering). The gate is evaluated on TRADING nights only — the sim
+    # scheduler skips non-trading days BEFORE this cycle runs — so a gate day
+    # that is an NYSE holiday skips that week (no catch-up; a shadow-step
+    # hole, not a book event), and weekend values (5/6) can NEVER fire: the
+    # gate warns about them below and fails OPEN (nightly) — the knob-off
+    # convention, because a silently-never-running knob is fail-closed
+    # disguised as configured. The manual consult / CLI / UI background scan
+    # are NOT gated — on-demand runs are the operator's own spend decision.
     try:
         from . import newsagent
-        d_result = await newsagent.run_news_scan(
-            out_dir=settings.sim_news_out_dir, dry_run=False)
-        logger.info("Monthly type-D shadow news scan: status=%s as_of=%s "
-                    "contexts=%d rows=%d deduped=%d errors=%d",
-                    d_result.get("status"), d_result.get("as_of"),
-                    d_result.get("n_contexts", 0), d_result.get("n_ledger_rows", 0),
-                    d_result.get("n_deduped", 0), d_result.get("n_errors", 0))
+        gate = settings.sim_news_scan_weekday
+        gate_now = now or datetime.now(UTC)
+        if gate in (5, 6):
+            # The weekend footgun: 5/6 name Saturday/Sunday — nights this
+            # cycle never ticks. Warn on every trading night until fixed.
+            logger.warning("Monthly type-D news scan: SIM_NEWS_SCAN_WEEKDAY=%d "
+                           "names a weekend day, but the scheduler ticks only "
+                           "on trading days — this value can NEVER fire and "
+                           "silently disables the scan. Use 0..4 (Mon..Fri); "
+                           "running nightly until fixed.",
+                           gate)
+        if 0 <= gate <= 4 and gate_now.weekday() != gate:
+            logger.info("Monthly type-D news scan: skipped — cadence gate "
+                        "SIM_NEWS_SCAN_WEEKDAY=%d, tonight is weekday %d "
+                        "(zero consults, zero rows; manual paths ungated)",
+                        gate, gate_now.weekday())
+        else:
+            d_result = await newsagent.run_news_scan(
+                out_dir=settings.sim_news_out_dir, dry_run=False)
+            logger.info("Monthly type-D shadow news scan: status=%s as_of=%s "
+                        "contexts=%d rows=%d deduped=%d errors=%d",
+                        d_result.get("status"), d_result.get("as_of"),
+                        d_result.get("n_contexts", 0), d_result.get("n_ledger_rows", 0),
+                        d_result.get("n_deduped", 0), d_result.get("n_errors", 0))
     except Exception as e:  # noqa: BLE001 — never break the rebuild
         logger.error("Monthly type-D news scan failed: %s", e, exc_info=True)
     if not _rebalance_lock.locked():

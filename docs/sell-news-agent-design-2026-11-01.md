@@ -287,6 +287,40 @@ There is no designed budget: the ceiling is the runaway guard, and if
 nightly cost ever needs governing, that is an owner decision made from
 the observed traces — not a mechanism inside the loop.
 
+**Addendum 2026-11-03 — the owner decision, made from the observed
+traces.** The first full nightly over the union (2026-11-02: 11 names,
+36 turns, 103 tool calls of which 97 `searxng_web_search`) cost ~$2 of
+**Exa** search-API spend (the instance's only quality engine; LLM tokens
+are a different, smaller line). The owner's call: not every night. The
+governing mechanism is the harness's own domain per the division of
+labor above — the WHEN, never the research — so the cadence knob
+`SIM_NEWS_SCAN_WEEKDAY` (-1 = nightly default, 0..4 = one UTC weekday)
+now gates the nightly call site (app/monthly.py); the deployment runs
+MONDAYS. (Corrected 2026-11-03, same day: the first cut said Sundays —
+but the sim scheduler skips non-trading days BEFORE the cycle, so a
+weekend gate can never fire; the knob now warns and fails open on 5/6.
+Monday is the first trading-night review of the week: the weekend's
+bad-news dumps — the classic Saturday/Sunday corporate bombshell — are
+caught with a ~1-day reaction path into Tuesday's open, versus ~6
+trading days under a Friday "week in review". A holiday Monday skips
+that week; the gate-day choice is a one-line .env change.) The weekly
+latency is a real sample caveat, recorded here: the ≥6-month sample
+measures the WEEKLY intervention's fills, not the nightly's — a
+conservative lower bound if a promotion ever moves the step to
+nightly, and the exact measurement if it stays weekly. Manual
+consults, the CLI, and the UI background scan stay
+ungated: on-demand runs are the operator's own spend decision. The loop
+itself is unchanged — no call caps, no budget inside the agent.
+A second, per-search lever lives where the engine does (the SHARED
+SearXNG instance, webui stack searxng/config/settings.yml): Exa's auto
+search bills $7/1k requests INCLUDING up to 10 results + contents, plus
+$1/1k per result above 10 — the instance's `results_per_page: 20` paid
+~$0.017/search; lowered to 10 (the bundled count) the same day, ~$0.007
+(~59% off every exa search, all consumers). Below 10 saves nothing (the
+base covers up to 10). The agent-side `num_results` parameter cannot
+govern this: the MCP truncates AFTER searxng fetched and Exa billed the
+page.
+
 ## Open items at wiring
 
 1. The MCP client choice: a lean hand-rolled JSON-RPC over httpx

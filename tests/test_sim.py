@@ -2677,3 +2677,24 @@ class TestTradingDayCalendar:
         monkeypatch.setattr(monthly, "run_monthly_cycle", boom)
         monkeypatch.setattr(daily_core, "run_daily_cycle", boom)
         await sim._scheduler_tick()  # must return without running anything
+
+    async def test_weekend_news_scan_gate_never_fires(self, monkeypatch):
+        """The 2026-11-03 footgun, pinned: SIM_NEWS_SCAN_WEEKDAY=6 (Sunday)
+        can NEVER fire — the tick skips non-trading days BEFORE the cycle,
+        so the gate is unreachable on weekends. A weekend gate value would
+        have silently disabled the type-D scan entirely; the gate itself
+        warns and fails open, but this tick-level test is the proof that
+        no cycle (and thus no D scan) ever runs on a Sunday."""
+        from app import daily_core, monthly
+        from app.config import settings
+
+        monkeypatch.setattr(sim, "_utcnow", lambda: datetime(2026, 9, 20, 22, 30))  # Sun
+        monkeypatch.setattr(settings, "sim_news_scan_weekday", 6)  # the footgun
+
+        async def boom(*a, **k):
+            raise AssertionError("a cycle ran on a non-trading day — the "
+                                "weekend news-scan gate fired")
+
+        monkeypatch.setattr(monthly, "run_monthly_cycle", boom)
+        monkeypatch.setattr(daily_core, "run_daily_cycle", boom)
+        await sim._scheduler_tick()

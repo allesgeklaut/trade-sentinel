@@ -195,8 +195,10 @@ The dashboard's AI chat, the sim bot's LLM reasoning, and the LLM benchmark all 
 
 ```dotenv
 # JSON list of backends (single line — dotenv can't parse multi-line values):
-LLM_BACKENDS=[{"name":"llama-server","type":"openai","url":"http://your-server-ip:8084","model":"Qwen3.8-27B-IQ4_XS.gguf"},{"name":"ollama","type":"ollama","url":"http://host.docker.internal:11434","model":"qwen3:32b"}]
+LLM_BACKENDS=[{"name":"llama-server","type":"openai","url":"http://your-server-ip:4000","model":"qwen3.8-27b"},{"name":"ollama","type":"ollama","url":"http://host.docker.internal:11434","model":"qwen3:32b"}]
 ```
+
+Always point `type: "openai"` backends at the **LiteLLM proxy** (port `:4000` here), never at a direct llama-server port: the proxy cold-starts the on-demand GPU model containers, so a direct URL only answers while its container happens to be up — the rest of the time every dashboard open logs `Model discovery failed` and any consult would fail.
 
 - `type: "openai"` — OpenAI-compatible `/v1/chat/completions`; works with llama.cpp **llama-server**, vLLM, LiteLLM, etc.
 - `type: "ollama"` — Ollama's native `/api/chat`.

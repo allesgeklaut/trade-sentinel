@@ -62,6 +62,26 @@ class Settings(BaseSettings):
     # consult log + the run artifact. The container is read-only except
     # /data and /tmp, hence the /data default.
     sim_news_out_dir: str = "/data/news-out"
+    # The NIGHTLY type-D scan's cadence gate (app/monthly.py, the run_news_scan
+    # call site): -1 (the default) = EVERY night — byte-identical to the
+    # pre-knob behavior; 0..4 = run the nightly scan ONLY on that UTC weekday
+    # (0=Monday .. 4=Friday, the same numbering as universe_sync_weekday).
+    # The scheduler itself runs at sim_run_hour UTC (23:30 UTC is already
+    # 00:30/01:30 the NEXT Vienna day) and the gate compares the run's UTC
+    # weekday — the knob is exact in UTC end-to-end. The gate is evaluated
+    # on TRADING nights only — the sim scheduler skips non-trading days
+    # before the cycle — so a gate day that is an NYSE holiday skips that
+    # week, and weekend values (5=Saturday, 6=Sunday) can NEVER fire: the
+    # gate warns about them below and fails OPEN (nightly), because a
+    # silently-never-running knob is fail-closed disguised as configured.
+    # The agent's per-run research is NEVER shaped (the design note's
+    # division of labor: the harness owns WHO and WHEN); this knob governs
+    # the WHEN only, in response to the observed Exa search spend (2026-11-02:
+    # 97 searches across 11 consults ≈ $2/night). Any other value also fails
+    # open (nightly) — the knob-off convention. NOT applied to the manual
+    # consult, the CLI, or the UI's background scan — on-demand runs are the
+    # operator's own spend decision.
+    sim_news_scan_weekday: int = -1
 
     paper_trading: bool = True
 

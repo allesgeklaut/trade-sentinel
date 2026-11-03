@@ -30,6 +30,16 @@ Covered:
       step (declared order C-then-D), a raising D step does not break the
       cycle (the rebuild still runs), and D is NOT gated on
       sim_monthly_llm_sells.
+  (i) the cadence gate (2026-11-03, the owner's Exa-spend decision):
+      SIM_NEWS_SCAN_WEEKDAY 0..4 runs the nightly D scan ONLY on that UTC
+      weekday (a gated-off night skips D — the rebuild still runs), -1
+      (the default) and any invalid value fail OPEN (nightly); weekend
+      values (5/6) can NEVER fire — the sim scheduler skips non-trading
+      days before the cycle — so the gate warns and fails OPEN (a
+      silently-never-running knob is fail-closed disguised as configured).
+      The gate touches the NIGHTLY call site only — never run_news_scan
+      itself, so the CLI / manual consult / UI background scan stay
+      ungated.
   (h) the UNION scope (2026-11-01): _book_contexts reads MonthlyPosition +
       DailyCorePosition and returns ONE context per NAME with per-book
       attribution ("books"/"positions") and byte-compatible flat fields
@@ -382,6 +392,10 @@ class TestNightlyWiring:
     def _patch_cycle(self, monkeypatch, tmp_path, d_impl):
         monkeypatch.setattr(settings, "sim_monthly_enabled", True)
         monkeypatch.setattr(settings, "sim_news_out_dir", str(tmp_path / "news-out"))
+        # Pin the cadence knob to nightly: the wiring tests assert the CALL
+        # ORDER, not the operator's cadence choice (the ambient deployed .env
+        # sets 0=Monday — the gate tests below set the value they need).
+        monkeypatch.setattr(settings, "sim_news_scan_weekday", -1)
         order: list[str] = []
 
         async def fake_c(now=None, **kwargs):
@@ -441,6 +455,92 @@ class TestNightlyWiring:
             now=datetime(2026, 3, 6, 23, 30, tzinfo=UTC))
         assert out == {"rebalanced": True}
         assert order == ["D", "rebalance"]          # C skipped, D still runs
+
+    # (i) the cadence gate — 2026-03-06 is a FRIDAY (weekday 4),
+    # 2026-03-09 a MONDAY (weekday 0).
+
+    async def test_d_weekday_gate_skips_nonmatching_night(self, mem_db,
+                                                          monkeypatch,
+                                                          tmp_path):
+        """SIM_NEWS_SCAN_WEEKDAY=0 (Monday): a Friday night skips the D scan
+        entirely (zero consults, zero Exa spend) and the cycle continues —
+        the rebuild still runs."""
+        async def ok_d():
+            return {"status": "ok", "as_of": AS_OF, "n_contexts": 1,
+                    "n_ledger_rows": 1, "n_deduped": 0, "n_errors": 0,
+                    "errors": [], "log_path": None, "artifact_path": None}
+        order = self._patch_cycle(monkeypatch, tmp_path, ok_d)
+        monkeypatch.setattr(settings, "sim_news_scan_weekday", 0)
+        out = await monthly.run_monthly_cycle(
+            now=datetime(2026, 3, 6, 23, 30, tzinfo=UTC))     # Friday
+        assert out == {"rebalanced": True}
+        assert order == ["C", "rebalance"]          # D skipped, no fail
+
+    async def test_d_weekday_gate_runs_on_matching_night(self, mem_db,
+                                                         monkeypatch,
+                                                         tmp_path):
+        """SIM_NEWS_SCAN_WEEKDAY=0: the Monday night runs the scan normally."""
+        async def ok_d():
+            return {"status": "ok", "as_of": AS_OF, "n_contexts": 1,
+                    "n_ledger_rows": 1, "n_deduped": 0, "n_errors": 0,
+                    "errors": [], "log_path": None, "artifact_path": None}
+        order = self._patch_cycle(monkeypatch, tmp_path, ok_d)
+        monkeypatch.setattr(settings, "sim_news_scan_weekday", 0)
+        out = await monthly.run_monthly_cycle(
+            now=datetime(2026, 3, 9, 23, 30, tzinfo=UTC))     # Monday
+        assert out == {"rebalanced": True}
+        assert order == ["C", "D", "rebalance"]
+
+    async def test_d_weekday_gate_weekend_value_fails_open_with_warning(
+            self, mem_db, monkeypatch, tmp_path, caplog):
+        """A weekend value (5/6) can NEVER fire — the sim scheduler skips
+        non-trading days before this cycle — so the gate warns (every trading
+        night until fixed) and fails OPEN: nightly runs, because a
+        silently-never-running knob is fail-closed disguised as configured."""
+        async def ok_d():
+            return {"status": "ok", "as_of": AS_OF, "n_contexts": 1,
+                    "n_ledger_rows": 1, "n_deduped": 0, "n_errors": 0,
+                    "errors": [], "log_path": None, "artifact_path": None}
+        order = self._patch_cycle(monkeypatch, tmp_path, ok_d)
+        monkeypatch.setattr(settings, "sim_news_scan_weekday", 6)
+        with caplog.at_level("WARNING", logger="trade_sentinel.monthly"):
+            out = await monthly.run_monthly_cycle(
+                now=datetime(2026, 3, 6, 23, 30, tzinfo=UTC))   # Friday
+        assert out == {"rebalanced": True}
+        assert order == ["C", "D", "rebalance"]  # fail-open: D ran nightly
+        assert any("can NEVER fire" in r.message for r in caplog.records)
+
+    async def test_d_weekday_gate_default_is_nightly(self, mem_db, monkeypatch,
+                                                     tmp_path):
+        """SIM_NEWS_SCAN_WEEKDAY=-1 (the default): every night runs —
+        byte-identical to the pre-knob behavior."""
+        async def ok_d():
+            return {"status": "ok", "as_of": AS_OF, "n_contexts": 1,
+                    "n_ledger_rows": 1, "n_deduped": 0, "n_errors": 0,
+                    "errors": [], "log_path": None, "artifact_path": None}
+        order = self._patch_cycle(monkeypatch, tmp_path, ok_d)
+        monkeypatch.setattr(settings, "sim_news_scan_weekday", -1)
+        out = await monthly.run_monthly_cycle(
+            now=datetime(2026, 3, 6, 23, 30, tzinfo=UTC))     # Friday
+        assert out == {"rebalanced": True}
+        assert order == ["C", "D", "rebalance"]
+
+    async def test_d_weekday_gate_invalid_value_fails_open(self, mem_db,
+                                                           monkeypatch,
+                                                           tmp_path):
+        """An out-of-range value (7 is not a weekday) fails OPEN: the scan
+        runs nightly — the knob-off convention (a broken knob must never
+        silently kill the step)."""
+        async def ok_d():
+            return {"status": "ok", "as_of": AS_OF, "n_contexts": 1,
+                    "n_ledger_rows": 1, "n_deduped": 0, "n_errors": 0,
+                    "errors": [], "log_path": None, "artifact_path": None}
+        order = self._patch_cycle(monkeypatch, tmp_path, ok_d)
+        monkeypatch.setattr(settings, "sim_news_scan_weekday", 7)
+        out = await monthly.run_monthly_cycle(
+            now=datetime(2026, 3, 6, 23, 30, tzinfo=UTC))     # Friday
+        assert out == {"rebalanced": True}
+        assert order == ["C", "D", "rebalance"]
 
 
 # ---------------------------------------------------------------------------

@@ -4498,6 +4498,19 @@
             return (v * 100).toFixed(1) + '%';
         }
 
+        // The paper-comparison chart's % axis: its series values are ALREADY
+        // in percent units (equity / contributions × 100 — 100 is break-even,
+        // see PaperPortfolioUI.buildComparisonSeries), so the axis formatter
+        // must NOT scale again. fmtPct expects FRACTIONS (scorecard rates) —
+        // using it here rendered the 100 baseline as "10000.0%" (the 85052fb
+        // fallout: the chart used to ride on the shadowing duplicate that
+        // did not scale). Null-safe like fmtPct; no sign decoration, the axis
+        // shows the raw 100-baseline scale.
+        function fmtPctAxis(v) {
+            if (v === null || v === undefined || !Number.isFinite(v)) return '—';
+            return v.toFixed(1) + '%';
+        }
+
         function renderSellScore(data) {
             const asof = document.getElementById('sellscore-asof');
             if (asof) {
@@ -4898,7 +4911,10 @@
                     grid: { vertLines: { color: '#12351c' }, horzLines: { color: '#12351c' } },
                     // ONE daily UTC axis for every curve.
                     timeScale: { timeVisible: false, secondsVisible: false },
-                    localization: paperMode === 'pct' ? { priceFormatter: fmtPct } : {},
+                    // % mode: the values are already percent units — fmtPctAxis
+                    // (NOT fmtPct, which would scale fractions ×100 again).
+                    localization: paperMode === 'pct'
+                        ? { priceFormatter: fmtPctAxis } : {},
                 });
                 for (const series of result.series) {
                     const isBenchmark = series.id === 'benchmark';

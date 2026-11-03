@@ -26,7 +26,12 @@ paper books (monthly + daily-core — one context per name, so a name held
 in both books is consulted ONCE), right after the type-C step
 (``monthly.run_monthly_cycle`` calls ``run_news_scan``; the
 ``python -m app.newsagent news`` CLI is a thin wrapper over the same
-scan core).
+scan core). The nightly's WHEN is governed by
+``SIM_NEWS_SCAN_WEEKDAY`` (-1 = every night, 0..4 = only that UTC
+weekday — trading nights only, the scheduler skips non-trading days
+before the gate, so weekend values can never fire; the harness owns
+the when, the model owns the research; see app/config.py); the manual
+paths below are never cadence-gated.
 
 Beside the nightly scan there is the MANUAL consult — ``run_manual_consult``
 (one name, the UI/API trigger) and the CLI's ``--fresh`` mode. Manual looks
