@@ -22,10 +22,11 @@ Covered:
   (e) per-name error isolation: one name's failure is collected
       (n_errors == 1) while the other name still gets its row — nothing
       escapes the scan;
-  (f) sellscore: with one D row + one A row, the A stats and the overall
-      block are byte-identical to the A-only run, n_d_shadow == 1, the D
-      entry appears in the history with status "shadow" and is not in A's
-      rows/scored/overall;
+  (f) sellscore (the 2026-11-04 promotion): with one D-HOLD row + one A row,
+      the D row scores through the same completed-window contract as C —
+      bucketed in types["D"], delta 0 for HOLD, window end = the next
+      month-end rebuild's fill session — while A's stats stay byte-identical
+      to the A-only run and an unknown event_type stays skipped-with-reason;
   (g) the wired nightly: run_monthly_cycle calls the C step and then the D
       step (declared order C-then-D), a raising D step does not break the
       cycle (the rebuild still runs), and D is NOT gated on
@@ -319,7 +320,7 @@ class TestRunNewsScan:
 # (f) sellscore — D rows are visible but never scored/bucketed
 # ---------------------------------------------------------------------------
 
-class TestSellscoreShadow:
+class TestSellscoreDPromotion:
     async def _seed_tape_and_a_row(self, mem_db):
         """The canned AAA tape + one scorable A-DEFER row (the recipe from
         test_sellscore.py's hand-computed A test)."""
@@ -346,12 +347,12 @@ class TestSellscoreShadow:
                 backend="test", model="m1", latency_ms=1.0))
             await s.commit()
 
-    async def test_d_row_shadow_not_in_a_bucket(self, mem_db):
+    async def test_d_row_scores_through_the_c_contract(self, mem_db):
         await self._seed_tape_and_a_row(mem_db)
         rep_a_only = await sellscore.score_sell_decisions(now=NOW)
-        assert rep_a_only["n_d_shadow"] == 0
         assert rep_a_only["types"]["A"]["n_rows"] == 1
         assert rep_a_only["types"]["A"]["n_decided"] == 1
+        assert rep_a_only["types"]["D"]["n_rows"] == 0
 
         async with mem_db() as s:
             s.add(_d_row())
@@ -359,29 +360,33 @@ class TestSellscoreShadow:
             await s.commit()
         rep = await sellscore.score_sell_decisions(now=NOW)
 
-        # the D row is counted, visible in the history, but scored nowhere
-        assert rep["n_d_shadow"] == 1
-        assert "D" not in rep["types"]
+        # the D row is BUCKETED and scored (the promotion): HOLD = delta 0
+        # over [session_date -> the next month-end rebuild's fill session]
+        tD = rep["types"]["D"]
+        assert tD["n_rows"] == 1 and tD["n_decided"] == 1
+        assert tD["n_divergent"] == 0
+        ev = tD["events"][0]
+        assert ev["event_id"] == f"D:AAA:{AS_OF}"
+        assert ev["window"]["start"] == AS_OF and ev["window"]["end"] == "2026-04-01"
+        assert ev["delta"] == 0.0 and ev["branch"] == "hold (engine's path)"
         d_entry = next(d for d in rep["decisions"] if d["event_type"] == "D")
-        assert d_entry["event_id"] == f"D:AAA:{AS_OF}"
-        assert d_entry["status"] == "shadow"
-        assert d_entry["skip_reason"] == \
-            "type-D shadow row — scoring pending the D scorer"
-        assert d_entry["delta"] is None and d_entry["window"] is None
-        # NOT bucketed into A/B/C, NOT in the scored events, NOT in overall
-        assert rep["types"]["A"]["n_rows"] == 1
+        assert d_entry["status"] == "scored" and d_entry["delta"] == 0.0
+        # NOT bucketed into A/B/C, and the A stats are UNAFFECTED by the D row
+        assert rep["types"]["A"] == rep_a_only["types"]["A"]
         assert all(e["event_id"] != f"D:AAA:{AS_OF}"
                    for e in rep["types"]["A"]["events"])
-        assert rep["overall"]["n_rows"] == 1
-        # the A stats and the overall block are UNAFFECTED by the D row
-        assert rep["types"]["A"] == rep_a_only["types"]["A"]
-        assert rep["overall"] == rep_a_only["overall"]
-        # any OTHER unknown event_type is skipped-with-reason the same way
+        # D now counts in the overall block (the promotion's measurement)
+        assert rep["overall"]["n_rows"] == 2
+        assert rep_a_only["overall"]["n_rows"] == 1
+        # any OTHER unknown event_type is still skipped-with-reason the same
+        # way, counted nowhere
         x_entry = next(d for d in rep["decisions"] if d["event_type"] == "X")
         assert x_entry["status"] == "skipped"
         assert "unknown event_type" in x_entry["skip_reason"]
-        assert rep["n_d_shadow"] == 1               # X is not a D row
-        assert rep["overall"]["n_rows"] == 1       # X counted nowhere either
+        assert x_entry["event_id"] not in {e["event_id"] for t in
+                                           ("A", "B", "C", "D")
+                                           for e in rep["types"][t]["events"]}
+        assert rep["overall"]["n_rows"] == 2       # X counted nowhere either
 
 
 # ---------------------------------------------------------------------------

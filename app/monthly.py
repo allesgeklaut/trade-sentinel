@@ -864,10 +864,14 @@ def quality_snapshot(fund: dict[str, dict[str, list[dict]]], ticker: str,
     return {"roe": roe, "p_fcf": p_fcf}
 
 
-def _band_fill(order: list[str], holdings: list[str], target_n: int, hold_band: int) -> list[str]:
+def _band_fill(order: list[str], holdings: list[str], target_n: int, hold_band: int,
+               *, exclude: set[str] | None = None) -> list[str]:
     """Hysteresis: held names inside the top `hold_band` of `order` keep their
     slots; remaining slots are filled by the best-ranked names not held. Held
-    names that fell out of the band release their slot."""
+    names that fell out of the band release their slot. ``exclude`` (the
+    2026-11-04 re-entry guard) removes names from the FILL candidates only —
+    a news-exited name must not be re-bought until the next completed
+    month-end, but held names are never force-released by it."""
     band = [t for t in order[:hold_band] if t in holdings]
     picked = list(band[:target_n])
     for t in order:
@@ -875,14 +879,21 @@ def _band_fill(order: list[str], holdings: list[str], target_n: int, hold_band: 
             break
         if t in picked or t in holdings:
             continue  # already kept, or held-but-outside-band -> slot released
+        if exclude and t in exclude:
+            continue  # the re-entry guard: not buyable this pass
         picked.append(t)
     return sorted(picked)
 
 
 def _deploy_targets(order: list[str], holdings: list[str], target_n: int,
-                    hold_band: int, *, refill: bool) -> list[str]:
+                    hold_band: int, *, refill: bool,
+                    exclude: set[str] | None = None) -> list[str]:
     """The hysteresis-selected names ONE deployment pass may act on.
 
+    ``exclude`` (the 2026-11-04 re-entry guard) reaches the fill candidates
+    only: a news-exited name (a FILLED D-EXIT at/after the governing
+    month-end, ``selllayer.news_exit_excluded``) is not buyable this pass —
+    see the design note's promotion addendum.
     PLANNING semantics: with ``refill`` the return is the POST-RELEASE
     membership — band members kept + open slots filled from the best-ranked
     non-held names — assuming every pending release succeeds. The live
@@ -919,7 +930,8 @@ def _deploy_targets(order: list[str], holdings: list[str], target_n: int,
     slots grew the daily-core book past the target (audit P0-D).
     """
     if refill:
-        members = _band_fill(order, holdings, target_n, hold_band)
+        members = _band_fill(order, holdings, target_n, hold_band,
+                             exclude=exclude)
     else:
         members = [t for t in order[:hold_band] if t in holdings][:target_n]
     member_set = set(members)
@@ -1032,9 +1044,13 @@ def _qv_order(frame: pd.DataFrame, lowvol_tilt: bool | None = None) -> tuple[pd.
 def pick_portfolio(rebal_date: pd.Timestamp, close: pd.DataFrame, vol: pd.DataFrame,
                    fundamentals: dict[str, dict[str, list[dict]]],
                    holdings: list[str] | None = None,
-                   frame: pd.DataFrame | None = None) -> tuple[list[str], pd.DataFrame | None]:
+                   frame: pd.DataFrame | None = None,
+                   *, exclude: set[str] | None = None
+                   ) -> tuple[list[str], pd.DataFrame | None]:
     """qv-mom-v1 picker: top target_n by score with hysteresis.
-    Returns (sorted picks, eligibility frame)."""
+    Returns (sorted picks, eligibility frame). ``exclude`` is the
+    2026-11-04 re-entry guard (news-exited names are not buyable this
+    pass — passed by the rebalance from ``selllayer.news_exit_excluded``)."""
     holdings = list(holdings or [])
     if frame is None:
         frame = eligible_frame(rebal_date, close, vol, fundamentals)
@@ -1042,7 +1058,7 @@ def pick_portfolio(rebal_date: pd.Timestamp, close: pd.DataFrame, vol: pd.DataFr
         return holdings, frame
     _elig, order = _qv_order(frame)
     picks = _band_fill(order, holdings, settings.sim_monthly_target_n,
-                       settings.sim_monthly_hold_band)
+                       settings.sim_monthly_hold_band, exclude=exclude)
     return picks, frame
 
 
@@ -1545,29 +1561,42 @@ async def _exec_sell(ticker: str, price: float, reason: str, *,
 async def _exec_sell_locked(ticker: str, price: float, reason: str,
                             stamp: dict) -> dict | None:
     async with Session() as s:
-        if not await _stamp_is_current(s, stamp):
-            logger.warning("Monthly SELL %s refused: stale epoch stamp", ticker)
-            return None
-        pos = await s.scalar(select(MonthlyPosition).where(MonthlyPosition.ticker == ticker))
-        if pos is None:
-            return None
-        acc = await s.get(MonthlyAccount, 1)
-        if acc is None:
-            return None
-        # The SELL goes through the shared primitive BEFORE any state change:
-        # an invalid/zero/NaN quote yields no fill, so a position is never
-        # deleted for $0 (or negative) proceeds and no trade is booked.
-        fill = factor_fills.sell_fill(acc.cash, pos.shares, price)
-        if fill is None:
-            return None
-        acc.cash = fill.cash_after
-        s.add(MonthlyTrade(ticker=ticker, side="SELL", shares=fill.shares, price=price,
-                           cash_after=acc.cash, reason=reason, mode=stamp["mode"],
-                           config_id=stamp["config_id"], epoch=stamp["epoch"]))
-        await s.delete(pos)
-        await s.commit()
-        return {"ticker": ticker, "side": "SELL", "shares": fill.shares,
-                "price": price, "proceeds": round(fill.notional, 2), "reason": reason}
+        trade = await _exec_sell_in_session(s, ticker, price, reason, stamp)
+        if trade is not None:
+            await s.commit()
+            trade.pop("trade_id")  # internal join key, public result unchanged
+        return trade
+
+
+async def _exec_sell_in_session(s, ticker: str, price: float, reason: str,
+                                stamp: dict) -> dict | None:
+    """Sell without committing; caller owns the state lock + transaction.
+
+    Shared by the public executor and D, whose trade and execution audit
+    must commit (or roll back) together. Uses the same zero-fee primitive.
+    """
+    if not await _stamp_is_current(s, stamp):
+        logger.warning("Monthly SELL %s refused: stale epoch stamp", ticker)
+        return None
+    pos = await s.scalar(select(MonthlyPosition).where(MonthlyPosition.ticker == ticker))
+    if pos is None:
+        return None
+    acc = await s.get(MonthlyAccount, 1)
+    if acc is None:
+        return None
+    fill = factor_fills.sell_fill(acc.cash, pos.shares, price)
+    if fill is None:
+        return None
+    acc.cash = fill.cash_after
+    row = MonthlyTrade(ticker=ticker, side="SELL", shares=fill.shares, price=price,
+                       cash_after=acc.cash, reason=reason, mode=stamp["mode"],
+                       config_id=stamp["config_id"], epoch=stamp["epoch"])
+    s.add(row)
+    await s.delete(pos)
+    await s.flush()
+    return {"ticker": ticker, "side": "SELL", "shares": fill.shares,
+            "price": price, "proceeds": round(fill.notional, 2), "reason": reason,
+            "trade_id": row.id}
 
 
 def _snapshot_json(frame: pd.DataFrame | None) -> str:
@@ -1872,8 +1901,13 @@ async def _run_rebalance_locked(force: bool, now: datetime | None) -> dict[str, 
     async with Session() as s:
         held_rows = (await s.scalars(select(MonthlyPosition))).all()
     held_before = sorted(p.ticker for p in held_rows)
+    # The 2026-11-04 re-entry guard: news-exited names (a FILLED D-EXIT at/
+    # after THIS month-end) are not buyable this rebuild.
+    from . import selllayer as _selllayer
+    _news_excluded = await _selllayer.news_exit_excluded(me_ts)
     picks, _ = await asyncio.to_thread(
-        pick_portfolio, me_ts, close, vol, fund, held_before, frame)
+        pick_portfolio, me_ts, close, vol, fund, held_before, frame,
+        exclude=_news_excluded)
     # Fill prices: the session's STRICT exact-date OPEN, USD-converted (never
     # a stale/forward-filled close). Moved UP from the SELL loop: the query is
     # read-only, and the LLM sell layer's type-B overlay needs the executable
@@ -2055,11 +2089,12 @@ async def run_monthly_cycle(now: datetime | None = None) -> dict[str, Any]:
         except Exception as e:  # noqa: BLE001 — never break the rebuild
             logger.error("Monthly sell-layer type-C step failed: %s", e, exc_info=True)
             c_result = {"error": f"{type(e).__name__}: {e}"}
-    # --- Type D (app/newsagent.py): the SHADOW material-news scan, declared
-    # order AFTER the type-C step, EVERY trading night. One agent run per
-    # monthly-book name; the ledger rows (event_type "D", engine "monthly")
-    # fill NULL forever in the shadow phase — NO execution authority
-    # (docs/sell-news-agent-design-2026-11-01.md). NOT gated on
+    # --- Type D (app/newsagent.py): the material-news scan, declared order
+    # AFTER the type-C step, EVERY trading night (the 2026-11-04 promotion
+    # addendum: the scan's verdict rows are executed by the type-D FILL
+    # step below when SIM_NEWS_EXECUTE is on — see that block). One agent
+    # run per monthly-book name; the ledger rows (event_type "D", engine
+    # "monthly") carry the verdicts. NOT gated on
     # sim_monthly_llm_sells (that knob owns A/B/C only): D's own knob is
     # SEARXNG_MCP_URL via the knob-off convention inside run_news_scan
     # (status "disabled" — zero rows, no error). Fail-safe: any failure is
@@ -2105,6 +2140,29 @@ async def run_monthly_cycle(now: datetime | None = None) -> dict[str, Any]:
                         d_result.get("n_deduped", 0), d_result.get("n_errors", 0))
     except Exception as e:  # noqa: BLE001 — never break the rebuild
         logger.error("Monthly type-D news scan failed: %s", e, exc_info=True)
+    # --- Type-D FILL step (the 2026-11-04 promotion addendum): pending
+    # D-EXIT rows fill at the first session strictly AFTER their decision
+    # date, on whichever paper book holds the name. Runs EVERY trading
+    # night (the cadence gate above owns the SCAN, not the fills — a
+    # manual scan's verdict from any weekday must still fill), declared
+    # order after the type-C step and BEFORE the rebuild so a filled exit
+    # frees its slot for the rebuild's picks (the re-entry guard inside
+    # the pick paths excludes the exited name itself from the refill).
+    # Fail-safe: knob off -> shadow (no fills); any failure is logged and
+    # never breaks the rebuild below.
+    try:
+        from . import selllayer as _selllayer
+        d_fill = await _selllayer.run_type_d_fill_step(now=now)
+        if d_fill.get("fills"):
+            logger.info("Monthly type-D fill step: %d fill(s) at %s open %s",
+                        len(d_fill["fills"]), d_fill.get("as_of"),
+                        [(f["ticker"], f["book"], round(f["price"], 2))
+                         for f in d_fill["fills"]])
+        elif d_fill.get("pending"):
+            logger.info("Monthly type-D fill step: %d pending EXIT row(s) "
+                        "(no eligible fill this session)", d_fill["pending"])
+    except Exception as e:  # noqa: BLE001 — never break the rebuild
+        logger.error("Monthly type-D fill step failed: %s", e, exc_info=True)
     if not _rebalance_lock.locked():
         result = await run_rebalance(now=now)
     else:
@@ -2404,6 +2462,13 @@ async def backfill(start: str | None = None,
                     marker = mkey
                 else:
                     held_before = sorted(shares)
+                    # NO re-entry guard here, deliberately: this is a
+                    # historical replay of month-end ME, and a D-EXIT fill
+                    # dated after ME is FUTURE information from ME's
+                    # perspective — excluding on it would be lookahead and
+                    # would break the replay's fidelity to what the engine
+                    # actually decided at the time (the guard is a
+                    # live-forward mechanism only, the rebuild path above).
                     picks, _ = await asyncio.to_thread(
                         pick_portfolio, me_ts, close, vol, fund, held_before, frame)
                     if mkey not in audit:  # audit row: the FIRST pass only

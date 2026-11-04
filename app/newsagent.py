@@ -18,10 +18,10 @@ every row) and the operator's reasoning-effort knob (recorded too).
 Tools: the shared searxng MCP via :mod:`app.mcpclient` — the ONLY news
 path for D (no direct-SearXNG client, the owner's call).
 
-Shadow-first: every run is recorded in the ``LlmSellDecision`` ledger
-(event_type "D", engine "monthly", the fill columns NULL forever in the
-shadow phase) with NO execution authority; the promotion rule lives in
-the design note. Nightly cadence: one run per NAME in the UNION of both
+Every run records a verdict in the ``LlmSellDecision`` ledger (event_type
+"D", engine "monthly"). The scan itself never trades; the separate nightly
+fill step can execute EXITs when SIM_NEWS_EXECUTE is enabled (the design
+note's 2026-11-04 promotion addendum). Nightly cadence: one run per NAME in the UNION of both
 paper books (monthly + daily-core — one context per name, so a name held
 in both books is consulted ONCE), right after the type-C step
 (``monthly.run_monthly_cycle`` calls ``run_news_scan``; the
@@ -467,12 +467,30 @@ async def _book_contexts(as_of: str,
     with the pre-union shape and are computed from the PRIMARY position:
     monthly if the name is held there, else daily_core. ``limit`` caps
     the union list ordered by ticker (a smoke-run convenience)."""
+    contexts, _ = await _book_snapshot(as_of, limit)
+    return contexts
+
+
+async def _book_snapshot(as_of: str, limit: int | None = None) -> tuple[list[dict], dict]:
+    """Capture research context AND execution identity before any model call.
+
+    The execution scope is separate from the frozen model inputs. An explicit
+    read transaction sees positions and epochs from ONE SQLite snapshot, even
+    if another worker resets/replaces a book while the research is running.
+    """
+    from . import run_config
+    from .newsexits import timestamp
+
     out: list[dict] = []
+    scopes: dict = {}
     async with Session() as s:
+        await s.execute(text("BEGIN"))
         monthly = (await s.scalars(
             select(MonthlyPosition).order_by(MonthlyPosition.ticker))).all()
         daily = (await s.scalars(
             select(DailyCorePosition).order_by(DailyCorePosition.ticker))).all()
+        epochs = {b: await run_config.current_epoch(b, session=s)
+                  for b in ("monthly", "daily_core")}
         books_by_ticker: dict[str, dict[str, object]] = {}
         for p in daily:
             books_by_ticker.setdefault(p.ticker, {})["daily_core"] = p
@@ -482,6 +500,9 @@ async def _book_contexts(as_of: str,
             if limit and len(out) >= limit:
                 break
             books = books_by_ticker[ticker]
+            scopes[ticker] = {"books": {
+                b: {"position_opened_at": timestamp(p.opened_at).isoformat(),
+                    "epoch": epochs[b]} for b, p in books.items()}}
             close = await s.scalar(
                 select(Candle.close)
                 .where(Candle.ticker == ticker,
@@ -524,7 +545,7 @@ async def _book_contexts(as_of: str,
                     tag: await _latest_fund(s, ticker, tag, as_of)
                     for tag in _FUNDAMENTAL_TAGS},
             })
-    return out
+    return out, scopes
 
 
 def _log(record: dict, path: Path) -> None:
@@ -606,7 +627,7 @@ async def run_news_scan(*, as_of: str | None = None, limit: int | None = None,
         logger.info("news scan: SEARXNG_MCP_URL is not set — the D step is "
                     "disabled (the knob-off convention)")
         return {"status": "disabled", **base}
-    contexts = await _book_contexts(as_of, limit)
+    contexts, execution_scopes = await _book_snapshot(as_of, limit)
     generated_at = generated_at or datetime.now(UTC).isoformat()
     out_dir = Path(out_dir)
     log_path = out_dir / f"news-consult-{as_of}.jsonl"
@@ -656,13 +677,13 @@ async def run_news_scan(*, as_of: str | None = None, limit: int | None = None,
                 logger.warning("news scan: JSONL log write failed for %s "
                                "(%s: %s) — the ledger row stands",
                                event_id, type(e).__name__, e)
-            # The ledger row — the shadow record with NO execution authority
-            # (the fill columns stay NULL by design; one writer, no drift:
-            # selllayer's append-only recorder).
+            # Immutable verdict + pre-consult execution scope. The scan never
+            # trades; the separate enabled fill step owns the transaction.
             await _record_ledger_row(
                 rec=rec, engine="monthly", session_date=as_of,
                 ticker=ticker,
-                context={"position": ctx, "citations": rec["citations"],
+                context={"position": ctx, "execution_scope": execution_scopes[ticker],
+                         "citations": rec["citations"],
                          "trace": rec["trace"], "temperature": rec["temperature"],
                          "reasoning_effort": rec["reasoning_effort"],
                          "tool_calls": rec["tool_calls"], "turns": rec["turns"],
@@ -742,7 +763,7 @@ async def run_manual_consult(ticker: str, *, as_of: str | None = None,
             return {"ok": False,
                     "reason": "the D step is disabled — SEARXNG_MCP_URL is "
                               "not set"}
-        contexts = await _book_contexts(as_of)
+        contexts, execution_scopes = await _book_snapshot(as_of)
         ctx = next((c for c in contexts if c["ticker"] == ticker), None)
         if ctx is None:
             return {"ok": False,
@@ -760,13 +781,13 @@ async def run_manual_consult(ticker: str, *, as_of: str | None = None,
             logger.warning("manual news consult: JSONL log write failed for "
                            "%s (%s: %s) — the ledger row stands",
                            event_id, type(e).__name__, e)
-        # The ledger row — the shadow record with NO execution authority
-        # (the fill columns stay NULL by design; one writer, no drift:
-        # selllayer's append-only recorder).
+        # Immutable verdict + pre-consult execution scope. No immediate trade;
+        # the separate enabled fill step owns the execution transaction.
         await _record_ledger_row(
             rec=rec, engine="monthly", session_date=as_of,
             ticker=ticker,
-            context={"position": ctx, "citations": rec["citations"],
+            context={"position": ctx, "execution_scope": execution_scopes[ticker],
+                     "citations": rec["citations"],
                      "trace": rec["trace"], "temperature": rec["temperature"],
                      "reasoning_effort": rec["reasoning_effort"],
                      "tool_calls": rec["tool_calls"], "turns": rec["turns"],

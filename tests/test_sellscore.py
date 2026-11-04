@@ -362,6 +362,81 @@ class TestTypeC:
         assert d["window"]["end"] == "2026-07-01" and "no executable price" in d["skip_reason"]
 
 
+class TestTypeD:
+    """The 2026-11-04 promotion: D scores through the SAME completed-window
+    contract as C — [the EXIT fill → the next month-end rebuild's fill]; the
+    WAIT is the counterfactual. HOLD = delta 0."""
+
+    async def test_exit_delta_hand_computed_same_contract_as_c(self, mem_db):
+        sessions = await _seed_candles(["EEE"])
+        fill_day = "2026-03-16"
+        fill_px = _open_of("EEE", fill_day, sessions)
+        await _add_ledger(event_type="D", engine="monthly", session_date="2026-03-15",
+                          ticker="EEE", decision="EXIT", event_id="D:EEE:2026-03-15:m",
+                          filled_at=datetime.strptime(fill_day, "%Y-%m-%d"), price=fill_px)
+        rep = await _score()
+        tD = rep["types"]["D"]
+        assert tD["n_decided"] == 1 and tD["n_divergent"] == 1
+        ev = tD["events"][0]
+        assert ev["window"]["start"] == fill_day and ev["window"]["end"] == "2026-04-01"
+        w = sessions.index("2026-04-01") - sessions.index(fill_day)
+        llm_ret = (1.0 - RATE) * _cy(w) - 1.0
+        engine_ret = _open_of("EEE", "2026-04-01", sessions) / fill_px - 1.0 - RATE
+        assert ev["delta"] == pytest.approx(llm_ret - engine_ret)
+
+    async def test_hold_scores_zero(self, mem_db):
+        await _seed_candles(["EEE"])
+        await _add_ledger(event_type="D", engine="monthly", session_date="2026-03-13",
+                          ticker="EEE", decision="HOLD", event_id="D:EEE:2026-03-13")
+        rep = await _score()
+        tD = rep["types"]["D"]
+        assert tD["n_decided"] == 1 and tD["n_divergent"] == 0
+        assert tD["events"][0]["delta"] == 0.0
+        assert rep["types"]["C"]["n_rows"] == 0   # never bucketed into C
+
+    async def test_unfilled_exit_stays_pending(self, mem_db):
+        await _seed_candles(["EEE"])
+        await _add_ledger(event_type="D", engine="monthly", session_date="2026-03-13",
+                          ticker="EEE", decision="EXIT", event_id="D:EEE:2026-03-13:m")
+        rep = await _score()
+        tD = rep["types"]["D"]
+        assert tD["n_decided"] == 0 and tD["n_pending"] == 1
+        d = rep["decisions"][0]
+        assert d["status"] == "pending" and "has not filled yet" in d["skip_reason"]
+
+    async def test_no_offline_reference_bar_is_declared(self, mem_db):
+        await _seed_candles(["EEE"])
+        await _add_ledger(event_type="D", engine="monthly", session_date="2026-03-13",
+                          ticker="EEE", decision="HOLD", event_id="D:EEE:2026-03-13")
+        rep = await _score()
+        assert "un-backtestable" in rep["reference_bars"]["D"]["source"]
+
+
+@pytest.mark.parametrize("event_type", ["C", "D"])
+async def test_month_end_exit_scores_at_immediately_following_rebuild(mem_db, event_type):
+    sessions = await _seed_candles(["EEE"], end="2026-03-31")
+    fill_day = "2026-03-31"
+    await _add_ledger(event_type=event_type, engine="monthly", session_date="2026-03-30",
+                      ticker="EEE", decision="EXIT",
+                      filled_at=datetime(2026, 3, 31),
+                      price=_open_of("EEE", fill_day, sessions))
+    before = await _score()
+    assert before["types"][event_type]["n_pending"] == 1
+    await _seed_candles(["EEE"], start="2026-04-01", end="2026-04-01")
+    report = await _score()
+    event = report["types"][event_type]["events"][0]
+    assert event["window"] == {"start": fill_day, "end": "2026-04-01", "sessions": 1}
+
+
+@pytest.mark.parametrize(("anchor", "expected"), [
+    ("2026-01-29", "2026-02-02"), ("2026-01-30", "2026-02-02"),
+    ("2026-02-02", "2026-03-02"), ("2026-02-27", "2026-03-02"),
+])
+def test_next_rebuild_respects_month_end_open_boundary(anchor, expected):
+    days = pd.bdate_range("2026-01-01", "2026-03-03").strftime("%Y-%m-%d").tolist()
+    assert sellscore._next_rebuild_fill(days, anchor) == expected
+
+
 # ---------------------------------------------------------------------------
 # 4. The completed-window rule: mid-window PENDING -> scored once data advances
 # ---------------------------------------------------------------------------

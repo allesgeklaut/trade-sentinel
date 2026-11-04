@@ -146,7 +146,8 @@ def _patch_engine(monkeypatch, *, bars, picks_by_month=None,
     async def fake_fund(_tickers):
         return {"Synthetic": {"tag": []}}
 
-    def fake_pick(rebal_date, _close, _vol, _fund, holdings=None, frame=None):
+    def fake_pick(rebal_date, _close, _vol, _fund, holdings=None, frame=None,
+                  exclude=None):
         return picks_by_month[pd.Timestamp(rebal_date).month], frame
 
     monkeypatch.setattr(monthly, "refresh_data", fake_refresh)

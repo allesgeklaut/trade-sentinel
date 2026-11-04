@@ -345,3 +345,125 @@ page.
 Wired only after the owner approves THIS note (the transport-fix slice is
 committed, so v1's other gate is met). The live ledger starts clean under
 the frozen A/B/C regime, and D accumulates as its own track beside it.
+
+## Addendum 2026-11-04 — the owner's PROMOTION decision: D executes on the paper books
+
+**The declaration.** The owner reviewed the shadow phase's first evidence
+(the 2026-11-02 nightly and the 2026-11-04 manual scan: 12 names, 114
+searches, $0.78 Exa, one material verdict — the AES take-private EXIT)
+and ordered execution: *"All this is just paper trading, I do not
+understand why we are so careful. I want now to execute D's
+suggestions."* Scope confirmed with the owner on 2026-11-04: **BOTH paper
+books** (monthly + daily-core, wherever the name is held). The Savings
+book — real money — is explicitly OUT of scope; D has no authority there
+now or later without a separate explicit order.
+
+**Why the predeclared ≥6-month rule is amended, not broken.** The rule's
+purpose was to never hand an LLM authority that isn't being measured. On
+paper books the risk calculus inverts: a wrong verdict costs no real
+capital, and an EXECUTED verdict records a real fill at a real session
+open — strictly better evidence than the counterfactual reconstruction
+the shadow would have used. The promotion is versioned and declared (this
+entry), the mechanism is knob-gated (`SIM_NEWS_EXECUTE`, off by default =
+the shadow phase exactly as before), and the measurement (the D scorer,
+below) ships in the same change — so the authority and the measurement
+arrive together, which is what the original rule was actually protecting.
+
+**The fill contract (mirrors the type-C step exactly, plus one guard).**
+A D-EXIT ledger row is a pending exit; the fill step runs EVERY trading
+night (never weekday-gated — the gate owns the SCAN, not the fills) and
+sells at the session's strict exact-date open (`_open_usd_map` +
+`_exec_sell`, reason "material-news exit" / "daily-core: material-news
+exit" per book), stamping the frozen fill columns. THE GUARD the C step
+never needed: D verdicts can arrive at ANY wall-clock (manual scans), so
+a row fills only at the first session STRICTLY AFTER its decision DATE
+(decided_at's date < the fill session's date). This is airtight against
+lookback with no market-clock assumptions — no bell times, no DST edge —
+and it is identical to C's effective cadence for cycle-decided rows
+(decide on session S, fill at S+1's open). A manual premarket verdict
+fills at the NEXT session's open, one session later than theoretically
+possible: correctness was chosen over speed on a paper book. Execution is
+bound to the consulted position lifecycle: released/replaced positions
+close without a trade, rather than authorizing the sale of a later buy.
+
+**The re-entry guard (the one mechanism C never needed).** A thesis-break
+exit self-excludes: the broken thesis also tanks the factor ranking, so
+the rebuild never re-buys the name. A NEWS exit does not — the merger,
+fraud or delisting is not in any factor — so without a guard both books
+would re-buy the name the very next deploy (sell Tuesday, re-bought
+Wednesday: execution as theater). The rule: a name with a FILLED D-EXIT
+whose fill date >= the governing month-end is excluded from NEW buys
+until the next completed month-end (the books' own membership cadence)
+— `news_exit_excluded(me)`, filtered at `_band_fill`'s fill candidates,
+wired into both books' deploy paths (monthly `pick_portfolio`, daily-core
+`_deploy_targets` call sites). Held names are never force-released by
+the guard: it blocks new buys only.
+
+**The D scorer (the scorecard's D bucket).** The predeclared measurement
+— "the D-EXIT counterfactual is the wait itself, on the same
+completed-window math as C" — is implemented as exactly that: D rows
+score through the same `_score_c` window contract ([the EXIT fill → the
+next month-end rebuild's fill session]; LLM branch = sold at the fill +
+proceeds at the declared cash yield; engine branch = held to the next
+rebuild's fill; HOLD = delta 0). The scorecard's D bucket replaces the
+"shadow, never scored" placeholder; historical HOLDs score as 0 when their
+windows complete, and existing pending EXITs use the same lifecycle checks.
+The promotion-review question — "is D's edge
+positive vs the wait?" — is now a read of the scorecard, per verdict,
+from day one.
+
+### Same-day review corrections — execution is not a completed score
+
+The owner's follow-up review found gaps in the first implementation. The
+repaired executor (`app/newsexits.py`) sells **all consulted books**, not
+an `if/elif` choice. Both books' trade/cash/position changes, per-book audit
+and ledger fill summary commit in **one transaction** under both book state
+locks. A database write reservation serializes separate worker processes.
+A late book refusal or ledger/provenance failure rolls back the entire
+verdict; a retry cannot inherit a half-booked sale.
+
+The nullable `LlmSellDecision.execution` JSON records each book's original
+position opening timestamp, epoch, disposition and (when filled) trade id,
+session date, booking time, shares, USD price and cash after. The existing
+fill columns summarize the primary book for compatibility; D is still
+scored **once per name-level verdict**, not twice for two books.
+Consulted books/entry dates come from the frozen context, with a conservative
+pre-decision-position bound for legacy context-free rows. Duplicate verdicts
+are closed as superseded; missing/replaced/reset positions close without a
+trade. None can sell a later re-entry. Missing opens alone remain retryable.
+
+The scorecard exposes **execution** independently of **score status**:
+filled exits and per-book fills appear immediately on refresh, while deltas
+remain pending until the next month-end rebuild's session is stored. Closed
+duplicates/non-executions are visible but not scored. The nightly job writes
+execution facts; the read-only scorecard computes outcomes on demand. Manual
+consult/scan UI wording reflects the enabled execution authority, rather than
+promising shadow-only behavior.
+
+### Second review — use the production envelope and a pre-consult snapshot
+
+Both real news writers persist the research input under `context.position`.
+The executor now reads that envelope (while supporting older direct contexts),
+so the consulted `books` and per-book entry dates actually constrain execution.
+An existing pending audit cannot widen that authority: any unconsulted leg
+left by the earlier executor is cancelled instead of sold.
+
+Entry dates alone cannot distinguish a same-day replacement during a long
+agent call. `_book_snapshot` therefore captures each consulted position's exact
+opening timestamp and book epoch in the **same SQLite read snapshot** as its
+research context, before calling the agent. Both manual and nightly writers
+persist these facts separately in `context.execution_scope`; they are not
+added to the model's frozen prompt inputs. The executor compares those facts
+against the current book, even on its first fill attempt. Legacy rows without
+an exact identity cannot authorize an ambiguous same-day acquisition; older
+positions still have to satisfy the recorded book/entry-date and reset guards.
+No historical verdict is rewritten or given a fabricated snapshot.
+
+The completed-window helper also treats a fill at the month-end session's
+**open** as preceding that month's rebuild. Its comparison session is the
+first stored session after that month-end, not after the following month-end.
+This corrects the shared C/D boundary without changing their return math.
+
+The event-history UI now uses labelled cards on phones, with wrapping
+execution/rationale text and expandable error details. Desktop retains the
+table. These presentation changes do not touch Savings math or trading state.

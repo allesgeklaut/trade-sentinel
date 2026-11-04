@@ -1005,9 +1005,10 @@ async def news_consult(req: NewsConsultRequest):
     request blocks until the verdict is recorded (no timeout changes; the
     UI's confirm() says so before firing).
 
-    The verdict is SHADOW-only (the fill columns stay NULL; no execution
-    authority — the promotion rule lives in
-    docs/sell-news-agent-design-2026-11-01.md). Response: ok, decision,
+    The consult records a verdict, never an immediate trade. When
+    SIM_NEWS_EXECUTE is enabled, a later nightly cycle can execute EXITs
+    on the consulted paper positions (the design note's promotion addendum).
+    Response: ok, decision,
     rationale, citations, turns, tool_calls, latency_ms, fail_safe,
     fail_reason, event_id, model, backend. A fail-safe record IS a valid
     response — this route NEVER 500s on an agent failure. Knob off
@@ -1041,9 +1042,9 @@ async def news_consult(req: NewsConsultRequest):
     if ticker in _NEWS_CONSULT_IN_FLIGHT:
         # Honest refusal (200 ok:false, this route's convention), not an
         # error status: the in-flight consult may still complete server-side
-        # and record its shadow row (the sell scorecard) — retry after it.
+        # and record its verdict (the sell scorecard) — retry after it.
         return {"ok": False,
-                "reason": f"a consult for {ticker} is already running — its shadow "
+                "reason": f"a consult for {ticker} is already running — its verdict "
                           f"row will appear in the sell scorecard; retry after it "
                           f"completes"}
     _NEWS_CONSULT_IN_FLIGHT.add(ticker)

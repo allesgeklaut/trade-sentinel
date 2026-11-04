@@ -2104,6 +2104,17 @@ REFERENCE_BARS = {
                    "thesis_break_exit), research doc §4a; the thesisbreak-ledger/1 is the "
                    "per-event view of the same comparison and must reconcile with it"),
     },
+    "D": {
+        "m5_vs_m0_pp_per_year": None,
+        "events_per_decade": None,
+        "source": ("NO offline reference bar exists — news is un-backtestable "
+                   "(no point-in-time news-wire reconstruction, docs/sell-news-agent-"
+                   "design-2026-11-01.md), so D's bar is the scorecard itself: the "
+                   "per-verdict wait counterfactual (the predeclared promotion "
+                   "measurement, the 2026-11-04 addendum). The promotion-review "
+                   "question is whether D's mean delta vs the wait turns positive "
+                   "as windows complete."),
+    },
 }
 
 COMPLETED_WINDOW_RULE = (
@@ -2111,7 +2122,10 @@ COMPLETED_WINDOW_RULE = (
     "type A scores when the defer branch realized a re-armed-stop breach on/before "
     "the as-of date, or when the as-of date reaches the predeclared window end "
     "(fill + 63 sessions, or the last stored session); type B and C score when the "
-    "as-of date reaches the event's next month-end rebuild date"
+    "as-of date reaches the event's next month-end rebuild date; type D (the "
+    "2026-11-04 promotion) scores on the type-C contract — an EXIT fills at the "
+    "first session strictly after its decision date and scores when the next "
+    "month-end rebuild's fill session is stored"
 )
 
 SMALL_N_CAVEAT = ("deltas are not meaningful until n accumulates — small-n samples are "

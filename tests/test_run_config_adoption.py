@@ -562,7 +562,8 @@ async def test_monthly_backfill_stamps_rows(run_db, monkeypatch, tmp_path):
     monkeypatch.setattr(monthly, "eligible_frame", lambda m, c, v, f: frame)
     monkeypatch.setattr(monthly, "_qv_order", lambda fr: (fr, list(tickers)))
     monkeypatch.setattr(monthly, "pick_portfolio",
-                        lambda d, c, v, f, holdings=None, frame=None:
+                        lambda d, c, v, f, holdings=None, frame=None,
+                                          exclude=None:
                         (sorted(tickers), frame))
     monkeypatch.setattr(settings, "sim_monthly_target_n", 2)
     monkeypatch.setattr(settings, "sim_monthly_hold_band", 3)

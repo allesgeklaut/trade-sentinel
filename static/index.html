@@ -1176,6 +1176,72 @@
             overflow-wrap: break-word
         }
 
+        #sellscore-history .event-detail {
+            min-width: 140px;
+            max-width: 280px;
+            white-space: normal;
+            overflow-wrap: anywhere;
+            vertical-align: top
+        }
+
+        #sellscore-history details summary {
+            cursor: pointer;
+            color: #f3bd61
+        }
+
+        @media (max-width: 700px) {
+            #sellscore-history {
+                max-height: 70vh;
+                overflow-x: hidden
+            }
+
+            #sellscore-history table,
+            #sellscore-history tbody {
+                display: block;
+                width: 100%
+            }
+
+            #sellscore-history tr:first-child {
+                display: none
+            }
+
+            #sellscore-history tr:not(:first-child) {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 8px 12px;
+                margin: 0 0 10px;
+                padding: 10px;
+                border: 1px solid #1d3a24;
+                border-radius: 6px;
+                background: #0b1710
+            }
+
+            #sellscore-history td,
+            #sellscore-history .event-detail {
+                display: block;
+                min-width: 0;
+                max-width: none;
+                padding: 0;
+                border: 0;
+                white-space: normal;
+                overflow-wrap: anywhere;
+                text-align: left
+            }
+
+            #sellscore-history td::before {
+                content: attr(data-label);
+                display: block;
+                margin-bottom: 2px;
+                color: #7aaa81;
+                font-size: 10px;
+                text-transform: uppercase
+            }
+
+            #sellscore-history .event-detail {
+                grid-column: 1 / -1
+            }
+        }
+
         #dailycore-view {
             display: none;
             max-width: 1400px;
@@ -1829,7 +1895,7 @@
         </div>
     </section>
         <div class="sim-section" id="news-consult-section">
-            <div class="bench-label">MATERIAL-NEWS CONSULT // TYPE-D AGENT (SHADOW)</div>
+            <div class="bench-label">MATERIAL-NEWS CONSULT // TYPE-D AGENT (PAPER BOOKS)</div>
             <div class="sim-actions">
                 <select id="news-consult-ticker"
                         title="One of the paper books' current positions (M = monthly, DC = daily-core) — the news agent judges recent news against that position's stated thesis"></select>
@@ -1843,15 +1909,15 @@
                 <div class="toolbar-scope">Scope: ONE name per consult — the picker offers the UNION of both paper
                     books' positions (M = monthly, DC = daily-core; a name held in both is consulted once). Each
                     consult runs ONE real agent run (real LLM + live searxng news search/read calls, ~1 minute at
-                    the deployed low effort) and is recorded as a SHADOW row (event <b>D:{ticker}:{as_of}:m</b>)
-                    in the LLM sell ledger — the verdict never places a trade (the fill columns stay NULL until
-                    the predeclared promotion rule). “Run all” scans every name in the union in the background
+                    the deployed low effort) and is recorded as a verdict (event <b>D:{ticker}:{as_of}:m</b>)
+                    in the LLM sell ledger. With D execution enabled, EXIT verdicts can sell the consulted
+                    paper positions on a later nightly cycle at an executable session open. The consult itself
+                    does not place a trade. Savings is never affected. “Run all” scans every name in the union in the background
                     (one real consult each, never deduped). Nightly scans use the 3-part
                     <b>D:{ticker}:{as_of}</b> ids and are unaffected.</div>
             </details>
         </div>
-        <!-- Slice 2: the shared LLM sell scorecard — spans BOTH paper accounts
-             (sim type A + monthly B/C), so it lives at the workspace level. -->
+        <!-- Shared sell scorecard: sim A, monthly B/C, monthly + daily-core D. -->
         <section id="sellscore-section" class="sim-section" aria-labelledby="sellscore-title">
             <div class="paper-comparison-head">
                 <div class="paper-comparison-heading">
@@ -4554,6 +4620,7 @@
                 A: 'TYPE A — SIM STANDING STOP (account: sim)',
                 B: 'TYPE B — MONTHLY BAND-DROP (account: monthly)',
                 C: 'TYPE C — MONTHLY THESIS BREAK (account: monthly)',
+                D: 'TYPE D — MATERIAL NEWS (monthly + daily-core)',
             };
             const barText = (t) => {
                 const b = (data.reference_bars || {})[t] || {};
@@ -4564,14 +4631,22 @@
                     + fmtPp(b.blanket_retention_median_pp_per_event) + '/event, share positive '
                     + fmtPct(b.blanket_retention_share_positive) + ' (n=' + (b.n_events_full_window || '—')
                     + ') — ' + (b.source || '');
+                if (t === 'D') return 'reference bar: none exists — news is un-backtestable; '
+                    + 'the bar is this scorecard (the wait counterfactual, per verdict)';
                 return 'reference bar (research): the M5 reconciliation '
                     + fmtPp(b.m5_vs_m0_pp_per_year) + '/yr, ' + (b.events_per_decade || '—')
                     + ' events/decade — ' + (b.source || '');
             };
-            cards.innerHTML = ['A', 'B', 'C'].map((t) => {
+            cards.innerHTML = ['A', 'B', 'C', 'D'].map((t) => {
                 const blk = (data.types || {})[t] || {};
                 const agg = blk.aggregate || {};
                 return '<div class="scorecard"><h4>' + escapeHtml(TYPE_LABEL[t]) + '</h4>'
+                    + (t === 'C' || t === 'D'
+                        ? '<div class="row"><span>exits filled (score may be pending)</span><b>'
+                            + (blk.n_filled || 0) + '</b></div>' : '')
+                    + (t === 'D'
+                        ? '<div class="row"><span>closed without a new trade</span><b>'
+                            + (blk.n_closed || 0) + '</b></div>' : '')
                     + '<div class="row"><span>decided (completed windows)</span><b>' + (blk.n_decided || 0) + '</b></div>'
                     + '<div class="row"><span>fail-safe rate</span><b>' + fmtPct(blk.fail_safe_rate)
                     + ' (' + (blk.n_fail_safe || 0) + '/' + (blk.n_rows || 0) + ')</b></div>'
@@ -4583,27 +4658,53 @@
                     + '<div class="row"><span>share positive</span><b>' + fmtPct(agg.share_positive) + '</b></div>'
                     + '</div>';
             }).join('');
-            bars.textContent = ['A', 'B', 'C'].map((t) => TYPE_LABEL[t].split(' — ')[0]
+            bars.textContent = ['A', 'B', 'C', 'D'].map((t) => TYPE_LABEL[t].split(' — ')[0]
                 + ': ' + barText(t)).join('\n')
                 + '\n' + (data.small_n_caveat || '');
             const rows = data.decisions || [];
             if (!rows.length) {
                 hist.innerHTML = '<div class="sim-empty">No decisions yet — the sell layer logs one row '
-                    + 'per live event (sim standing stop / monthly band-drop / monthly thesis break); '
+                    + 'per live event (sim standing stop / monthly band-drop / monthly thesis break / '
+                    + 'material news); '
                     + 'scored rows appear here once their predeclared windows complete.</div>';
                 return;
             }
             const cell = (v) => v === null || v === undefined ? '—' : escapeHtml(String(v));
+            const executionText = (d) => {
+                const e = d.execution || {};
+                const legs = Object.entries(e.books || {}).map(([book, leg]) => {
+                    let text = book.replace('_', '-') + ': ' + (leg.status || 'pending');
+                    if (leg.status === 'filled') text += ' ' + (leg.session_date || '')
+                        + ' @ ' + leg.price + ' USD (' + leg.shares + ' shares)';
+                    if (leg.reason) text += ' — ' + leg.reason;
+                    if (leg.by_event_id) text += ' [' + leg.by_event_id + ']';
+                    return text;
+                });
+                if (legs.length) return cell(legs.join('; '));
+                if (e.status === 'in_cycle') return 'in-cycle (see account trades)';
+                if (e.status === 'not_applicable') return 'no exit requested';
+                return cell((e.status || '—') + (e.filled_at ? ' ' + e.filled_at : '')
+                    + (e.price !== undefined && e.price !== null ? ' @ ' + e.price + ' USD' : ''));
+            };
+            const eventCell = (label, value, detail = false) => '<td data-label="'
+                + label + '"' + (detail ? ' class="event-detail"' : '') + '>' + value + '</td>';
+            const failSafeText = (d) => d.fail_safe
+                ? '<details><summary>YES — error details</summary>' + cell(d.fail_reason) + '</details>'
+                : 'no';
             hist.innerHTML = '<table><tr><th>date</th><th>account</th><th>ticker</th><th>event</th>'
-                + '<th>LLM call</th><th>engine call</th><th>fail-safe</th><th>delta</th><th>status</th>'
+                + '<th>LLM call</th><th>engine call</th><th>fail-safe</th><th>execution</th>'
+                + '<th>delta</th><th>score status</th>'
                 + '<th>rationale</th></tr>'
-                + rows.map((d) => '<tr><td>' + cell(d.session_date) + '</td><td>' + cell(d.account)
-                + '</td><td>' + cell(d.ticker) + '</td><td>' + cell(d.event_type)
-                + '</td><td>' + cell(d.decision) + '</td><td>' + cell(d.branch)
-                + '</td><td>' + (d.fail_safe ? 'YES (' + cell(d.fail_reason) + ')' : 'no')
-                + '</td><td>' + (d.delta === null || d.delta === undefined ? 'pending'
-                    : fmtPp(d.delta)) + '</td><td>' + cell(d.status)
-                + '</td><td>' + cell(d.rationale) + '</td></tr>').join('') + '</table>';
+                + rows.map((d) => '<tr>'
+                + eventCell('date', cell(d.session_date)) + eventCell('account', cell(d.account))
+                + eventCell('ticker', cell(d.ticker)) + eventCell('event', cell(d.event_type))
+                + eventCell('LLM call', cell(d.decision)) + eventCell('engine call', cell(d.branch))
+                + eventCell('fail-safe', failSafeText(d), true)
+                + eventCell('execution', executionText(d), true)
+                + eventCell('delta', (d.delta === null || d.delta === undefined
+                    ? (d.status === 'pending' ? 'pending' : '—')
+                    : fmtPp(d.delta))) + eventCell('score status', cell(d.status))
+                + eventCell('rationale', cell(d.rationale), true) + '</tr>').join('') + '</table>';
         }
 
         async function loadSellScore() {
@@ -6315,7 +6416,8 @@
             }
             if (!confirm('Run ONE real material-news consult for ' + ticker + '?\n\n'
                 + 'This fires ONE real agent run — real LLM calls plus live searxng news search/read calls — '
-                + 'and typically takes about a minute. The verdict is a SHADOW consult only: it never places a trade.')) return;
+                + 'and typically takes about a minute. With D execution enabled, an EXIT can sell the consulted '
+                + 'paper positions on a later nightly cycle. Savings is never affected.')) return;
             btn.disabled = true;
             status.textContent = 'Consulting ' + ticker + '… (one real agent run — LLM + news search calls, ~1 minute)';
             if (out) out.innerHTML = '';
@@ -6332,15 +6434,15 @@
             } catch (e) {
                 // The request failed or timed out (e.g. a tunnel 524's HTML
                 // error page arrives as the raw body): the consult may STILL
-                // be running server-side and may still record its shadow row,
+                // be running server-side and may still record its verdict,
                 // so do not blindly re-click — that fires a SECOND real agent
                 // consult. Show an honest sentence; the technical detail is
                 // truncated and rendered dim below it.
                 const full = String(e && e.message ? e.message : e);
                 const detail = full.length > 200 ? full.slice(0, 200) + '…' : full;
                 const honest = 'The request failed or timed out — the consult may still be '
-                    + 'running server-side and may still record its shadow row (visible in '
-                    + "the LLM sell scorecard's shadow rows). Check there before retrying; "
+                    + 'running server-side and may still record its verdict (visible in '
+                    + 'the LLM sell scorecard). Check there before retrying; '
                     + 'a retry fires another real agent consult.';
                 status.textContent = honest;
                 if (out) out.innerHTML = '<div class="sim-empty" style="padding:8px 0;text-align:left">'
@@ -6365,7 +6467,7 @@
             let html = '<div style="margin-top:8px;font-size:13px">'
                 + '<div>Full scan finished (as-of ' + escapeHtml(String(st.as_of || '—')) + '): '
                 + '<b>' + results.length + '</b> consulted, <b>' + errors.length + '</b> error(s) — '
-                + 'shadow rows only (D:{ticker}:{as_of}:m), no trade is ever placed.</div>';
+                + 'verdicts recorded (D:{ticker}:{as_of}:m). Enabled EXITs can execute on a later nightly cycle.</div>';
             if (results.length) {
                 html += '<div style="margin-top:6px">';
                 results.forEach(r => {
@@ -6410,7 +6512,8 @@
                 + 'Each of the ' + n + ' names gets ONE real agent consult — real LLM calls plus live searxng '
                 + 'news search/read calls — about 1 minute per name, so expect roughly ' + n + ' minutes in total '
                 + '(a 7-20 name book runs ~7-20 minutes). The scan runs in the BACKGROUND; this page polls its progress.\n\n'
-                + 'Every verdict is a SHADOW consult only (it never places a trade), and every run consults again — '
+                + 'Enabled EXIT verdicts can sell paper positions on a later nightly cycle; Savings is never affected. '
+                + 'Every run consults again — '
                 + 'results are never deduped.')) return;
             btn.disabled = true;
             scanBtn.disabled = true;
@@ -6439,7 +6542,7 @@
                 renderNewsScan(st);
                 const nErr = (st.errors || []).length;
                 status.textContent = 'Full scan finished: ' + (st.results || []).length + ' consulted, '
-                    + nErr + ' error(s) — shadow rows in the LLM sell scorecard.';
+                    + nErr + ' error(s) — verdicts in the LLM sell scorecard.';
             } catch (e) {
                 // Honest bounded error state (same style as consultNews):
                 // the scan may STILL be running server-side, so do not

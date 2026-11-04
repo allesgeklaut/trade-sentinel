@@ -83,6 +83,15 @@ class Settings(BaseSettings):
     # operator's own spend decision.
     sim_news_scan_weekday: int = -1
 
+    # Type-D EXECUTION (the 2026-11-04 promotion, docs/sell-news-agent-design
+    # entry of that date): when truthy, D-EXIT ledger rows fill at the first
+    # session strictly after their decision date on whichever PAPER book
+    # holds the name (monthly + daily-core), and the names are excluded from
+    # re-buys until the next completed month-end. Empty/0/false = the shadow
+    # phase exactly as before (fills stay NULL forever). The Savings book
+    # (real money) is out of scope regardless of this knob.
+    sim_news_execute: bool = False
+
     paper_trading: bool = True
 
     # --- Signal scoring variant -------------------------------------------

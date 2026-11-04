@@ -367,18 +367,18 @@ class LlmSellDecision(Base):
         — the counterfactual the scorecard compares against.
       * The FILL columns (``filled_at``, ``shares``, ``price``, ``cash_after``)
         are written ONCE, when the decision's trade actually executes — in
-        practice ONLY the type-C EXIT rows fill (at the NEXT session's strict
+        practice the type-C/D EXIT rows fill (at a later session's strict
         open). Type A/B rows keep all four NULL BY DESIGN: they act
         in-cycle (the stop executes / the retention releases at the
         rebuild) and their executions are traced via SimTrade /
         MonthlyRebalance, not as pending orders. ``filled_at`` is stamped
-        after the trade committed, so it is always >= ``decided_at``; an
+        at execution, so it is always >= ``decided_at``; an
         unfilled C-EXIT keeps all four NULL — the decided-but-unfilled
         pending record the next cycle re-scans (there is NO pending-order
         persistence beyond this ledger).
 
-    Rows are NEVER updated (except the frozen fill stamping on execution) or
-    deleted. ``fail_safe`` marks decisions where the LLM could not answer
+    Verdicts are NEVER changed or deleted; only fill stamping and the type-D
+    per-book execution lifecycle audit are mutable. ``fail_safe`` marks decisions where the LLM could not answer
     (no backend / transport error / timeout / malformed / refusal) — the
     engine's own rule stood.
     """
@@ -390,7 +390,7 @@ class LlmSellDecision(Base):
     # Operator-local "YYYY-MM-DD" — the event's decision session: the
     # stop-fire session S for type A; the decision session F for B and C.
     session_date: Mapped[str] = mapped_column(String(10))
-    event_type: Mapped[str] = mapped_column(String(1))  # A | B | C
+    event_type: Mapped[str] = mapped_column(String(1))  # A | B | C | D
     engine: Mapped[str] = mapped_column(String(8))      # sim | monthly
     event_id: Mapped[str] = mapped_column(String(96), index=True)
     ticker: Mapped[str] = mapped_column(String(32))
@@ -408,6 +408,13 @@ class LlmSellDecision(Base):
     shares: Mapped[float | None] = mapped_column(Float, nullable=True)
     price: Mapped[float | None] = mapped_column(Float, nullable=True)
     cash_after: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Type-D execution audit, separate from the immutable verdict/context.
+    # JSON {status, books: {book: {status, position_opened_at, epoch,
+    # session_date, filled_at, trade_id, shares, price, cash_after, ...}}}.
+    # All book sells and this audit commit atomically. Filled/closed legs
+    # never run again; legacy fill columns summarize the first filled book.
+    # NULL = not processed (or a pre-audit legacy row), not a fabricated fill.
+    execution: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Which backend/model answered ("" when the no-backend short-circuit fired).
     backend: Mapped[str] = mapped_column(String(64), default="")
     model: Mapped[str] = mapped_column(String(128), default="")
@@ -1561,6 +1568,12 @@ async def _migrate_engine(db_engine):
         # rebalance month a closed epoch already logged. Runs before the
         # additive ALTER loops below and is a complete no-op on a current DB.
         await _migrate_phase2_schema(conn)
+        # D's per-book lifecycle/fill audit. Never infer historical fills.
+        columns = await conn.run_sync(
+            lambda c: _sqlite_columns(c, "llm_sell_decisions"))
+        if "execution" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE llm_sell_decisions ADD COLUMN execution TEXT"))
         # Manual migration for screener_results: add action/strength columns
         # for existing DBs created before these columns existed. SQLAlchemy's
         # create_all does not alter existing tables. Idempotent: sqlite raises

@@ -589,6 +589,76 @@ async def run_type_c_step(now: datetime | None = None, *, transport=None,
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+async def run_type_d_fill_step(now=None) -> dict:
+    """The type-D FILL step — the 2026-11-04 promotion (the design note's
+    addendum of that date; the owner's declared decision, scope BOTH paper
+    books). Fills pending D-EXIT ledger rows at the first session STRICTLY
+    AFTER the row's decision date, on whichever book holds the name:
+
+    1. The guard the C step never needed: D verdicts arrive at ANY
+       wall-clock (manual scans), so a row fills only when its decided_at
+       DATE is strictly before the fill session's date — an airtight
+       no-lookback invariant with no market-clock assumptions (no bell
+       times, no DST edge). For cycle-decided rows this is identical to
+       C's effective cadence: decide on session S, fill at S+1's open.
+    2. The price: the session's strict exact-date open
+       (``monthly._open_usd_map`` + the book's own ``_exec_sell``),
+       exactly the session fill contract — never a stale/forward price.
+    3. BOTH books execute through their transaction-level sell primitives,
+       under both state locks. Trades, fill columns and per-book lifecycle
+       audit commit atomically (app/newsexits.py). Replaced/released/reset
+       positions and duplicate verdicts close without selling a later buy.
+    4. The frozen fill columns summarize the first book; execution JSON
+       records every book's trade/session. The scorecard exposes execution
+       separately from the still-pending performance window.
+
+    Runs EVERY trading night (never weekday-gated — the cadence gate owns
+    the SCAN, not the fills) via ``monthly.run_monthly_cycle``, declared
+    order after the type-C step. Fail-safe: knob off -> the shadow phase
+    exactly as before; any failure -> logged, never raised.
+    """
+    if not settings.sim_news_execute:
+        return {"skipped": True, "reason": "SIM_NEWS_EXECUTE off (shadow)"}
+    try:
+        return await _run_type_d_fill_step_impl(now)
+    except Exception as e:  # noqa: BLE001 — the live book never breaks
+        logger.error("sell layer type-D fill step failed (%s: %s)", type(e).__name__, e,
+                     exc_info=True)
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+async def _run_type_d_fill_step_impl(now) -> dict:
+    from .newsexits import fill_pending
+    return await fill_pending(now)
+
+
+async def news_exit_excluded(me) -> set[str]:
+    """Tickers a deployment pass must NOT buy (the re-entry guard, the
+    2026-11-04 promotion addendum): names with a FILLED D-EXIT whose fill
+    is at/after the governing month-end ``me``. Until the next completed
+    month-end re-evaluates the name on fresh data, both books' deploy
+    paths exclude it from NEW buys — a news exit is not in any factor, so
+    without this guard the rank-first refill would re-buy the name the
+    very next session (sell Tuesday, re-bought Wednesday). ``me`` is a
+    pandas Timestamp (normalized); held names are never force-released by
+    this guard — it blocks new buys only (a name can only be both held
+    and excluded via a pre-guard re-buy, and the band hysteresis owns
+    held names).
+    """
+    me_ts = pd.Timestamp(me)
+    if me_ts.tzinfo is not None:
+        me_ts = me_ts.tz_localize(None)
+    me_ts = me_ts.normalize()
+    async with db_mod.Session() as s:
+        rows = (await s.scalars(
+            select(LlmSellDecision.ticker)
+            .where(LlmSellDecision.event_type == "D",
+                   LlmSellDecision.decision == "EXIT",
+                   LlmSellDecision.filled_at.is_not(None),
+                   LlmSellDecision.filled_at >= me_ts.to_pydatetime()))).all()
+    return set(rows)
+
+
 async def _run_type_c_step_impl(now, *, transport=None, fund, close, vol, frame) -> dict:
     from . import fundamentals as fundamentals_mod
     from . import monthly as monthly_mod

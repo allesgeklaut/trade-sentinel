@@ -1196,33 +1196,41 @@ async def _exec_sell(ticker: str, price: float, reason: str, *,
 
 
 async def _exec_sell_locked(ticker: str, price: float, reason: str,
-                            stamp: dict) -> dict | None:
+                             stamp: dict) -> dict | None:
     async with Session() as s:
-        if not await _stamp_is_current(s, stamp):
-            logger.warning("Daily-core SELL %s refused: stale epoch stamp", ticker)
-            return None
-        pos = await s.scalar(select(DailyCorePosition).where(DailyCorePosition.ticker == ticker))
-        if pos is None:
-            return None
-        acc = await _account(s)
-        if acc is None:
-            return None
-        # The SELL goes through the shared zero-fee primitive BEFORE any state
-        # change: it liquidates the position's own share count as-is (no
-        # re-flooring) for exactly shares * price, and an unusable quote
-        # (NaN/inf/non-positive) books no fill — so a position is never
-        # deleted for $0 (or NaN/inf) proceeds and no trade is written.
-        fill = factor_fills.sell_fill(acc.cash, pos.shares, price)
-        if fill is None:
-            return None  # no fill, no mutation
-        acc.cash = fill.cash_after
-        s.add(DailyCoreTrade(ticker=ticker, side="SELL", shares=fill.shares, price=price,
-                             cash_after=acc.cash, reason=reason, mode=stamp["mode"],
-                             config_id=stamp["config_id"], epoch=stamp["epoch"]))
-        await s.delete(pos)
-        await s.commit()
-        return {"ticker": ticker, "side": "SELL", "shares": fill.shares,
-                "price": price, "proceeds": round(fill.notional, 2), "reason": reason}
+        trade = await _exec_sell_in_session(s, ticker, price, reason, stamp)
+        if trade is not None:
+            await s.commit()
+            trade.pop("trade_id")
+        return trade
+
+
+async def _exec_sell_in_session(s, ticker: str, price: float, reason: str,
+                                stamp: dict) -> dict | None:
+    """Caller owns the state lock + transaction; identical sell primitive
+    to the public executor, but D can stamp its audit before the commit."""
+    if not await _stamp_is_current(s, stamp):
+        logger.warning("Daily-core SELL %s refused: stale epoch stamp", ticker)
+        return None
+    pos = await s.scalar(select(DailyCorePosition).where(DailyCorePosition.ticker == ticker))
+    if pos is None:
+        return None
+    acc = await _account(s)
+    if acc is None:
+        return None
+    fill = factor_fills.sell_fill(acc.cash, pos.shares, price)
+    if fill is None:
+        return None
+    acc.cash = fill.cash_after
+    row = DailyCoreTrade(ticker=ticker, side="SELL", shares=fill.shares, price=price,
+                         cash_after=acc.cash, reason=reason, mode=stamp["mode"],
+                         config_id=stamp["config_id"], epoch=stamp["epoch"])
+    s.add(row)
+    await s.delete(pos)
+    await s.flush()
+    return {"ticker": ticker, "side": "SELL", "shares": fill.shares,
+            "price": price, "proceeds": round(fill.notional, 2), "reason": reason,
+            "trade_id": row.id}
 
 
 # ---------------------------------------------------------------------------
@@ -1389,9 +1397,13 @@ async def compute_targets(force: bool = False, now: datetime | None = None
         # through _deploy_targets so the picks carry the hysteresis-selected
         # membership in RANKING order (deployment funds best rank first;
         # _band_fill's alphabetical sort is for the monthly display path).
+        # The 2026-11-04 re-entry guard: news-exited names are not buyable
+        # until the next completed month-end re-evaluates them.
+        from . import selllayer as _selllayer
         picks = monthly_mod._deploy_targets(
             order, held, settings.sim_monthly_target_n,
-            settings.sim_monthly_hold_band, refill=True)
+            settings.sim_monthly_hold_band, refill=True,
+            exclude=await _selllayer.news_exit_excluded(me))
         await _store_ranking(band, picks, me.to_pydatetime(), **stamp)
         return band, picks, frame
 
@@ -1504,9 +1516,13 @@ async def run_deployment(now: datetime | None = None, *, mode: str | None = None
     # against the post-SELL held set. The executor backstop below (skip
     # new-name buys once the ACTUAL book is at target_n) enforces the
     # ten-slot guarantee when a release fails (no executable quote).
+    # The 2026-11-04 re-entry guard (live deploy only): news-exited names
+    # are not buyable this pass.
+    from . import selllayer as _selllayer
     picks = monthly_mod._deploy_targets(
         band, held_before, settings.sim_monthly_target_n,
-        settings.sim_monthly_hold_band, refill=True)
+        settings.sim_monthly_hold_band, refill=True,
+        exclude=await _selllayer.news_exit_excluded(me))
     # Mid-run configuration guard: the awaits above (frame math, refresh) give
     # an operator time to change the variant/universe/overlays. The decisions
     # were computed under `cfg`; executing/stamping them under a NEW config
@@ -2205,6 +2221,11 @@ async def backfill(start: str | None = None,
             # plan — the executor backstop below (do_buy skips new names
             # once len(shares) >= target_n) enforces the ten-slot guarantee.
             if order:
+                # NO re-entry guard here, deliberately: this is the
+                # historical BACKFILL, and a D-EXIT fill dated after the
+                # replayed month-end is future information from that
+                # month-end's perspective (lookahead — the guard is a
+                # live-forward mechanism only).
                 deploy_picks = monthly_mod._deploy_targets(
                     order, list(shares), target_n, hold_band,
                     refill=len(shares) < target_n)

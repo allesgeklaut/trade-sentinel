@@ -55,11 +55,14 @@ stored candles/trades/rebalances, deterministic byte-identical modulo the
 declared wall-clock field (``generated_at``). It never raises on a single row's
 problems — the row is counted + skipped with a reason.
 
-Type-D rows (the shadow material-news scan, app/newsagent.py) appear in the
-decision history with status "shadow" but are NEVER scored, NEVER bucketed
-into A/B/C and NEVER counted in the per-type or overall stats (the D scorer
-does not exist in the shadow phase; ``n_d_shadow`` counts them); any other
-unknown event_type is skipped-with-reason the same way.
+Type-D rows (the material-news agent, app/newsagent.py) score, since the
+2026-11-04 promotion, through the SAME completed-window contract as type C —
+[the row's EXIT fill → the next month-end rebuild's fill session]; LLM branch
+= sold at the fill + proceeds at the cash yield, engine branch = held to the
+next rebuild (the WAIT is the counterfactual, the predeclared promotion
+measurement), HOLD = delta 0 — see docs/sell-news-agent-design-2026-11-01.md
+(the promotion addendum). Any other unknown event_type is
+skipped-with-reason.
 
 Costs/cash conventions: ``reval.CostConfig()``'s declared rates (the same
 stock bps + cash yield the study used), imported from reval, not redefined.
@@ -102,7 +105,7 @@ RATIONALE_LEN = 200
 # The decisions that DIVERGE from the engine's own rule (everything else —
 # CONFIRM/HOLD, and every fail-safe whose implied branch IS the engine's path
 # — scores delta 0 by construction).
-DIVERGENT_DECISION = {"A": "DEFER", "B": "DEFER", "C": "EXIT"}
+DIVERGENT_DECISION = {"A": "DEFER", "B": "DEFER", "C": "EXIT", "D": "EXIT"}
 
 # The strict-open loader signature shared by the B/C scorers:
 # ``async (day, names) -> {ticker: open | None}`` (monthly._open_usd_map).
@@ -208,19 +211,16 @@ def _rebuild_for(session_date: str, rebalance_rows: list) -> object | None:
 
 def _next_rebuild_fill(days: list[str], anchor: str) -> str | None:
     """The next month-end rebuild's fill session after ``anchor``: the first
-    stored session after the first COMPLETED month-end later than the
-    month-end governing ``anchor`` (the ``sellreview._next_rebuild`` /
-    ``_book_plumbing`` convention). None while the next rebuild's session is
-    not stored yet — the window is PENDING."""
+    stored session after the first COMPLETED month-end AT OR AFTER the
+    anchor. A fill at month-end's OPEN precedes that month's rebuild, so it
+    must score at the following session, not one month later. None while
+    the next rebuild's session is not stored yet — the window is PENDING."""
     if not days:
         return None
     idx = pd.DatetimeIndex([pd.Timestamp(d) for d in days])
     months = monthly_mod.completed_month_ends(idx, idx[0], idx[-1])
     a = pd.Timestamp(anchor)
-    me0 = max((m for m in months if m <= a), default=None)
-    if me0 is None:
-        return None
-    later = [m for m in months if m > me0]
+    later = [m for m in months if m >= a]
     if not later:
         return None
     me2_str = later[0].strftime("%Y-%m-%d")
@@ -367,11 +367,20 @@ async def _score_b(row, rebalance_rows: list, days: list[str], open_fn: OpenFn,
 
 async def _score_c(row, days: list[str], open_fn: OpenFn,
                    costs: reval.CostConfig) -> dict:
-    """Type C: the early exit + cash yield vs held-to-next-rebuild, over
-    [the row's EXIT fill → the next month-end rebuild's fill]."""
+    """Type C — and, since the 2026-11-04 promotion, type D through the SAME
+    window contract (the predeclared measurement: "the D-EXIT counterfactual
+    is the wait itself, on the same completed-window math as C"; see the
+    design note's promotion addendum): the early exit + cash yield vs
+    held-to-next-rebuild, over [the row's EXIT fill → the next month-end
+    rebuild's fill]."""
     tk = row.ticker
     rate = costs.rate_for(tk, "stock")
-    if row.decision != DIVERGENT_DECISION["C"]:
+    if row.event_type == "D" and row.decision == "EXIT":
+        state = _json(row.execution).get("status")
+        if state in ("superseded", "not_executed"):
+            return {"status": "skipped", "reason":
+                    "EXIT " + state.replace("_", " ") + " — no independent trade to score"}
+    if row.decision != DIVERGENT_DECISION[row.event_type]:
         f2 = _next_rebuild_fill(days, row.session_date)
         if f2 is None:
             return {"status": "pending",
@@ -384,7 +393,12 @@ async def _score_c(row, days: list[str], open_fn: OpenFn,
         return {"status": "pending",
                 "window": {"start": row.session_date, "end": None,
                            "reason": "the EXIT has not filled yet (fill columns NULL)"}}
-    fill_d = pd.Timestamp(row.filled_at)
+    # The D audit declares the execution SESSION independently of the
+    # bookkeeping timestamp. Legacy C/D rows retain the original fallback.
+    legs = _json(row.execution).get("books", {}) if row.event_type == "D" else {}
+    sessions = [leg["session_date"] for leg in legs.values()
+                if leg.get("status") == "filled" and leg.get("session_date")]
+    fill_d = pd.Timestamp(min(sessions) if sessions else row.filled_at)
     if fill_d.tzinfo is not None:
         fill_d = fill_d.tz_localize(None)
     fill_d = fill_d.strftime("%Y-%m-%d")
@@ -417,6 +431,21 @@ async def _score_c(row, days: list[str], open_fn: OpenFn,
 # ---------------------------------------------------------------------------
 # The scorer
 # ---------------------------------------------------------------------------
+
+def _execution_for(row) -> dict:
+    """Execution is NOT scoring: an exit can be filled with a pending score.
+    Legacy rows expose only facts actually recorded, never an inferred book.
+    """
+    if row.event_type == "D" and row.execution:
+        return _json(row.execution)
+    if row.filled_at is not None:
+        return {"status": "filled", "books": {}, "filled_at": row.filled_at.isoformat(),
+                "price": row.price, "shares": row.shares,
+                "note": "legacy fill; no per-book execution audit"}
+    if row.event_type in ("C", "D"):
+        return {"status": "pending" if row.decision == "EXIT" else "not_applicable",
+                "books": {}}
+    return {"status": "in_cycle", "books": {}}
 
 async def score_sell_decisions(db=None, *, now: datetime | None = None) -> dict:
     """Compute the sell scorecard ON DEMAND from the stored ledger + prices.
@@ -463,9 +492,8 @@ async def score_sell_decisions(db=None, *, now: datetime | None = None) -> dict:
 
     per_type: dict[str, dict] = {t: {"rows": [], "scored": [], "pending": 0,
                                       "skipped": [], "n_fail_safe": 0}
-                                  for t in ("A", "B", "C")}
+                                  for t in ("A", "B", "C", "D")}
     decisions: list[dict] = []
-    n_d_shadow = 0
     for row in rows:
         et = row.event_type
         base = {
@@ -475,22 +503,16 @@ async def score_sell_decisions(db=None, *, now: datetime | None = None) -> dict:
             "decision": row.decision, "parsed": bool(row.parsed),
             "fail_safe": bool(row.fail_safe), "fail_reason": row.fail_reason,
             "rationale": (row.rationale or "")[:RATIONALE_LEN],
+            "execution": _execution_for(row),
         }
         if et not in per_type:
-            # Type-D shadow rows (and any OTHER unknown event_type) are
-            # visible and honest in the history but NEVER scored, NEVER
-            # bucketed into A/B/C, NEVER counted in the per-type or overall
-            # stats — the old silent else-"A" fallback let D rows pollute
-            # the A bucket.
-            if et == "D":
-                n_d_shadow += 1
-                decisions.append({**base, "status": "shadow", "delta": None,
-                                  "window": None, "branch": None,
-                                  "detail": None,
-                                  "skip_reason": "type-D shadow row — scoring "
-                                                 "pending the D scorer"})
-            else:
-                decisions.append({**base, "status": "skipped", "delta": None,
+            # Any unknown event_type stays visible and honest in the
+            # history but is NEVER scored and NEVER counted in the
+            # per-type or overall stats — the old silent else-"A" fallback
+            # let unknown rows pollute the A bucket. (Type D moved INTO
+            # per_type at the 2026-11-04 promotion — it now scores through
+            # the same completed-window contract as C.)
+            decisions.append({**base, "status": "skipped", "delta": None,
                                   "window": None, "branch": None,
                                   "detail": None,
                                   "skip_reason": f"unknown event_type {et!r} — "
@@ -547,6 +569,9 @@ async def score_sell_decisions(db=None, *, now: datetime | None = None) -> dict:
             "n_rows": n_rows,
             "n_decided": len(scored),
             "n_pending": bucket["pending"],
+            "n_filled": sum(r.filled_at is not None for r in bucket["rows"]),
+            "n_closed": sum(_execution_for(r)["status"] in ("superseded", "not_executed")
+                            for r in bucket["rows"]),
             "n_skipped": len(bucket["skipped"]),
             "skipped": bucket["skipped"],
             "n_fail_safe": bucket["n_fail_safe"],
@@ -560,9 +585,9 @@ async def score_sell_decisions(db=None, *, now: datetime | None = None) -> dict:
         }
 
     types_out = {t: _type_block(per_type[t], sellreview.REFERENCE_BARS[t])
-                 for t in ("A", "B", "C")}
-    all_rows = [r for t in ("A", "B", "C") for r in per_type[t]["rows"]]
-    all_scored = [r for t in ("A", "B", "C") for r in per_type[t]["scored"]]
+                 for t in ("A", "B", "C", "D")}
+    all_rows = [r for t in ("A", "B", "C", "D") for r in per_type[t]["rows"]]
+    all_scored = [r for t in ("A", "B", "C", "D") for r in per_type[t]["scored"]]
     overall_bucket = {"rows": all_rows, "scored": all_scored,
                       "pending": sum(per_type[t]["pending"] for t in per_type),
                       "skipped": [s for t in per_type for s in per_type[t]["skipped"]],
@@ -578,7 +603,6 @@ async def score_sell_decisions(db=None, *, now: datetime | None = None) -> dict:
         "generated_at": generated_at,
         "data_as_of": data_as_of,
         "read_only": True,
-        "n_d_shadow": n_d_shadow,
         # B rows whose DEFER the rebuild's capacity cap released anyway
         # (flagged "capacity_released" on their history entries above).
         "n_capacity_released": sum(1 for d in decisions if d.get("capacity_released")),

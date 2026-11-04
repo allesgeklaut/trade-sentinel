@@ -2201,7 +2201,7 @@
         "name": "news_consult_block_renderNewsConsult_and_consultNews",
         "start_marker": "        // --- Type-D material-news consult (one real agent run per click) ---",
         "end_marker": "        async function backfillMonthly() {",
-        "sha256": "0a9372ad0b18c1b669c611fd2e598474225d375d7607c5a0684a783d34eb1844"
+        "sha256": "5b4db3c641617c9e4f1365802659a6138b9a63965ee862eb7e79879debfe08b1"
       }
     ]
   },

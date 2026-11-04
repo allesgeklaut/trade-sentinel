@@ -87,6 +87,10 @@ async def mem_db(monkeypatch):
     monkeypatch.setattr(monthly, "Session", session_factory)
     monkeypatch.setattr(fund_mod, "Session", session_factory)
     monkeypatch.setattr(edgar_mod, "Session", session_factory)
+    # The type-D fill step also touches the daily-core book (the 2026-11-04
+    # promotion: fills execute on whichever book holds the name).
+    import app.daily_core as daily_core_mod
+    monkeypatch.setattr(daily_core_mod, "Session", session_factory)
 
     async with session_factory() as s:
         s.add(SimAccount(id=1, cash=settings.sim_start_cash, last_allowance_month=None))
@@ -596,7 +600,8 @@ class TestTypeBRebalanceIntegration:
         added = [t for t in tickers if t not in held][0]
         forced_picks = sorted((held - {dropped}) | {added})
 
-        def fake_pick_portfolio(rebal_date, c, v, f, holdings=None, frame=None):
+        def fake_pick_portfolio(rebal_date, c, v, f, holdings=None, frame=None,
+                               exclude=None):
             return list(forced_picks), frame
         monkeypatch.setattr(monthly, "pick_portfolio", fake_pick_portfolio)
 
@@ -848,6 +853,240 @@ class TestTypeC:
         ctx = json.loads(rows[0].context)
         assert ctx["mom_rank_pct_in_frame"] is not None
         assert ctx["eligible_in_frame"] is True
+
+
+# ---------------------------------------------------------------------------
+# 4b. Type D — the FILL step (the 2026-11-04 promotion: execution on the
+#     paper books; the guard, both books, the re-entry exclusion)
+# ---------------------------------------------------------------------------
+
+async def _pending_d_row(decided_at: datetime, ticker: str = "AAA",
+                         session_date: str = "2026-02-01") -> None:
+    """Insert an UNFILLED type-D EXIT ledger row (a verdict awaiting its
+    fill session)."""
+    from app.db import Session
+    async with Session() as s:
+        s.add(LlmSellDecision(
+            decided_at=decided_at, session_date=session_date,
+            event_type="D", engine="monthly",
+            event_id=f"D:{ticker}:{session_date}:m", ticker=ticker,
+            decision="EXIT", rationale="test", prompt_version="sellshadow/1-d",
+            parsed=True, fail_safe=False, fail_reason=None,
+            backend="test", model="m1", latency_ms=1.0))
+        await s.commit()
+
+
+async def _add_open_candle(ticker: str, day: str, open_px: float) -> None:
+    from app.db import Session
+    async with Session() as s:
+        s.add(Candle(ticker=ticker, timestamp=datetime.strptime(day, "%Y-%m-%d"),
+                     open=open_px, high=open_px + 1.0, low=open_px - 1.0,
+                     close=open_px + 0.5, volume=1000.0))
+        await s.commit()
+
+
+class TestTypeDFill:
+    """The promotion's contract: a D-EXIT fills at the first session
+    STRICTLY AFTER its decision date, on whichever book holds the name."""
+
+    async def _seed_monthly_position(self, ticker="AAA", shares=100.0, cost=100.0):
+        from app.db import Session
+        async with Session() as s:
+            s.add(MonthlyPosition(ticker=ticker, shares=shares, avg_cost=cost,
+                                  opened_at=datetime(2026, 1, 5)))
+            await s.commit()
+
+    async def _seed_core_position(self, ticker="AAA", shares=100.0, cost=100.0):
+        import app.daily_core as daily_core_mod
+        from app.db import Session
+        async with Session() as s:
+            acc = await daily_core_mod._account(s)
+            acc.cash = 50_000.0
+            s.add(daily_core_mod.DailyCorePosition(ticker=ticker, shares=shares,
+                                                   avg_cost=cost,
+                                                   opened_at=datetime(2026, 1, 5)))
+            await s.commit()
+
+    async def _trades(self, model):
+        from app.db import Session
+        async with Session() as s:
+            return (await s.scalars(select(model).order_by(model.id))).all()
+
+    async def test_knob_off_is_the_shadow_phase(self, mem_db, monkeypatch):
+        monkeypatch.setattr(settings, "sim_news_execute", False)
+        res = await selllayer.run_type_d_fill_step(now=datetime(2026, 2, 3, 23, 30, tzinfo=UTC))
+        assert res == {"skipped": True, "reason": "SIM_NEWS_EXECUTE off (shadow)"}
+
+    async def test_row_decided_before_today_fills_at_today_open_monthly(
+            self, mem_db, monkeypatch):
+        monkeypatch.setattr(settings, "sim_news_execute", True)
+        from app.db import Session
+        async with Session() as s:
+            cash_before = (await s.get(MonthlyAccount, 1)).cash
+        await self._seed_monthly_position()
+        # A manual scan's verdict, decided YESTERDAY premarket (2026-02-02).
+        await _pending_d_row(datetime(2026, 2, 2, 5, 54, tzinfo=UTC))
+        await _add_open_candle("AAA", "2026-02-03", 42.0)
+        res = await selllayer.run_type_d_fill_step(
+            now=datetime(2026, 2, 3, 23, 30, tzinfo=UTC))
+        assert len(res["fills"]) == 1
+        f = res["fills"][0]
+        assert f["ticker"] == "AAA" and f["book"] == "monthly" and f["price"] == 42.0
+        rows = await _ledger_rows()
+        assert len(rows) == 1
+        r = rows[0]
+        assert r.filled_at is not None and r.filled_at >= r.decided_at
+        assert r.price == 42.0 and r.shares == 100.0
+        assert r.cash_after is not None
+        trades = await self._trades(MonthlyTrade)
+        assert len(trades) == 1 and trades[0].reason == "material-news exit"
+        # the position is gone, the proceeds booked (100 sh @ 42.0)
+        async with Session() as s:
+            pos = (await s.scalars(select(MonthlyPosition))).all()
+            acc = await s.get(MonthlyAccount, 1)
+        assert pos == []
+        assert acc.cash == pytest.approx(cash_before + 100.0 * 42.0)
+
+    async def test_same_day_decision_never_fills_same_day(self, mem_db, monkeypatch):
+        """THE GUARD: a verdict from today may postdate today's open (manual
+        scans run at any wall-clock), so it waits for the NEXT session."""
+        monkeypatch.setattr(settings, "sim_news_execute", True)
+        await self._seed_monthly_position()
+        # decided TODAY premarket — before today's open, but the invariant is
+        # date-strict: today never fills today.
+        await _pending_d_row(datetime(2026, 2, 3, 5, 54, tzinfo=UTC),
+                             session_date="2026-02-02")
+        await _add_open_candle("AAA", "2026-02-03", 42.0)
+        res = await selllayer.run_type_d_fill_step(
+            now=datetime(2026, 2, 3, 23, 30, tzinfo=UTC))
+        assert res["fills"] == [] and res["pending"] == 1
+        rows = await _ledger_rows()
+        assert rows[0].filled_at is None
+        # the NEXT session fills it at that session's open
+        await _add_open_candle("AAA", "2026-02-04", 41.0)
+        res2 = await selllayer.run_type_d_fill_step(
+            now=datetime(2026, 2, 4, 23, 30, tzinfo=UTC))
+        assert len(res2["fills"]) == 1 and res2["fills"][0]["price"] == 41.0
+        rows = await _ledger_rows()
+        assert rows[0].filled_at is not None and rows[0].price == 41.0
+
+    async def test_daily_core_book_fills_with_its_own_reason(self, mem_db, monkeypatch):
+        from app.db import DailyCorePosition, DailyCoreTrade
+        monkeypatch.setattr(settings, "sim_news_execute", True)
+        await self._seed_core_position()
+        await _pending_d_row(datetime(2026, 2, 2, 5, 54, tzinfo=UTC))
+        await _add_open_candle("AAA", "2026-02-03", 42.0)
+        res = await selllayer.run_type_d_fill_step(
+            now=datetime(2026, 2, 3, 23, 30, tzinfo=UTC))
+        assert len(res["fills"]) == 1
+        assert res["fills"][0]["book"] == "daily-core" and res["fills"][0]["price"] == 42.0
+        trades = await self._trades(DailyCoreTrade)
+        assert len(trades) == 1
+        assert trades[0].reason == "daily-core: material-news exit"
+        from app.db import Session
+        async with Session() as s:
+            pos = (await s.scalars(select(DailyCorePosition))).all()
+        assert pos == []
+
+    async def test_not_held_closes_without_a_trade(self, mem_db, monkeypatch):
+        """A verdict whose name left both books (band-released in between)
+        closes instead of becoming authority over a later acquisition."""
+        monkeypatch.setattr(settings, "sim_news_execute", True)
+        await _pending_d_row(datetime(2026, 2, 2, 5, 54, tzinfo=UTC))
+        await _add_open_candle("AAA", "2026-02-03", 42.0)
+        res = await selllayer.run_type_d_fill_step(
+            now=datetime(2026, 2, 3, 23, 30, tzinfo=UTC))
+        assert res["fills"] == [] and res["pending"] == 0 and res["closed"] == 1
+        rows = await _ledger_rows()
+        assert rows[0].filled_at is None
+        assert json.loads(rows[0].execution)["status"] == "not_executed"
+
+    async def test_missing_open_retries_next_cycle(self, mem_db, monkeypatch):
+        monkeypatch.setattr(settings, "sim_news_execute", True)
+        await self._seed_monthly_position()
+        await _pending_d_row(datetime(2026, 2, 2, 5, 54, tzinfo=UTC))
+        # no candle on the fill session: no executable open -> retried
+        res = await selllayer.run_type_d_fill_step(
+            now=datetime(2026, 2, 3, 23, 30, tzinfo=UTC))
+        assert res["fills"] == [] and res["pending"] == 1
+        await _add_open_candle("AAA", "2026-02-04", 41.0)
+        res2 = await selllayer.run_type_d_fill_step(
+            now=datetime(2026, 2, 4, 23, 30, tzinfo=UTC))
+        assert len(res2["fills"]) == 1
+
+
+class TestNewsExcluded:
+    """The re-entry guard: news-exited names are not buyable until the next
+    completed month-end re-evaluates them."""
+
+    async def _filled_d_row(self, filled_at: datetime, ticker="AAA"):
+        from app.db import Session
+        async with Session() as s:
+            s.add(LlmSellDecision(
+                decided_at=filled_at, session_date="2026-02-02",
+                event_type="D", engine="monthly",
+                event_id=f"D:{ticker}:2026-02-02:m", ticker=ticker,
+                decision="EXIT", rationale="test", prompt_version="sellshadow/1-d",
+                parsed=True, fail_safe=False, fail_reason=None,
+                filled_at=filled_at, price=42.0, shares=10.0, cash_after=1.0,
+                backend="test", model="m1", latency_ms=1.0))
+            await s.commit()
+
+    async def test_fill_after_month_end_is_excluded(self, mem_db):
+        # the governing month-end is 2026-01-30; a fill on 2026-02-03 is
+        # AFTER it -> the name is not buyable until the next month-end.
+        await self._filled_d_row(datetime(2026, 2, 3, 15, 0, tzinfo=UTC))
+        excl = await selllayer.news_exit_excluded(pd.Timestamp("2026-01-30"))
+        assert excl == {"AAA"}
+
+    async def test_fill_before_month_end_is_not_excluded(self, mem_db):
+        # the fill predates the governing month-end: the rebuild at that
+        # month-end already re-evaluated the name with the fill in the past.
+        await self._filled_d_row(datetime(2026, 2, 3, 15, 0, tzinfo=UTC))
+        excl = await selllayer.news_exit_excluded(pd.Timestamp("2026-03-31"))
+        assert excl == set()
+
+    async def test_unfilled_rows_never_exclude(self, mem_db):
+        from app.db import Session
+        async with Session() as s:
+            s.add(LlmSellDecision(
+                decided_at=datetime(2026, 2, 2, tzinfo=UTC), session_date="2026-02-02",
+                event_type="D", engine="monthly", event_id="D:AAA:2026-02-02:m",
+                ticker="AAA", decision="EXIT", rationale="t", prompt_version="1",
+                parsed=True, fail_safe=False, fail_reason=None,
+                backend="test", model="m1", latency_ms=1.0))
+            await s.commit()
+        excl = await selllayer.news_exit_excluded(pd.Timestamp("2026-01-30"))
+        assert excl == set()
+
+    async def test_hold_rows_never_exclude(self, mem_db):
+        from app.db import Session
+        async with Session() as s:
+            s.add(LlmSellDecision(
+                decided_at=datetime(2026, 2, 2, 15, 0, tzinfo=UTC),
+                session_date="2026-02-02", event_type="D", engine="monthly",
+                event_id="D:AAA:2026-02-02", ticker="AAA", decision="HOLD",
+                rationale="t", prompt_version="1", parsed=True, fail_safe=False,
+                fail_reason=None, filled_at=datetime(2026, 2, 2, 15, 0, tzinfo=UTC),
+                price=42.0, backend="test", model="m1", latency_ms=1.0))
+            await s.commit()
+        excl = await selllayer.news_exit_excluded(pd.Timestamp("2026-01-30"))
+        assert excl == set()
+
+
+def test_band_fill_exclude_blocks_new_buys_only():
+    """_band_fill with the re-entry guard: an excluded name is skipped as a
+    FILL candidate, but a held name keeps its slot regardless."""
+    order = ["AAA", "BBB", "CCC", "DDD"]
+    # AAA excluded, not held: skipped; BBB takes the slot
+    picks = monthly._band_fill(order, [], 2, 4, exclude={"AAA"})
+    assert picks == ["BBB", "CCC"]
+    # AAA excluded AND held (only possible via a pre-guard re-buy): it KEEPS
+    # its slot — the guard never force-releases a held name
+    picks = monthly._band_fill(order, ["AAA"], 2, 4, exclude={"AAA"})
+    assert picks == ["AAA", "BBB"]
+    # no exclusion: the unchanged behavior
+    assert monthly._band_fill(order, [], 2, 4) == ["AAA", "BBB"]
 
 
 # ---------------------------------------------------------------------------

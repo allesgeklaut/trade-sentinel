@@ -593,13 +593,19 @@ async def test_mirror_curve_replays_true_time_series(mem_db):
     assert [c["value"] for c in curve] == [100.0, 150.0, 200.0]
 
 
-async def test_mirror_curve_carries_price_forward(mem_db):
+@pytest.mark.parametrize("base", [
+    # Explicit local midday anchors, including the autumn DST transition.
+    # now(UTC)-10d + 24h at CI's Nov-3 clock produced TWO Oct-25 local
+    # snapshots; that tested grouping accidentally, not price carry-forward.
+    datetime(2026, 2, 10, 12, tzinfo=savings._TZ),
+    datetime(2026, 10, 24, 12, tzinfo=savings._TZ),
+])
+async def test_mirror_curve_carries_price_forward(mem_db, base):
     """Dates without a candle for a ticker are marked at the most recent
     prior close, not zero."""
     from datetime import timedelta
 
     await _seed_ranking(mem_db, ["AAPL"])
-    base = datetime.now(UTC) - timedelta(days=10)
     # One candle early; snapshots on three consecutive days after it.
     await _seed_candle(mem_db, "AAPL", 100.0, when=base)
     await _seed_candle(mem_db, "EURUSD=X", 1.0, when=base)
@@ -614,6 +620,25 @@ async def test_mirror_curve_carries_price_forward(mem_db):
         await s.commit()
     curve = await savings.get_mirror_curve(100)
     assert [c["value"] for c in curve] == [100.0, 100.0, 100.0]
+
+
+async def test_mirror_curve_groups_repeated_local_day_at_dst_end(mem_db):
+    """24 UTC hours need not be a new local day: keep one point per day."""
+    base = datetime(2026, 10, 24, 22, 5, tzinfo=UTC)
+    await _seed_candle(mem_db, "AAPL", 100.0, when=base)
+    await _seed_candle(mem_db, "EURUSD=X", 1.0, when=base)
+    async with mem_db() as s:
+        s.add(savings.SavingsMirrorEntry(
+            amount=100.0, source_ticker="", breakdown='[["AAPL", 1.0, 100.0]]',
+            created_at=base))
+        for i in range(3):
+            s.add(savings.SavingsSnapshot(
+                cash=0.0, positions_value=0.0, total_equity=0.0, contributed=0.0,
+                created_at=base + timedelta(days=i)))
+        await s.commit()
+    curve = await savings.get_mirror_curve(100)
+    assert [c["date"] for c in curve] == ["2026-10-25", "2026-10-26"]
+    assert [c["value"] for c in curve] == [100.0, 100.0]
 
 
 # ---------------------------------------------------------------------------

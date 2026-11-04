@@ -35,6 +35,12 @@ CASES = json.loads(CASES_PATH.read_text(encoding="utf-8"))
 FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
 # ---------------------------------------------------------------------------
+# 2026-11-04 D execution review repair: the owner's "fix everything" order
+# includes correcting manual-consult confirmations that still promised
+# shadow-only/no trades after promotion. Only the news-consult source guard
+# is re-pinned to 5b4db3c641617c9e4f1365802659a6138b9a63965ee862eb7e79879debfe08b1.
+# Savings (6438c993...) and mddOf are byte-identical; no financial math moved.
+#
 # Digest re-pin history (source_guards + fixture payload pins, which live in
 # tests/fixtures/portfolio_ui_cases.json):
 #   - pinned at Phase 3A;
