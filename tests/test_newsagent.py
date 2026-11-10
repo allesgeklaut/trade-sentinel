@@ -289,6 +289,10 @@ def test_describe_tools_appends_instance_note_to_engines_param():
     assert desc.startswith("generic text")
     assert "exaapi" in desc
     assert newsagent._INSTANCE_ENGINES_NOTE in desc
+    assert "tinyfish news" in desc
+    assert "exa keyless" in desc
+    assert "Those scrapers support time_range" in desc
+    assert "No engine on this instance supports time_range" not in desc
 
 
 def test_describe_tools_is_a_noop_on_foreign_or_missing_shapes():

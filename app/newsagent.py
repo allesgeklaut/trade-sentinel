@@ -231,12 +231,17 @@ async def _execute_calls(mcp, calls: list[dict]) -> list[dict]:
 # honest environment documentation, not research steering — the model
 # still owns every search decision (prompt sellshadow/1-d stays frozen).
 _INSTANCE_ENGINES_NOTE = (
-    "Live on this instance: exaapi (Exa neural web search — by far the "
-    "highest-quality engine here) and wikipedia. Omitting `engines` uses "
-    "the default set: exaapi + wikipedia for general, exaapi for news — "
-    "this is best. Other engine names are either ignored (unregistered — "
-    "the default set is used) or off the default set. No engine on this "
-    "instance supports time_range: omit it."
+    "Instance defaults (verified 2026-11-10): general uses exaapi, "
+    "exa keyless, tinyfish keyless, wikipedia, brave, duckduckgo, mojeek "
+    "and startpage; news uses exaapi and tinyfish news. Omit `engines` "
+    "to use the category's default set. The API engines form the backbone; "
+    "the four scrapers (brave, duckduckgo, mojeek, startpage) are best-effort "
+    "and may be temporarily suspended for CAPTCHA or access errors. "
+    "Those scrapers support time_range; exaapi, the keyless API engines "
+    "and wikipedia do not. Setting time_range excludes engines without "
+    "support, including both default news engines. Tavily keyless and "
+    "web scout are opt-in, not defaults (Tavily has a small shared quota; "
+    "Web Scout is billed and slower). Bing and Google are not defaults."
 )
 
 
