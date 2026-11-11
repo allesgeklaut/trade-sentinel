@@ -396,6 +396,56 @@ def _monthly_tape(n_days=400, tickers=("AAA", "BBB", "CCC", "DDD")):
 
 
 class TestTypeBOverlay:
+    async def test_fill_day_prices_and_filings_cannot_change_retention(self, mem_db, monkeypatch):
+        """The actual overlay must consult at ME, even with F/future data cached."""
+        await self._setup_book(mem_db)
+        dates, close, _, fund = _monthly_tape()
+        me_ts, fill_day = dates[-2], dates[-1]
+        frame = self._fake_frame(["AAA", "CCC", "DDD", "BBB"])
+        contexts = []
+        bench_dates = []
+
+        async def consult(event_id, event_type, context, **kwargs):
+            contexts.append(context)
+            return {"event_id": event_id, "event_type": event_type,
+                    "decision": "DEFER" if context["current_close"] > 1000 else "CONFIRM",
+                    "parsed": True, "fail_safe": False}
+
+        async def bench(as_of):
+            bench_dates.append(as_of)
+            return None
+
+        monkeypatch.setattr(selllayer, "consult_live", consult)
+        monkeypatch.setattr(selllayer, "_bench_series", bench)
+
+        async def run(prices, fundamentals):
+            return await selllayer._overlay_type_b_impl(
+                held_before=["AAA", "BBB"], picks=["AAA", "CCC", "DDD"],
+                fill_map={"AAA": 100, "BBB": 99, "CCC": 50, "DDD": 51},
+                frame=frame, close=prices, fund=fundamentals, members=list(close.columns),
+                me_ts=me_ts, f_date=fill_day, target_n=3, hold_band=3)
+
+        first, _ = await run(close, fund)
+        changed = close.copy()
+        changed.loc[fill_day, "BBB"] = 10000
+        changed.loc[fill_day + pd.Timedelta(days=1)] = 20000
+        import copy
+        changed_fund = copy.deepcopy(fund)
+        for key in changed_fund["BBB"]:
+            changed_fund["BBB"][key].append({
+                "start": None, "end": "2025-06-30",
+                "filed": fill_day.strftime("%Y-%m-%d"), "val": -1e12})
+        second, _ = await run(changed, changed_fund)
+        assert first == second == ["AAA", "CCC", "DDD"]
+        assert contexts[0] == contexts[1]
+        assert bench_dates == [me_ts, me_ts]
+        ctx = contexts[0]
+        assert ctx["decision_date"] == me_ts.strftime("%Y-%m-%d")
+        assert ctx["fill_date"] == fill_day.strftime("%Y-%m-%d")
+        assert ctx["current_close"] == close.loc[me_ts, "BBB"]
+        rows = await _ledger_rows()
+        assert all(r.session_date == fill_day.strftime("%Y-%m-%d") for r in rows)
+
     async def _setup_book(self, mem_db, held=("AAA", "BBB")):
         from app.db import Session
         async with Session() as s:
@@ -685,8 +735,24 @@ class TestTypeC:
         assert r.filled_at is None and r.price is None      # the pending record
         decided_at = r.decided_at
 
-        # NEXT nightly cycle: the fill step sells at THAT session's strict open.
+        # Re-entering the executor on the decision session must not sell at
+        # that morning's open, even when the bar is already cached.
         from app.db import Session
+        async with Session() as s:
+            s.add(Candle(ticker="AAA", timestamp=datetime(2026, 2, 2), open=41.0,
+                         high=43.0, low=40.0, close=42.0, volume=1000.0))
+            await s.commit()
+        retry = await selllayer.run_type_c_step(
+            now=night1, transport=mock_transport('{"decision": "HOLD"}'),
+            fund=fund, close=close, vol=vol)
+        assert retry["fills"] == [] and retry["scans"] == []
+        async with Session() as s:
+            assert await s.scalar(select(func.count()).select_from(MonthlyPosition)) == 1
+            assert await s.scalar(select(func.count()).select_from(MonthlyTrade)) == 0
+        pending = (await _ledger_rows())[0]
+        assert pending.filled_at is None and pending.price is None
+
+        # NEXT nightly cycle: the fill step sells at THAT session's strict open.
         async with Session() as s:
             s.add(Candle(ticker="AAA", timestamp=datetime(2026, 2, 3), open=42.0,
                          high=43.0, low=41.0, close=42.5, volume=1000.0))

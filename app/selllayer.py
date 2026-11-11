@@ -475,8 +475,15 @@ async def _overlay_type_b_impl(*, held_before, picks, fill_map, frame, close, fu
     if f_ts.tzinfo is not None:
         f_ts = f_ts.tz_localize(None)
     f_ts = f_ts.normalize()
-    as_of = f_ts.strftime("%Y-%m-%d")
-    plumb = _book_plumbing(close, f_ts, frame, hold_band)
+    fill_date = f_ts.strftime("%Y-%m-%d")
+    decision_ts = pd.Timestamp(me_ts)
+    if decision_ts.tzinfo is not None:
+        decision_ts = decision_ts.tz_localize(None)
+    decision_ts = decision_ts.normalize()
+    as_of = decision_ts.strftime("%Y-%m-%d")
+    # Retention changes the executed portfolio: its valuation, filings and
+    # benchmark inputs must share the ranking's completed month-end cutoff.
+    plumb = _book_plumbing(close, decision_ts, frame, hold_band)
     async with db_mod.Session() as s:
         held_rows = (await s.scalars(select(MonthlyPosition))).all()
         acc = await s.get(MonthlyAccount, 1)
@@ -489,7 +496,7 @@ async def _overlay_type_b_impl(*, held_before, picks, fill_map, frame, close, fu
         pos_val = sum(h["shares"] * (plumb["close_map"].get(t, {}).get(as_of) or 0.0)
                       for t, h in holdings.items())
         equity = float(acc.cash) + pos_val
-    bench = await _bench_series(f_ts)
+    bench = await _bench_series(decision_ts)
 
     retained: list[str] = []
     consulted = 0
@@ -508,15 +515,15 @@ async def _overlay_type_b_impl(*, held_before, picks, fill_map, frame, close, fu
         band = plumb["band"]
         ctx.update({
             "event_type": "B", "decision_date": as_of,
-            "rebuild_date": as_of, "fill_date": as_of,
+            "rebuild_date": fill_date, "fill_date": fill_date,
             "fill_price": float(fill_map[t]), "fill_kind": "open",
             "band_excludes_name": ((t not in band) if band is not None else None),
-            "event_id": f"B:{t}:{as_of}",
+            "event_id": f"B:{t}:{fill_date}",
         })
         rec = await consult_live(ctx["event_id"], "B", ctx, transport=transport)
         consulted += 1
         await _record_decision(
-            rec=rec, engine="monthly", session_date=as_of, ticker=t, context=ctx,
+            rec=rec, engine="monthly", session_date=fill_date, ticker=t, context=ctx,
             engine_branch={"action": "release at rebuild", "fill_price": float(fill_map[t])})
         if rec["decision"] == "DEFER":
             retained.append(t)
@@ -684,7 +691,9 @@ async def _run_type_c_step_impl(now, *, transport=None, fund, close, vol, frame)
 
     # --- 1. FILL step -------------------------------------------------------
     fills: list[dict] = []
-    to_fill = [r for r in pending if r.ticker in held]
+    # session_date is the frozen decision session; decided_at is the audit
+    # wall clock (which can differ for injected-clock/replay runs).
+    to_fill = [r for r in pending if r.ticker in held and r.session_date < as_of]
     if to_fill:
         open_map = await monthly_mod._open_usd_map(sorted(r.ticker for r in to_fill), f_ts)
         for r in to_fill:

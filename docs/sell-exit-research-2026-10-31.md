@@ -280,7 +280,7 @@ the existing rule).
 **Authorized model.** **`deepseek-v4.1-flash-mistral`** (exact id, as it
 appears in the live hosting's model dropdown), served by the owner's
 **Mistral** serving behind the LAN LiteLLM proxy at
-`http://192.168.0.46:4000` (OpenAI-compatible; the repo's LLM layer selects
+`http://your-server-ip:4000` (OpenAI-compatible; the repo's LLM layer selects
 backends via the `LLM_BACKENDS` JSON). Verified from the offline sandbox on
 2026-10-31: the proxy's health endpoint answers, the sandbox's key store
 (`/opt/secrets/litellm.key`) authenticates, the model id is present in the

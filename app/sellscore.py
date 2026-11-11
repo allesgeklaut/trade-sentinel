@@ -21,7 +21,7 @@ pre-measured reference bars (``sellreview.REFERENCE_BARS``).
     ``MonthlyRebalance.sell_layer`` JSON BY THE REBUILD'S IDENTITY, not by a
     month string: the B row's ``session_date`` is the rebuild's FILL session
     (the first session AFTER the governing month-end — app/selllayer.py writes
-    ``as_of = f_date``), while ``MonthlyRebalance.rebal_date`` stores the
+    ``session_date = fill_date``), while ``MonthlyRebalance.rebal_date`` stores the
     governing month-end (``me_ts``) and ``rebal_month`` its month, so the join
     is the audit row with the GREATEST ``rebal_date`` strictly before the row's
     ``session_date`` (preferring ``sell_layer NOT NULL``, then highest epoch —
@@ -186,7 +186,7 @@ def _rebuild_for(session_date: str, rebalance_rows: list) -> object | None:
 
     The B row's ``session_date`` is the rebuild's FILL session (the first
     session AFTER the governing month-end — app/selllayer.py writes
-    ``as_of = f_date``), while ``rebal_date`` stores the governing month-end
+    ``session_date = fill_date``), while ``rebal_date`` stores the governing month-end
     (``me_ts``) and ``rebal_month`` its calendar month — so a month-string join
     (``session_date[:7] == rebal_month``) never matches live rows. The join is
     by the rebuild's identity instead: the row with the GREATEST ``rebal_date``

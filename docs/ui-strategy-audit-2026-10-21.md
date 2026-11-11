@@ -1324,7 +1324,7 @@ first Phase 5 slice (the sell-side program predeclared in
 deterministic machinery for the LLM sell-decider — built OFFLINE, with zero
 LLM/network calls (the authorized model `deepseek-v4.1-flash-mistral` is a
 recorded constant; the Mistral serving behind the LAN LiteLLM proxy at
-192.168.0.46:4000 was separately verified reachable and smoke-tested
+`http://your-server-ip:4000` was separately verified reachable and smoke-tested
 1-token from the sandbox, key at `/opt/secrets/litellm.key`).
 
 `app/sellshadow.py` (new, 1,049 lines): (1) `contexts` — the stop-fire
