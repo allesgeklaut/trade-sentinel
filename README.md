@@ -195,8 +195,10 @@ The dashboard's AI chat, the sim bot's LLM reasoning, and the LLM benchmark all 
 
 ```dotenv
 # JSON list of backends (single line — dotenv can't parse multi-line values):
-LLM_BACKENDS=[{"name":"llama-server","type":"openai","url":"http://your-server-ip:8084","model":"Qwen3.8-27B-IQ4_XS.gguf"},{"name":"ollama","type":"ollama","url":"http://host.docker.internal:11434","model":"qwen3:32b"}]
+LLM_BACKENDS=[{"name":"llama-server","type":"openai","url":"http://your-server-ip:4000","model":"qwen3.8-27b"},{"name":"ollama","type":"ollama","url":"http://host.docker.internal:11434","model":"qwen3:32b"}]
 ```
+
+Always point `type: "openai"` backends at the **LiteLLM proxy** (port `:4000` here), never at a direct llama-server port: the proxy cold-starts the on-demand GPU model containers, so a direct URL only answers while its container happens to be up — the rest of the time every dashboard open logs `Model discovery failed` and any consult would fail.
 
 - `type: "openai"` — OpenAI-compatible `/v1/chat/completions`; works with llama.cpp **llama-server**, vLLM, LiteLLM, etc.
 - `type: "ollama"` — Ollama's native `/api/chat`.
@@ -227,8 +229,8 @@ The **Savings** tab tracks a *real* account (e.g. Trade Republic cash + Sparplä
 - **Sparpläne**: configure plans (ticker, € amount, day-of-month); the tracker buys virtually from the tracked cash on that day at the cached close, with catch-up after downtime and a WARN event (pointing at a true-up) when the cash is insufficient. EUR pricing is native for EU listings (`.DE` etc.), USD-converted via `EURUSD=X` for US names.
 - **Manual buys**: one-off purchases paid from the tracked cash (an ETF you bought directly in TR, outside any Sparplan) — **Add buy** deducts from the cash, books a `MANUAL_BUY` ledger event and mirrors the € like a Sparplan execution. Refused when the tracked cash can't cover it (true-up first).
 - **Saveback**: TR invests the 1% Saveback into a Sparplan asset on the 2nd of the next month — book what actually landed with the **Add Saveback** button. Saveback is *bonus money TR gives you* (cash untouched, position bought "from nothing") — do **not** use it for buys you paid from your cash; use **Add buy** for those.
-- **Removing a position** (sold in TR) releases the mirror € its buys allocated, so the mirror always tracks the same € as the positions actually held.
-- **Daily-core mirror**: every € that goes into positions (seed holdings, Sparplan buys, manual buys, Saveback) is mirrored into the *then-current* daily-core top-10 suggestion — an honest forward comparison of "your picks vs daily-core's picks" for the same money on the same dates. No backward mirror exists: the ranking history isn't stored, and replaying today's picks over past dates would be look-ahead bias.
+- **Removing a position** (sold in TR) releases only the mirror € that position still has outstanding. The mirror book is append-only: historical mirror entries are never edited or deleted, so every mirror-curve date strictly before the removal day replays unchanged (only the removal day's daily aggregate moves). The current allocation is cancelled by a new dated reversal entry instead, and the mirror holdings are rebuilt from what remains. Still-parked (not-yet-allocated) mirror € for that position is cancelled with it, while seed mirror € and other positions' allocations stay.
+- **Daily-core mirror**: every € that goes into positions (seed holdings, Sparplan buys, manual buys, Saveback) is split equally across the *then-current* daily-core picks (priced ones only) and bought at their latest cached EUR prices — an honest forward comparison of "your picks vs daily-core's picks" on the same dates. It mirrors the picks, not the full Daily-Core strategy: no rebalance/sell rules, protection overlays or cash-timing logic. No backward mirror exists: the ranking history isn't stored, and replaying today's picks over past dates would be look-ahead bias.
 
 No connection to Trade Republic exists — this is a manual ledger with derived valuations, not a broker integration. The daily pass runs at `SAVINGS_SNAPSHOT_HOUR:MINUTE` (default 23:40 UTC) on every calendar day, independently of `SIM_ENABLED`.
 

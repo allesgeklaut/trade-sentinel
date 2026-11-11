@@ -1,0 +1,2496 @@
+{
+  "schema": 1,
+  "description": "Independent explicit cases for static/portfolio.js::buildComparisonSeries. Expected values are hand-computed from the contract and from the immutable Phase-3A fixture data; they are never produced by calling the implementation.",
+  "nonfinite_sentinels": {
+    "$nonfinite": [
+      "NaN",
+      "Infinity",
+      "-Infinity"
+    ]
+  },
+  "cases": [
+    {
+      "name": "sim_pct_primary_with_overlays",
+      "input": {
+        "selected": "sim",
+        "mode": "pct",
+        "accounts": {
+          "sim": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T20:00:00+00:00",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-22T20:00:00+00:00",
+                "total_equity": 2100,
+                "allowance_total": 2000
+              },
+              {
+                "at": "2026-10-21T14:30:00-04:00",
+                "total_equity": 1100.0,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-21T09:15:00+00:00",
+                "total_equity": 1155.0,
+                "allowance_total": 1000
+              }
+            ],
+            "live": {
+              "total_equity": 2200,
+              "allowance_total": 2000
+            }
+          },
+          "monthly": {
+            "snapshots": [
+              {
+                "date": "2026-10-19",
+                "total_equity": 2000,
+                "allowance_total": 2000
+              },
+              {
+                "date": "2026-10-21",
+                "total_equity": 2100,
+                "allowance_total": 2000
+              },
+              {
+                "date": "2026-10-22",
+                "total_equity": 2200,
+                "allowance_total": 2000
+              }
+            ],
+            "live": null
+          },
+          "dailycore": {
+            "snapshots": [
+              {
+                "date": "2026-10-18",
+                "total_equity": 3000,
+                "allowance_total": 3000
+              },
+              {
+                "date": "2026-10-20",
+                "total_equity": 3060,
+                "allowance_total": 3000
+              },
+              {
+                "date": "2026-10-22",
+                "total_equity": 3150,
+                "allowance_total": 3000
+              }
+            ],
+            "live": {
+              "valuation": {
+                "total_equity": 3180,
+                "allowance_total": 3000
+              }
+            }
+          },
+          "benchmark": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T20:00:00+00:00",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-22T20:00:00+00:00",
+                "total_equity": 1020,
+                "allowance_total": 1000
+              }
+            ],
+            "live": null
+          }
+        },
+        "today": "2026-10-23"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-23",
+        "primary": "sim",
+        "series": [
+          {
+            "id": "sim",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-21",
+                "value": 115.5
+              },
+              {
+                "time": "2026-10-22",
+                "value": 105.0
+              },
+              {
+                "time": "2026-10-23",
+                "value": 110.0
+              }
+            ]
+          },
+          {
+            "id": "monthly",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-19",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-21",
+                "value": 105.0
+              },
+              {
+                "time": "2026-10-22",
+                "value": 110.0
+              }
+            ]
+          },
+          {
+            "id": "dailycore",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-18",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-20",
+                "value": 102.0
+              },
+              {
+                "time": "2026-10-22",
+                "value": 105.0
+              },
+              {
+                "time": "2026-10-23",
+                "value": 106.0
+              }
+            ]
+          },
+          {
+            "id": "benchmark",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-22",
+                "value": 102.0
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-20",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-21",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-22",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-23",
+            "value": 100.0
+          }
+        ],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "monthly_pct_primary_with_overlays",
+      "input": {
+        "selected": "monthly",
+        "mode": "pct",
+        "accounts": {
+          "monthly": {
+            "snapshots": [
+              {
+                "date": "2026-10-20",
+                "total_equity": 5000,
+                "allowance_total": 4000
+              },
+              {
+                "date": "2026-10-21",
+                "total_equity": 6000,
+                "allowance_total": 5000
+              }
+            ],
+            "live": null
+          },
+          "sim": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T00:00:00Z",
+                "total_equity": 900,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-21T00:00:00Z",
+                "total_equity": 950,
+                "allowance_total": 1000
+              }
+            ],
+            "live": {
+              "total_equity": 1000,
+              "allowance_total": 1000
+            }
+          },
+          "dailycore": {
+            "snapshots": [
+              {
+                "date": "2026-10-19",
+                "total_equity": 1100,
+                "allowance_total": 1000
+              }
+            ],
+            "live": null
+          },
+          "benchmark": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T00:00:00Z",
+                "total_equity": 2100,
+                "allowance_total": 2000
+              }
+            ],
+            "live": null
+          }
+        },
+        "today": "2026-10-21"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-21",
+        "primary": "monthly",
+        "series": [
+          {
+            "id": "monthly",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 125.0
+              },
+              {
+                "time": "2026-10-21",
+                "value": 120.0
+              }
+            ]
+          },
+          {
+            "id": "sim",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 90.0
+              },
+              {
+                "time": "2026-10-21",
+                "value": 100.0
+              }
+            ]
+          },
+          {
+            "id": "dailycore",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-19",
+                "value": 110.0
+              }
+            ]
+          },
+          {
+            "id": "benchmark",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 105.0
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-20",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-21",
+            "value": 100.0
+          }
+        ],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "dailycore_pct_primary_live_status",
+      "input": {
+        "selected": "dailycore",
+        "mode": "pct",
+        "accounts": {
+          "dailycore": {
+            "snapshots": [
+              {
+                "date": "2026-10-20",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "date": "2026-10-21",
+                "total_equity": 1050,
+                "allowance_total": 1000
+              }
+            ],
+            "live": {
+              "valuation": {
+                "total_equity": 1100,
+                "allowance_total": 1000
+              }
+            }
+          },
+          "sim": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T20:00:00Z",
+                "total_equity": 1200,
+                "allowance_total": 1000
+              }
+            ],
+            "live": null
+          }
+        },
+        "today": "2026-10-22"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-22",
+        "primary": "dailycore",
+        "series": [
+          {
+            "id": "dailycore",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-21",
+                "value": 105.0
+              },
+              {
+                "time": "2026-10-22",
+                "value": 110.0
+              }
+            ]
+          },
+          {
+            "id": "sim",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 120.0
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-20",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-21",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-22",
+            "value": 100.0
+          }
+        ],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "sim_usd_primary_with_overlays",
+      "input": {
+        "selected": "sim",
+        "mode": "usd",
+        "accounts": {
+          "sim": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T20:00:00+00:00",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-22T20:00:00+00:00",
+                "total_equity": 2100,
+                "allowance_total": 2000
+              },
+              {
+                "at": "2026-10-21T09:15:00+00:00",
+                "total_equity": 1100,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-21T14:30:00-04:00",
+                "total_equity": 1155,
+                "allowance_total": 1000
+              }
+            ],
+            "live": {
+              "total_equity": 2200,
+              "allowance_total": 2000
+            }
+          },
+          "monthly": {
+            "snapshots": [
+              {
+                "date": "2026-10-19",
+                "total_equity": 2000,
+                "allowance_total": 2000
+              },
+              {
+                "date": "2026-10-21",
+                "total_equity": 2100,
+                "allowance_total": 2000
+              },
+              {
+                "date": "2026-10-22",
+                "total_equity": 2200,
+                "allowance_total": 2000
+              }
+            ],
+            "live": null
+          },
+          "dailycore": {
+            "snapshots": [
+              {
+                "date": "2026-10-18",
+                "total_equity": 3000,
+                "allowance_total": 3000
+              },
+              {
+                "date": "2026-10-20",
+                "total_equity": 3060,
+                "allowance_total": 3000
+              },
+              {
+                "date": "2026-10-22",
+                "total_equity": 3150,
+                "allowance_total": 3000
+              }
+            ],
+            "live": {
+              "valuation": {
+                "total_equity": 3180,
+                "allowance_total": 3000
+              }
+            }
+          },
+          "benchmark": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T20:00:00+00:00",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-22T20:00:00+00:00",
+                "total_equity": 1020,
+                "allowance_total": 1000
+              }
+            ],
+            "live": null
+          }
+        },
+        "today": "2026-10-23"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-23",
+        "primary": "sim",
+        "series": [
+          {
+            "id": "sim",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 1000.0
+              },
+              {
+                "time": "2026-10-21",
+                "value": 1155.0
+              },
+              {
+                "time": "2026-10-22",
+                "value": 2100.0
+              },
+              {
+                "time": "2026-10-23",
+                "value": 2200.0
+              }
+            ]
+          },
+          {
+            "id": "monthly",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-19",
+                "value": 2000.0
+              },
+              {
+                "time": "2026-10-21",
+                "value": 2100.0
+              },
+              {
+                "time": "2026-10-22",
+                "value": 2200.0
+              }
+            ]
+          },
+          {
+            "id": "dailycore",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-18",
+                "value": 3000.0
+              },
+              {
+                "time": "2026-10-20",
+                "value": 3060.0
+              },
+              {
+                "time": "2026-10-22",
+                "value": 3150.0
+              },
+              {
+                "time": "2026-10-23",
+                "value": 3180.0
+              }
+            ]
+          },
+          {
+            "id": "benchmark",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 1000.0
+              },
+              {
+                "time": "2026-10-22",
+                "value": 1020.0
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-20",
+            "value": 1000.0
+          },
+          {
+            "time": "2026-10-21",
+            "value": 1000.0
+          },
+          {
+            "time": "2026-10-22",
+            "value": 2000.0
+          },
+          {
+            "time": "2026-10-23",
+            "value": 2000.0
+          }
+        ],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "monthly_usd_primary_with_overlays",
+      "input": {
+        "selected": "monthly",
+        "mode": "usd",
+        "accounts": {
+          "monthly": {
+            "snapshots": [
+              {
+                "date": "2026-10-20",
+                "total_equity": 5000,
+                "allowance_total": 4000
+              },
+              {
+                "date": "2026-10-21",
+                "total_equity": 6000,
+                "allowance_total": 5000
+              }
+            ],
+            "live": null
+          },
+          "sim": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T00:00:00Z",
+                "total_equity": 900,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-21T00:00:00Z",
+                "total_equity": 950,
+                "allowance_total": 1000
+              }
+            ],
+            "live": {
+              "total_equity": 1000,
+              "allowance_total": 1000
+            }
+          },
+          "dailycore": {
+            "snapshots": [
+              {
+                "date": "2026-10-19",
+                "total_equity": 1100,
+                "allowance_total": 1000
+              }
+            ],
+            "live": null
+          },
+          "benchmark": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T00:00:00Z",
+                "total_equity": 2100,
+                "allowance_total": 2000
+              }
+            ],
+            "live": null
+          }
+        },
+        "today": "2026-10-21"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-21",
+        "primary": "monthly",
+        "series": [
+          {
+            "id": "monthly",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 5000.0
+              },
+              {
+                "time": "2026-10-21",
+                "value": 6000.0
+              }
+            ]
+          },
+          {
+            "id": "sim",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 900.0
+              },
+              {
+                "time": "2026-10-21",
+                "value": 1000.0
+              }
+            ]
+          },
+          {
+            "id": "dailycore",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-19",
+                "value": 1100.0
+              }
+            ]
+          },
+          {
+            "id": "benchmark",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 2100.0
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-20",
+            "value": 4000.0
+          },
+          {
+            "time": "2026-10-21",
+            "value": 5000.0
+          }
+        ],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "dailycore_usd_primary_live_status",
+      "input": {
+        "selected": "dailycore",
+        "mode": "usd",
+        "accounts": {
+          "dailycore": {
+            "snapshots": [
+              {
+                "date": "2026-10-20",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "date": "2026-10-21",
+                "total_equity": 1050,
+                "allowance_total": 1000
+              }
+            ],
+            "live": {
+              "valuation": {
+                "total_equity": 1100,
+                "allowance_total": 1000
+              }
+            }
+          },
+          "sim": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T20:00:00Z",
+                "total_equity": 1200,
+                "allowance_total": 1000
+              }
+            ],
+            "live": null
+          }
+        },
+        "today": "2026-10-22"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-22",
+        "primary": "dailycore",
+        "series": [
+          {
+            "id": "dailycore",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 1000.0
+              },
+              {
+                "time": "2026-10-21",
+                "value": 1050.0
+              },
+              {
+                "time": "2026-10-22",
+                "value": 1100.0
+              }
+            ]
+          },
+          {
+            "id": "sim",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 1200.0
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-20",
+            "value": 1000.0
+          },
+          {
+            "time": "2026-10-21",
+            "value": 1000.0
+          },
+          {
+            "time": "2026-10-22",
+            "value": 1000.0
+          }
+        ],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "live_replace_today_last_row",
+      "input": {
+        "selected": "sim",
+        "mode": "pct",
+        "accounts": {
+          "sim": {
+            "snapshots": [
+              {
+                "at": "2026-10-21T10:00:00Z",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-22T09:00:00Z",
+                "total_equity": 1100,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-22T15:00:00Z",
+                "total_equity": 1200,
+                "allowance_total": 1000
+              }
+            ],
+            "live": {
+              "total_equity": 1250,
+              "allowance_total": 1000
+            }
+          }
+        },
+        "today": "2026-10-22"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-22",
+        "primary": "sim",
+        "series": [
+          {
+            "id": "sim",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-21",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-22",
+                "value": 125.0
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-21",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-22",
+            "value": 100.0
+          }
+        ],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "live_append_today",
+      "input": {
+        "selected": "sim",
+        "mode": "pct",
+        "accounts": {
+          "sim": {
+            "snapshots": [
+              {
+                "at": "2026-10-21T20:00:00Z",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-22T20:00:00Z",
+                "total_equity": 1100,
+                "allowance_total": 1000
+              }
+            ],
+            "live": {
+              "total_equity": 1300,
+              "allowance_total": 1000
+            }
+          }
+        },
+        "today": "2026-10-23"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-23",
+        "primary": "sim",
+        "series": [
+          {
+            "id": "sim",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-21",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-22",
+                "value": 110.0
+              },
+              {
+                "time": "2026-10-23",
+                "value": 130.0
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-21",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-22",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-23",
+            "value": 100.0
+          }
+        ],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "fresh_live_only_is_empty",
+      "input": {
+        "selected": "sim",
+        "mode": "pct",
+        "accounts": {
+          "sim": {
+            "snapshots": [],
+            "live": {
+              "total_equity": 1000,
+              "allowance_total": 1000
+            }
+          },
+          "monthly": {
+            "snapshots": [
+              {
+                "date": "2026-10-20",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              }
+            ],
+            "live": null
+          }
+        },
+        "today": "2026-10-23"
+      },
+      "expected": {
+        "empty": true,
+        "asOf": null,
+        "primary": "sim",
+        "series": [],
+        "contributed": [],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "missing_primary_is_empty",
+      "input": {
+        "selected": "monthly",
+        "mode": "pct",
+        "accounts": {
+          "sim": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T20:00:00Z",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              }
+            ],
+            "live": null
+          },
+          "dailycore": {
+            "snapshots": [
+              {
+                "date": "2026-10-20",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              }
+            ],
+            "live": null
+          }
+        },
+        "today": "2026-10-23"
+      },
+      "expected": {
+        "empty": true,
+        "asOf": null,
+        "primary": "monthly",
+        "series": [],
+        "contributed": [],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "missing_overlays_primary_only",
+      "input": {
+        "selected": "sim",
+        "mode": "pct",
+        "accounts": {
+          "sim": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T20:00:00Z",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-21T20:00:00Z",
+                "total_equity": 1100,
+                "allowance_total": 1000
+              }
+            ],
+            "live": null
+          }
+        },
+        "today": "2026-10-21"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-21",
+        "primary": "sim",
+        "series": [
+          {
+            "id": "sim",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-21",
+                "value": 110.0
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-20",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-21",
+            "value": 100.0
+          }
+        ],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "empty_overlays_omitted",
+      "input": {
+        "selected": "sim",
+        "mode": "pct",
+        "accounts": {
+          "sim": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T20:00:00Z",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              }
+            ],
+            "live": null
+          },
+          "monthly": {
+            "snapshots": [],
+            "live": null
+          },
+          "dailycore": {
+            "snapshots": [],
+            "live": null
+          },
+          "benchmark": {
+            "snapshots": [],
+            "live": null
+          }
+        },
+        "today": "2026-10-21"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-20",
+        "primary": "sim",
+        "series": [
+          {
+            "id": "sim",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 100.0
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-20",
+            "value": 100.0
+          }
+        ],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "pct_nonpositive_denominator_omitted_warned",
+      "input": {
+        "selected": "sim",
+        "mode": "pct",
+        "accounts": {
+          "sim": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T20:00:00Z",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-21T20:00:00Z",
+                "total_equity": 1500,
+                "allowance_total": 0
+              },
+              {
+                "at": "2026-10-22T20:00:00Z",
+                "total_equity": 2000,
+                "allowance_total": -500
+              },
+              {
+                "at": "2026-10-23T20:00:00Z",
+                "total_equity": 2100,
+                "allowance_total": 2000
+              }
+            ],
+            "live": null
+          },
+          "monthly": {
+            "snapshots": [
+              {
+                "date": "2026-10-20",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "date": "2026-10-21",
+                "total_equity": 900,
+                "allowance_total": 0
+              },
+              {
+                "date": "2026-10-22",
+                "total_equity": 950
+              },
+              {
+                "date": "2026-10-23",
+                "total_equity": 2200,
+                "allowance_total": 2000
+              }
+            ],
+            "live": null
+          },
+          "dailycore": {
+            "snapshots": [
+              {
+                "date": "2026-10-20",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "date": "2026-10-21",
+                "total_equity": 1000,
+                "allowance_total": -100
+              },
+              {
+                "date": "2026-10-22",
+                "total_equity": 1000
+              },
+              {
+                "date": "2026-10-23",
+                "total_equity": 3000,
+                "allowance_total": 3000
+              }
+            ],
+            "live": null
+          }
+        },
+        "today": "2026-10-23"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-23",
+        "primary": "sim",
+        "series": [
+          {
+            "id": "sim",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-23",
+                "value": 105.0
+              }
+            ]
+          },
+          {
+            "id": "monthly",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-23",
+                "value": 110.0
+              }
+            ]
+          },
+          {
+            "id": "dailycore",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-23",
+                "value": 100.0
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-20",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-23",
+            "value": 100.0
+          }
+        ],
+        "warnings_min": 1,
+        "warning_contains": "(?i)(contribut|pct|percent|denominator)"
+      }
+    },
+    {
+      "name": "usd_nonpositive_denominator_included",
+      "input": {
+        "selected": "sim",
+        "mode": "usd",
+        "accounts": {
+          "sim": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T20:00:00Z",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-21T20:00:00Z",
+                "total_equity": 1500,
+                "allowance_total": 0
+              },
+              {
+                "at": "2026-10-22T20:00:00Z",
+                "total_equity": 2000,
+                "allowance_total": -500
+              },
+              {
+                "at": "2026-10-23T20:00:00Z",
+                "total_equity": 2100,
+                "allowance_total": 2000
+              }
+            ],
+            "live": null
+          }
+        },
+        "today": "2026-10-23"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-23",
+        "primary": "sim",
+        "series": [
+          {
+            "id": "sim",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 1000.0
+              },
+              {
+                "time": "2026-10-21",
+                "value": 1500.0
+              },
+              {
+                "time": "2026-10-22",
+                "value": 2000.0
+              },
+              {
+                "time": "2026-10-23",
+                "value": 2100.0
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-20",
+            "value": 1000.0
+          },
+          {
+            "time": "2026-10-21",
+            "value": 0.0
+          },
+          {
+            "time": "2026-10-22",
+            "value": -500.0
+          },
+          {
+            "time": "2026-10-23",
+            "value": 2000.0
+          }
+        ],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "nonfinite_and_invalid_dates_fail_closed",
+      "input": {
+        "selected": "sim",
+        "mode": "pct",
+        "accounts": {
+          "sim": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T20:00:00Z",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "at": "not-a-date",
+                "total_equity": 1100,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-21T20:00:00Z",
+                "total_equity": {
+                  "$nonfinite": "NaN"
+                },
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-22T20:00:00Z",
+                "total_equity": 1100,
+                "allowance_total": {
+                  "$nonfinite": "Infinity"
+                }
+              },
+              {
+                "at": "",
+                "total_equity": 1300,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-23T20:00:00Z",
+                "total_equity": 1200,
+                "allowance_total": 1000
+              },
+              {
+                "date": "2026-13-01",
+                "total_equity": 1400,
+                "allowance_total": 1000
+              }
+            ],
+            "live": null
+          },
+          "monthly": {
+            "snapshots": [
+              {
+                "date": "2026-10-20",
+                "total_equity": {
+                  "$nonfinite": "-Infinity"
+                },
+                "allowance_total": 1000
+              },
+              {
+                "date": "2026-10-21",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              }
+            ],
+            "live": null
+          }
+        },
+        "today": "2026-10-24"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-23",
+        "primary": "sim",
+        "series": [
+          {
+            "id": "sim",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-23",
+                "value": 120.0
+              }
+            ]
+          },
+          {
+            "id": "monthly",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-21",
+                "value": 100.0
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-20",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-23",
+            "value": 100.0
+          }
+        ],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "all_invalid_primary_rows_empty",
+      "input": {
+        "selected": "sim",
+        "mode": "pct",
+        "accounts": {
+          "sim": {
+            "snapshots": [
+              {
+                "at": "not-a-date",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-21T20:00:00Z",
+                "total_equity": {
+                  "$nonfinite": "NaN"
+                },
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-22T20:00:00Z",
+                "total_equity": 1000,
+                "allowance_total": {
+                  "$nonfinite": "Infinity"
+                }
+              }
+            ],
+            "live": null
+          },
+          "monthly": {
+            "snapshots": [
+              {
+                "date": "2026-10-20",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              }
+            ],
+            "live": null
+          }
+        },
+        "today": "2026-10-24"
+      },
+      "expected": {
+        "empty": true,
+        "asOf": null,
+        "primary": "sim",
+        "series": [],
+        "contributed": [],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "utc_day_last_row_wins_sorted",
+      "input": {
+        "selected": "sim",
+        "mode": "pct",
+        "accounts": {
+          "sim": {
+            "snapshots": [
+              {
+                "at": "2026-10-22T01:00:00Z",
+                "total_equity": 1000.0,
+                "allowance_total": 1000.0
+              },
+              {
+                "at": "2026-10-22T23:30:00Z",
+                "total_equity": 1200.0,
+                "allowance_total": 1000.0
+              },
+              {
+                "at": "2026-10-21T22:00:00-05:00",
+                "total_equity": 1100.0,
+                "allowance_total": 1000.0
+              },
+              {
+                "at": "2026-10-20T23:30:00-05:00",
+                "total_equity": 900.0,
+                "allowance_total": 1000.0
+              },
+              {
+                "date": "2026-10-19",
+                "total_equity": 1000.0,
+                "allowance_total": 1000.0
+              }
+            ],
+            "live": null
+          }
+        },
+        "today": "2026-10-24"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-22",
+        "primary": "sim",
+        "series": [
+          {
+            "id": "sim",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-19",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-21",
+                "value": 90.0
+              },
+              {
+                "time": "2026-10-22",
+                "value": 110.0
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-19",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-21",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-22",
+            "value": 100.0
+          }
+        ],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "pct_is_equity_over_own_contribution_not_twr",
+      "input": {
+        "selected": "sim",
+        "mode": "pct",
+        "accounts": {
+          "sim": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T20:00:00Z",
+                "total_equity": 1100,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-21T20:00:00Z",
+                "total_equity": 2150,
+                "allowance_total": 2000
+              }
+            ],
+            "live": null
+          }
+        },
+        "today": "2026-10-22"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-21",
+        "primary": "sim",
+        "series": [
+          {
+            "id": "sim",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 110.0
+              },
+              {
+                "time": "2026-10-21",
+                "value": 107.5
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-20",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-21",
+            "value": 100.0
+          }
+        ],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "dailycore_flat_live_replace",
+      "input": {
+        "selected": "dailycore",
+        "mode": "pct",
+        "accounts": {
+          "dailycore": {
+            "snapshots": [
+              {
+                "date": "2026-10-21",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "date": "2026-10-22",
+                "total_equity": 1050,
+                "allowance_total": 1000
+              }
+            ],
+            "live": {
+              "total_equity": 1200,
+              "allowance_total": 1000
+            }
+          }
+        },
+        "today": "2026-10-22"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-22",
+        "primary": "dailycore",
+        "series": [
+          {
+            "id": "dailycore",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-21",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-22",
+                "value": 120.0
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-21",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-22",
+            "value": 100.0
+          }
+        ],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "benchmark_overlay_live_standardized",
+      "input": {
+        "selected": "monthly",
+        "mode": "pct",
+        "accounts": {
+          "monthly": {
+            "snapshots": [
+              {
+                "date": "2026-10-21",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "date": "2026-10-22",
+                "total_equity": 1100,
+                "allowance_total": 1000
+              }
+            ],
+            "live": {
+              "total_equity": 1150,
+              "allowance_total": 1000
+            }
+          },
+          "benchmark": {
+            "snapshots": [
+              {
+                "at": "2026-10-21T20:00:00Z",
+                "total_equity": 1000,
+                "allowance_total": 1000
+              },
+              {
+                "at": "2026-10-22T20:00:00Z",
+                "total_equity": 1100,
+                "allowance_total": 1000
+              }
+            ],
+            "live": {
+              "total_equity": 1300,
+              "allowance_total": 1000
+            }
+          }
+        },
+        "today": "2026-10-23"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-23",
+        "primary": "monthly",
+        "series": [
+          {
+            "id": "monthly",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-21",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-22",
+                "value": 110.0
+              },
+              {
+                "time": "2026-10-23",
+                "value": 115.0
+              }
+            ]
+          },
+          {
+            "id": "benchmark",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-21",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-22",
+                "value": 110.0
+              },
+              {
+                "time": "2026-10-23",
+                "value": 130.0
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-21",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-22",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-23",
+            "value": 100.0
+          }
+        ],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    },
+    {
+      "name": "asof_tracks_primary_not_latest_overlay",
+      "input": {
+        "selected": "monthly",
+        "mode": "pct",
+        "accounts": {
+          "monthly": {
+            "snapshots": [
+              {
+                "date": "2026-10-20",
+                "total_equity": 1000.0,
+                "allowance_total": 1000.0
+              },
+              {
+                "date": "2026-10-21",
+                "total_equity": 1100.0,
+                "allowance_total": 1000.0
+              }
+            ],
+            "live": null
+          },
+          "benchmark": {
+            "snapshots": [
+              {
+                "at": "2026-10-20T20:00:00Z",
+                "total_equity": 1000.0,
+                "allowance_total": 1000.0
+              },
+              {
+                "at": "2026-10-22T20:00:00Z",
+                "total_equity": 1100.0,
+                "allowance_total": 1000.0
+              }
+            ],
+            "live": {
+              "total_equity": 1200.0,
+              "allowance_total": 1000.0
+            }
+          }
+        },
+        "today": "2026-10-23"
+      },
+      "expected": {
+        "empty": false,
+        "asOf": "2026-10-21",
+        "primary": "monthly",
+        "series": [
+          {
+            "id": "monthly",
+            "primary": true,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-21",
+                "value": 110.0
+              }
+            ]
+          },
+          {
+            "id": "benchmark",
+            "primary": false,
+            "data": [
+              {
+                "time": "2026-10-20",
+                "value": 100.0
+              },
+              {
+                "time": "2026-10-22",
+                "value": 110.0
+              },
+              {
+                "time": "2026-10-23",
+                "value": 120.0
+              }
+            ]
+          }
+        ],
+        "contributed": [
+          {
+            "time": "2026-10-20",
+            "value": 100.0
+          },
+          {
+            "time": "2026-10-21",
+            "value": 100.0
+          }
+        ],
+        "warnings_min": 0,
+        "warning_contains": null
+      }
+    }
+  ],
+  "legacy_golden": {
+    "provenance": {
+      "baseline_index_sha256": "205f0f81036ae2a65b90b3ac946a3ae0981d4733c3768036a42330225b194661",
+      "baseline_workspace_css_sha256": "f70f06ac6c6d22c0e747f852f09b6190e657dfda62c7bf0f52163a0a424361f7",
+      "fixture_sha256": "640e9b964e653708e12b4665dd7683a5e15f8dde2870e75ec8383c2703d13747",
+      "fixed_today": "2026-10-30",
+      "capture_method": "DEV-ONLY, outside the committed tests: extracted the real legacy loadSimEquity/loadMonthlyEquity/loadDailyCoreEquity plus withLiveToday/mddOf from /tmp/opencode/phase3b-baseline/static/index.html, ran them with deterministic API/LightweightCharts/DOM stubs and a fixed Date, and recorded setData payloads. The committed tests only read the pinned values below; they never need /tmp.",
+      "fixture_source": "tests/fixtures/ui_phase3.json (populated mode)"
+    },
+    "mdd_of_sim_equity_pct": 17.101550790720655,
+    "with_live_today_sample": [
+      {
+        "time": "2026-10-28",
+        "value": 1,
+        "contributed": 1
+      },
+      {
+        "time": "2026-10-30",
+        "value": 3,
+        "contributed": 2
+      }
+    ],
+    "allowed_differences": [
+      "Daily Sim and DCA benchmark: legacy plotted raw intraday `at` timestamps (duplicate timestamps possible) and the Daily Sim chart never appended/replaced the live valuation on the DCA overlay. The shared comparator standardizes every curve to one point per UTC day (last input row wins) and applies the provided live mark. Values for the same UTC day's last recorded mark are unchanged.",
+      "Daily-Core and Monthly benchmark overlays: legacy already deduped by day and applied live. The shared comparator produces the same values; the legacy raw intraday path is intentionally not reproduced.",
+      "Pct mode: legacy `toPct` fell back to the USD equity value when contributed <= 0, silently mixing units. The shared comparator omits those pct points and emits a warning. USD mode is unchanged and keeps the actual equity/contribution values.",
+      "Legacy x-axis: Sim/DCA used epoch-second timestamps; the shared comparator uses UTC YYYY-MM-DD date strings on every curve. This is presentation-only."
+    ],
+    "pins": [
+      {
+        "selected": "sim",
+        "mode": "pct",
+        "time": "2026-08-31",
+        "value": 111.975,
+        "source": "legacy sim primary"
+      },
+      {
+        "selected": "sim",
+        "mode": "pct",
+        "time": "2026-10-30",
+        "value": 111.4977,
+        "source": "legacy sim primary (live today)"
+      },
+      {
+        "selected": "monthly",
+        "mode": "pct",
+        "time": "2026-08-31",
+        "value": 109.69,
+        "source": "legacy monthly primary"
+      },
+      {
+        "selected": "monthly",
+        "mode": "pct",
+        "time": "2026-10-30",
+        "value": 92.55325,
+        "source": "legacy monthly primary (live today)"
+      },
+      {
+        "selected": "dailycore",
+        "mode": "pct",
+        "time": "2026-08-31",
+        "value": 105.26666666666667,
+        "source": "legacy dailycore primary"
+      },
+      {
+        "selected": "dailycore",
+        "mode": "pct",
+        "time": "2026-10-30",
+        "value": 94.28445454545455,
+        "source": "legacy dailycore primary (live today)"
+      },
+      {
+        "selected": "sim",
+        "mode": "usd",
+        "time": "2026-08-31",
+        "value": 8958.0,
+        "source": "legacy sim primary"
+      },
+      {
+        "selected": "sim",
+        "mode": "usd",
+        "time": "2026-10-30",
+        "value": 11149.77,
+        "source": "legacy sim primary (live today)"
+      },
+      {
+        "selected": "monthly",
+        "mode": "usd",
+        "time": "2026-08-31",
+        "value": 10969.0,
+        "source": "legacy monthly primary"
+      },
+      {
+        "selected": "monthly",
+        "mode": "usd",
+        "time": "2026-10-30",
+        "value": 11106.39,
+        "source": "legacy monthly primary (live today)"
+      },
+      {
+        "selected": "dailycore",
+        "mode": "usd",
+        "time": "2026-08-31",
+        "value": 9474.0,
+        "source": "legacy dailycore primary"
+      },
+      {
+        "selected": "dailycore",
+        "mode": "usd",
+        "time": "2026-10-30",
+        "value": 10371.29,
+        "source": "legacy dailycore primary (live today)"
+      }
+    ],
+    "overlay_pins": [
+      {
+        "id": "benchmark",
+        "mode": "pct",
+        "time": "2026-08-31",
+        "value": 89.1,
+        "source": "legacy sim/monthly/dailycore overlay"
+      },
+      {
+        "id": "benchmark",
+        "mode": "pct",
+        "time": "2026-10-30",
+        "value": 133.98,
+        "source": "legacy monthly/dailycore overlay (live)",
+        "allowed_difference": "legacy sim overlay showed 46.43333... because it omitted live"
+      },
+      {
+        "id": "sim",
+        "mode": "pct",
+        "time": "2026-10-30",
+        "value": 111.4977
+      },
+      {
+        "id": "monthly",
+        "mode": "pct",
+        "time": "2026-10-30",
+        "value": 92.55325
+      },
+      {
+        "id": "dailycore",
+        "mode": "pct",
+        "time": "2026-10-30",
+        "value": 94.28445454545455
+      },
+      {
+        "id": "benchmark",
+        "mode": "usd",
+        "time": "2026-08-31",
+        "value": 891.0
+      },
+      {
+        "id": "benchmark",
+        "mode": "usd",
+        "time": "2026-10-30",
+        "value": 4019.4
+      }
+    ],
+    "golden_inputs": {
+      "today": "2026-10-30",
+      "selected_modes": [
+        [
+          "sim",
+          "pct"
+        ],
+        [
+          "sim",
+          "usd"
+        ],
+        [
+          "monthly",
+          "pct"
+        ],
+        [
+          "monthly",
+          "usd"
+        ],
+        [
+          "dailycore",
+          "pct"
+        ],
+        [
+          "dailycore",
+          "usd"
+        ]
+      ],
+      "mapping": {
+        "sim": {
+          "snapshots": "portfolios.sim.equity",
+          "live": "portfolios.sim.status"
+        },
+        "monthly": {
+          "snapshots": "portfolios.monthly.equity",
+          "live": "portfolios.monthly.status"
+        },
+        "dailycore": {
+          "snapshots": "portfolios.daily_core.equity",
+          "live": "portfolios.daily_core.status"
+        },
+        "benchmark": {
+          "snapshots": "portfolios.sim.benchmark_equity",
+          "live": "portfolios.sim.benchmark"
+        }
+      }
+    }
+  },
+  "source_guards": {
+    "index_path": "static/index.html",
+    "functions": [
+      {
+        "name": "mddOf",
+        "start_marker": "        function mddOf(points) {",
+        "end_marker": "        // Small caption under each equity chart",
+        "sha256": "237c6ebde46f9af4c6078aec5511afa57805396a78dbcf462d2ba94c9e0641dd"
+      },
+      {
+        "name": "savings_block_all_functions_and_math",
+        "start_marker": "        // ===================== Savings tracker (real money, EUR) =====================",
+        "end_marker": "        // ===================== Monthly qv-mom portfolio =====================",
+        "sha256": "6438c993c37b72081c87e3b53880346dfab2672e66c36b8f76d704a4f983dd7a"
+      },
+      {
+        "name": "news_consult_block_renderNewsConsult_and_consultNews",
+        "start_marker": "        // --- Type-D material-news consult (one real agent run per click) ---",
+        "end_marker": "        async function backfillMonthly() {",
+        "sha256": "5b4db3c641617c9e4f1365802659a6138b9a63965ee862eb7e79879debfe08b1"
+      }
+    ]
+  },
+  "positions_cases": [
+    {
+      "name": "empty_standard",
+      "positions": [],
+      "options": {
+        "emptyText": "No open positions \u2014 waiting for first rebalance."
+      },
+      "expected_html": "<div class=\"sim-empty\">No open positions \u2014 waiting for first rebalance.</div>"
+    },
+    {
+      "name": "standard_columns_and_formatting",
+      "positions": [
+        {
+          "ticker": "AAPL",
+          "shares": 1.5,
+          "avg_cost": 100,
+          "current_price": 110,
+          "value": 165,
+          "pnl_pct": 10
+        },
+        {
+          "ticker": "MSFT",
+          "shares": 2,
+          "avg_cost": 200,
+          "current_price": 190,
+          "value": 380,
+          "pnl_pct": -5
+        }
+      ],
+      "options": {
+        "emptyText": "none"
+      },
+      "expected_headers": [
+        "Ticker",
+        "Shares",
+        "Avg Cost",
+        "Price",
+        "Value",
+        "P&L%"
+      ],
+      "expected_rows": [
+        [
+          "AAPL",
+          "1.5000",
+          "$100.00",
+          "$110.00",
+          "$165.00",
+          "+10.00%"
+        ],
+        [
+          "MSFT",
+          "2.0000",
+          "$200.00",
+          "$190.00",
+          "$380.00",
+          "-5.00%"
+        ]
+      ],
+      "expected_row_classes": [
+        "buy",
+        "sell"
+      ],
+      "forbid_weight_column": true
+    },
+    {
+      "name": "dailycore_rank_weight_and_escaping",
+      "positions": [
+        {
+          "ticker": "<BAD>&",
+          "shares": 2.5,
+          "avg_cost": 10,
+          "current_price": 20,
+          "value": 50,
+          "pnl_pct": 0
+        }
+      ],
+      "options": {
+        "showRank": true,
+        "showWeight": true,
+        "rankMap": {},
+        "totalEquity": 200
+      },
+      "expected_headers": [
+        "Ticker",
+        "Rank",
+        "Shares",
+        "Avg Cost",
+        "Price",
+        "Value",
+        "Weight",
+        "P&L%"
+      ],
+      "expected_rows": [
+        [
+          "&lt;BAD&gt;&amp;",
+          "\u2014",
+          "2.5000",
+          "$10.00",
+          "$20.00",
+          "$50.00",
+          "25.0%",
+          "+0.00%"
+        ]
+      ],
+      "expected_row_classes": [
+        ""
+      ]
+    },
+    {
+      "name": "dailycore_weight_zero_total_equity",
+      "positions": [
+        {
+          "ticker": "JPM",
+          "shares": 1,
+          "avg_cost": 10,
+          "current_price": 10,
+          "value": 10,
+          "pnl_pct": 0
+        }
+      ],
+      "options": {
+        "showRank": true,
+        "showWeight": true,
+        "rankMap": {
+          "JPM": 4
+        },
+        "totalEquity": 0
+      },
+      "expected_headers": [
+        "Ticker",
+        "Rank",
+        "Shares",
+        "Avg Cost",
+        "Price",
+        "Value",
+        "Weight",
+        "P&L%"
+      ],
+      "expected_rows": [
+        [
+          "JPM",
+          "4",
+          "1.0000",
+          "$10.00",
+          "$10.00",
+          "$10.00",
+          "0.0%",
+          "+0.00%"
+        ]
+      ],
+      "expected_row_classes": [
+        ""
+      ]
+    }
+  ],
+  "savings_cases": [
+    {
+      "name": "eur_passthrough",
+      "mode": "eur",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 1005.0, "contributed": 1000.0, "positions_value": 400.0},
+        {"date": "2026-10-02", "total_equity": 1010.0, "contributed": 1000.0, "positions_value": 405.0}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": 400.0, "value": 402.0},
+        {"date": "2026-10-02", "allocated": 400.0, "value": 408.0}
+      ]}
+    },
+    {
+      "name": "pct_is_value_over_invested_not_contributed",
+      "mode": "pct",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 1005.0, "contributed": 1000.0, "positions_value": 400.0},
+        {"date": "2026-10-02", "total_equity": 1050.0, "contributed": 1000.0, "positions_value": 450.0}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": 400.0, "value": 402.0},
+        {"date": "2026-10-02", "allocated": 400.0, "value": 408.0}
+      ]}
+    },
+    {
+      "name": "pct_omits_days_without_invested_basis",
+      "mode": "pct",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 1000.0, "contributed": 1000.0, "positions_value": 0.0},
+        {"date": "2026-10-02", "total_equity": 1000.0, "contributed": 1000.0, "positions_value": 10.0},
+        {"date": "2026-10-03", "total_equity": 1040.0, "contributed": 1000.0, "positions_value": 40.0}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-02", "allocated": 0.0, "value": 0.0},
+        {"date": "2026-10-03", "allocated": 40.0, "value": 44.0}
+      ]}
+    },
+    {
+      "name": "pct_omitted_counts_days_not_rows",
+      "mode": "pct",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 1000.0, "contributed": 1000.0, "positions_value": 30.0},
+        {"date": "2026-10-02", "total_equity": 1000.0, "contributed": 0.0, "positions_value": 40.0}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": 30.0, "value": 30.9},
+        {"date": "2026-10-02", "allocated": 0.0, "value": 0.0}
+      ]}
+    },
+    {
+      "name": "pct_asof_tracks_last_plotted_day",
+      "mode": "pct",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 100.0, "contributed": 100.0, "positions_value": 40.0},
+        {"date": "2026-10-02", "total_equity": 0.0, "contributed": 0.0, "positions_value": 0.0}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": 40.0, "value": 40.0}
+      ]}
+    },
+    {
+      "name": "pct_positions_null_keeps_baseline_and_mirror",
+      "mode": "pct",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 1005.0, "contributed": 1000.0, "positions_value": null}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": 100.0, "value": 104.0}
+      ]}
+    },
+    {
+      "name": "pct_zero_positions_with_basis_is_not_zero_percent",
+      "mode": "pct",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 1000.0, "contributed": 1000.0, "positions_value": 0.0}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": 200.0, "value": 197.24}
+      ]}
+    },
+    {
+      "name": "pct_duplicate_days_last_row_wins",
+      "mode": "pct",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 900.0, "contributed": 1000.0, "positions_value": 300.0},
+        {"date": "2026-10-01", "total_equity": 1005.0, "contributed": 1000.0, "positions_value": 400.0}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": 400.0, "value": 402.0}
+      ]}
+    },
+    {
+      "name": "numeric_strings_are_accepted_like_the_paper_module",
+      "mode": "pct",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": "1005.0", "contributed": "1000.0", "positions_value": "400.0"}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": "400.0", "value": "402.0"}
+      ]}
+    },
+    {
+      "name": "last_row_per_day_wins",
+      "mode": "eur",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 900.0, "contributed": 1000.0, "positions_value": 300.0},
+        {"date": "2026-10-01", "total_equity": 1005.0, "contributed": 1000.0, "positions_value": 400.0}
+      ],
+      "mirror": null
+    },
+    {
+      "name": "invalid_rows_skipped_never_zero_filled",
+      "mode": "eur",
+      "snapshots": [
+        {"date": "2026-02-31", "total_equity": 100.0, "contributed": 100.0, "positions_value": 10.0},
+        {"date": "2026-10-01", "total_equity": null, "contributed": 100.0, "positions_value": 10.0},
+        {"date": "2026-10-02", "total_equity": 100.0, "contributed": 100.0, "positions_value": null}
+      ],
+      "mirror": {"curve": [
+        {"date": "2026-10-01", "allocated": 0.0, "value": 0.0},
+        {"date": "2026-10-02", "allocated": 25.0, "value": 0.0}
+      ]}
+    },
+    {
+      "name": "unknown_mode_falls_back_to_eur",
+      "mode": "percent",
+      "snapshots": [
+        {"date": "2026-10-01", "total_equity": 1005.0, "contributed": 1000.0, "positions_value": 400.0}
+      ],
+      "mirror": null
+    }
+  ]
+}

@@ -2,6 +2,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:////data/trading.db"
+    # Second, disposable SQLite database (the DEV sandbox). Selected per
+    # request via the ts_db cookie; history-rewriting actions (backfills,
+    # resets) are refused on PROD and only run here. Empty = feature
+    # disabled: no dev engine, no switch, every request is served by PROD.
+    # Must be a file path (never :memory:) and never the PROD file — both
+    # are refused at startup with an error log.
+    database_url_dev: str = ""
     # auto = Twelve Data when TWELVE_DATA_API_KEY is set, else yfinance.
     # yfinance / twelvedata force one source (twelvedata requires a key).
     market_data_provider: str = "auto"
@@ -30,13 +37,60 @@ class Settings(BaseSettings):
     # legacy OLLAMA_URL / OLLAMA_MODEL settings are used as a single backend.
     llm_backends: str = ""
     llm_state_file: str = "/data/llm_state.json"
-    # Qwen3 thinking budget applied to OpenAI-compatible backends (llama-server).
-    # One of: low | medium | high | xhigh. Empty = leave server default untouched.
+    # Reasoning effort for the LLM wire. On a backend that declares
+    # chat_template_kwargs (local vLLM / llama-server) it maps to the
+    # Qwen3 thinking budget (low | medium | high | xhigh); on strict
+    # OpenAI-schema backends it rides VERBATIM as reasoning_effort — the
+    # supported vocabulary is SERVER-SPECIFIC (the LAN proxy's Mistral
+    # route takes none | low | high | xhigh | max and rejects medium;
+    # OpenAI takes medium but not xhigh/max), so set a value your server
+    # supports. Empty = the plain path, no reasoning field.
     llm_reasoning_effort: str = ""
 
     # --- SearXNG news search (optional) -------------------------------
     searxng_url: str = ""  # e.g. "http://your-server-ip:8081"; empty = disabled
     searxng_timeout: float = 10.0
+    # --- The shared searxng MCP tool server (the type-D material-news
+    # agent, app/newsagent.py; docs/sell-news-agent-design-2026-11-01.md).
+    # Base URL of the MCP (Streamable HTTP), e.g. "http://searxng-mcp:8808/mcp"
+    # on the stacks-shared docker network. Empty = the D step is disabled —
+    # the same convention as every integration.
+    searxng_mcp_url: str = ""
+    searxng_mcp_timeout_s: float = 30.0
+    # Where the nightly type-D shadow news scan (app/newsagent.py, wired
+    # into monthly.run_monthly_cycle) writes its artifacts — the JSONL
+    # consult log + the run artifact. The container is read-only except
+    # /data and /tmp, hence the /data default.
+    sim_news_out_dir: str = "/data/news-out"
+    # The NIGHTLY type-D scan's cadence gate (app/monthly.py, the run_news_scan
+    # call site): -1 (the default) = EVERY night — byte-identical to the
+    # pre-knob behavior; 0..4 = run the nightly scan ONLY on that UTC weekday
+    # (0=Monday .. 4=Friday, the same numbering as universe_sync_weekday).
+    # The scheduler itself runs at sim_run_hour UTC (23:30 UTC is already
+    # 00:30/01:30 the NEXT Vienna day) and the gate compares the run's UTC
+    # weekday — the knob is exact in UTC end-to-end. The gate is evaluated
+    # on TRADING nights only — the sim scheduler skips non-trading days
+    # before the cycle — so a gate day that is an NYSE holiday skips that
+    # week, and weekend values (5=Saturday, 6=Sunday) can NEVER fire: the
+    # gate warns about them below and fails OPEN (nightly), because a
+    # silently-never-running knob is fail-closed disguised as configured.
+    # The agent's per-run research is NEVER shaped (the design note's
+    # division of labor: the harness owns WHO and WHEN); this knob governs
+    # the WHEN only, in response to the observed Exa search spend (2026-11-02:
+    # 97 searches across 11 consults ≈ $2/night). Any other value also fails
+    # open (nightly) — the knob-off convention. NOT applied to the manual
+    # consult, the CLI, or the UI's background scan — on-demand runs are the
+    # operator's own spend decision.
+    sim_news_scan_weekday: int = -1
+
+    # Type-D EXECUTION (the 2026-11-04 promotion, docs/sell-news-agent-design
+    # entry of that date): when truthy, D-EXIT ledger rows fill at the first
+    # session strictly after their decision date on whichever PAPER book
+    # holds the name (monthly + daily-core), and the names are excluded from
+    # re-buys until the next completed month-end. Empty/0/false = the shadow
+    # phase exactly as before (fills stay NULL forever). The Savings book
+    # (real money) is out of scope regardless of this knob.
+    sim_news_execute: bool = False
 
     paper_trading: bool = True
 
@@ -62,7 +116,7 @@ class Settings(BaseSettings):
     sim_monthly_allowance: float = 1000.0
     sim_start_cash: float = 0.0
     sim_universe: str = "diversified-plus"
-    sim_strategy: str = "deterministic"  # deterministic | llm | hybrid
+    sim_strategy: str = "deterministic"  # deterministic only — the llm/hybrid whole-cycle modes are retired; a stale llm/hybrid value falls back to deterministic (logged) in sim.run_cycle
     sim_max_position_pct: float = 10.0
     sim_min_cash_pct: float = 5.0
     sim_max_positions: int = 10
@@ -76,10 +130,6 @@ class Settings(BaseSettings):
     # keep OFF until the scoring-side fix is evaluated on its own branch.
     sim_min_run_5d: float = 0.0
     sim_max_dist_above: float = 0.0
-    sim_llm_review_interval: int = 1  # consult the LLM every N cycles (1=daily, 5=weekly)
-    sim_llm_minimal_prompt: bool = False  # use the minimal system prompt (no methodology/regime rules)
-    sim_llm_mode_aware_prompt: bool = False  # use the mode-aware minimal prompt (engine owns exits; LLM adds BUYs only)
-    sim_llm_failure_marker: bool = False  # hybrid: consult the LLM only on engine failure (stop-out cascade / drawdown)
     # Fundamentals context (daily sim): show point-in-time ROE % and P/FCF per
     # candidate in the LLM's signals table. Missing fundamentals render as "-"
     # (neutral); the table is omitted entirely when off (zero prompt change).
@@ -89,6 +139,23 @@ class Settings(BaseSettings):
     # thin coverage) — only known-bad data blocks. Opt-in until the replay
     # A/B verdict (bull-window right-tail cost is the known risk class).
     sim_block_negative_roe: bool = False
+    # --- LLM sell layer (app/selllayer.py): the LLM as the SELL brain of the
+    # live paper accounts, EXECUTING (not just advising) at three decision
+    # moments — A: the sim's standing-stop fire, B: the monthly rebuild's
+    # band-drops, C: the monthly book's thesis breaks. Fail-safe everywhere:
+    # with the knob off (or no LLM backend configured) the engines behave
+    # exactly as without the layer. DECLARED default True: the account behaves
+    # exactly as today until a backend is configured (the no-backend
+    # short-circuit), then the layer goes live.
+    sim_llm_sell_layer: bool = True      # type A (sim standing-stop overlay)
+    sim_monthly_llm_sells: bool = True    # types B + C (monthly book overlay)
+    # Per-consult wall-clock bound (asyncio.wait_for) on top of the transport
+    # call — llm.chat's own timeout is the global 1200s setting, far too long
+    # for a nightly cycle.
+    sell_layer_timeout_s: float = 60.0
+    # Type-A defer cap: max consecutive DEFERs per position before the stop
+    # executes regardless (counted from the LlmSellDecision ledger).
+    sell_layer_max_defers: int = 2
     # Daily-core rank deployment: boost factor for the #1-ranked name's target
     # weight, decaying linearly to 1.0 at the band edge (rank N gets exactly
     # the equal weight). 0.5 = top name may hold 1.5x the equal weight while
@@ -130,6 +197,15 @@ class Settings(BaseSettings):
     # its price falls this fraction below its own peak since entry. Targets
     # momentum-sleeve crashes the market-trend brakes cannot see (§12).
     sim_daily_core_trailing_stop: float = 0.0
+    # thesis_break (bool, default False): the M5 fundamental thesis-break
+    # exit — when a holding's newly FILED fundamentals (filing-date PIT) would
+    # knock it out of the eligible frame's HARD gates (record missing,
+    # equity <= 0, TTM NI missing, shares missing, or ROE = TTM NI / equity
+    # <= 0), exit at the next session's open. Fundamental-only: F/P-FCF
+    # changes alone do NOT trigger (the value leg is a rank, not a gate), and
+    # the price-side gates (mcap, dollar_vol, momentum, staleness) are NOT
+    # re-checked intraday. Re-entry is unchanged (the monthly ranking's rules).
+    sim_daily_core_thesis_break: bool = False
     # basket_trend_days (0 = off): "gradient filter" — N-day rate-of-change of
     # the strategy's own target basket (equal-weight top-N candidates). Cash
     # out when the gradient stays negative for basket_confirm_days, re-enter
@@ -225,6 +301,18 @@ class Settings(BaseSettings):
     sim_monthly_min_history_days: int = 253  # trading days of valid closes required
     sim_monthly_cost_oneway: float = 0.0010  # paper friction, one-way bps on notional swapped
     sim_monthly_fundamentals_source: str = "edgar"  # edgar (US filers) + yfinance fallback | yfinance-only
+    # Price-age policy for the FACTOR ENGINES only (app/price_freshness.py is
+    # the one definition): a stored print older than this many CALENDAR days
+    # is not a current mark — a missing/stale quote is not a valid executable
+    # price. Rationale: factor prices are daily bars, so 10 calendar days is
+    # ~7 sessions — enough to bridge the US/EU holiday gaps including
+    # Thanksgiving week (Thu+Fri closed) and a weekend, while anything older
+    # than a full trading week+ is no longer "today's" price. Overshoot on
+    # this boundary only delays the visible stale flag by days, so the
+    # tighter default is the safer one. NOT used by the savings tracker (a
+    # real-money EUR ledger with its own owner) or the technical sim (its own
+    # raw-price contract, app/session.py) — factor marks/ranking/FX only.
+    factor_price_max_age_days: int = 10
 
     # --- SEC EDGAR fair-access contact ------------------------------------
     # SEC's edge blocks User-Agents without a contact email on www.sec.gov (the

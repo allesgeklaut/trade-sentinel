@@ -90,10 +90,6 @@ def _mark_fresh(ticker: str) -> None:
     _fresh_at[ticker] = time.monotonic()
 
 
-def fresh_count() -> int:
-    return len(_fresh_at)
-
-
 def _is_fresh(ticker: str, max_age_seconds: float, now: float) -> bool:
     return (now - _fresh_at.get(ticker, float("-inf"))) < max_age_seconds
 
@@ -117,6 +113,31 @@ def provider():
         if value=="twelvedata": raise ValueError("TWELVE_DATA_API_KEY is required when MARKET_DATA_PROVIDER=twelvedata")
         return "yfinance"
     return "twelvedata"
+
+# --- Candle provenance vocabulary -------------------------------------------
+# Every row written by _store_candles records the provenance of the values it
+# currently holds (the last write that touched it), never a guess about
+# history:
+#   source            the provider that ACTUALLY served the OHLCV. The
+#                     configured provider is not evidence: a Twelve Data
+#                     failure falls back to Yahoo for that request.
+#   adjustment_basis  the adjustment contract REQUESTED from the provider.
+#                     Both paths ask for split+dividend-adjusted bars, but
+#                     this records the request — not a verified corporate-
+#                     action history.
+SOURCE_YFINANCE = "yfinance"
+SOURCE_TWELVEDATA = "twelvedata"
+ADJUSTMENT_SPLIT_DIVIDEND = "split_dividend_adjusted"
+
+# SQLite caps one SQL statement at 32,766 host parameters. The candle upsert
+# binds 10 parameters per row (ticker, timestamp, open, high, low, close,
+# volume, source, adjustment_basis, ingested_at — raise this count if a column
+# is added), so a single multi-row statement fits at most 3,276 rows. 2,000
+# rows/chunk = 20,000 parameters stays safely under the cap with headroom, and
+# an uncached 10y (3,650 bars) or max (5,000 bars) payload becomes a few
+# chunks instead of one statement that always fails with
+# "too many SQL variables".
+CANDLE_UPSERT_MAX_ROWS = 2000
 
 # Range presets: key → (yfinance period, twelvedata outputsize)
 RANGES = {
@@ -214,40 +235,101 @@ async def search(q):
     return await asyncio.to_thread(yahoo_search,q)
 
 async def refresh(ticker, period="2y"):
+    """Fetch and cache candles for one ticker via the configured provider.
+
+    The stored provenance names the provider that ACTUALLY served the bars:
+    Twelve Data only when its request succeeded, Yahoo everywhere else (forced
+    yfinance provider, Twelve Data error, or an exhausted daily quota).
+    """
     if period not in RANGES: raise ValueError(f"Unsupported range: {period}")
     yf_period, td_output = RANGES[period]
+    source = SOURCE_YFINANCE  # every non-Twelve-success path is Yahoo
     if provider()=="yfinance":
         values=await asyncio.to_thread(yahoo_history,ticker,yf_period)
     elif await _twelve_limiter.acquire():
         try:
             values=await _twelve_history(ticker,td_output)
+            source = SOURCE_TWELVEDATA
         except Exception as e:
             logger.warning("twelvedata refresh failed for %s (%s) — falling back to yfinance",ticker,e)
             values=await asyncio.to_thread(yahoo_history,ticker,yf_period)
     else:
         # Daily budget spent — yfinance for the rest of the day.
         values=await asyncio.to_thread(yahoo_history,ticker,yf_period)
-    await _store_candles(ticker, values)
+    await _store_candles(ticker, values, source=source,
+                         adjustment_basis=ADJUSTMENT_SPLIT_DIVIDEND)
     _mark_fresh(ticker)
 
-async def _store_candles(ticker, values):
-    """Upsert normalized candles for one ticker."""
+async def _store_candles(ticker, values, *, source=None, adjustment_basis=None,
+                         ingested_at=None):
+    """Upsert normalized candles for one ticker, with their provenance.
+
+    ``values`` are plain provider rows ({timestamp, open, high, low, close,
+    volume}). Only those OHLCV fields are copied, so the caller's payload is
+    never mutated and stray keys cannot reach the INSERT. ``volume`` keeps the
+    historical behaviour of the "normalized row" contract: the ``Candle``
+    column default (0) applies only when the row OMITS the key; any explicit
+    value is passed through unchanged (never silently coerced), so an invalid
+    one still fails at the DB exactly as it did before.
+
+    ``source``/``adjustment_basis``/``ingested_at`` describe the values being
+    written and are persisted in the same statement as the OHLCV — on insert
+    and on conflict, so a refresh can never update prices while leaving
+    contradictory provenance behind. ``ingested_at`` defaults to the UTC time
+    of this write, assigned here (the storage layer) rather than by providers.
+
+    The upsert runs in ``CANDLE_UPSERT_MAX_ROWS``-row statements (SQLite's
+    per-statement host-parameter cap; a 10y/max provider payload no longer
+    fits in one), all inside the SAME session/transaction with a single commit
+    at the end: a failure in any chunk rolls the whole store back, exactly
+    like the previous single-statement contract.
+
+    A direct legacy call without metadata is still supported: it stores the
+    OHLCV normally and records source/basis NULL — unknown, never guessed —
+    because the updated content's origin was not declared. Rows that no write
+    touches keep what they have; rows predating provenance tracking keep NULL
+    (init_db backfills nothing).
+    """
+    ingested = datetime.now(UTC) if ingested_at is None else ingested_at
     async with Session() as s:
         if values:
-            stmt = sqlite_insert(Candle).values(
-                [{"ticker": ticker, **x} for x in values]
-            )
-            stmt = stmt.on_conflict_do_update(
-                index_elements=["ticker", "timestamp"],
-                set_={
-                    "open": stmt.excluded.open,
-                    "high": stmt.excluded.high,
-                    "low": stmt.excluded.low,
-                    "close": stmt.excluded.close,
-                    "volume": stmt.excluded.volume,
-                },
-            )
-            await s.execute(stmt)
+            rows = [
+                {
+                    "ticker": ticker,
+                    "timestamp": x["timestamp"],
+                    "open": x["open"],
+                    "high": x["high"],
+                    "low": x["low"],
+                    "close": x["close"],
+                    # Missing key only: keeps the old column default (0) for
+                    # normalized direct-call rows while an explicit value
+                    # (even an invalid one) is never silently coerced.
+                    "volume": x["volume"] if "volume" in x else 0,
+                    "source": source,
+                    "adjustment_basis": adjustment_basis,
+                    "ingested_at": ingested,
+                }
+                for x in values
+            ]
+            # One transaction, one commit: chunks are only a parameter-cap
+            # workaround, never a partial-write boundary.
+            for start in range(0, len(rows), CANDLE_UPSERT_MAX_ROWS):
+                chunk = rows[start:start + CANDLE_UPSERT_MAX_ROWS]
+                stmt = sqlite_insert(Candle).values(chunk)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["ticker", "timestamp"],
+                    set_={
+                        "open": stmt.excluded.open,
+                        "high": stmt.excluded.high,
+                        "low": stmt.excluded.low,
+                        "close": stmt.excluded.close,
+                        "volume": stmt.excluded.volume,
+                        "source": stmt.excluded.source,
+                        "adjustment_basis": stmt.excluded.adjustment_basis,
+                        "ingested_at": stmt.excluded.ingested_at,
+                    },
+                )
+                await s.execute(stmt)
         await s.commit()
 
 async def refresh_yfinance(ticker, period="2y"):
@@ -256,11 +338,14 @@ async def refresh_yfinance(ticker, period="2y"):
     Used by the bulk paths that must NOT touch the metered provider (the
     screener's universe update/refresh/deep-load, and the daily sim/day-core
     universe refreshes when they don't reuse the nightly prefetch). One S&P 500
-    pass is ~500 requests; Yahoo is free and unmetered for this.
+    pass is ~500 requests; Yahoo is free and unmetered for this. Provenance is
+    recorded as Yahoo even when MARKET_DATA_PROVIDER=twelvedata.
     """
     if period not in RANGES: raise ValueError(f"Unsupported range: {period}")
     yf_period, _ = RANGES[period]
-    await _store_candles(ticker, await asyncio.to_thread(yahoo_history,ticker,yf_period))
+    await _store_candles(ticker, await asyncio.to_thread(yahoo_history,ticker,yf_period),
+                         source=SOURCE_YFINANCE,
+                         adjustment_basis=ADJUSTMENT_SPLIT_DIVIDEND)
     _mark_fresh(ticker)
 async def candles(ticker, period=None):
     async with Session() as s:

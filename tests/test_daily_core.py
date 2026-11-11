@@ -12,7 +12,7 @@ data so they don't touch the real data volume. They cover:
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 
 import pandas as pd
 import pytest
@@ -48,12 +48,30 @@ async def mem_db(monkeypatch):
     await engine.dispose()
 
 
-@pytest.fixture
-def fake_ranking(monkeypatch):
-    """Patch the ranking loaders so compute_targets sees a tiny fixed frame.
+def _flat_100_maps(monkeypatch):
+    """Stub both price maps flat at $100: ``monthly._price_usd_map`` supplies
+    the marks (rule 3: the session's close) and ``monthly._open_usd_map`` the
+    fills (rule 2: the session's strict exact-date OPEN). Constant prices
+    make the two agree, so a booked weight equals what its fill spent."""
+    async def fake_price_map(tickers, asof=None):
+        return {t: 100.0 for t in tickers}
 
-    The frame is what monthly.eligible_frame/_qv_order/_band_fill consume:
-    index=ticker, columns roe/p_fcf/mom/... with an `eligible` flag.
+    async def fake_open_map(tickers, d):
+        return {t: 100.0 for t in tickers}
+    monkeypatch.setattr(monthly, "_price_usd_map", fake_price_map)
+    monkeypatch.setattr(monthly, "_open_usd_map", fake_open_map)
+
+
+@pytest.fixture
+def fake_ranking(monkeypatch, tmp_path):
+    """Patch the DECISION pipeline behind a tiny fixed ranking.
+
+    The live daily-core decision path is: ``_stored_month_end(now)`` resolves
+    the decision month-end (the completed month-end <= S under the month-end
+    band policy), ``_core_frame(me)`` builds the eligibility frame + ranking
+    order for it, and the deployment hysteresis-selects picks, fills at the
+    session's strict open and values at the session's close. The fakes pin
+    the month-end and the 4-name order; both price maps are flat $100.
     """
     frame = pd.DataFrame(
         {
@@ -68,14 +86,18 @@ def fake_ranking(monkeypatch):
         },
         index=pd.Index(["AAA", "BBB", "CCC", "DDD"], name="ticker"),
     )
-    async def fake_targets(force=False):
-        band = ["AAA", "BBB", "CCC", "DDD"]
-        async with daily_core.Session() as s:
-            held = [p.ticker for p in
-                    (await s.scalars(select(daily_core.DailyCorePosition))).all()]
-        picks = monthly._band_fill(band, held, 3, 4)
-        return band, picks, frame
-    monkeypatch.setattr(daily_core, "compute_targets", fake_targets)
+    me = pd.Timestamp("2026-09-30")
+
+    async def fake_stored_me(_now):
+        return me
+
+    async def fake_core_frame(_me):
+        return frame, ["AAA", "BBB", "CCC", "DDD"]
+
+    monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(daily_core, "_stored_month_end", fake_stored_me)
+    monkeypatch.setattr(daily_core, "_core_frame", fake_core_frame)
+    _flat_100_maps(monkeypatch)
     return frame
 
 
@@ -136,6 +158,145 @@ class TestAllowance:
 # Deployment
 # ---------------------------------------------------------------------------
 
+
+@pytest.fixture
+def ten_slot_ranking(monkeypatch, tmp_path):
+    """A 25-name ranking, deliberately NON-alphabetical, behind the live
+    decision pipeline (``_stored_month_end`` + ``_core_frame``) so the
+    ten-slot contract can be asserted against a realistic ranking where
+    rank order != ticker order."""
+    order = ["Z01", "M02", "C03", "P04", "B05", "A06", "Z07", "Q08", "K09",
+             "J10", "I11", "H12", "G13", "F14", "E15", "D16", "C17", "B18",
+             "A19", "Z20", "Y21", "X22", "W23", "V24", "U25"]
+    me = pd.Timestamp("2026-09-30")
+
+    async def fake_stored_me(_now):
+        return me
+
+    async def fake_core_frame(_me):
+        return None, order
+
+    monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(daily_core, "_stored_month_end", fake_stored_me)
+    monkeypatch.setattr(daily_core, "_core_frame", fake_core_frame)
+    _flat_100_maps(monkeypatch)
+    return order
+
+
+async def _seed_dc(cash: float, positions: list[tuple[str, float, float]]):
+    async with daily_core.Session() as s:
+        acc = await daily_core._account(s)
+        acc.cash = cash
+        await s.commit()
+        for t, sh, avg in positions:
+            s.add(daily_core.DailyCorePosition(ticker=t, shares=sh, avg_cost=avg))
+        await s.commit()
+
+
+async def _dc_positions() -> list[tuple[str, float]]:
+    async with daily_core.Session() as s:
+        rows = (await s.scalars(select(daily_core.DailyCorePosition))).all()
+        return sorted((p.ticker, p.shares) for p in rows)
+
+
+def _flat_px_100(tickers):
+    return _px({t: 100.0 for t in tickers})
+
+
+class TestTenSlotContract:
+    """The live deployment must fund the hysteresis-selected picks (never
+    band[:target_n]) and never grow the book past the ten-slot target,
+    however incomplete the release state is (audit P0-D)."""
+
+    def test_ten_retained_plus_cash_stays_ten(self, mem_db, ten_slot_ranking,
+                                              monkeypatch):
+        """Audit P0-D exact reproduction: ten valid retained positions (the
+        ranking's ranks 2-11) plus one fresh monthly cash cycle stay TEN —
+        the old band[:target_n] buy loop bought rank-1 Z01, the one name
+        the picks never chose, and produced the 'resulting 11'."""
+        held = ["M02", "C03", "P04", "B05", "A06", "Z07", "Q08", "K09",
+                "J10", "I11"]
+        asyncio.run(_seed_dc(1000.0, [(t, 10.0, 100.0) for t in held]))
+
+        async def scenario():
+            return await daily_core.run_deployment()
+        r = asyncio.run(scenario())
+
+        traded = [(t["ticker"], t["side"]) for t in r["trades"]]
+        assert ("Z01", "BUY") not in traded      # the 11th-name buy is gone
+        assert all(side == "BUY" for _, side in traded)   # no phantom sells
+        # fresh cash reinforces exactly the retained picks, then stops
+        assert r["valuation"]["cash"] == pytest.approx(0.0, abs=1.0)
+        pos = asyncio.run(_dc_positions())
+        assert [t for t, _ in pos] == sorted(held)     # still exactly ten
+
+    def test_failed_release_keeps_slot_no_replacement_eleventh(
+            self, mem_db, ten_slot_ranking, monkeypatch):
+        """`_exec_sell` returns None when no usable price exists (no candle,
+        zero avg_cost): the released slot stays occupied and filling the
+        planned replacement anyway created an 11th holding. The BUY loop
+        counts the ACTUAL post-SELL positions."""
+        held = ["M02", "C03", "P04", "B05", "A06", "Z07", "Q08", "K09",
+                "J10", "ZZZ"]  # ZZZ: out of band, unpriceable, avg_cost 0
+        asyncio.run(_seed_dc(1000.0, [(t, 10.0, 100.0) for t in held[:9]]
+                            + [("ZZZ", 5.0, 0.0)]))
+        # ZZZ has no stored bar this session: both the strict-open fill map
+        # (rule 2) and the mark map (rule 3) return None for it, so the mark
+        # falls back to avg_cost and the release leg gets NO executable quote.
+        async def fake_price_map(tickers, asof=None):
+            return {t: 100.0 for t in tickers if t != "ZZZ"}
+
+        async def fake_open_map(tickers, d):
+            return {t: 100.0 for t in tickers if t != "ZZZ"}
+        monkeypatch.setattr(monthly, "_price_usd_map", fake_price_map)
+        monkeypatch.setattr(monthly, "_open_usd_map", fake_open_map)
+
+        async def scenario():
+            return await daily_core.run_deployment()
+        r = asyncio.run(scenario())
+
+        sells = [t for t in r["trades"] if t["side"] == "SELL"]
+        assert sells == []                     # the release failed: no price
+        buys = [t["ticker"] for t in r["trades"] if t["side"] == "BUY"]
+        assert "Z01" not in buys               # the planned replacement...
+        assert len(buys) == 0                  # ...is not bought: no free slot
+        pos = asyncio.run(_dc_positions())
+        assert [t for t, _ in pos] == sorted(held)   # book unchanged, still ten
+
+    def test_rank_first_funding_limited_cash(self, mem_db, ten_slot_ranking,
+                                             monkeypatch):
+        """With limited cash the deployment funds the BEST-RANKED picks —
+        never the alphabetically-first ones (deployment is rank-ordered,
+        not _band_fill's sorted())."""
+        held = ["C03", "P04"]  # ranks 3-4, both at weight
+        asyncio.run(_seed_dc(250.0, [(t, 10.0, 100.0) for t in held]))
+
+        async def scenario():
+            return await daily_core.run_deployment()
+        r = asyncio.run(scenario())
+
+        buys = [t["ticker"] for t in r["trades"] if t["side"] == "BUY"]
+        # equity 2250 -> weight 225: Z01 takes 225, M02 the remaining 25 —
+        # in RANK order (alphabetical funding would have bought A06 first)
+        assert buys == ["Z01", "M02"]
+        pos = asyncio.run(_dc_positions())
+        assert [t for t, _ in pos] == sorted(held + ["Z01", "M02"])
+
+    def test_backfill_respects_ten_slot_target(self, mem_db, fake_market,
+                                               monkeypatch):
+        """The persisted backfill replay keeps positions <= target_n at
+        every point: month 1 builds the book, month 2 only tops up/fills."""
+        monkeypatch.setattr(daily_core, "_current_month", lambda: "2026-08")
+        r = asyncio.run(daily_core.backfill(start="2026-07-01"))
+        assert r["ok"] is True
+
+        async def check():
+            async with daily_core.Session() as s:
+                rows = (await s.scalars(select(daily_core.DailyCorePosition))).all()
+                assert 0 < len(rows) <= settings.sim_monthly_target_n
+        asyncio.run(check())
+
+
 class TestDeployment:
     def test_rank_first_topup(self, mem_db, fake_ranking, monkeypatch):
         """Free cash deploys best-rank-first toward equal weight
@@ -145,9 +306,6 @@ class TestDeployment:
                 acc = await daily_core._account(s)
                 acc.cash = 3000.0
                 await s.commit()
-            monkeypatch.setattr(
-                monthly, "_price_usd_map",
-                lambda tickers: _px({t: 100.0 for t in tickers}))
             r = await daily_core.run_deployment()
             assert r["deployed"] is True
             # weight = 3000/10 = 300 per slot; the 4-ticker fake ranking
@@ -169,9 +327,6 @@ class TestDeployment:
                 # worth: equity 1200 → weight 120 → all 4 topped to 120.
                 acc.cash = 1200.0
                 await s.commit()
-            monkeypatch.setattr(
-                monthly, "_price_usd_map",
-                lambda tickers: _px({t: 100.0 for t in tickers}))
             r = await daily_core.run_deployment()
             vals = {t["ticker"]: t["cost"] for t in r["trades"]}
             assert vals == {"AAA": 120.0, "BBB": 120.0, "CCC": 120.0, "DDD": 120.0}
@@ -189,9 +344,6 @@ class TestDeployment:
                 await s.commit()
             # BBB at 100/share = 1000 value = already at weight (equity 1000/3 ≈ 333
             # per slot — actually BBB is OVER weight, so nothing more to buy there)
-            monkeypatch.setattr(
-                monthly, "_price_usd_map",
-                lambda tickers: _px({t: 100.0 for t in tickers}))
             r = await daily_core.run_deployment()
             # No cash: no trades at all
             assert r["trades"] == []
@@ -209,13 +361,64 @@ class TestDeployment:
             def fake_map(tickers):
                 px = {t: 100.0 for t in tickers}
                 px["ZZZ"] = 60.0
-                return _px(px)
-            monkeypatch.setattr(monthly, "_price_usd_map", lambda tickers: fake_map(tickers))
+                return px
+            monkeypatch.setattr(monthly, "_price_usd_map",
+                                lambda tickers, asof=None: _px(fake_map(tickers)))
+            monkeypatch.setattr(monthly, "_open_usd_map",
+                                lambda tickers, d: _px(fake_map(tickers)))
             r = await daily_core.run_deployment()
             sells = [t for t in r["trades"] if t["side"] == "SELL"]
             assert len(sells) == 1 and sells[0]["ticker"] == "ZZZ"
             assert sells[0]["proceeds"] == pytest.approx(300.0)
         asyncio.run(scenario())
+
+    def test_release_frees_slot_replacement_buys_same_session(
+            self, mem_db, monkeypatch, tmp_path):
+        """Regression (golden parity, tests/test_cadence_parity.py): a band
+        release that SUCCEEDS must fund its replacement the SAME session,
+        at that session's strict open. The old planning recomputed the
+        picks with the PRE-release held count (refill=len(held_before) <
+        target_n -> False on a full book), dropping the replacement the
+        band-switch branch had planned and deferring the buy to the next
+        session — while the persisted replay, which plans against the
+        post-SELL held set, bought it immediately, so the live vs replay
+        trade streams diverged (~1.6% price gap one wiggle day apart)."""
+        asyncio.run(_seed_dc(0.0, [("AAA", 10.0, 100.0), ("BBB", 10.0, 100.0)]))
+        monkeypatch.setattr(settings, "sim_monthly_target_n", 2)
+        monkeypatch.setattr(settings, "sim_monthly_hold_band", 3)
+
+        async def fake_stored_me(_now):
+            return pd.Timestamp("2026-07-31")
+
+        async def fake_core_frame(_me):
+            # July's ranking: BBB fell out of the top-3 band (rank 4);
+            # CCC is the best-ranked non-held name.
+            return None, ["AAA", "CCC", "DDD", "BBB"]
+
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+        monkeypatch.setattr(daily_core, "_stored_month_end", fake_stored_me)
+        monkeypatch.setattr(daily_core, "_core_frame", fake_core_frame)
+
+        def fake_map(tickers):
+            px = {t: 100.0 for t in tickers}
+            px["BBB"] = 60.0   # the release leg's strict open
+            px["CCC"] = 40.0   # the replacement's strict open
+            return px
+        monkeypatch.setattr(monthly, "_price_usd_map",
+                            lambda tickers, asof=None: _px(fake_map(tickers)))
+        monkeypatch.setattr(monthly, "_open_usd_map",
+                            lambda tickers, d: _px(fake_map(tickers)))
+
+        async def scenario():
+            return await daily_core.run_deployment()
+        r = asyncio.run(scenario())
+
+        legs = [(t["side"], t["ticker"], t["price"]) for t in r["trades"]]
+        assert ("SELL", "BBB", 60.0) in legs
+        # THE REGRESSION: the replacement is funded THIS session
+        assert ("BUY", "CCC", 40.0) in legs
+        pos = asyncio.run(_dc_positions())
+        assert [t for t, _ in pos] == ["AAA", "CCC"]
 
     def test_second_run_is_noop(self, mem_db, fake_ranking, monkeypatch):
         """Deployment is idempotent: targets met -> no further trades."""
@@ -224,9 +427,6 @@ class TestDeployment:
                 acc = await daily_core._account(s)
                 acc.cash = 3000.0
                 await s.commit()
-            monkeypatch.setattr(
-                monthly, "_price_usd_map",
-                lambda tickers: _px({t: 100.0 for t in tickers}))
             r1 = await daily_core.run_deployment()
             n1 = len(r1["trades"])
             assert n1 > 0
@@ -249,85 +449,239 @@ def _px(px: dict):
     return _Awy(px)
 
 class TestStoredRanking:
-    def test_compute_targets_reads_stored_ranking(self, mem_db, monkeypatch):
-        """compute_targets() (force=False) reads the daily_core_ranking row
-        instead of recomputing the fundamentals math; force=True recomputes
-        and re-stores."""
+    def test_load_stored_ranking_returns_date_band_picks(self, mem_db):
+        """_load_stored_ranking() returns ``(ranking_date, band, picks)`` —
+        the ranking_date lets the ME-match gate tell WHICH month-end ranked."""
         from app.db import DailyCoreRanking
+
+        me = datetime(2026, 9, 30)
+
+        async def seed():
+            async with mem_db() as s:
+                s.add(DailyCoreRanking(id=1, ranking_date=me,
+                                       band="AAA,BBB,CCC", picks="AAA,BBB"))
+                await s.commit()
+        asyncio.run(seed())
+
+        stored = asyncio.run(daily_core._load_stored_ranking())
+        # SQLite round-trips DateTime columns as UTC-aware: normalize before
+        # comparing (the production readers do the same).
+        rd = pd.Timestamp(stored[0])
+        if rd.tzinfo is not None:
+            rd = rd.tz_localize(None)
+        assert rd == pd.Timestamp(me)
+        assert stored[1:] == (["AAA", "BBB", "CCC"], ["AAA", "BBB"])
+
+    def test_stored_ranking_absent_is_none(self, mem_db):
+        assert asyncio.run(daily_core._load_stored_ranking()) is None
+
+    def test_compute_targets_reads_stored_ranking_on_me_match(
+            self, mem_db, monkeypatch, tmp_path):
+        """compute_targets() (force=False) returns the stored decision when
+        the stored ranking_date AND provenance stamp match the resolved
+        month-end — the whole month runs on ONE decision, so the expensive
+        frame never recomputes and no age gate applies.
+
+        The cache is a DERIVED artifact: an UNKNOWN provenance (legacy NULL
+        ``config_id``) invalidates the row and forces a recompute, because it
+        cannot be proven to describe this run's configuration. This fixture is
+        deliberately KNOWN-MATCHING: it seeds the row with the exact paper
+        ``config_id``/epoch the run resolves.
+        """
+        from app import run_config
+        from app.db import DailyCoreRanking
+
+        me = pd.Timestamp("2026-09-30")
+
+        # Patch the state file BEFORE capturing the configuration: the run
+        # config reads the persisted runtime selections from it, so a real
+        # /data file would change the config hash this fixture stamps with
+        # (and reset/compute could attempt a write outside the temp dir).
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+
+        async def resolve_stamp() -> dict:
+            """The stamp compute_targets() resolves for this run (no execution:
+            a read-cache pass registers a config, never a RunExecution)."""
+            cfg = daily_core.current_config()
+            return {
+                "config_id": await run_config.get_or_create(
+                    "daily_core", "paper", cfg, session_factory=mem_db),
+                "epoch": await run_config.current_epoch(
+                    "daily_core", session_factory=mem_db),
+            }
+
+        stamp = asyncio.run(resolve_stamp())
+
+        async def seed():
+            async with mem_db() as s:
+                s.add(DailyCoreRanking(
+                    id=1, ranking_date=me.to_pydatetime(),
+                    band="AAA,BBB,CCC", picks="AAA,BBB",
+                    mode="paper", config_id=stamp["config_id"],
+                    epoch=stamp["epoch"]))
+                await s.commit()
+        asyncio.run(seed())
+
+        async def fake_stored_me(_now):
+            return me
+        monkeypatch.setattr(daily_core, "_stored_month_end", fake_stored_me)
+
+        async def boom(_me):
+            raise AssertionError("frame recomputed though the stored ranking matched")
+        monkeypatch.setattr(daily_core, "_core_frame", boom)
+
+        band, picks, frame = asyncio.run(daily_core.compute_targets())
+        assert (band, picks, frame) == (["AAA", "BBB", "CCC"], ["AAA", "BBB"], None)
+
+    def test_newer_month_end_recomputes_and_restores(
+            self, mem_db, monkeypatch, tmp_path):
+        """When the resolved month-end is NEWER than the stored decision
+        (a completed month-end behind the cycle), compute_targets recomputes
+        the frame at that month-end and re-stores the row with the new
+        ranking_date — the old stale-ranking test's ME-match replacement."""
+        from app.db import DailyCoreRanking
+
+        old_me, new_me = pd.Timestamp("2026-08-31"), pd.Timestamp("2026-09-30")
+
+        async def seed():
+            async with mem_db() as s:
+                s.add(DailyCoreRanking(id=1, ranking_date=old_me.to_pydatetime(),
+                                       band="OLD", picks="OLD"))
+                await s.commit()
+        asyncio.run(seed())
+
+        async def fake_stored_me(_now):
+            return new_me
+        monkeypatch.setattr(daily_core, "_stored_month_end", fake_stored_me)
 
         calls = {"n": 0}
+        frame = pd.DataFrame({"eligible": [True] * 4},
+                             index=pd.Index(["AAA", "BBB", "CCC", "DDD"],
+                                            name="ticker"))
 
-        async def fake_targets(**kwargs):
+        async def fake_core_frame(me):
             calls["n"] += 1
-            return ["AAA", "BBB", "CCC"], ["AAA", "BBB", "CCC"], None
-
-        # Simulate a stored ranking from today
-        async def seed():
-            async with mem_db() as s:
-                s.add(DailyCoreRanking(
-                    id=1,
-                    ranking_date=datetime.now(UTC).replace(tzinfo=None),
-                    band="AAA,BBB,CCC", picks="AAA,BBB,CCC"))
-                await s.commit()
-        asyncio.run(seed())
-
-        monkeypatch.setattr(daily_core, "compute_targets", fake_targets)
-        # Read the STORED ranking through the real read helper:
-        stored = asyncio.run(daily_core._load_stored_ranking())
-        assert stored == (["AAA", "BBB", "CCC"], ["AAA", "BBB", "CCC"])
-
-    def test_stale_ranking_is_ignored(self, mem_db):
-        """A ranking older than a day is treated as absent."""
-        from app.db import DailyCoreRanking
-
-        async def seed():
-            async with mem_db() as s:
-                s.add(DailyCoreRanking(
-                    id=1,
-                    ranking_date=datetime.now(UTC).replace(tzinfo=None) - timedelta(days=2),
-                    band="AAA", picks="AAA"))
-                await s.commit()
-        asyncio.run(seed())
-        stored = asyncio.run(daily_core._load_stored_ranking())
-        assert stored is None
-
-    def test_concurrent_compute_runs_once(self, mem_db, monkeypatch):
-        """The UI fires two status requests on first tab load; both call
-        compute_targets() with no stored ranking. They must not both run the
-        expensive full-universe ranking — the second reads the first's
-        freshly stored result."""
-        import app.monthly as monthly_mod
-
-        calls = {"fund": 0}
-        frame = pd.DataFrame({"eligible": [True]},
-                             index=pd.Index(["AAA"], name="ticker"))
-        day = pd.DatetimeIndex(["2026-09-01"])
-
-        async def fake_fund(_tickers):
-            calls["fund"] += 1
-            await asyncio.sleep(0)  # yield so a racer could interleave
-            return {"AAA": {}}
-
-        async def fake_frames(_tickers, _asof, start=None):
-            return pd.DataFrame({"AAA": [1.0]}, index=day), \
-                   pd.DataFrame({"AAA": [1.0]}, index=day)
-
-        monkeypatch.setattr(daily_core, "universe_tickers", lambda _u: ["AAA"])
-        monkeypatch.setattr(daily_core.fundamentals_mod, "load_fundamentals", fake_fund)
-        monkeypatch.setattr(daily_core.monthly_mod, "load_frames", fake_frames)
-        monkeypatch.setattr(monthly_mod, "eligible_frame", lambda *a: frame)
-        monkeypatch.setattr(monthly_mod, "_qv_order", lambda f: (f["eligible"], ["AAA"]))
-        monkeypatch.setattr(monthly_mod, "_band_fill", lambda o, h, n, b: ["AAA"])
+            assert me == new_me
+            return frame, ["AAA", "BBB", "CCC", "DDD"]
+        monkeypatch.setattr(daily_core, "_core_frame", fake_core_frame)
 
         async def scenario():
+            monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+            return await daily_core.compute_targets()
+        band, picks, got_frame = asyncio.run(scenario())
+        # hold_band=20 > 4 names: band is the whole order; the pick pass
+        # refills (deployment tops up toward the plan) in ranking order.
+        assert band == ["AAA", "BBB", "CCC", "DDD"]
+        assert picks == ["AAA", "BBB", "CCC", "DDD"]
+        assert got_frame is frame
+        assert calls["n"] == 1
+
+        async def check():
+            async with mem_db() as s:
+                row = await s.get(DailyCoreRanking, 1)
+                rd = pd.Timestamp(row.ranking_date)
+                if rd.tzinfo is not None:
+                    rd = rd.tz_localize(None)
+                assert rd.normalize() == new_me
+                assert row.band == "AAA,BBB,CCC,DDD"
+        asyncio.run(check())
+
+    def test_force_recomputes_even_when_stored_matches(
+            self, mem_db, monkeypatch, tmp_path):
+        """force=True bypasses the ME-match gate and re-runs the frame at the
+        resolved month-end (the UI's forced refresh)."""
+        from app.db import DailyCoreRanking
+
+        me = pd.Timestamp("2026-09-30")
+
+        async def seed():
+            async with mem_db() as s:
+                s.add(DailyCoreRanking(id=1, ranking_date=me.to_pydatetime(),
+                                       band="AAA", picks="AAA"))
+                await s.commit()
+        asyncio.run(seed())
+
+        async def fake_stored_me(_now):
+            return me
+        monkeypatch.setattr(daily_core, "_stored_month_end", fake_stored_me)
+
+        calls = {"n": 0}
+        frame = pd.DataFrame({"eligible": [True, True]},
+                             index=pd.Index(["AAA", "BBB"], name="ticker"))
+
+        async def fake_core_frame(_me):
+            calls["n"] += 1
+            return frame, ["AAA", "BBB"]
+        monkeypatch.setattr(daily_core, "_core_frame", fake_core_frame)
+
+        async def scenario():
+            monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+            return await daily_core.compute_targets(force=True)
+        band, picks, got = asyncio.run(scenario())
+        assert band == ["AAA", "BBB"] and picks == ["AAA", "BBB"]
+        assert got is frame and calls["n"] == 1
+
+        async def check():
+            async with mem_db() as s:
+                row = await s.get(DailyCoreRanking, 1)
+                assert row.band == "AAA,BBB"  # re-stored with the new decision
+        asyncio.run(check())
+
+    def test_no_completed_month_end_returns_empty_without_frame(
+            self, mem_db, monkeypatch, tmp_path):
+        """No completed month-end behind the cycle: nothing to rank yet —
+        an empty decision, no fabricated frame, no store."""
+        from app.db import DailyCoreRanking
+
+        async def fake_stored_me(_now):
+            return None
+        monkeypatch.setattr(daily_core, "_stored_month_end", fake_stored_me)
+
+        async def boom(_me):
+            raise AssertionError("no month-end must not compute a frame")
+        monkeypatch.setattr(daily_core, "_core_frame", boom)
+
+        async def scenario():
+            monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
+            return await daily_core.compute_targets()
+        assert asyncio.run(scenario()) == ([], [], None)
+
+        async def check():
+            async with mem_db() as s:
+                assert await s.get(DailyCoreRanking, 1) is None
+        asyncio.run(check())
+
+    def test_concurrent_compute_runs_once(self, mem_db, monkeypatch, tmp_path):
+        """The UI fires two status requests on first tab load; both call
+        compute_targets() with no stored ranking. They must not both run the
+        expensive full-universe frame — the second reads the first's freshly
+        stored result (ME-match) from inside the lock."""
+        me = pd.Timestamp("2026-09-30")
+        calls = {"frame": 0}
+        frame = pd.DataFrame({"eligible": [True]},
+                             index=pd.Index(["AAA"], name="ticker"))
+
+        async def fake_stored_me(_now):
+            return me
+        monkeypatch.setattr(daily_core, "_stored_month_end", fake_stored_me)
+
+        async def fake_core_frame(_me):
+            calls["frame"] += 1
+            await asyncio.sleep(0)  # yield so a racer could interleave
+            return frame, ["AAA"]
+        monkeypatch.setattr(daily_core, "_core_frame", fake_core_frame)
+
+        async def scenario():
+            monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
             r1, r2 = await asyncio.gather(
                 daily_core.compute_targets(),
                 daily_core.compute_targets(),
             )
             assert r1[0] == ["AAA"] and r2[0] == ["AAA"]
+            assert r1[1] == ["AAA"] and r2[1] == ["AAA"]
         asyncio.run(scenario())
-        assert calls["fund"] == 1, (
-            f"full-universe ranking computed {calls['fund']} times concurrently"
+        assert calls["frame"] == 1, (
+            f"full-universe ranking computed {calls['frame']} times concurrently"
         )
 
 
@@ -336,13 +690,21 @@ class TestStoredRanking:
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def fake_market(monkeypatch):
-    """Patch daily_core's market/fundamentals loaders + ranking so backfill
-    replays a tiny deterministic two-ticker market (no network, no DB rows)."""
-    import pandas as pd
+def fake_market(monkeypatch, tmp_path):
+    """Patch daily_core's backfill loaders so the replay walks a tiny
+    deterministic two-ticker market (no network, no DB rows).
 
+    Two COMPLETE months: 2026-07-31 and 2026-08-31 are the real US session
+    month-ends, so the replay ranks against scheduled month-ends only. The
+    window ends 2026-08-28, so August's decision would fill 2026-09-01 —
+    outside the window, pending at walk end (the deferred-fill cadence).
+    Prices are FLAT per ticker (open == close): the exact-equality equity
+    checks stay float-clean. The strict-OPEN fill rule is pinned separately
+    in TestBackfill.test_fills_use_the_strict_session_open, which swaps in
+    an open frame that differs from the close frame."""
     dates = pd.bdate_range("2026-07-01", "2026-08-28")
     close = pd.DataFrame({"AAA": 100.0, "BBB": 50.0}, index=dates)
+    open_px = close.copy()
     vol = pd.DataFrame(1e6, index=dates, columns=["AAA", "BBB"])
 
     def fake_frame(m, c, v, f):
@@ -352,19 +714,20 @@ def fake_market(monkeypatch):
     def fake_order(frame):
         return frame["eligible"], ["AAA", "BBB"]
 
-    async def fake_load_frames(_tickers, _asof, start=None):
-        return close, vol
+    async def fake_load_ohlcv_frames(_tickers, _asof, start=None):
+        return open_px, close, vol
 
     async def fake_load_fundamentals(_tickers):
         return {"AAA": {"x": []}, "BBB": {"x": []}}
 
+    monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(daily_core, "universe_tickers", lambda _u: ["AAA", "BBB"])
     monkeypatch.setattr(daily_core.fundamentals_mod, "load_fundamentals",
                         fake_load_fundamentals)
-    monkeypatch.setattr(daily_core.monthly_mod, "load_frames", fake_load_frames)
-    monkeypatch.setattr(daily_core.monthly_mod, "eligible_frame", fake_frame)
-    monkeypatch.setattr(daily_core.monthly_mod, "_qv_order", fake_order)
-    return {"close": close}
+    monkeypatch.setattr(monthly, "load_ohlcv_frames", fake_load_ohlcv_frames)
+    monkeypatch.setattr(monthly, "eligible_frame", fake_frame)
+    monkeypatch.setattr(monthly, "_qv_order", fake_order)
+    return {"open": open_px, "close": close}
 
 
 class TestBackfill:
@@ -415,6 +778,60 @@ class TestBackfill:
                     assert tr.shares > 0
                     assert tr.price > 0
                     assert tr.created_at.strftime("%Y-%m") == "2026-08"
+        asyncio.run(check())
+
+    def test_july_decision_fills_first_session_after_month_end(
+            self, mem_db, fake_market, monkeypatch):
+        """Deferred-fill cadence (replay side): July's sessions have no band
+        (the prior month-end June 30 is not in the tape), so the July
+        month-end's decision is the FIRST decision and its fills land on the
+        first session after the month-end (2026-08-03) — never on the
+        month-end itself and never at a stale or forward-filled close."""
+        from app.db import DailyCoreTrade as Tr
+
+        monkeypatch.setattr(daily_core, "_current_month", lambda: "2026-08")
+        r = asyncio.run(daily_core.backfill(start="2026-07-01"))
+        assert r["ok"] is True
+
+        async def check():
+            async with mem_db() as s:
+                rows = (await s.scalars(
+                    select(Tr).order_by(Tr.created_at))).all()
+                assert rows
+                days = {x.created_at.strftime("%Y-%m-%d") for x in rows}
+                # every fill lands on the first session after the July ME
+                assert days == {"2026-08-03"}
+                for tr in rows:
+                    assert tr.price == {"AAA": 100.0, "BBB": 50.0}[tr.ticker]
+        asyncio.run(check())
+
+    def test_fills_use_the_strict_session_open(self, mem_db, fake_market,
+                                               monkeypatch):
+        """Rule 2, replay side: the fill books the fill session's OPEN —
+        not the previous session's close (stale) and not the fill session's
+        close. Open 99/49 vs close 101/51 on every session makes all three
+        distinguishable."""
+        from app.db import DailyCoreTrade as Tr
+
+        open_px = pd.DataFrame({"AAA": 99.0, "BBB": 49.0},
+                               index=fake_market["close"].index)
+
+        async def fake_load_ohlcv(_tickers, _asof, start=None):
+            return open_px, fake_market["close"], \
+                pd.DataFrame(1e6, index=fake_market["close"].index,
+                             columns=["AAA", "BBB"])
+        monkeypatch.setattr(monthly, "load_ohlcv_frames", fake_load_ohlcv)
+        monkeypatch.setattr(daily_core, "_current_month", lambda: "2026-08")
+
+        r = asyncio.run(daily_core.backfill(start="2026-08-01"))
+        assert r["ok"] is True and r["trades"] > 0
+
+        async def check():
+            async with mem_db() as s:
+                rows = (await s.scalars(select(Tr))).all()
+                prices = {tr.ticker: tr.price for tr in rows}
+                # the strict session OPEN — never the close (101/51)
+                assert prices == {"AAA": 99.0, "BBB": 49.0}
         asyncio.run(check())
 
     def test_allowance_rows_match_deposited_months_only(self, mem_db, fake_market,
@@ -471,12 +888,29 @@ class TestBackfill:
 
 
 class TestReset:
-    def test_reset_clears_state_and_restores_start_cash(self, mem_db):
+    def test_reset_clears_current_state_and_preserves_history(
+            self, mem_db, monkeypatch, tmp_path):
+        """A reset CLOSES the epoch; it does not rewrite it.
+
+        Portfolio *state* is cleared and re-seeded for the fresh epoch
+        (positions gone, cash = start, allowance marker None), while the closed
+        epoch's money ledger — trades, allowances and snapshots — survives
+        bit-for-bit in every mapped column. The old test asserted the opposite
+        (all four tables empty), which described the destructive reset that
+        rewrote the paper book's own record; the epoch boundary in
+        app/run_config.py replaces it (a later backfill must be refusable
+        because the live origin still exists).
+        """
+        from app import run_config
         from app.db import DailyCoreAccount as Acc
         from app.db import DailyCoreAllowance as Al
         from app.db import DailyCorePosition as Pos
         from app.db import DailyCoreSnapshot as Sn
         from app.db import DailyCoreTrade as Tr
+        from app.db import RunEpoch
+
+        # reset re-writes the basket state file: keep it out of /data
+        monkeypatch.setattr(daily_core, "_STATE_FILE", tmp_path / "state.json")
 
         async def seed():
             async with mem_db() as s:
@@ -490,20 +924,56 @@ class TestReset:
                 s.add(Sn(cash=0.0, positions_value=1.0, total_equity=1.0,
                          allowance_total=1000.0))
                 await s.commit()
+
+        async def dump(model) -> list[dict]:
+            """Every mapped column of every row of *model*, in id order."""
+            async with mem_db() as s:
+                rows = (await s.scalars(select(model).order_by(model.id))).all()
+            cols = [c.name for c in model.__table__.columns]
+            return [{c: getattr(r, c) for c in cols} for r in rows]
+
+        async def history_dump() -> dict[str, list[dict]]:
+            return {m.__name__: await dump(m) for m in (Tr, Al, Sn)}
+
         asyncio.run(seed())
+        before = asyncio.run(history_dump())
 
         r = asyncio.run(daily_core.reset_daily_core())
         assert r["ok"] is True
         assert r["cash"] == settings.sim_monthly_start_cash
+        assert r["epoch"] == 2
+        assert r["preserved"] == {"trades": 1, "snapshots": 1, "allowances": 1}
 
         async def check():
             async with mem_db() as s:
-                for model in (Pos, Tr, Al, Sn):
-                    assert (await s.scalars(select(model))).all() == []
+                assert (await s.scalars(select(Pos))).all() == []
                 acc = await s.get(Acc, 1)
                 assert acc.cash == settings.sim_monthly_start_cash
                 assert acc.last_allowance_month is None
+                epochs = (await s.scalars(select(RunEpoch))).all()
+                assert [(e.engine, e.epoch) for e in epochs] == [("daily_core", 2)]
+                assert await run_config.current_epoch("daily_core", session=s) == 2
         asyncio.run(check())
+
+        # The closed epoch's ledger is preserved bit-for-bit ...
+        after = asyncio.run(history_dump())
+        for name, rows in before.items():
+            assert after[name] == rows, \
+                f"{name}: the reset rewrote the closed epoch's rows"
+
+        async def curve_check():
+            # ... and the equity curve restarts EMPTY in the new epoch: the
+            # preserved snapshots must not leak into the fresh book's chart.
+            assert await daily_core.get_equity_curve() == []
+            async with mem_db() as s:
+                s.add(Sn(cash=250.0, positions_value=0.0, total_equity=250.0,
+                         allowance_total=250.0, epoch=2))
+                await s.commit()
+            curve = await daily_core.get_equity_curve()
+            assert [(c["cash"], c["positions_value"], c["total_equity"],
+                     c["allowance_total"], c["epoch"]) for c in curve] == \
+                [(250.0, 0.0, 250.0, 250.0, 2)]
+        asyncio.run(curve_check())
 
 
 # ---------------------------------------------------------------------------

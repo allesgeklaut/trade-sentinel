@@ -14,6 +14,14 @@ Backends are configured through the ``LLM_BACKENDS`` JSON env var, e.g.::
       {"name":"ollama","type":"ollama","url":"http://host.docker.internal:11434","model":"deepseek-v4-flash:0731-cloud"}
     ]
 
+A backend may declare ``chat_template_kwargs`` (a dict) for vLLM-native
+chat-template overrides (e.g. ``{"enable_thinking": true}`` plus the
+``LLM_REASONING_EFFORT`` thinking budget). The field is OPT-IN: strict
+OpenAI-schema servers reject it (HTTP 422 ``extra_forbidden`` on
+``body.chat_template_kwargs``, probe-verified 2026-10-31 through the LAN
+LiteLLM proxy routing to Mistral), so it is only sent when the backend
+declares it.
+
 The actively selected backend is persisted to a small JSON file so the choice
 survives restarts.  For backwards compatibility the legacy ``OLLAMA_URL`` /
 ``OLLAMA_MODEL`` settings are honoured when ``LLM_BACKENDS`` is not set.
@@ -106,11 +114,21 @@ def _configured_backends() -> list[dict[str, Any]]:
         url = str(b.get("url") or "").strip().rstrip("/")
         model = str(b.get("model") or "").strip()
         api_key = str(b.get("api_key") or "").strip()
+        # vLLM-native chat-template overrides, OPT-IN per backend: strict
+        # OpenAI-schema servers reject the field with HTTP 422
+        # "extra_forbidden" (probe-verified 2026-10-31 through the LAN
+        # LiteLLM proxy -> Mistral), so it is only sent when declared.
+        ctk = b.get("chat_template_kwargs")
+        chat_kwargs = dict(ctk) if isinstance(ctk, dict) else {}
         if btype not in ("ollama", "openai") or not url or not name:
-            logger.warning("Skipping invalid LLM backend entry: %r", b)
+            # Redacted on purpose: a malformed entry may carry an inline
+            # api_key — the key must NEVER reach the logs (the app's own
+            # invariant, pinned by test).
+            logger.warning("Skipping invalid LLM backend entry: %r",
+                           {k: v for k, v in b.items() if k != "api_key"})
             continue
         out.append({"name": name, "type": btype, "url": url, "model": model,
-                     "api_key": api_key})
+                    "api_key": api_key, "chat_template_kwargs": chat_kwargs})
     return out
 
 
@@ -233,12 +251,22 @@ async def select_backend(name: str, model: str | None = None) -> dict[str, Any]:
 # Ollama seed/temperature, so pinning would be ignored anyway and only adds
 # false reproducibility expectations to backtests.
 
-async def chat(messages: list[dict[str, str]]) -> dict[str, Any]:
+async def chat(messages: list[dict[str, Any]], *,
+               temperature: float | None = None,
+               timeout_s: float | None = None,
+               tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Send a chat request to the active backend.
 
     ``messages`` is a list of ``{"role": ..., "content": ...}`` dicts (system
-    messages included). Returns ``{"text": ..., "backend": ..., "model": ...,
-    "reasoning": ...}``.
+    messages included). ``temperature`` is sent ONLY when set (None leaves
+    the server's default) — the sell layer passes its frozen recorded
+    temperature so the wire matches what every consult record declares.
+    ``timeout_s`` overrides the read bound per call. ``tools`` is the
+    OpenAI function-calling surface (the type-D news agent's native
+    tools; a core OpenAI field, sent only when set). Returns
+    ``{"text": ..., "backend": ..., "model": ..., "reasoning": ...,
+    "tool_calls": [...]}`` — ``tool_calls`` is the normalized list
+    (``[]`` when the turn called no tools).
     """
     backend = await current_backend()
     if not backend:
@@ -247,13 +275,17 @@ async def chat(messages: list[dict[str, str]]) -> dict[str, Any]:
             "backend": "",
             "model": "",
             "reasoning": "",
+            "tool_calls": [],
         }
-    text, reasoning, model = await _post_chat(backend, messages)
+    text, reasoning, model, tool_calls = await _post_chat(
+        backend, messages, temperature=temperature, timeout_s=timeout_s,
+        tools=tools)
     return {
         "text": text,
         "backend": backend["name"],
         "model": model,
         "reasoning": reasoning,
+        "tool_calls": tool_calls,
     }
 
 
@@ -329,16 +361,31 @@ async def chat_stream(messages: list[dict[str, str]]):
                     "model": backend["model"] or "default",
                     "messages": messages,
                     "stream": True,
-                    "chat_template_kwargs": {"enable_thinking": True},
                 }
+                # Same opt-in contract as _post_chat (the non-streaming
+                # path): the vLLM-native chat_template_kwargs ride ONLY on
+                # a declared backend — strict OpenAI-schema servers reject
+                # the field with 422 "extra_forbidden" (probe-verified
+                # 2026-10-31 through the LAN LiteLLM proxy -> Mistral) —
+                # and on the strict path the effort rides as the
+                # OpenAI-style reasoning_effort (the operator's value,
+                # case-normalized — never a curated list; the server
+                # validates it). This is
+                # the live chat UI's wire (the chat endpoint + the sim
+                # chat), so the streaming variant must not regress it.
+                chat_kwargs = dict(backend.get("chat_template_kwargs") or {})
                 effort = str(settings.llm_reasoning_effort or "").strip().lower()
-                if effort in ("low", "medium", "high", "xhigh"):
-                    payload["chat_template_kwargs"]["thinking_budget"] = {
-                        "low": 512,
-                        "medium": 2048,
-                        "high": 8192,
-                        "xhigh": 32768,
-                    }[effort]
+                if chat_kwargs:
+                    if effort in ("low", "medium", "high", "xhigh"):
+                        chat_kwargs["thinking_budget"] = {
+                            "low": 512,
+                            "medium": 2048,
+                            "high": 8192,
+                            "xhigh": 32768,
+                        }[effort]
+                    payload["chat_template_kwargs"] = chat_kwargs
+                elif effort:
+                    payload["reasoning_effort"] = effort
                 async with client.stream(
                     "POST", backend["url"] + "/v1/chat/completions",
                     json=payload, headers=_auth_headers(backend),
@@ -407,12 +454,16 @@ async def chat_stream(messages: list[dict[str, str]]):
 
 
 async def _post_chat(
-    backend: dict[str, Any], messages: list[dict[str, str]]
-) -> tuple[str, str, str]:
-    """Raw POST for one backend; returns (text, reasoning, model_id)."""
+    backend: dict[str, Any], messages: list[dict[str, Any]],
+    *, temperature: float | None = None, timeout_s: float | None = None,
+    tools: list[dict[str, Any]] | None = None
+) -> tuple[str, str, str, list[dict[str, Any]]]:
+    """Raw POST for one backend; returns (text, reasoning, model_id,
+    tool_calls)."""
     timeout = httpx.Timeout(
         connect=10.0,
-        read=settings.ollama_timeout_seconds,
+        read=(timeout_s if timeout_s is not None
+              else settings.ollama_timeout_seconds),
         write=30.0,
         pool=10.0,
     )
@@ -421,46 +472,129 @@ async def _post_chat(
             req_body: dict[str, Any] = {
                 "model": backend["model"], "messages": messages, "stream": False,
             }
+            if temperature is not None:
+                req_body["options"] = {"temperature": temperature}
             resp = await client.post(backend["url"] + "/api/chat", json=req_body)
         else:
             payload: dict[str, Any] = {
                 "model": backend["model"] or "default",
                 "messages": messages,
                 "stream": False,
-                "chat_template_kwargs": {"enable_thinking": True},
             }
+            if temperature is not None:
+                payload["temperature"] = temperature
+                if temperature == 0.0:
+                    # Greedy sampling needs the full nucleus on strict servers:
+                    # Mistral rejects a bare temperature 0 with HTTP 400 code
+                    # 3054, "top_p must be 1 when using greedy sampling"
+                    # (probe-verified live 2026-11-03 through the LAN proxy —
+                    # every A/B/C sell consult fail-safed on it on 2026-11-02;
+                    # temp 0.0 + top_p 1.0 answers 200). top_p 1.0 is the
+                    # no-op nucleus everywhere (the OpenAI default), so the
+                    # field rides ONLY with the greedy temperature — the
+                    # frozen 0.0 regime (sellshadow's constants) is unchanged,
+                    # now expressed in the form the server contract requires.
+                    payload["top_p"] = 1.0
+            if tools:
+                # A core OpenAI field (unlike the opt-in chat_template_kwargs
+                # above): sent only when the caller passes a tool surface.
+                payload["tools"] = tools
+            # The vLLM-native kwargs ride ONLY when the backend declared
+            # them: strict OpenAI-schema servers (LiteLLM routing to
+            # Mistral/OpenAI/...) reject the field with 422
+            # "extra_forbidden" (probe-verified 2026-10-31), so the clean
+            # body is the default. On the strict path the reasoning effort
+            # travels as the OpenAI-style ``reasoning_effort`` (the
+            # operator's value, case-normalized — never a curated list):
+            # the supported vocabulary is SERVER-SPECIFIC — the LAN proxy's
+            # Mistral route answers none/low/high/xhigh/max and rejects
+            # "medium" (HTTP 400 "reasoning_effort 'medium' is not supported
+            # for this model; supported values: ['none', 'low', 'high',
+            # 'xhigh', 'max']"; low/high answer 200 with
+            # ``reasoning_content`` + ``usage.reasoning_tokens``), while
+            # OpenAI itself takes "medium" but not xhigh/max — so the app
+            # does NOT curate the list; the operator sets a value their
+            # server supports and the server validates it (all probe-
+            # verified 2026-10-31).
+            chat_kwargs = dict(backend.get("chat_template_kwargs") or {})
             effort = str(settings.llm_reasoning_effort or "").strip().lower()
-            if effort in ("low", "medium", "high", "xhigh"):
-                payload["chat_template_kwargs"]["thinking_budget"] = {
-                    "low": 512,
-                    "medium": 2048,
-                    "high": 8192,
-                    "xhigh": 32768,
-                }[effort]
+            if chat_kwargs:
+                if effort in ("low", "medium", "high", "xhigh"):
+                    chat_kwargs["thinking_budget"] = {
+                        "low": 512,
+                        "medium": 2048,
+                        "high": 8192,
+                        "xhigh": 32768,
+                    }[effort]
+                payload["chat_template_kwargs"] = chat_kwargs
+            elif effort:
+                payload["reasoning_effort"] = effort
             resp = await client.post(
                 backend["url"] + "/v1/chat/completions",
                 json=payload, headers=_auth_headers(backend),
             )
         if getattr(resp, "status_code", 200) != 200:
-            raise RuntimeError(
-                f"LLM backend {backend['name']} returned HTTP {resp.status_code}"
-            )
+            # The body rides along (same contract as the streaming path above):
+            # a bare status code is undiagnosable — the 2026-10-30 type-A
+            # fail-safes recorded only "HTTP 400" and the reason (the route's
+            # rejection text, e.g. an unsupported-value listing) was lost with
+            # it. Snippet-bounded; response bodies carry no credentials.
+            msg = (f"LLM backend {backend['name']} returned HTTP "
+                   f"{resp.status_code}")
+            body = str(getattr(resp, "text", "") or "")[:200]
+            if body:
+                msg += f": {body}"
+            raise RuntimeError(msg)
         data = resp.json()
     return _extract_content(data, backend)
 
 
-def _extract_content(data: Any, backend: dict[str, Any]) -> tuple[str, str, str]:
-    """Pull (text, reasoning, model) from either an OpenAI-compatible or an
-    Ollama chat response shape, whichever is present."""
+def _parse_tool_calls(raw: Any) -> list[dict[str, Any]]:
+    """Normalize OpenAI-style ``tool_calls`` (from chat completions) into the
+    app's shape: ``[{"id", "name", "arguments" (a dict when the JSON string
+    parses to one, else the raw string), "arguments_raw"}]``. Malformed
+    entries are skipped — an empty list simply means "no tool calls this
+    turn" (the caller decides what that means)."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for tc in raw:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function")
+        if not isinstance(fn, dict) or not fn.get("name"):
+            continue
+        args_raw = fn.get("arguments")
+        if not isinstance(args_raw, str):
+            args_raw = json.dumps(args_raw) if args_raw is not None else "{}"
+        try:
+            args: Any = json.loads(args_raw)
+        except (json.JSONDecodeError, ValueError):
+            args = args_raw  # unparsable: kept raw — the caller surfaces it
+        out.append({"id": str(tc.get("id") or ""),
+                    "name": str(fn["name"]),
+                    "arguments": args,
+                    "arguments_raw": args_raw})
+    return out
+
+
+def _extract_content(data: Any,
+                     backend: dict[str, Any]) -> tuple[str, str, str, list]:
+    """Pull (text, reasoning, model, tool_calls) from either an
+    OpenAI-compatible or an Ollama chat response shape, whichever is
+    present. A tool-call turn with no text still returns its tool_calls
+    (the agent loop's signal to continue)."""
     if isinstance(data, dict):
         choice = (data.get("choices") or [{}])[0]
         msg = choice.get("message") if isinstance(choice, dict) else None
         content = (msg or {}).get("content") or ""
         reasoning = (msg or {}).get("reasoning_content") or (msg or {}).get("reasoning") or ""
         model = data.get("model") or ""
-        if content:
-            return content, reasoning, model
+        tool_calls = _parse_tool_calls((msg or {}).get("tool_calls"))
+        if content or tool_calls:
+            return content, reasoning, model, tool_calls
     msg = data.get("message") if isinstance(data, dict) else None
     content = (msg or {}).get("content") or (data.get("response") if isinstance(data, dict) else "") or ""
     reasoning = (msg or {}).get("reasoning") or ""
-    return content, reasoning, backend["model"]
+    return (content, reasoning, backend["model"],
+            _parse_tool_calls((msg or {}).get("tool_calls")))

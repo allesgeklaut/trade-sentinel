@@ -31,5 +31,15 @@ services:
       - TZ=Europe/Vienna
       - LITELLM_API_KEY_FILE=/run/secrets/litellm.key
       - TWELVE_DATA_API_KEY_FILE=/run/secrets/twelvedata.key
+    # stacks-shared: reaches the webui stack's SearXNG engine at
+    # http://searxng:8080 for news search (and, for a future research
+    # agent, the shared MCP tool server at http://searxng-mcp:8808/mcp).
+    networks:
+      - default
+      - stacks-shared
 volumes:
   trade_sentinel_data:
+
+networks:
+  stacks-shared:
+    external: true

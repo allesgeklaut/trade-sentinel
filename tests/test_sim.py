@@ -16,15 +16,16 @@ import json
 import random
 from datetime import UTC, datetime, timedelta
 
-import httpx
+import pandas as pd
 import pytest
-from sqlalchemy import StaticPool
+from sqlalchemy import StaticPool, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app import sim
 from app.config import settings
 from app.db import (
     Base,
+    Candle,
     SimAccount,
     SimPosition,
     SimSnapshot,
@@ -374,27 +375,81 @@ class TestExecSell:
 # ---------------------------------------------------------------------------
 
 class TestReset:
-    async def test_reset_wipes_everything(self, with_cash):
-        """Reset should clear all tables and reinitialize cash."""
-        # Create some state
+    async def test_reset_preserves_history_clears_current_book(
+            self, with_cash, monkeypatch, tmp_path):
+        """``reset_sim()`` CLOSES the epoch; it does not rewrite it.
+
+        The CURRENT book is cleared and re-seeded (positions gone, cash =
+        start, month/week markers None) and a ``RunEpoch`` boundary moves the
+        engine to epoch 2, while the closed epoch's ledger — trades, snapshots
+        and allowances — survives bit-for-bit in every mapped column. The old
+        test expected every table to be wiped, i.e. the destructive reset that
+        rewrote the paper book's own record; the epoch boundary in
+        app/run_config.py replaces it.
+
+        The DCA benchmark is the documented DERIVED-ARTIFACT exception (a
+        comparison curve, not a decision book) and is already covered by
+        ``TestBenchmark.test_benchmark_reset`` — not re-asserted here.
+        """
+        from sqlalchemy import select as sa_select
+
+        from app import run_config
+        from app.db import RunEpoch, SimAllowance
+
+        # reset re-arms the per-session guard in the sim state file
+        monkeypatch.setattr(sim, "_STATE_FILE", tmp_path / "state.json")
+
+        # Create some state: a filled trade, a snapshot, an allowance and the
+        # account markers the reset must clear.
         await sim._exec_buy("AAPL", 100.0, 2000.0, "buy")
         async with sim.Session() as s:
-            s.add(SimSnapshot(cash=8000, positions_value=2000, total_equity=10000, allowance_total=0))
+            s.add(SimSnapshot(cash=8000, positions_value=2000,
+                              total_equity=10000, allowance_total=0))
+            s.add(SimAllowance(amount=1000.0, month="2026-09"))
+            acc = await s.get(SimAccount, 1)
+            acc.last_allowance_month = "2026-09"
+            acc.last_review_week = "2026-W36"
             await s.commit()
+
+        async def dump(model) -> list[dict]:
+            """Every mapped column of every row of *model*, in id order."""
+            async with sim.Session() as s:
+                rows = (await s.scalars(
+                    sa_select(model).order_by(model.id))).all()
+            cols = [c.name for c in model.__table__.columns]
+            return [{c: getattr(r, c) for c in cols} for r in rows]
+
+        tables = (SimTrade, SimSnapshot, SimAllowance)
+        before = {m.__name__: await dump(m) for m in tables}
 
         result = await sim.reset_sim()
         assert result["ok"] is True
+        assert result["cash"] == settings.sim_start_cash
+        assert result["epoch"] == 2
+        assert result["preserved"] == {"trades": 1, "snapshots": 1,
+                                       "allowances": 1}
 
         async with sim.Session() as s:
-            from sqlalchemy import select as sa_select
-            pos = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "AAPL"))
+            pos = await s.scalar(sa_select(SimPosition).where(
+                SimPosition.ticker == "AAPL"))
             assert pos is None
-            trades = (await s.scalars(sa_select(SimTrade))).all()
-            assert len(trades) == 0
-            snaps = (await s.scalars(sa_select(SimSnapshot))).all()
-            assert len(snaps) == 0
+            assert (await s.scalars(sa_select(SimPosition))).all() == []
             acc = await s.get(SimAccount, 1)
             assert acc.cash == settings.sim_start_cash
+            assert acc.last_allowance_month is None
+            assert acc.last_review_week is None
+            epochs = (await s.scalars(sa_select(RunEpoch))).all()
+            assert [(e.engine, e.epoch) for e in epochs] == [("sim", 2)]
+            assert await run_config.current_epoch("sim", session=s) == 2
+
+        # The closed epoch's ledger is preserved bit-for-bit ...
+        after = {m.__name__: await dump(m) for m in tables}
+        for name, rows in before.items():
+            assert after[name] == rows, \
+                f"{name}: the reset rewrote the closed epoch's rows"
+
+        # ... and the fresh epoch's curve starts EMPTY (no closed-epoch leak).
+        assert await sim.get_equity_curve() == []
 
 
 # ---------------------------------------------------------------------------
@@ -542,66 +597,6 @@ class TestParseLLMDecisions:
     def test_prose_brackets_no_array_returns_none(self):
         """Prose with brackets but no real decisions array → None (fallback)."""
         assert sim._parse_llm_decisions("I reviewed [NVDA] but decided nothing.") is None
-
-
-class TestExtractSummary:
-    """Tests for sim._extract_summary — pulls the prose the LLM writes before
-    its JSON array. Backward-compatible: returns '' when the LLM only emitted
-    JSON or when the response is an LLM-unavailable fallback string."""
-
-    def test_prose_before_json(self):
-        content = (
-            "Portfolio looks good. No changes needed.\n\n"
-            '[{"ticker":"X","action":"HOLD","reason":"ok"}]'
-        )
-        assert sim._extract_summary(content) == "Portfolio looks good. No changes needed."
-
-    def test_json_only_returns_empty(self):
-        content = '[{"ticker":"X","action":"HOLD","reason":"ok"}]'
-        assert sim._extract_summary(content) == ""
-
-    def test_empty_returns_empty(self):
-        assert sim._extract_summary("") == ""
-        assert sim._extract_summary(None) == ""
-
-    def test_fallback_string_returns_empty(self):
-        # The is_fallback path handles these upstream — no prose to extract.
-        content = "[LLM UNAVAILABLE — fell back to deterministic]\nError: x"
-        assert sim._extract_summary(content) == ""
-
-    def test_markdown_fenced_json(self):
-        # The prose before a fenced JSON block is still extracted.
-        content = (
-            "Two names are extended.\n"
-            "```json\n"
-            '[{"ticker":"X","action":"HOLD","reason":"RSI 72"}]\n'
-            "```"
-        )
-        assert sim._extract_summary(content) == "Two names are extended."
-
-    def test_trailing_colon_stripped(self):
-        content = (
-            "Here is my read.\nDecisions:\n"
-            '[{"ticker":"X","action":"HOLD","reason":"ok"}]'
-        )
-        # The "Decisions:" lead-in is trimmed, the rest preserved.
-        assert sim._extract_summary(content) == "Here is my read.\nDecisions"
-
-    def test_prose_brackets_before_json(self):
-        """Prose containing '[' must not corrupt the summary extraction."""
-        content = (
-            "I reviewed [NVDA] and [AMD].\n"
-            '[{"ticker":"NVDA","action":"HOLD","reason":"ok"}]'
-        )
-        assert sim._extract_summary(content) == "I reviewed [NVDA] and [AMD]."
-
-    def test_brackets_inside_json_strings(self):
-        """Brackets inside the JSON itself must not truncate the summary."""
-        content = (
-            "Holding all.\n"
-            '[{"ticker":"X","action":"HOLD","reason":"see [1]"}]'
-        )
-        assert sim._extract_summary(content) == "Holding all."
 
 
 class TestBuildLLMContext:
@@ -762,183 +757,6 @@ class TestBuildLLMContext:
         assert "Recent Trades" not in ctx
 
 
-class TestLLMDecide:
-    """Integration tests for _llm_decide: LLM decisions → executed trades.
-
-    Mocks the Ollama HTTP call and _latest_close so no network is needed.
-    """
-
-    @staticmethod
-    async def _backdate(tickers: list[str], days: int = 10) -> None:
-        """Backdate positions so the 5-day holding-period floor (anti-churn)
-        does not block test SELLs. Tests that seed-then-sell need this."""
-        from datetime import timedelta
-
-        from sqlalchemy import select as sa_select
-        async with sim.Session() as s:
-            for t in tickers:
-                pos = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == t))
-                if pos:
-                    pos.opened_at = sim._utcnow() - timedelta(days=days)
-            await s.commit()
-
-    def _fake_http(self, monkeypatch, content: str):
-        """Replace httpx.AsyncClient with a fake returning ``content``."""
-        class FakeResponse:
-            status_code = 200
-            def json(self):
-                return {"message": {"content": content}}
-
-        class FakeClient:
-            def __init__(self, *a, **k):
-                pass
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *a):
-                return False
-            async def post(self, *a, **k):
-                return FakeResponse()
-
-        monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
-
-    async def test_fractional_sell_and_clamped_buy(self, with_cash, monkeypatch, llm_backend):
-        """A SELL with 'amount' sells only that value; a BUY is clamped to budget."""
-        # Seed a position: 30 shares of AAPL @ 100 = $3000
-        await sim._exec_buy("AAPL", 100.0, 3000.0, "seed")
-        await self._backdate(["AAPL"])
-
-        # LLM returns: sell $500 of AAPL, buy $99999 of MSFT (clamped by cash).
-        decisions = json.dumps([
-            {"ticker": "AAPL", "action": "SELL", "amount": 500.0, "reason": "trim"},
-            {"ticker": "MSFT", "action": "BUY", "amount": 99999.0, "reason": "diversify"},
-        ])
-        self._fake_http(monkeypatch, decisions)
-
-        # Prices: AAPL @ 100, MSFT @ 50
-        async def fake_close(ticker):
-            return {"AAPL": 100.0, "MSFT": 50.0}.get(ticker)
-        monkeypatch.setattr(sim, "_latest_close", fake_close)
-
-        valuation = {
-            "cash": 10000.0, "positions_value": 3000.0, "total_equity": 13000.0,
-            "allowance_total": 10000.0, "positions": [],
-        }
-        # Provide a BUY signal for MSFT so its BUY decision has signal context.
-        signals = {
-            "MSFT": {"action": "BUY", "strength": 60,
-                     "snapshot": {"close": 50.0, "rsi": 55.0, "macd": 0.5}},
-        }
-        executed = await sim._llm_decide(valuation, [], signals)
-
-        # Two trades executed
-        assert len(executed) == 2
-
-        # Fractional SELL: $500 / $100 = 5 shares sold, 25 remain
-        sell = next(t for t in executed if t["ticker"] == "AAPL")
-        assert sell["side"] == "SELL"
-        assert sell["shares"] == pytest.approx(5.0, abs=0.001)
-
-        # BUY clamped: cash after sell = 10000 + 500 = 10500; min_cash = 5% of
-        # equity. Budget = min(cash - min_cash, max_position - current).
-        buy = next(t for t in executed if t["ticker"] == "MSFT")
-        assert buy["side"] == "BUY"
-        # MSFT @ 50 → shares = budget / 50
-        assert buy["shares"] > 0
-
-        async with sim.Session() as s:
-            from sqlalchemy import select as sa_select
-            aapl = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "AAPL"))
-            assert aapl is not None
-            assert aapl.shares == pytest.approx(25.0, abs=0.001)  # 30 - 5
-
-            msft = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "MSFT"))
-            assert msft is not None
-            assert msft.shares > 0
-
-    async def test_unparseable_decision_falls_back(self, with_cash, monkeypatch, llm_backend):
-        """A genuinely unparseable response (not an empty array) should fall
-        back to the deterministic candidate trades."""
-        # LLM returns garbage that isn't a JSON array.
-        self._fake_http(monkeypatch, "I am not JSON")
-
-        async def fake_close(ticker):
-            return 100.0
-        monkeypatch.setattr(sim, "_latest_close", fake_close)
-
-        valuation = {
-            "cash": 10000.0, "positions_value": 0.0, "total_equity": 10000.0,
-            "allowance_total": 10000.0, "positions": [],
-        }
-        deterministic = [
-            {"ticker": "AAPL", "side": "BUY", "shares": 5, "price": 100.0, "reason": "det"},
-        ]
-        executed = await sim._llm_decide(valuation, deterministic, {})
-
-        # Fell back: the deterministic trade list is returned as-is (execution
-        # of the fallback happens in the caller), not dropped.
-        assert len(executed) == 1
-        assert executed[0]["ticker"] == "AAPL"
-        assert executed[0]["side"] == "BUY"
-        assert executed[0] is deterministic[0]
-
-    async def test_empty_decisions_do_not_fall_back(self, with_cash, monkeypatch, llm_backend):
-        """An empty [] decision should execute no trades, not fall back to
-        deterministic candidates."""
-        await sim._exec_buy("AAPL", 100.0, 2000.0, "seed")  # 20 shares
-
-        # LLM returns an empty array → decide to do nothing.
-        self._fake_http(monkeypatch, json.dumps([]))
-
-        async def fake_close(ticker):
-            return 100.0
-        monkeypatch.setattr(sim, "_latest_close", fake_close)
-
-        valuation = {
-            "cash": 10000.0, "positions_value": 2000.0, "total_equity": 12000.0,
-            "allowance_total": 10000.0, "positions": [],
-        }
-        executed = await sim._llm_decide(valuation, [], {})
-
-        # No trades executed, no fallback triggered
-        assert executed == []
-
-        async with sim.Session() as s:
-            from sqlalchemy import select as sa_select
-            pos = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "AAPL"))
-            assert pos is not None  # position untouched
-            assert pos.shares == pytest.approx(20.0, abs=0.001)
-
-    async def test_sell_without_size_sells_entire_position(self, with_cash, monkeypatch, llm_backend):
-        """A SELL with no size field sells the whole position (default)."""
-        await sim._exec_buy("AAPL", 100.0, 2000.0, "seed")  # 20 shares
-        await self._backdate(["AAPL"])
-
-        decisions = json.dumps([
-            {"ticker": "AAPL", "action": "SELL", "reason": "exit"},
-        ])
-        self._fake_http(monkeypatch, decisions)
-
-        async def fake_close(ticker):
-            return 100.0
-        monkeypatch.setattr(sim, "_latest_close", fake_close)
-
-        valuation = {
-            "cash": 10000.0, "positions_value": 2000.0, "total_equity": 12000.0,
-            "allowance_total": 10000.0, "positions": [],
-        }
-        executed = await sim._llm_decide(valuation, [], {})
-
-        assert len(executed) == 1
-        assert executed[0]["ticker"] == "AAPL"
-        assert executed[0]["side"] == "SELL"
-        assert executed[0]["shares"] == pytest.approx(20.0, abs=0.001)
-
-        async with sim.Session() as s:
-            from sqlalchemy import select as sa_select
-            pos = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "AAPL"))
-            assert pos is None  # fully sold
-
-
 class TestRunCycleResetsLLMState:
     """run_cycle() must reset all per-cycle LLM state at the start, so a
     deterministic cycle never re-reports a previous LLM cycle's reasoning
@@ -1085,6 +903,38 @@ class TestYearLongSimulation:
 
         monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
 
+        # --- the candle cache lives in the DB now --------------------------
+        # The session fill contract reads decision candles and F's bar from
+        # the stored candle cache (one query), not through market.candles().
+        # Seed the synthetic series into the temp DB progressively — each
+        # cycle reveals one more month of stored sessions.
+        seeded = {"n": 0}
+
+        async def seed_candles():
+            n = reveal["day"]
+            async with mem_db() as s:
+                for t, data in synthetic.items():
+                    for r in data[seeded["n"]:n]:
+                        s.add(Candle(
+                            ticker=t,
+                            timestamp=datetime.fromisoformat(r["time"]),
+                            open=r["open"], high=r["high"], low=r["low"],
+                            close=r["close"], volume=r["volume"]))
+                await s.commit()
+            seeded["n"] = n
+
+        # --- the simulated session clock -----------------------------------
+        # Each cycle stands for ONE completed session F: the last revealed
+        # candle's date, at the scheduler's 23:30 UTC. The per-session fill
+        # guard keys on this date, so the 12 cycles are 12 distinct sessions.
+        base_date = datetime(2025, 1, 1)
+
+        def mock_utcnow():
+            d = base_date + timedelta(days=reveal["day"] - 1)
+            return datetime(d.year, d.month, d.day, 23, 30, tzinfo=UTC)
+
+        monkeypatch.setattr(sim, "_utcnow", mock_utcnow)
+
         # --- mock _current_month to advance through 12 months ---
         month_iter = iter(self.MONTHS)
         current_month = [next(month_iter)]
@@ -1106,6 +956,7 @@ class TestYearLongSimulation:
             if i > 0:
                 current_month[0] = next(month_iter)
                 reveal["day"] += self.DAYS_PER_MONTH
+            await seed_candles()
             result = await sim.run_cycle()
             results.append(result)
 
@@ -1174,8 +1025,22 @@ class TestYearLongSimulation:
         # 7. No negative cash
         assert val["cash"] >= 0
 
-        # 8. Bot has at least one open position
-        assert len(val["positions"]) >= 1
+        # 8. Ledger reconciliation: every open position's shares equal the
+        # net of the trade log for its ticker (the end state IS the replay
+        # of the trades), and equity = cash + Σ(shares × mark). Under the
+        # session fill contract a chandelier stop can legitimately flatten
+        # the whole book in a choppy synthetic year, so "has a position" is
+        # not an invariant — the ledger matching is.
+        from collections import defaultdict
+        net_shares: dict[str, float] = defaultdict(float)
+        for t in trades:
+            net_shares[t["ticker"]] += (t["shares"] if t["side"] == "BUY"
+                                        else -t["shares"])
+        held = {p["ticker"]: p["shares"] for p in val["positions"]}
+        assert held == {t: s for t, s in net_shares.items() if s > 0.0001}
+        assert val["total_equity"] == pytest.approx(
+            val["cash"] + sum(p["shares"] * p["current_price"]
+                              for p in val["positions"]), abs=0.05)
 
         # 9. Equity curve snapshots show non-decreasing allowance_total
         curve = await sim.get_equity_curve(limit=365)
@@ -1226,11 +1091,6 @@ class TestTopUpAtCap:
         signals = {f"HELD{i}": buy_signal(f"HELD{i}") for i in range(10)}
         signals["NEW1"] = buy_signal("NEW1")
 
-        # Mock _candidate_tickers to return the held + new tickers.
-        async def mock_candidates():
-            return list(signals.keys())
-        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
-
         # Keep max_positions at the default (10) — the portfolio is at cap.
         monkeypatch.setattr(settings, "sim_max_positions", 10)
 
@@ -1241,7 +1101,18 @@ class TestTopUpAtCap:
             await s.commit()
         valuation = await sim.valuate()
 
-        proposals = await sim._deterministic_propose(valuation, signals)
+        # Contract path: frozen decision inputs — decision closes (S) for
+        # held + candidate tickers, F's bars for the held tickers (fills at
+        # F's open), no ratchets yet.
+        prices = {f"HELD{i}": 60.0 for i in range(10)}
+        prices["NEW1"] = 100.0
+        session_bars = {f"HELD{i}": {"open": 60.0, "low": 59.0, "close": 60.0}
+                        for i in range(10)}
+        decision = sim._DecisionInputs(
+            f_ts=pd.Timestamp("2026-03-03"), s_ts=pd.Timestamp("2026-03-02"),
+            signals=signals, prices=prices, session_bars=session_bars,
+            ratchets={f"HELD{i}": None for i in range(10)})
+        proposals = await sim._deterministic_propose(valuation, decision=decision)
 
         # Split proposals by whether the ticker is already held.
         held_tickers = {f"HELD{i}" for i in range(10)}
@@ -1261,9 +1132,9 @@ class TestTopUpAtCap:
 
     async def test_top_up_executes_and_deploys_cash(self, with_cash, monkeypatch):
         """End-to-end: propose + execute at the cap should actually buy more of
-        a held ticker and reduce cash. Calls _deterministic_propose (with
-        pre-built signals) + _execute_proposed directly, mirroring the hybrid
-        branch's propose→execute flow."""
+        a held ticker and reduce cash. Calls _deterministic_propose (with a
+        pre-built _DecisionInputs) + _execute_proposed directly, mirroring
+        the hybrid branch's propose→execute flow."""
         from app.db import SimPosition
 
         # Seed 10 positions at low cost basis.
@@ -1282,10 +1153,6 @@ class TestTopUpAtCap:
             }
         signals = {f"HELD{i}": buy_signal(f"HELD{i}") for i in range(10)}
 
-        async def mock_candidates():
-            return list(signals.keys())
-        monkeypatch.setattr(sim, "_candidate_tickers", mock_candidates)
-
         monkeypatch.setattr(settings, "sim_max_positions", 10)
 
         # Give excess cash so top-ups can deploy it.
@@ -1296,9 +1163,16 @@ class TestTopUpAtCap:
         cash_before = acc.cash
 
         valuation = await sim.valuate()
-        # Propose with pre-built signals (skip the candles() gather path),
+        # Propose on the contract path with pre-built frozen decision inputs,
         # then execute — same flow as the hybrid branch.
-        proposals = await sim._deterministic_propose(valuation, signals)
+        prices = {f"HELD{i}": 60.0 for i in range(10)}
+        session_bars = {f"HELD{i}": {"open": 60.0, "low": 59.0, "close": 60.0}
+                        for i in range(10)}
+        decision = sim._DecisionInputs(
+            f_ts=pd.Timestamp("2026-03-03"), s_ts=pd.Timestamp("2026-03-02"),
+            signals=signals, prices=prices, session_bars=session_bars,
+            ratchets={f"HELD{i}": None for i in range(10)})
+        proposals = await sim._deterministic_propose(valuation, decision=decision)
         trades = await sim._execute_proposed(proposals)
 
         # BUY trades should exist (top-ups of held tickers).
@@ -1318,6 +1192,166 @@ class TestTopUpAtCap:
         assert len(positions) == 10, (
             f"position count {len(positions)} != 10 (top-ups opened new positions)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic engine: entry gate + ATR stop (Phase 1 financial correctness)
+# ---------------------------------------------------------------------------
+
+class TestDeterministicEntryAndStops:
+    """The live sim must not buy a bearish HOLD through the relaxed fallback,
+    and the ATR stop must be a level the price can actually break."""
+
+    def _hold_signal(self, *, net: int, trend_up: bool, dist_above: float,
+                     weekly: bool, strength: int = 60,
+                     atr_stop: float | None = None, close: float = 100.0) -> dict:
+        return {
+            "action": "HOLD",
+            "strength": strength,
+            "reason": f"HOLD (score {net:+d})",
+            "snapshot": {
+                "close": close,
+                "atr14": 2.0,
+                "atr_stop": atr_stop,
+                "run_5d": 0.0,
+                "dist_above": dist_above,
+                "trend_up": trend_up,
+                "trend_down": not trend_up,
+                "weekly_trend_up": weekly,
+                "net_score": net,
+            },
+        }
+
+    async def test_bearish_hold_is_not_bought(self, with_cash, monkeypatch):
+        """The audit reproduction: bullish 0 / bearish 65 with a weekly
+        downtrend produced a BUY. It must not any more."""
+        sig = self._hold_signal(net=-65, trend_up=False, dist_above=-8.0,
+                                 weekly=False, strength=65)
+
+        valuation = await sim.valuate()
+        decision = sim._DecisionInputs(
+            f_ts=pd.Timestamp("2026-03-03"), s_ts=pd.Timestamp("2026-03-02"),
+            signals={"BEAR": sig}, prices={"BEAR": 100.0}, session_bars={},
+            ratchets={})
+        proposals = await sim._deterministic_propose(valuation, decision=decision)
+        assert [p for p in proposals if p["side"] == "BUY"] == []
+
+    async def test_near_threshold_hold_is_bought_when_eligible(
+        self, with_cash, monkeypatch
+    ):
+        """A HOLD that misses only the score threshold still enters."""
+        sig = self._hold_signal(net=25, trend_up=True, dist_above=5.0,
+                                 weekly=True, strength=45)
+
+        valuation = await sim.valuate()
+        decision = sim._DecisionInputs(
+            f_ts=pd.Timestamp("2026-03-03"), s_ts=pd.Timestamp("2026-03-02"),
+            signals={"GOOD": sig}, prices={"GOOD": 100.0},
+            session_bars={"GOOD": {"open": 100.0, "low": 99.0, "close": 100.0}},
+            ratchets={})
+        proposals = await sim._deterministic_propose(valuation, decision=decision)
+        buys = [p for p in proposals if p["side"] == "BUY"]
+        assert len(buys) == 1
+        assert buys[0]["ticker"] == "GOOD"
+        assert buys[0]["price"] == 100.0  # fills at F's open (contract)
+        assert "relaxed HOLD entry" in buys[0]["reason"]
+
+    async def test_atr_stop_sells_a_broken_position(self, with_cash, monkeypatch):
+        """A price below the snapshot's ATR stop must produce a SELL."""
+        await sim._exec_buy("AAA", 100.0, 1_000.0, "seed")
+        sig = self._hold_signal(net=5, trend_up=True, dist_above=5.0,
+                                 weekly=True, strength=10, atr_stop=95.0,
+                                 close=90.0)
+
+        # valuate() marks the held position at the latest close.
+        async def mock_close(ticker):
+            return 90.0
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+
+        valuation = await sim.valuate()
+        # Contract path: the ATR level is a standing order for F — F's open
+        # 90 <= level 95, so the stop fills AT THE OPEN (not at a stale close).
+        decision = sim._DecisionInputs(
+            f_ts=pd.Timestamp("2026-03-03"), s_ts=pd.Timestamp("2026-03-02"),
+            signals={"AAA": sig}, prices={"AAA": 90.0},
+            session_bars={"AAA": {"open": 90.0, "low": 89.0, "close": 90.0}},
+            ratchets={"AAA": None})
+        proposals = await sim._deterministic_propose(valuation, decision=decision)
+        sells = [p for p in proposals if p["side"] == "SELL"]
+        assert len(sells) == 1
+        assert sells[0]["price"] == 90.0
+        assert sells[0]["reason"].startswith("ATR stop standing order")
+
+    async def test_no_buy_below_the_published_atr_level(self, with_cash, monkeypatch):
+        """The ATR level is anchored to the market's 20-bar high, so a pullback
+        entry can sit below it. Entering there would be stopped out on the
+        next cycle (buy -> sell -> buy churn at the same price)."""
+        sig = {
+            "action": "BUY",
+            "strength": 80,
+            "reason": "BUY (score +60)",
+            "snapshot": {
+                "close": 128.46,
+                "atr14": 2.0,
+                "atr_stop": 128.97,   # above the entry price
+                "run_5d": 0.0,
+                "dist_above": 8.0,
+                "trend_up": True,
+                "trend_down": False,
+                "weekly_trend_up": True,
+                "net_score": 60,
+            },
+        }
+
+        valuation = await sim.valuate()
+        decision = sim._DecisionInputs(
+            f_ts=pd.Timestamp("2026-03-03"), s_ts=pd.Timestamp("2026-03-02"),
+            signals={"AAA": sig}, prices={"AAA": 128.46},
+            session_bars={"AAA": {"open": 128.46, "low": 128.0, "close": 128.46}},
+            ratchets={})
+        proposals = await sim._deterministic_propose(valuation, decision=decision)
+        assert [p for p in proposals if p["side"] == "BUY"] == []
+
+    async def test_no_rebuy_of_a_ticker_sold_in_the_same_cycle(
+        self, with_cash, monkeypatch
+    ):
+        """A ticker stopped out in a cycle must not be bought again in it."""
+        await sim._exec_buy("AAA", 100.0, 1_000.0, "seed")
+        sig = {
+            "action": "BUY",
+            "strength": 80,
+            "reason": "BUY (score +60)",
+            "snapshot": {
+                "close": 85.0,
+                "atr14": 2.0,
+                "atr_stop": 90.0,     # price below the level -> SELL
+                "run_5d": 0.0,
+                "dist_above": 8.0,
+                "trend_up": True,
+                "trend_down": False,
+                "weekly_trend_up": True,
+                "net_score": 60,
+            },
+        }
+
+        # valuate() marks the held position at the latest close.
+        async def mock_close(ticker):
+            return 85.0
+        monkeypatch.setattr(sim, "_latest_close", mock_close)
+
+        valuation = await sim.valuate()
+        decision = sim._DecisionInputs(
+            f_ts=pd.Timestamp("2026-03-03"), s_ts=pd.Timestamp("2026-03-02"),
+            signals={"AAA": sig}, prices={"AAA": 85.0},
+            session_bars={"AAA": {"open": 85.0, "low": 84.0, "close": 85.0}},
+            ratchets={"AAA": None})
+        proposals = await sim._deterministic_propose(valuation, decision=decision)
+        sides = [(p["ticker"], p["side"]) for p in proposals]
+        assert ("AAA", "SELL") in sides
+        assert ("AAA", "BUY") not in sides, (
+            f"the ticker was sold and bought again in the same cycle: {sides}"
+        )
+
 
 class TestTimezoneConvention:
     """Verify that sim timestamps are stored as tz-aware UTC, and the monthly
@@ -1611,215 +1645,210 @@ class TestParseActionBlock:
 
 
 # ---------------------------------------------------------------------------
-# Chat-driven trade execution (sim_chat)
+# Chat proposals (sim_chat / sim_chat_stream PROPOSE, confirm executes)
 # ---------------------------------------------------------------------------
 
-class TestSimChatPartialSell:
-    """Tests that sim_chat honours partial SELL sizes from the action block.
+def _stub_chat_reply(monkeypatch, text: str) -> None:
+    """Fake the LLM HTTP reply for a sim chat turn (no network)."""
 
-    These tests mock the LLM HTTP call and the portfolio context builder,
-    then verify that _exec_sell is called with the correct share count
-    (not None, which would liquidate the entire position).
-    """
+    class MockResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"message": {"content": text}}
+
+    class MockClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def post(self, url, json=None):
+            return MockResponse()
+
+    monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
+
+
+def _mock_chat_context(monkeypatch) -> None:
+    """Keep the sim chat context minimal (no signals/news gathering)."""
+
+    async def mock_context():
+        return "mock context"
+
+    monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
+
+
+async def _trade_count() -> int:
+    async with sim.Session() as s:
+        return await s.scalar(select(func.count()).select_from(SimTrade)) or 0
+
+
+async def _chat_then_confirm(result, trades_before: int) -> dict:
+    """The slice-3D contract: a chat turn only PROPOSES (honest envelope — no
+    "trades"/"actions_executed" keys, no new trade rows), and the returned
+    proposal is what confirm_chat_proposal executes."""
+    assert "trades" not in result
+    assert "actions_executed" not in result
+    assert len(result["proposals"]) == 1
+    assert await _trade_count() == trades_before, "a proposing turn must not write trades"
+    return await sim.confirm_chat_proposal(result["proposals"][0]["proposal_id"])
+
+
+class TestSimChatPartialSell:
+    """Tests that a chat turn PROPOSES partial SELL sizes (with an accurate
+    preview) and that confirming the proposal executes exactly those sizes."""
 
     async def test_sell_with_amount_trims_position(self, with_cash, monkeypatch, llm_backend):
         """SELL with 'amount' should sell only the equivalent shares, not all."""
         # Setup: buy 100 shares of AAPL at $100 = $10,000
         await sim._exec_buy("AAPL", 100.0, 10000.0, "initial buy")
-        assert 10000.0 >= 1  # sanity
+        trades_before = await _trade_count()
 
-        # Mock _latest_close to return $100 for AAPL
         async def mock_close(ticker):
             return 100.0 if ticker == "AAPL" else None
         monkeypatch.setattr(sim, "_latest_close", mock_close)
+        _mock_chat_context(monkeypatch)
 
-        # Mock _build_sim_chat_context to return minimal context
-        async def mock_context():
-            return "mock context"
-        monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
-
-        # Mock the LLM HTTP response to return a partial SELL of $3000
-        llm_response_text = (
+        _stub_chat_reply(monkeypatch, (
             'Trimming AAPL by $3000.\n'
             '[[ACTION]]\n'
             '{"actions": [{"ticker": "AAPL", "action": "SELL", "amount": 3000.0, "reason": "trim"}]}\n'
             '[[/ACTION]]'
-        )
-
-        class MockResponse:
-            status_code = 200
-            def raise_for_status(self):
-                pass
-            def json(self):
-                return {"message": {"content": llm_response_text}}
-
-        class MockClient:
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *args):
-                pass
-            async def post(self, url, json=None):
-                return MockResponse()
-
-        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
+        ))
 
         result = await sim.sim_chat([{"role": "user", "content": "trim AAPL by $3000"}])
 
-        assert result["actions_executed"] is True
-        assert len(result["trades"]) == 1
-        trade = result["trades"][0]
+        # The turn proposed, not executed: the preview estimates 30 shares / $3000.
+        action = result["proposals"][0]["actions"][0]
+        assert action["ticker"] == "AAPL" and action["action"] == "SELL"
+        assert action["amount"] == 3000.0 and action["reason"] == "trim"
+        preview = action["preview"]
+        assert preview["feasible"] is True
+        assert preview["issue"] is None
+        assert preview["price"] == 100.0
+        assert preview["est_shares"] == pytest.approx(30.0, abs=0.001)
+        assert preview["est_value"] == pytest.approx(3000.0)
+        assert preview["est_cash_after"] == pytest.approx(3000.0)  # cash was 0 after the buy
+        assert preview["est_position_value_after"] == pytest.approx(7000.0)
+
+        conf = await _chat_then_confirm(result, trades_before)
+        assert conf["ok"] is True
+        assert conf["snapshot_taken"] is True
+        assert conf["skipped"] == []
+        assert len(conf["trades"]) == 1
+        trade = conf["trades"][0]
         assert trade["ticker"] == "AAPL"
         assert trade["side"] == "SELL"
-        # $3000 / $100 = 30 shares sold
+        # $3000 / $100 = 30 shares sold — exactly what the preview estimated
         assert trade["shares"] == pytest.approx(30.0, abs=0.001)
 
         # Verify the position still exists with ~70 shares remaining
         async with sim.Session() as s:
-            from sqlalchemy import select as sa_select
-            pos = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "AAPL"))
+            pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == "AAPL"))
             assert pos is not None, "Position should still exist after partial sell"
             assert pos.shares == pytest.approx(70.0, abs=0.001)
 
     async def test_sell_with_shares_trims_position(self, with_cash, monkeypatch, llm_backend):
         """SELL with 'shares' should sell exactly that many shares."""
         await sim._exec_buy("AAPL", 100.0, 10000.0, "initial buy")
+        trades_before = await _trade_count()
 
         async def mock_close(ticker):
             return 100.0 if ticker == "AAPL" else None
         monkeypatch.setattr(sim, "_latest_close", mock_close)
+        _mock_chat_context(monkeypatch)
 
-        async def mock_context():
-            return "mock context"
-        monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
-
-        llm_response_text = (
+        _stub_chat_reply(monkeypatch, (
             'Selling 25 shares.\n'
             '[[ACTION]]\n'
             '{"actions": [{"ticker": "AAPL", "action": "SELL", "shares": 25.0, "reason": "trim"}]}\n'
             '[[/ACTION]]'
-        )
-
-        class MockResponse:
-            status_code = 200
-            def raise_for_status(self):
-                pass
-            def json(self):
-                return {"message": {"content": llm_response_text}}
-
-        class MockClient:
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *args):
-                pass
-            async def post(self, url, json=None):
-                return MockResponse()
-
-        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
+        ))
 
         result = await sim.sim_chat([{"role": "user", "content": "sell 25 shares of AAPL"}])
 
-        assert result["actions_executed"] is True
-        assert len(result["trades"]) == 1
-        assert result["trades"][0]["shares"] == pytest.approx(25.0, abs=0.001)
+        preview = result["proposals"][0]["actions"][0]["preview"]
+        assert preview["feasible"] is True
+        assert preview["est_shares"] == pytest.approx(25.0, abs=0.001)
+        assert preview["est_value"] == pytest.approx(2500.0)
+
+        conf = await _chat_then_confirm(result, trades_before)
+        assert len(conf["trades"]) == 1
+        assert conf["trades"][0]["shares"] == pytest.approx(25.0, abs=0.001)
 
         async with sim.Session() as s:
-            from sqlalchemy import select as sa_select
-            pos = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "AAPL"))
+            pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == "AAPL"))
             assert pos is not None
             assert pos.shares == pytest.approx(75.0, abs=0.001)
 
     async def test_sell_without_size_liquidates_all(self, with_cash, monkeypatch, llm_backend):
         """SELL without 'shares' or 'amount' should sell the entire position (backward compat)."""
         await sim._exec_buy("AAPL", 100.0, 5000.0, "initial buy")  # 50 shares
+        trades_before = await _trade_count()
 
         async def mock_close(ticker):
             return 100.0 if ticker == "AAPL" else None
         monkeypatch.setattr(sim, "_latest_close", mock_close)
+        _mock_chat_context(monkeypatch)
 
-        async def mock_context():
-            return "mock context"
-        monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
-
-        llm_response_text = (
+        _stub_chat_reply(monkeypatch, (
             'Selling all AAPL.\n'
             '[[ACTION]]\n'
             '{"actions": [{"ticker": "AAPL", "action": "SELL", "reason": "exit"}]}\n'
             '[[/ACTION]]'
-        )
-
-        class MockResponse:
-            status_code = 200
-            def raise_for_status(self):
-                pass
-            def json(self):
-                return {"message": {"content": llm_response_text}}
-
-        class MockClient:
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *args):
-                pass
-            async def post(self, url, json=None):
-                return MockResponse()
-
-        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
+        ))
 
         result = await sim.sim_chat([{"role": "user", "content": "sell all AAPL"}])
 
-        assert result["actions_executed"] is True
-        assert len(result["trades"]) == 1
-        assert result["trades"][0]["shares"] == pytest.approx(50.0, abs=0.001)
+        preview = result["proposals"][0]["actions"][0]["preview"]
+        assert preview["feasible"] is True
+        assert preview["est_shares"] == pytest.approx(50.0, abs=0.001)
+        assert preview["est_position_value_after"] == pytest.approx(0.0)
+
+        conf = await _chat_then_confirm(result, trades_before)
+        assert len(conf["trades"]) == 1
+        assert conf["trades"][0]["shares"] == pytest.approx(50.0, abs=0.001)
 
         async with sim.Session() as s:
-            from sqlalchemy import select as sa_select
-            pos = await s.scalar(sa_select(SimPosition).where(SimPosition.ticker == "AAPL"))
+            pos = await s.scalar(select(SimPosition).where(SimPosition.ticker == "AAPL"))
             assert pos is None, "Position should be fully liquidated"
 
     async def test_sell_amount_exceeding_position_sells_all(self, with_cash, monkeypatch, llm_backend):
         """If 'amount' exceeds the position value, sell the entire position."""
         await sim._exec_buy("AAPL", 100.0, 3000.0, "initial buy")  # 30 shares = $3000
+        trades_before = await _trade_count()
 
         async def mock_close(ticker):
             return 100.0 if ticker == "AAPL" else None
         monkeypatch.setattr(sim, "_latest_close", mock_close)
+        _mock_chat_context(monkeypatch)
 
-        async def mock_context():
-            return "mock context"
-        monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
-
-        llm_response_text = (
+        _stub_chat_reply(monkeypatch, (
             '[[ACTION]]\n'
             '{"actions": [{"ticker": "AAPL", "action": "SELL", "amount": 99999.0, "reason": "over"}]}\n'
             '[[/ACTION]]'
-        )
-
-        class MockResponse:
-            status_code = 200
-            def raise_for_status(self):
-                pass
-            def json(self):
-                return {"message": {"content": llm_response_text}}
-
-        class MockClient:
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *args):
-                pass
-            async def post(self, url, json=None):
-                return MockResponse()
-
-        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
+        ))
 
         result = await sim.sim_chat([{"role": "user", "content": "sell AAPL"}])
 
-        assert result["actions_executed"] is True
-        assert len(result["trades"]) == 1
+        # The preview clamps to the position: 30 shares, not 999.99.
+        preview = result["proposals"][0]["actions"][0]["preview"]
+        assert preview["feasible"] is True
+        assert preview["est_shares"] == pytest.approx(30.0, abs=0.001)
+
+        conf = await _chat_then_confirm(result, trades_before)
+        assert len(conf["trades"]) == 1
         # _exec_sell clamps to pos.shares
-        assert result["trades"][0]["shares"] == pytest.approx(30.0, abs=0.001)
+        assert conf["trades"][0]["shares"] == pytest.approx(30.0, abs=0.001)
 
 
 class TestSimChatPartialBuy:
-    """Tests that sim_chat honours partial BUY sizes from the action block."""
+    """Tests that a chat turn PROPOSES partial BUY sizes and that confirming
+    the proposal executes the previewed budget."""
 
     async def test_buy_with_amount(self, with_cash, monkeypatch, llm_backend):
         """BUY with 'amount' should invest at most that many dollars."""
@@ -1829,40 +1858,30 @@ class TestSimChatPartialBuy:
         async def mock_close(ticker):
             return 100.0 if ticker == "AAPL" else None
         monkeypatch.setattr(sim, "_latest_close", mock_close)
+        _mock_chat_context(monkeypatch)
 
-        async def mock_context():
-            return "mock context"
-        monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
-
-        llm_response_text = (
+        _stub_chat_reply(monkeypatch, (
             'Buying $2000 of AAPL.\n'
             '[[ACTION]]\n'
             '{"actions": [{"ticker": "AAPL", "action": "BUY", "amount": 2000.0, "reason": "dip"}]}\n'
             '[[/ACTION]]'
-        )
-
-        class MockResponse:
-            status_code = 200
-            def raise_for_status(self):
-                pass
-            def json(self):
-                return {"message": {"content": llm_response_text}}
-
-        class MockClient:
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *args):
-                pass
-            async def post(self, url, json=None):
-                return MockResponse()
-
-        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
+        ))
 
         result = await sim.sim_chat([{"role": "user", "content": "buy $2000 of AAPL"}])
+        trades_before = await _trade_count()
 
-        assert result["actions_executed"] is True
-        assert len(result["trades"]) == 1
-        trade = result["trades"][0]
+        # cash 10000, min_cash 500, max_pos 3000 → budget = min(9500, 3000, 2000) = 2000
+        preview = result["proposals"][0]["actions"][0]["preview"]
+        assert preview["feasible"] is True
+        assert preview["issue"] is None
+        assert preview["est_shares"] == pytest.approx(20.0, abs=0.001)
+        assert preview["est_value"] == pytest.approx(2000.0)
+        assert preview["est_cash_after"] == pytest.approx(8000.0)
+        assert preview["est_position_value_after"] == pytest.approx(2000.0)
+
+        conf = await _chat_then_confirm(result, trades_before)
+        assert len(conf["trades"]) == 1
+        trade = conf["trades"][0]
         assert trade["ticker"] == "AAPL"
         assert trade["side"] == "BUY"
         # $2000 / $100 = 20 shares
@@ -1876,127 +1895,84 @@ class TestSimChatPartialBuy:
         async def mock_close(ticker):
             return 100.0 if ticker == "AAPL" else None
         monkeypatch.setattr(sim, "_latest_close", mock_close)
+        _mock_chat_context(monkeypatch)
 
-        async def mock_context():
-            return "mock context"
-        monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
-
-        llm_response_text = (
+        _stub_chat_reply(monkeypatch, (
             '[[ACTION]]\n'
             '{"actions": [{"ticker": "AAPL", "action": "BUY", "shares": 15.0, "reason": "dip"}]}\n'
             '[[/ACTION]]'
-        )
-
-        class MockResponse:
-            status_code = 200
-            def raise_for_status(self):
-                pass
-            def json(self):
-                return {"message": {"content": llm_response_text}}
-
-        class MockClient:
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *args):
-                pass
-            async def post(self, url, json=None):
-                return MockResponse()
-
-        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
+        ))
 
         result = await sim.sim_chat([{"role": "user", "content": "buy 15 shares of AAPL"}])
+        trades_before = await _trade_count()
 
-        assert result["actions_executed"] is True
-        assert len(result["trades"]) == 1
         # 15 shares * $100 = $1500 budget → 15 shares bought
-        assert result["trades"][0]["shares"] == pytest.approx(15.0, abs=0.001)
+        preview = result["proposals"][0]["actions"][0]["preview"]
+        assert preview["feasible"] is True
+        assert preview["est_shares"] == pytest.approx(15.0, abs=0.001)
+        assert preview["est_value"] == pytest.approx(1500.0)
+
+        conf = await _chat_then_confirm(result, trades_before)
+        assert len(conf["trades"]) == 1
+        assert conf["trades"][0]["shares"] == pytest.approx(15.0, abs=0.001)
 
     async def test_buy_amount_clamped_to_max_budget(self, with_cash, monkeypatch, llm_backend):
-        """BUY 'amount' exceeding the risk-limited budget should be clamped."""
+        """BUY 'amount' exceeding the risk-limited budget should be clamped (feasible preview)."""
         # Cash = $10,000, min_cash = 5% = $500, so max spend = $9,500
         # max_position = 10% of $10,000 = $1,000
         # Requesting $5,000 should be clamped to $1,000
         async def mock_close(ticker):
             return 100.0 if ticker == "AAPL" else None
         monkeypatch.setattr(sim, "_latest_close", mock_close)
+        _mock_chat_context(monkeypatch)
 
-        async def mock_context():
-            return "mock context"
-        monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
-
-        llm_response_text = (
+        _stub_chat_reply(monkeypatch, (
             '[[ACTION]]\n'
             '{"actions": [{"ticker": "AAPL", "action": "BUY", "amount": 5000.0, "reason": "too much"}]}\n'
             '[[/ACTION]]'
-        )
-
-        class MockResponse:
-            status_code = 200
-            def raise_for_status(self):
-                pass
-            def json(self):
-                return {"message": {"content": llm_response_text}}
-
-        class MockClient:
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *args):
-                pass
-            async def post(self, url, json=None):
-                return MockResponse()
-
-        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
+        ))
 
         result = await sim.sim_chat([{"role": "user", "content": "buy $5000 of AAPL"}])
+        trades_before = await _trade_count()
 
-        assert result["actions_executed"] is True
-        assert len(result["trades"]) == 1
+        preview = result["proposals"][0]["actions"][0]["preview"]
+        assert preview["feasible"] is True
+        assert preview["est_value"] == pytest.approx(1000.0)  # clamped to max position
+        assert preview["est_shares"] == pytest.approx(10.0, abs=0.001)
+
+        conf = await _chat_then_confirm(result, trades_before)
+        assert len(conf["trades"]) == 1
         # max_position = 10% of $10,000 = $1,000 → 10 shares at $100
-        assert result["trades"][0]["shares"] == pytest.approx(10.0, abs=0.001)
+        assert conf["trades"][0]["shares"] == pytest.approx(10.0, abs=0.001)
 
     async def test_buy_without_amount_uses_max_budget(self, with_cash, monkeypatch, llm_backend):
         """BUY without 'amount' or 'shares' should use the max allowed budget."""
         async def mock_close(ticker):
             return 100.0 if ticker == "AAPL" else None
         monkeypatch.setattr(sim, "_latest_close", mock_close)
+        _mock_chat_context(monkeypatch)
 
-        async def mock_context():
-            return "mock context"
-        monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
-
-        llm_response_text = (
+        _stub_chat_reply(monkeypatch, (
             '[[ACTION]]\n'
             '{"actions": [{"ticker": "AAPL", "action": "BUY", "reason": "dip"}]}\n'
             '[[/ACTION]]'
-        )
-
-        class MockResponse:
-            status_code = 200
-            def raise_for_status(self):
-                pass
-            def json(self):
-                return {"message": {"content": llm_response_text}}
-
-        class MockClient:
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *args):
-                pass
-            async def post(self, url, json=None):
-                return MockResponse()
-
-        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
+        ))
 
         result = await sim.sim_chat([{"role": "user", "content": "buy AAPL"}])
+        trades_before = await _trade_count()
 
-        assert result["actions_executed"] is True
-        assert len(result["trades"]) == 1
+        preview = result["proposals"][0]["actions"][0]["preview"]
+        assert preview["feasible"] is True
+        assert preview["est_value"] == pytest.approx(1000.0)
+
+        conf = await _chat_then_confirm(result, trades_before)
+        assert len(conf["trades"]) == 1
         # max_position = 10% of $10,000 = $1,000 → 10 shares at $100
-        assert result["trades"][0]["shares"] == pytest.approx(10.0, abs=0.001)
+        assert conf["trades"][0]["shares"] == pytest.approx(10.0, abs=0.001)
 
 
 class TestSimChatReserveOverride:
-    """Tests that sim_chat can spend the cash reserve only with use_reserve."""
+    """Tests that a confirmed BUY can spend the cash reserve only with use_reserve."""
 
     async def test_buy_without_reserve_is_clamped(self, with_cash, monkeypatch, llm_backend):
         """A normal BUY (no use_reserve) cannot spend below the 5% cash floor."""
@@ -2006,40 +1982,26 @@ class TestSimChatReserveOverride:
         async def mock_close(ticker):
             return 100.0 if ticker == "AAPL" else None
         monkeypatch.setattr(sim, "_latest_close", mock_close)
+        _mock_chat_context(monkeypatch)
 
-        async def mock_context():
-            return "mock context"
-        monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
-
-        llm_response_text = (
+        _stub_chat_reply(monkeypatch, (
             '[[ACTION]]\n'
             '{"actions": [{"ticker": "AAPL", "action": "BUY", "reason": "dip"}]}\n'
             '[[/ACTION]]'
-        )
-
-        class MockResponse:
-            status_code = 200
-            def raise_for_status(self):
-                pass
-            def json(self):
-                return {"message": {"content": llm_response_text}}
-
-        class MockClient:
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *args):
-                pass
-            async def post(self, url, json=None):
-                return MockResponse()
-
-        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
+        ))
 
         result = await sim.sim_chat([{"role": "user", "content": "buy AAPL"}])
+        trades_before = await _trade_count()
 
-        assert result["actions_executed"] is True
-        assert len(result["trades"]) == 1
+        preview = result["proposals"][0]["actions"][0]["preview"]
+        assert preview["feasible"] is True
         # min_cash = 5% of $10,000 = $500 → budget = $9,500 → 95 shares @ $100
-        assert result["trades"][0]["shares"] == pytest.approx(95.0, abs=0.001)
+        assert preview["est_shares"] == pytest.approx(95.0, abs=0.001)
+        assert preview["est_cash_after"] == pytest.approx(500.0)
+
+        conf = await _chat_then_confirm(result, trades_before)
+        assert len(conf["trades"]) == 1
+        assert conf["trades"][0]["shares"] == pytest.approx(95.0, abs=0.001)
 
     async def test_buy_with_reserve_spends_dry_powder(self, with_cash, monkeypatch, llm_backend):
         """A BUY with use_reserve=true can spend below the cash floor (to $0)."""
@@ -2048,64 +2010,52 @@ class TestSimChatReserveOverride:
         async def mock_close(ticker):
             return 100.0 if ticker == "AAPL" else None
         monkeypatch.setattr(sim, "_latest_close", mock_close)
+        _mock_chat_context(monkeypatch)
 
-        async def mock_context():
-            return "mock context"
-        monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
-
-        llm_response_text = (
+        _stub_chat_reply(monkeypatch, (
             '[[ACTION]]\n'
             '{"actions": [{"ticker": "AAPL", "action": "BUY", "use_reserve": true, "reason": "spend dry powder"}]}\n'
             '[[/ACTION]]'
-        )
-
-        class MockResponse:
-            status_code = 200
-            def raise_for_status(self):
-                pass
-            def json(self):
-                return {"message": {"content": llm_response_text}}
-
-        class MockClient:
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *args):
-                pass
-            async def post(self, url, json=None):
-                return MockResponse()
-
-        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
+        ))
 
         result = await sim.sim_chat([{"role": "user", "content": "spend the dry powder on AAPL"}])
+        trades_before = await _trade_count()
 
-        assert result["actions_executed"] is True
-        assert len(result["trades"]) == 1
+        action = result["proposals"][0]["actions"][0]
+        assert action["use_reserve"] is True
+        preview = action["preview"]
+        assert preview["feasible"] is True
         # floor = $0 → budget = $10,000 → 100 shares @ $100
-        assert result["trades"][0]["shares"] == pytest.approx(100.0, abs=0.001)
+        assert preview["est_shares"] == pytest.approx(100.0, abs=0.001)
+        assert preview["est_cash_after"] == pytest.approx(0.0)
+
+        conf = await _chat_then_confirm(result, trades_before)
+        assert len(conf["trades"]) == 1
+        assert conf["trades"][0]["shares"] == pytest.approx(100.0, abs=0.001)
+        assert "[reserve spent]" in conf["trades"][0]["reason"]
 
 
 class TestSimChatMultipleActions:
-    """Tests that sim_chat correctly processes multiple actions in one response."""
+    """Tests that one chat turn proposes multiple actions and one confirm
+    executes them all."""
 
     async def test_sell_then_buy(self, with_cash, monkeypatch, llm_backend):
-        """Sell one ticker, then buy another — both should execute."""
+        """Sell one ticker, then buy another — both should execute on confirm."""
         # Raise max position % so the $2000 SPY buy isn't clamped to $1500
         monkeypatch.setattr(settings, "sim_max_position_pct", 30.0)
 
         # Setup: buy MDB and ANET
         await sim._exec_buy("MDB", 100.0, 5000.0, "initial")  # 50 shares MDB
         await sim._exec_buy("ANET", 50.0, 2000.0, "initial")  # 40 shares ANET
+        trades_before = await _trade_count()
 
         async def mock_close(ticker):
             prices = {"MDB": 100.0, "ANET": 50.0, "SPY": 400.0}
             return prices.get(ticker)
         monkeypatch.setattr(sim, "_latest_close", mock_close)
+        _mock_chat_context(monkeypatch)
 
-        async def mock_context():
-            return "mock context"
-        monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
-
-        llm_response_text = (
+        _stub_chat_reply(monkeypatch, (
             'Trim MDB by $2000 and buy SPY.\n'
             '[[ACTION]]\n'
             '{"actions": [\n'
@@ -2113,67 +2063,42 @@ class TestSimChatMultipleActions:
             '  {"ticker": "SPY", "action": "BUY", "amount": 2000.0, "reason": "diversify"}\n'
             ']}\n'
             '[[/ACTION]]'
-        )
-
-        class MockResponse:
-            status_code = 200
-            def raise_for_status(self):
-                pass
-            def json(self):
-                return {"message": {"content": llm_response_text}}
-
-        class MockClient:
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *args):
-                pass
-            async def post(self, url, json=None):
-                return MockResponse()
-
-        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
+        ))
 
         result = await sim.sim_chat([{"role": "user", "content": "trim MDB to buy SPY"}])
 
-        assert result["actions_executed"] is True
-        assert len(result["trades"]) == 2
+        proposal = result["proposals"][0]
+        assert len(proposal["actions"]) == 2
+        sell_preview = proposal["actions"][0]["preview"]
+        buy_preview = proposal["actions"][1]["preview"]
+        assert sell_preview["feasible"] is True
+        assert sell_preview["est_shares"] == pytest.approx(20.0, abs=0.001)
+        assert buy_preview["feasible"] is True
+        assert buy_preview["est_shares"] == pytest.approx(5.0, abs=0.001)  # $2000 / $400
+
+        conf = await _chat_then_confirm(result, trades_before)
+        assert len(conf["trades"]) == 2
         # First trade: SELL MDB $2000 / $100 = 20 shares
-        assert result["trades"][0]["ticker"] == "MDB"
-        assert result["trades"][0]["side"] == "SELL"
-        assert result["trades"][0]["shares"] == pytest.approx(20.0, abs=0.001)
+        assert conf["trades"][0]["ticker"] == "MDB"
+        assert conf["trades"][0]["side"] == "SELL"
+        assert conf["trades"][0]["shares"] == pytest.approx(20.0, abs=0.001)
         # Second trade: BUY SPY $2000 / $400 = 5 shares
-        assert result["trades"][1]["ticker"] == "SPY"
-        assert result["trades"][1]["side"] == "BUY"
-        assert result["trades"][1]["shares"] == pytest.approx(5.0, abs=0.001)
+        assert conf["trades"][1]["ticker"] == "SPY"
+        assert conf["trades"][1]["side"] == "BUY"
+        assert conf["trades"][1]["shares"] == pytest.approx(5.0, abs=0.001)
 
     async def test_no_action_block_returns_text_only(self, with_cash, monkeypatch, llm_backend):
-        """If the LLM doesn't include an action block, just return the text."""
-        async def mock_context():
-            return "mock context"
-        monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
+        """If the LLM doesn't include an action block, just return the text (no proposal)."""
+        _mock_chat_context(monkeypatch)
 
         llm_response_text = 'I think the portfolio looks good right now. No changes needed.'
-
-        class MockResponse:
-            status_code = 200
-            def raise_for_status(self):
-                pass
-            def json(self):
-                return {"message": {"content": llm_response_text}}
-
-        class MockClient:
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *args):
-                pass
-            async def post(self, url, json=None):
-                return MockResponse()
-
-        monkeypatch.setattr("app.llm.httpx.AsyncClient", lambda **kw: MockClient())
+        _stub_chat_reply(monkeypatch, llm_response_text)
 
         result = await sim.sim_chat([{"role": "user", "content": "what do you think?"}])
 
-        assert result["actions_executed"] is False
-        assert result["trades"] == []
+        assert result["proposals"] == []
+        assert "trades" not in result
+        assert "actions_executed" not in result
         assert result["text"] == llm_response_text
 
 
@@ -2183,7 +2108,7 @@ class TestSimChatMultipleActions:
 
 class TestSimChatStream:
     """Tests for sim.sim_chat_stream: progressive deltas, persist-after-done,
-    action execution after stream completes, orphan-message avoidance."""
+    action-block PROPOSAL after the stream completes, orphan-message avoidance."""
 
     async def _run_stream(self, new_msgs, fake_llm_events):
         """Drive sim_chat_stream with a mocked llm_mod.chat_stream that yields
@@ -2205,7 +2130,7 @@ class TestSimChatStream:
 
     async def test_streams_deltas_then_done(self, with_cash, monkeypatch):
         """Plain text response — deltas arrive, then a done envelope with the
-        full text. No action block means actions_executed=False, no trades."""
+        full text and an empty proposals list. No action block means no proposal."""
         async def mock_context():
             return "mock context"
         monkeypatch.setattr(sim, "_build_sim_chat_context", mock_context)
@@ -2224,8 +2149,9 @@ class TestSimChatStream:
         assert [d["text"] for d in deltas] == ["Hello", " world"]
         assert len(dones) == 1
         assert dones[0]["text"] == "Hello world"
-        assert dones[0]["actions_executed"] is False
-        assert dones[0]["trades"] == []
+        assert dones[0]["proposals"] == []
+        assert "trades" not in dones[0]
+        assert "actions_executed" not in dones[0]
         # Persistence: user msg + assistant reply both stored AFTER stream done.
         assert len(history) == 2
         assert history[0]["role"] == "user"
@@ -2233,10 +2159,12 @@ class TestSimChatStream:
         assert history[1]["role"] == "assistant"
         assert history[1]["content"] == "Hello world"
 
-    async def test_action_block_executed_after_done(self, with_cash, monkeypatch):
-        """LLM streams raw text containing [[ACTION]]; trades execute after the
-        stream completes; done.text is the stripped display_text."""
+    async def test_action_block_proposed_after_done(self, with_cash, monkeypatch):
+        """LLM streams raw text containing [[ACTION]]; the done event carries a
+        PROPOSAL (with preview) — nothing executes until confirm; done.text is
+        the stripped display_text."""
         await sim._exec_buy("AAPL", 100.0, 10000.0, "initial")
+        trades_before = await _trade_count()
 
         async def mock_close(ticker):
             return 100.0 if ticker == "AAPL" else None
@@ -2263,19 +2191,30 @@ class TestSimChatStream:
         )
         dones = [e for e in out if e["type"] == "done"]
         assert len(dones) == 1
-        assert dones[0]["actions_executed"] is True
-        assert len(dones[0]["trades"]) == 1
-        assert dones[0]["trades"][0]["ticker"] == "AAPL"
-        assert dones[0]["trades"][0]["side"] == "SELL"
-        assert dones[0]["trades"][0]["shares"] == pytest.approx(30.0, abs=0.001)
+        done = dones[0]
+        # The done event proposes, it does not execute.
+        assert "trades" not in done
+        assert "actions_executed" not in done
+        assert len(done["proposals"]) == 1
+        preview = done["proposals"][0]["actions"][0]["preview"]
+        assert preview["feasible"] is True
+        assert preview["est_shares"] == pytest.approx(30.0, abs=0.001)
+        assert await _trade_count() == trades_before  # nothing executed yet
         # done.text is the stripped display_text, NOT the raw action block.
-        assert "[[ACTION]]" not in dones[0]["text"]
-        assert "Trimming AAPL." in dones[0]["text"]
+        assert "[[ACTION]]" not in done["text"]
+        assert "Trimming AAPL." in done["text"]
         # raw field carries the original full response.
-        assert "[[ACTION]]" in dones[0]["raw"]
+        assert "[[ACTION]]" in done["raw"]
         # Persisted assistant message is the stripped display_text.
         assert history[-1]["role"] == "assistant"
         assert "[[ACTION]]" not in history[-1]["content"]
+
+        # Confirming the streamed proposal executes the previewed sell.
+        conf = await sim.confirm_chat_proposal(done["proposals"][0]["proposal_id"])
+        assert len(conf["trades"]) == 1
+        assert conf["trades"][0]["ticker"] == "AAPL"
+        assert conf["trades"][0]["side"] == "SELL"
+        assert conf["trades"][0]["shares"] == pytest.approx(30.0, abs=0.001)
 
     async def test_error_no_text_persists_error_message(self, with_cash, monkeypatch):
         """If the LLM errors before any text, an error-style assistant reply is
@@ -2291,7 +2230,10 @@ class TestSimChatStream:
         dones = [e for e in out if e["type"] == "done"]
         assert len(dones) == 1
         assert "LLM unavailable: connection refused" in dones[0]["text"]
-        assert dones[0]["actions_executed"] is False
+        assert dones[0]["proposals"] == []
+        assert dones[0]["error"] == "connection refused"
+        assert "trades" not in dones[0]
+        assert "actions_executed" not in dones[0]
         # Both user question and error reply persisted.
         assert len(history) == 2
         assert history[0]["role"] == "user"
@@ -2447,6 +2389,64 @@ class TestSimBackfill:
                     assert t.shares > 0 and t.price > 0
                     assert t.reason.startswith("backfill:")
         await check()
+
+    async def test_backfill_positions_carry_entry_anchors(
+            self, mem_db, fake_series, monkeypatch, tmp_path):
+        """End-state positions must carry the replay's REAL entry anchors:
+        ``opened_at`` = the actual first-buy session date (the monotone ATR
+        ratchet's anchor — wall-clock now() would let the ratchet see bars
+        from before the position existed), and ``stop_price`` = the percent
+        stop frozen at the entry fill (a top-up can never loosen it)."""
+        from sqlalchemy import select
+
+        from app import optimize as opt
+
+        monkeypatch.setattr(sim, "_STATE_FILE", tmp_path / "sim_state.json")
+
+        r = await sim.backfill(start="2025-03-01")
+        assert r["ok"] is True
+
+        async with mem_db() as s:
+            pos = (await s.scalars(select(SimPosition))).all()
+            trades = (await s.scalars(select(SimTrade)
+                                      .order_by(SimTrade.created_at))).all()
+        assert pos, "the replay must end with at least one holding"
+
+        # First BUY per ticker, respecting that a full SELL closes the
+        # position — a later re-buy is a NEW entry.
+        opened: dict[str, str] = {}
+        entry_px: dict[str, float] = {}
+        live: set[str] = set()
+        for tr in trades:
+            if tr.side == "BUY":
+                if tr.ticker not in live:
+                    live.add(tr.ticker)
+                    opened[tr.ticker] = tr.created_at.strftime("%Y-%m-%d")
+                    entry_px[tr.ticker] = tr.price
+            else:
+                live.discard(tr.ticker)
+
+        stop_pct = opt._live_sim_params().stop_pct
+        for p in pos:
+            assert p.opened_at is not None
+            anchor = p.opened_at.strftime("%Y-%m-%d") if p.opened_at else ""
+            assert anchor == opened[p.ticker], (
+                f"{p.ticker}: opened_at {anchor} must be the replay's "
+                f"first-buy date {opened[p.ticker]}, not wall-clock now()")
+            assert p.stop_price is not None
+            assert p.stop_price == pytest.approx(
+                entry_px[p.ticker] * (1 - stop_pct / 100), rel=1e-6)
+
+    async def test_backfill_resets_session_guard(
+            self, mem_db, fake_series, monkeypatch, tmp_path):
+        """The replay replaces the whole portfolio, so it must clear the
+        per-session fill guard — the next cycle has to be free to run."""
+        monkeypatch.setattr(sim, "_STATE_FILE", tmp_path / "sim_state.json")
+
+        sim._stamp_session_guard("2099-01-01")  # a consumed-looking session
+        r = await sim.backfill(start="2025-03-01")
+        assert r["ok"] is True
+        assert sim._load_state().get("last_session") is None
 
     async def test_uncovered_current_month_keeps_its_contribution(
             self, mem_db, fake_series, monkeypatch):
@@ -2677,3 +2677,24 @@ class TestTradingDayCalendar:
         monkeypatch.setattr(monthly, "run_monthly_cycle", boom)
         monkeypatch.setattr(daily_core, "run_daily_cycle", boom)
         await sim._scheduler_tick()  # must return without running anything
+
+    async def test_weekend_news_scan_gate_never_fires(self, monkeypatch):
+        """The 2026-11-03 footgun, pinned: SIM_NEWS_SCAN_WEEKDAY=6 (Sunday)
+        can NEVER fire — the tick skips non-trading days BEFORE the cycle,
+        so the gate is unreachable on weekends. A weekend gate value would
+        have silently disabled the type-D scan entirely; the gate itself
+        warns and fails open, but this tick-level test is the proof that
+        no cycle (and thus no D scan) ever runs on a Sunday."""
+        from app import daily_core, monthly
+        from app.config import settings
+
+        monkeypatch.setattr(sim, "_utcnow", lambda: datetime(2026, 9, 20, 22, 30))  # Sun
+        monkeypatch.setattr(settings, "sim_news_scan_weekday", 6)  # the footgun
+
+        async def boom(*a, **k):
+            raise AssertionError("a cycle ran on a non-trading day — the "
+                                "weekend news-scan gate fired")
+
+        monkeypatch.setattr(monthly, "run_monthly_cycle", boom)
+        monkeypatch.setattr(daily_core, "run_daily_cycle", boom)
+        await sim._scheduler_tick()

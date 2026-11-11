@@ -16,7 +16,7 @@ import pytest
 
 from app import sim
 from app.monthly import quality_snapshot
-from app.strategy import StrategyParams, propose_trades
+from app.strategy import StrategyParams, _fallback_eligible, propose_trades
 
 
 # pandas-stubs types Timestamp constructors as returning Timestamp | NaTType,
@@ -168,6 +168,40 @@ def _buy_signal(ticker: str) -> dict:
                          "run_5d": 0.0, "dist_above": 0.0}}
 
 
+def _hold_signal(ticker: str) -> dict:
+    """A HOLD that is a *near-threshold* BUY, i.e. eligible for the relaxed
+    HOLD fallback.
+
+    The fallback is not a loophole: a HOLD only enters when it clears the
+    same gate as a strict BUY (``analysis.entry_eligible``) and carries a
+    bullish net score — a daily uptrend, more than 2% above the SMA-200, a
+    weekly uptrend and ``net_score > 0``. A HOLD fixture that misses any of
+    these is blocked *before* the quality guard runs, so the quality-guard
+    tests below would pass for the wrong reason (blocked by the trend gate
+    instead of by the ROE guard).
+
+    The numbers mirror what ``analysis`` produces: bullish 60 / bearish 35
+    -> net +25 -> HOLD (below the BUY threshold of 40) with strength 60
+    (``max(bullish, bearish)``).
+    """
+    return {
+        "action": "HOLD",
+        "strength": 60,
+        "reason": "HOLD (score +25)",
+        "snapshot": {
+            "close": 100.0,
+            "rsi": 55.0,
+            "macd": 0.3,
+            "run_5d": 0.0,
+            "net_score": 25,          # bullish (bullish 60 > bearish 35)
+            "trend_up": True,         # daily uptrend (close > SMA50 > SMA200)
+            "trend_down": False,
+            "weekly_trend_up": True,  # weekly chart trending up
+            "dist_above": 8.0,        # more than 2% above the SMA-200
+        },
+    }
+
+
 def _valuation() -> dict:
     return {"cash": 10_000.0, "positions_value": 0.0, "total_equity": 10_000.0,
             "allowance_total": 10_000.0, "positions": []}
@@ -235,8 +269,12 @@ class TestBlockNegativeRoe:
     def test_relaxed_hold_fallback_also_guarded(self):
         # The relaxed fallback (HOLD with high strength) routes through the
         # same _entry_ok guard — negative-ROE names must be blocked there too.
+        # The HOLD fixture is otherwise fully eligible, so the quality guard
+        # is the ONLY reason for the block (asserted below).
         quality = {"LOSS": {"roe": -0.5, "p_fcf": None}}
-        hold_sig = {**_buy_signal("LOSS"), "action": "HOLD", "strength": 60}
+        hold_sig = _hold_signal("LOSS")
+        eligible, _why = _fallback_eligible(hold_sig, _GUARD_PARAMS)
+        assert eligible, "the HOLD fixture must clear the fallback entry gate"
         out = propose_trades(
             [], 10_000.0, {"LOSS": 100.0}, {"LOSS": hold_sig},
             _GUARD_PARAMS, quality_of=lambda t: quality.get(t),
@@ -245,12 +283,16 @@ class TestBlockNegativeRoe:
 
     def test_relaxed_hold_fallback_passes_when_quality_ok(self):
         quality = {"OK": {"roe": 0.3, "p_fcf": None}}
-        hold_sig = {**_buy_signal("OK"), "action": "HOLD", "strength": 60}
+        hold_sig = _hold_signal("OK")
+        eligible, _why = _fallback_eligible(hold_sig, _GUARD_PARAMS)
+        assert eligible, "the HOLD fixture must clear the fallback entry gate"
         out = propose_trades(
             [], 10_000.0, {"OK": 100.0}, {"OK": hold_sig},
             _GUARD_PARAMS, quality_of=lambda t: quality.get(t),
         )
         assert len(out) == 1 and out[0]["side"] == "BUY"
+        # It entered through the relaxed HOLD fallback, not as a strict BUY.
+        assert "relaxed HOLD entry" in out[0]["reason"]
 
 
 # ---------------------------------------------------------------------------

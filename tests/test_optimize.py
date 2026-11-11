@@ -7,7 +7,7 @@ parameter sweep) using synthetic candles — no DB, no network.
 from __future__ import annotations
 
 import random
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 import pytest
@@ -121,6 +121,109 @@ class TestRowStrength:
     def test_hold_uses_max(self):
         row = {"bullish": 30.0, "bearish": 55.0}
         assert _row_strength(row, "HOLD") == 55
+
+
+class TestByTimeAdapterGateFields:
+    """The deterministic replay adapter must carry the canonical snapshot
+    fields the entry gate and the tightened HOLD fallback read (review D2):
+    net_score / trend_up / trend_down / weekly_trend_up. The old adapter
+    omitted them, so the fallback failed closed in EVERY replay while the
+    live engine kept using it."""
+
+    @staticmethod
+    def _row(**over) -> dict:
+        row = {"close": 100.0, "net": 25.0, "bullish": 40.0, "bearish": 15.0,
+               "trend_up": True, "trend_down": False, "dist_above": 5.0,
+               "dist_below": -5.0, "atr_stop": None, "atr14": 2.0,
+               "weekly_trend_up": True, "run_5d": 3.0, "run_20d": 4.0,
+               "run_60d": 6.0, "dist_52w_high": -2.0}
+        row.update(over)
+        return row
+
+    @staticmethod
+    def _signals(row: dict, day: str = "2026-10-20") -> dict:
+        return optimize._signals_for_day_from_bytime(
+            {"UP": {day: row}}, day, ReplayParams())
+
+    def test_snapshot_carries_gate_fields(self):
+        sig = self._signals(self._row())["UP"]
+        snap = sig["snapshot"]
+        assert sig["action"] == "HOLD"          # net 25 < buy_threshold 40
+        assert snap["net_score"] == 25          # canonical int conversion
+        assert snap["trend_up"] is True
+        assert snap["trend_down"] is False
+        assert snap["weekly_trend_up"] is True
+        assert snap["dist_above"] == 5.0
+
+    def test_non_finite_net_fails_closed_to_none(self):
+        # math.isfinite (review D): int(+inf)/int(-inf) raise OverflowError
+        sig = self._signals(self._row(net=float("inf")))["UP"]
+        assert sig["snapshot"]["net_score"] is None
+        sig2 = self._signals(self._row(net=float("-inf")))["UP"]
+        assert sig2["snapshot"]["net_score"] is None
+        sig3 = self._signals(self._row(net=float("nan")))["UP"]
+        assert sig3["snapshot"]["net_score"] is None
+
+    def test_weekly_flag_missing_defaults_true_like_canonical(self):
+        row = self._row()
+        row.pop("weekly_trend_up")
+        sig = self._signals(row)["UP"]
+        assert sig["snapshot"]["weekly_trend_up"] is True
+
+    def test_adapter_proposal_matches_live_shaped_signal(self):
+        """The adapter path and the live engine path must propose the SAME
+        trade for the same facts: net 25 below the BUY threshold with
+        strength 40 — the relaxed HOLD fallback fires in BOTH (it never
+        fired in any replay while the adapter omitted the fields)."""
+        from app.strategy import StrategyParams, propose_trades
+        row = self._row()
+        adapted = self._signals(row)["UP"]
+        live_shaped = {"action": "HOLD", "strength": 40,
+                       "reason": "HOLD (strength 40)",
+                       "snapshot": dict(adapted["snapshot"])}
+        positions: list[dict] = []
+        prices = {"UP": 100.0}
+        sp = StrategyParams(buy_threshold=40, sell_threshold=-40)
+        p_adapter = propose_trades(positions, 10000.0, prices,
+                                   {"UP": adapted}, sp)
+        p_live = propose_trades(positions, 10000.0, prices,
+                                {"UP": live_shaped}, sp)
+        assert [x["side"] for x in p_adapter] == ["BUY"] == \
+            [x["side"] for x in p_live]
+        assert p_adapter[0]["ticker"] == "UP" == p_live[0]["ticker"]
+        # and the fallback never fired before the fix (reason parity)
+        assert "relaxed" in p_adapter[0]["reason"].lower() or \
+            "fallback" in p_adapter[0]["reason"].lower()
+
+    def test_bearish_and_weekly_down_block_the_fallback(self):
+        from app.strategy import StrategyParams, propose_trades
+        sp = StrategyParams(buy_threshold=40, sell_threshold=-40)
+        # bearish HOLD: net negative, strength 40 — fallback must NOT fire
+        bear = self._signals(self._row(net=-25.0, bullish=15.0, bearish=40.0,
+                                       trend_up=False))["UP"]
+        assert propose_trades([], 10000.0, {"UP": 100.0}, {"UP": bear}, sp) == []
+        # weekly trend down blocks the entry gate
+        wdown = self._signals(self._row(weekly_trend_up=False))["UP"]
+        assert propose_trades([], 10000.0, {"UP": 100.0}, {"UP": wdown}, sp) == []
+
+
+class TestMaxDrawdownDelegation:
+    """_max_drawdown is now a thin wrapper on app.performance.max_drawdown
+    (one cash-flow-neutral definition for backend + UI, audit P0-B)."""
+
+    def test_delegates_to_performance_percent(self):
+        from app.performance import max_drawdown
+        eq = [100.0, 120.0, 90.0, 110.0]
+        assert optimize._max_drawdown(eq) == pytest.approx(max_drawdown(eq))
+        assert optimize._max_drawdown(eq) == pytest.approx(25.0)  # in PERCENT
+
+    def test_deposit_only_is_no_drawdown(self):
+        # the audit's P0-B reproduction: invest 1000, grow to 1200, then
+        # deposit 1000 with NO price move — the old equity/invested-ratio
+        # arithmetic reported 8.33% despite no investment loss after the peak
+        eq = [1000.0, 1200.0, 2200.0]
+        inv = [1000.0, 1000.0, 2000.0]
+        assert optimize._max_drawdown(eq, inv) == pytest.approx(0.0)
 
 
 class TestSplitWindows:
@@ -1344,13 +1447,17 @@ class TestDailyCoreMonthlyParity:
             for t in tickers
         }
 
-        async def fake_load_frames(_tickers, _asof, start=None):
-            return close, vol
+        async def fake_load_ohlcv(_tickers, _asof, start=None):
+            # open == close on this synthetic tape: the session-fill rule
+            # (F's STRICT open, no ffill) is exercised separately in
+            # tests/test_replay_fills.py; here the fixture stays a close tape
+            # so the overlay/parity assertions compare like for like.
+            return close, close, vol
 
         async def fake_load_fundamentals(_tickers):
             return fund
 
-        monkeypatch.setattr(monthly_mod, "load_frames", fake_load_frames)
+        monkeypatch.setattr(monthly_mod, "load_ohlcv_frames", fake_load_ohlcv)
         monkeypatch.setattr(fundamentals_mod, "load_fundamentals", fake_load_fundamentals)
         return {"tickers": tickers, "close": close}
 
@@ -1406,8 +1513,10 @@ class TestDailyCoreMonthlyParity:
 
 class TestFillBuy:
     """The daily-core BUY fill must reserve the one-way fee inside the spend
-    so a full-cash buy can never drive cash negative (milestone parity with
-    daily_core.backfill's do_buy)."""
+    so a full-cash buy can never drive cash negative AND floor the share
+    count through ``factor_fills.share_size`` (the live ``_exec_buy`` /
+    ``daily_core.backfill.do_buy`` rule) — research fills must be
+    byte-identical to the live executor's on the same budget/fill price."""
 
     def test_full_cash_buy_never_negative(self):
         fill = optimize._fill_buy(cash=1000.0, price=50.0,
@@ -1415,8 +1524,10 @@ class TestFillBuy:
         assert fill is not None
         notional, shares, cash_after = fill
         assert cash_after >= 0.0
-        assert notional == pytest.approx(1000.0 / 1.001)
-        assert shares == pytest.approx(notional / 50.0)
+        # 1000/1.001 = $999.001 of spend -> 19.98 shares at the 4dp floor
+        assert shares == pytest.approx(19.98)
+        assert notional == pytest.approx(19.98 * 50.0)
+        assert cash_after == pytest.approx(1000.0 - 999.0 * 1.001)
 
     def test_partial_buy_keeps_cash_positive(self):
         fill = optimize._fill_buy(cash=1000.0, price=50.0,
@@ -1425,6 +1536,30 @@ class TestFillBuy:
         notional, _shares, cash_after = fill
         assert notional == 300.0
         assert cash_after == pytest.approx(1000.0 - 300.0 - 0.3)
+
+    def test_shares_match_the_live_share_size_floor(self):
+        from app.factor_fills import share_size
+        fill = optimize._fill_buy(cash=1000.0, price=137.31,
+                                  delta_value=1000.0, cost=0.0)
+        assert fill is not None
+        notional, shares, _cash = fill
+        assert shares == share_size(min(1000.0, 1000.0), 137.31)
+        assert notional == pytest.approx(shares * 137.31)
+
+    def test_drops_the_leg_the_live_executor_would_reject(self):
+        """The live executor sizes from the ROUNDED cash and then refuses a
+        leg whose booked cost exceeds the exact cash. Real tape case
+        (tests/test_replay_fills.py, 2026-09-01): cash $1000.0054, budget
+        $1000.01 -> 10.0144 shares -> $1000.0059 booked -> the LIVE leg is
+        skipped and retried next session. The research fill must skip it too
+        (before this, it shrank the budget to the exact cash and filled)."""
+        assert optimize._fill_buy(cash=1000.005354, price=99.8567877,
+                                  delta_value=1000.01, cost=0.0) is None
+        # ... and the retry at the next session's price DOES fill
+        retry = optimize._fill_buy(cash=1000.005354, price=101.941213,
+                                   delta_value=1000.01, cost=0.0)
+        assert retry is not None
+        assert retry[1] == pytest.approx(9.8096)
 
     def test_too_small_returns_none(self):
         assert optimize._fill_buy(cash=0.5, price=50.0,
@@ -1444,8 +1579,8 @@ class TestContributionDays:
     def test_first_trading_day_of_each_month(self):
         days = pd.DatetimeIndex(["2025-01-15", "2025-01-31",
                                  "2025-02-03", "2025-02-28"])
-        months = [pd.Timestamp("2025-01-31"), pd.Timestamp("2025-02-28")]
-        got = optimize._contribution_days(days, months)
+        keys = {(2025, 1), (2025, 2)}
+        got = optimize._contribution_days(days, keys)
         assert got == {pd.Timestamp("2025-01-15"), pd.Timestamp("2025-02-03")}
 
     def test_starts_mid_month_still_deposits(self):
@@ -1453,16 +1588,178 @@ class TestContributionDays:
         # on the first day the window sees (matching the monthly baseline's
         # one contribution for that month-end).
         days = pd.DatetimeIndex(["2025-01-15", "2025-01-31"])
-        months = [pd.Timestamp("2025-01-31")]
-        assert optimize._contribution_days(days, months) == {pd.Timestamp("2025-01-15")}
+        assert optimize._contribution_days(days, {(2025, 1)}) == {
+            pd.Timestamp("2025-01-15")}
 
     def test_one_contribution_per_month_key(self):
         days = pd.DatetimeIndex(["2024-12-30", "2025-01-02", "2025-01-31",
                                  "2025-02-03", "2025-02-28"])
-        months = [pd.Timestamp("2024-12-31"), pd.Timestamp("2025-01-31"),
-                  pd.Timestamp("2025-02-28")]
-        got = optimize._contribution_days(days, months)
+        got = optimize._contribution_days(
+            days, {(2024, 12), (2025, 1), (2025, 2)})
         assert len(got) == 3
+
+    def test_month_key_without_window_days_is_skipped(self):
+        # A key with no trading day inside the window deposits nothing —
+        # callers pass the trailing-window month explicitly; a month the
+        # window never touches can't fund.
+        days = pd.DatetimeIndex(["2025-01-15", "2025-01-31"])
+        assert optimize._contribution_days(days, {(2025, 3)}) == set()
+
+
+class TestMonthlyBacktestCalendarSettlement:
+    """The monthly aggregate settles contributions per CALENDAR month
+    spanned (review round 3): the live engine deposits monthly regardless
+    of eligibility or of whether the month's month-end candle is stored, so
+    a skipped interior month-end must not vanish that month's funding — and
+    a dead month must not trim the sequence based on FUTURE frame
+    eligibility. (Fee/cost policy is deliberately NOT touched here.)"""
+
+    TICKERS = ["A01", "B02", "C03", "D04", "E05", "F06", "G07", "H08"]
+
+    def _canned_frame(self, order: list[str]) -> pd.DataFrame:
+        roe = {t: 0.5 - 0.01 * i for i, t in enumerate(order)}
+        rows = {t: {"roe": roe.get(t, 0.001), "p_fcf": 20.0, "mcap": 1e10,
+                    "dollar_vol": 1e8, "mom": 0.1, "price": 100.0,
+                    "vol": 0.2, "eligible": True}
+                for t in self.TICKERS}
+        return pd.DataFrame(rows).T
+
+    def _dead_frame(self) -> pd.DataFrame:
+        return self._canned_frame(self.TICKERS).assign(eligible=False)
+
+    async def _run(self, monkeypatch, close, vol, frames, end="2026-03-31"):
+        from app import monthly as monthly_mod
+        monkeypatch.setattr(
+            monthly_mod, "eligible_frame",
+            lambda d, c, v, f: frames.get(pd.Timestamp(d).normalize()))
+        return await optimize._monthly_backtest(
+            "2026-01-02", end, "diversified-plus", 1000.0, False,
+            close_preloaded=(close, vol), fund_preloaded={})
+
+    def _market(self, last_day: str = "2026-03-31") -> tuple[pd.DataFrame, pd.DataFrame]:
+        dates = pd.bdate_range("2023-06-01", last_day)
+        close = pd.DataFrame(100.0, index=dates, columns=self.TICKERS)
+        vol = pd.DataFrame(1e6, index=dates, columns=self.TICKERS)
+        return close, vol
+
+    async def test_interior_month_end_hole_still_funds_that_month(
+            self, monkeypatch):
+        """February 2026's scheduled month-end (Feb-27) is missing from the
+        candles: months = [Jan-30, Mar-31], but the window spans THREE
+        calendar months — the aggregate must settle 3 contributions (Jan's
+        at Jan-30, Feb's + Mar's accrued at Mar-31), not 2."""
+        close, vol = self._market()
+        hole = pd.Timestamp("2026-02-27")
+        assert hole in close.index
+        close = close.drop(index=hole)
+        vol = vol.drop(index=hole)
+        frames = {pd.Timestamp(k): self._canned_frame(self.TICKERS)
+                  for k in ("2026-01-30", "2026-03-31")}
+        m = await self._run(monkeypatch, close, vol, frames)
+
+        assert m is not None
+        assert m.contributed == pytest.approx(3000.0)  # was 2000 before
+        assert m.window[0] == "2026-01-30"
+
+    async def test_dead_month_not_trimmed_still_funds_and_holds(
+            self, monkeypatch):
+        """A dead January frame (no eligible names) must not trim the
+        sequence: January is still funded (its deposit settles at its own
+        month-end) and the dead month holds the previous picks instead of
+        silently erasing the month's reporting."""
+        close, vol = self._market()
+        frames = {pd.Timestamp("2026-01-30"): self._dead_frame(),
+                  pd.Timestamp("2026-02-27"): self._canned_frame(self.TICKERS),
+                  pd.Timestamp("2026-03-31"): self._canned_frame(self.TICKERS)}
+        m = await self._run(monkeypatch, close, vol, frames)
+
+        assert m is not None
+        # all three months funded, starting at the DEAD month (the old trim
+        # started at the first live month and dropped January's funding)
+        assert m.contributed == pytest.approx(3000.0)  # was 2000 before
+        assert m.window[0] == "2026-01-30"
+        # the dead month holds the (empty) book — it is reported, not erased
+
+    async def test_leading_missing_month_end_funds_the_start_months(
+            self, monkeypatch):
+        """Window starts Jan-2 but January's month-end candle is missing
+        (first completed end is February's): the count keys on the CALENDAR
+        months present in the window, so February's month-end settles BOTH
+        January's and February's deposits — the old fixed k=1 dropped
+        January's funding."""
+        close, vol = self._market()
+        hole = pd.Timestamp("2026-01-30")  # January's scheduled month-end
+        assert hole in close.index
+        close = close.drop(index=hole)
+        vol = vol.drop(index=hole)
+        frames = {pd.Timestamp("2026-02-27"): self._canned_frame(self.TICKERS)}
+        m = await self._run(monkeypatch, close, vol, frames, end="2026-02-27")
+
+        assert m is not None
+        assert m.contributed == pytest.approx(2000.0)  # was 1000 before
+        assert m.window == ("2026-02-27", "2026-02-27")
+        # The rebalance FILL is the first session after Feb-27 (Mar-2), which
+        # is outside the window: the deferred rebalance is PENDING, so both
+        # deposits stay parked and NO swap cost is charged on a decision that
+        # never filled (the pre-contract close-fill charged 10 bps here).
+        assert m.final_value == pytest.approx(2000.0)
+
+    async def test_trailing_stretch_settles_every_funding_month(
+            self, monkeypatch):
+        """Jan-31 valid, February's month-end bar missing, window ends
+        Mar-13: the trailing stretch spans Feb AND Mar — both must fund (3
+        contributions total). The old trailing block deposited a fixed 1."""
+        close, vol = self._market()
+        hole = pd.Timestamp("2026-02-27")  # February's scheduled month-end
+        assert hole in close.index
+        close = close.drop(index=hole)
+        vol = vol.drop(index=hole)
+        frames = {pd.Timestamp("2026-01-30"): self._canned_frame(self.TICKERS)}
+        m = await self._run(monkeypatch, close, vol, frames,
+                            end="2026-03-13")
+
+        assert m is not None
+        assert m.contributed == pytest.approx(3000.0)  # was 2000 before
+        # Flat market. Jan-30's rebalance FILLS on Feb-2 (the deferred
+        # session) and that session is also February's deposit day, so both
+        # arrived deposits deploy there (2000 x one-way cost); March's
+        # deposit is parked until the (pending) next rebalance.
+        assert m.final_value == pytest.approx(
+            2000.0 * (1 - 0.001) + 1000.0)
+
+    async def test_trailing_contributions_are_parked_not_invested(
+            self, monkeypatch):
+        """Parked-vs-invested separation on a rising market: the trailing
+        stretch has NO rebalance, so its contributions must NOT earn the
+        stretch's gap return — only the invested portfolio does. The old
+        deposit-then-mark ordering handed parked money the stretch's
+        return."""
+        dates = pd.bdate_range("2023-06-01", "2026-03-13")
+        growth = pd.Series([1.01 ** i for i in range(len(dates))], index=dates)
+        close = pd.DataFrame(100.0, index=dates, columns=self.TICKERS) \
+            .mul(growth, axis=0)
+        vol = pd.DataFrame(1e6, index=dates, columns=self.TICKERS)
+        hole = pd.Timestamp("2026-02-27")
+        close = close.drop(index=hole)
+        vol = vol.drop(index=hole)
+        frames = {pd.Timestamp("2026-01-30"): self._canned_frame(self.TICKERS)}
+        m = await self._run(monkeypatch, close, vol, frames)
+
+        assert m is not None
+        assert m.contributed == pytest.approx(3000.0)
+        # invested at the deferred fill session (Feb-2, the first session
+        # after Jan-30): 2000 arrived deposits -> one-way cost on the
+        # full-entry swap
+        invested0 = 2000.0 * (1 - 0.001)
+        fill_day = pd.Timestamp("2026-02-02")
+        gap = float(
+            (close.loc["2026-03-13"] / close.loc[fill_day] - 1.0)
+            .dropna().mean())
+        expected = invested0 * (1.0 + gap) + 1000.0  # parked earns 0%
+        assert m.final_value == pytest.approx(expected, rel=1e-9)
+        # and the parked money clearly did NOT ride the gap return
+        lumped = (invested0 + 1000.0) * (1.0 + gap)
+        assert m.final_value < lumped
 
 
 class TestMonthPriceMap:
@@ -1535,13 +1832,17 @@ class TestDailyCoreRiskOverlays:
             for t in tickers
         }
 
-        async def fake_load_frames(_tickers, _asof, start=None):
-            return close, vol
+        async def fake_load_ohlcv(_tickers, _asof, start=None):
+            # open == close on this synthetic tape: the session-fill rule
+            # (F's STRICT open, no ffill) is exercised separately in
+            # tests/test_replay_fills.py; here the fixture stays a close tape
+            # so the overlay/parity assertions compare like for like.
+            return close, close, vol
 
         async def fake_load_fundamentals(_tickers):
             return fund
 
-        monkeypatch.setattr(monthly_mod, "load_frames", fake_load_frames)
+        monkeypatch.setattr(monthly_mod, "load_ohlcv_frames", fake_load_ohlcv)
         monkeypatch.setattr(fundamentals_mod, "load_fundamentals", fake_load_fundamentals)
         return {"tickers": tickers, "close": close}
 
@@ -1677,13 +1978,17 @@ class TestDailyCoreProtection:
             for t in tickers
         }
 
-        async def fake_load_frames(_tickers, _asof, start=None):
-            return close, vol
+        async def fake_load_ohlcv(_tickers, _asof, start=None):
+            # open == close on this synthetic tape: the session-fill rule
+            # (F's STRICT open, no ffill) is exercised separately in
+            # tests/test_replay_fills.py; here the fixture stays a close tape
+            # so the overlay/parity assertions compare like for like.
+            return close, close, vol
 
         async def fake_load_fundamentals(_tickers):
             return fund
 
-        monkeypatch.setattr(monthly_mod, "load_frames", fake_load_frames)
+        monkeypatch.setattr(monthly_mod, "load_ohlcv_frames", fake_load_ohlcv)
         monkeypatch.setattr(fundamentals_mod, "load_fundamentals", fake_load_fundamentals)
         return {"close": close}
 
@@ -1841,3 +2146,101 @@ class TestDailyCoreProtection:
             with_baseline=False, basket_trend_days=10, basket_confirm_days=3,
             basket_good_times=True, basket_arm_sma=50)
         assert g50 is not None and g50.basket_events >= 1
+
+
+# ---------------------------------------------------------------------------
+# prune-candles: the one WRITING subcommand — 8-year fail-closed guard
+# ---------------------------------------------------------------------------
+
+
+class TestPruneCandles:
+    """prune-candles deletes Candle rows from the SHARED live DB — the one
+    maintenance exception to app.optimize's read-only rule. A --before
+    cutoff within 8 years of today must be REFUSED unless --allow-degrade is
+    passed, because the savings mirror reads 8 years of candle history back
+    (app/savings.py _eur_close_history)."""
+
+    @pytest.fixture
+    async def candle_db(self, monkeypatch):
+        from sqlalchemy import StaticPool, func, select
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        from app.db import Base, Candle
+
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        monkeypatch.setattr(optimize, "Session", session_factory)
+
+        async def _count() -> int:
+            async with session_factory() as s:
+                return (await s.scalar(select(func.count()).select_from(Candle))) or 0
+
+        async def _seed(ticker: str, day: str) -> None:
+            async with session_factory() as s:
+                s.add(Candle(ticker=ticker, timestamp=datetime.strptime(day, "%Y-%m-%d"),
+                             open=1.0, high=1.0, low=1.0, close=1.0, volume=1))
+                await s.commit()
+
+        yield _count, _seed
+        await engine.dispose()
+
+    def test_parser_has_allow_degrade_flag_defaulting_off(self):
+        p = optimize._build_parser()
+        args = p.parse_args(["prune-candles", "--before", "2020-01-01"])
+        assert args.command == "prune-candles" and args.allow_degrade is False
+        args = p.parse_args(["prune-candles", "--before", "2020-01-01", "--allow-degrade"])
+        assert args.allow_degrade is True
+
+    async def test_refuses_cutoff_within_8_years_without_flag(self, candle_db, capsys):
+        count, seed = candle_db
+        today = datetime.now(UTC).date()
+        recent = (today - timedelta(days=365 * 3)).strftime("%Y-%m-%d")  # 3y ago: inside 8y
+        old = (today - timedelta(days=365 * 10)).strftime("%Y-%m-%d")   # 10y ago: outside
+        await seed("AAA", recent)
+        await seed("AAA", old)
+        await optimize._prune_candles(recent, dry_run=False)
+        out = capsys.readouterr().out
+        assert "refused" in out and "8 years" in out and "savings" in out
+        assert "_eur_close_history" in out  # names the 8-year mirror reader
+        assert await count() == 2           # NOTHING deleted (fail closed)
+
+    async def test_dry_run_within_8_years_is_refused_too(self, candle_db, capsys):
+        count, seed = candle_db
+        recent = (datetime.now(UTC).date() - timedelta(days=30)).strftime("%Y-%m-%d")
+        await seed("AAA", recent)
+        await optimize._prune_candles(recent, dry_run=True)
+        assert "refused" in capsys.readouterr().out
+        assert await count() == 1
+
+    async def test_allow_degrade_deletes_within_8_years(self, candle_db, capsys):
+        count, seed = candle_db
+        today = datetime.now(UTC).date()
+        recent = (today - timedelta(days=365 * 3)).strftime("%Y-%m-%d")
+        old = (today - timedelta(days=365 * 10)).strftime("%Y-%m-%d")
+        await seed("AAA", recent)
+        await seed("AAA", old)
+        await optimize._prune_candles(recent, dry_run=False, allow_degrade=True)
+        assert "deleted 1 of 2" in capsys.readouterr().out
+        assert await count() == 1           # only the old row went
+
+    async def test_old_cutoff_allowed_without_flag(self, candle_db, capsys):
+        count, seed = candle_db
+        today = datetime.now(UTC).date()
+        cutoff = (today - timedelta(days=365 * 10)).strftime("%Y-%m-%d")  # outside the 8y window
+        older = (today - timedelta(days=365 * 11)).strftime("%Y-%m-%d")   # strictly before cutoff
+        keep = (today - timedelta(days=365 * 9)).strftime("%Y-%m-%d")
+        await seed("AAA", older)
+        await seed("AAA", keep)
+        await optimize._prune_candles(cutoff, dry_run=False)  # 10y ago: allowed, no flag
+        assert "deleted 1 of 2" in capsys.readouterr().out
+        assert await count() == 1  # only the strictly-before row went
+
+    def test_module_docstring_discloses_the_write_exception(self):
+        doc = optimize.__doc__
+        assert "prune-candles" in doc and "not read-only" in doc
